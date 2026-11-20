@@ -1,0 +1,483 @@
+#!/usr/bin/env node
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'platform', 'tauri', 'bridge', 'chat.js'), 'utf8');
+const chatViewSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'features', 'chat', 'ChatView.jsx'), 'utf8');
+const tauriBridgeSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'platform', 'tauri', 'bridge.js'), 'utf8') +
+  fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8');
+const webBridgeSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'platform', 'web', 'bridge.js'), 'utf8') +
+  // normalizePinvouScene 已随 dead-code dedup 移入共享 payload；正则 pin 需把 payload 一并纳入。
+  fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8');
+const sessionsRustSource = fs.readFileSync(path.join(__dirname, '..', 'src-tauri', 'src', 'app', 'commands', 'sessions.rs'), 'utf8');
+// The tauri persona/review loaders live in the shared base since the
+// lane-merge residual wave (the protocol map still pins those invokes to the
+// sessions domain).
+const tauriSessionsSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'platform', 'tauri', 'bridge', 'sessions.js'), 'utf8');
+const sharedBaseSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8');
+
+// 提取两个 bridge 里真实的 normalizePinvouScene 白名单正则源码，供测试复用，
+// 保证 sidecar 记录路径走的是源码里的白名单，而不是各自 mock 的宽松实现。
+function extractNormalizeSceneRegex(source) {
+  const match = source.match(/return\s*(\/\^.*?\/)\.test\(scene\)/);
+  if (!match) throw new Error('normalizePinvouScene 正则未找到');
+  return match[1];
+}
+const tauriNormalizeSceneRegexSource = extractNormalizeSceneRegex(tauriBridgeSource);
+const webNormalizeSceneRegexSource = extractNormalizeSceneRegex(webBridgeSource);
+// eval 出真正的 RegExp 对象（源码里就是字面量正则）
+const tauriNormalizeSceneRegex = eval(tauriNormalizeSceneRegexSource);
+
+// The scene sidecar sync block (the two reporting helpers plus the sync function) is
+// extracted verbatim from the source: it is used both for a byte-for-byte comparison
+// across the two hosts and for actually executing the failure paths in a sandbox.
+const CACHED_SCENE_EVENTS = [{ pos: 0, scene: 'design:poster' }];
+function extractSceneSyncBlock(source) {
+  const match = source.match(
+    /function reportSidecarReadFailure\(kind, sid, error\) \{[\s\S]*?async function syncPinvouSceneEventsForSession\(sid\) \{[\s\S]*?\n {2}\}\n/,
+  );
+  return match ? match[0] : '';
+}
+async function runSceneSync(block, { readFails = false, saveFails = false } = {}) {
+  const warnings = [];
+  const sandbox = {
+    console: { warn: (...args) => warnings.push(args.map(String).join(' ')) },
+    window: { localStorage: { setItem() {}, getItem() { return null; } } },
+    loadPinvouSceneEventsForSession: () => [...CACHED_SCENE_EVENTS],
+    normalizePinvouSceneEvents: (events) => (Array.isArray(events) ? events : []),
+    pinvouSceneStorageKey: (sid) => `pinvou_scene_events_v1:${sid}`,
+    async invoke(command) {
+      if (command === 'get_session_pinvou_scene_events') {
+        if (readFails) throw new Error('sidecar unreadable');
+        return [];
+      }
+      if (command === 'save_session_pinvou_scene_events') {
+        if (saveFails) throw new Error('No space left on device');
+        return null;
+      }
+      return null;
+    },
+  };
+  vm.runInNewContext(`${block}\nthis.__syncScene = syncPinvouSceneEventsForSession;`, sandbox, {
+    filename: 'scene-sidecar-block.js',
+  });
+  try {
+    return { value: await sandbox.__syncScene('s1'), warnings, threw: false };
+  } catch (error) {
+    return { value: null, warnings, threw: String(error) };
+  }
+}
+
+// The steered-message sidecar exists only in the tauri host (the web bridge has
+// no steer persistence), so there is no byte twin to compare against. Run the
+// real source block through the same failure paths as the scene sidecar: a read
+// failure degrades to the cache, and a migration-write failure must never throw
+// across the bare await in the session-switch path. The reporting helpers live
+// before the scene block, outside the steered span, so they are extracted too and
+// the sandbox executes the real reporter wording rather than mirrored stubs.
+function extractSidecarReporters(source) {
+  const match = source.match(
+    /function reportSidecarReadFailure\(kind, sid, error\) \{[\s\S]*?function reportSidecarWriteFailure\(kind, sid, error\) \{[\s\S]*?\n {2}\}\n/,
+  );
+  return match ? match[0] : '';
+}
+function extractSteeredSyncBlock(source) {
+  const match = source.match(
+    /const STEERED_MESSAGES_STORAGE_PREFIX[\s\S]*?async function syncSteeredMessagesForSession\(sid\) \{[\s\S]*?\n {2}\}\n/,
+  );
+  return match ? match[0] : '';
+}
+async function runSteeredSync(reporters, block, { readFails = false, saveFails = false, cachedEvents = [] } = {}) {
+  const warnings = [];
+  const sandbox = {
+    console: { warn: (...args) => warnings.push(args.map(String).join(' ')) },
+    window: { localStorage: { setItem() {}, getItem: () => JSON.stringify(cachedEvents) } },
+    async invoke(command) {
+      if (command === 'get_session_steered_messages') {
+        if (readFails) throw new Error('sidecar unreadable');
+        return [];
+      }
+      if (command === 'save_session_steered_messages') {
+        if (saveFails) throw new Error('No space left on device');
+        return null;
+      }
+      return null;
+    },
+  };
+  vm.runInNewContext(`${reporters}\n${block}\nthis.__syncSteered = syncSteeredMessagesForSession;`, sandbox, {
+    filename: 'steered-sidecar-block.js',
+  });
+  try {
+    return { value: await sandbox.__syncSteered('s1'), warnings, threw: false };
+  } catch (error) {
+    return { value: null, warnings, threw: String(error) };
+  }
+}
+
+// Persona events and pinvou reviews have no local migration cache, but the
+// backend now fails a corrupt sidecar explicitly (missing stays []). The
+// loaders must degrade to [] exactly as before, just not silently. The
+// lane-merge residual wave relocated both loader bodies into the shared base
+// (bridge-shared-helpers.js) and both hosts delegate; extract and execute the
+// shared bodies verbatim like the scene/steered blocks, with the real tauri
+// reporters, and pin the two hosts' delegation to their cluster instances.
+function extractSharedPersonaReviewLoaders(source) {
+  const match = source.match(
+    /async function loadPersonaEventsForSession\(sid\) \{[\s\S]*?async function loadPinvouReviewsForSession\(sid\) \{[\s\S]*?return \[\];\n *\}\n *\}\n/,
+  );
+  return match ? match[0] : '';
+}
+async function runPersonaReviewLoaders(reporters, block, { readFails = false } = {}) {
+  const warnings = [];
+  const sandbox = {
+    console: { warn: (...args) => warnings.push(args.map(String).join(' ')) },
+    async invoke(command) {
+      if (readFails) throw new Error('sidecar unreadable');
+      if (command === 'get_session_persona_events') return [{ pos: 0, kind: 'equip' }];
+      if (command === 'get_session_pinvou_reviews') return null;
+      return null;
+    },
+  };
+  vm.runInNewContext(
+    `${reporters}\n${block}\nthis.__loadPersona = loadPersonaEventsForSession;\nthis.__loadReviews = loadPinvouReviewsForSession;`,
+    sandbox,
+    { filename: 'persona-review-sidecar-block.js' },
+  );
+  return {
+    persona: await sandbox.__loadPersona('s1'),
+    reviews: await sandbox.__loadReviews('s1'),
+    warnings,
+  };
+}
+
+function createFeature(options = {}) {
+  const sandbox = {
+    window: { __PINVOU_TAURI_BRIDGE_FEATURES__: {} },
+    console,
+  };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8'), sandbox, { filename: 'shared/bridge-shared-helpers.js' });
+  vm.runInNewContext(source, sandbox, { filename: 'bridge/chat.js' });
+  const factory = sandbox.window.__PINVOU_TAURI_BRIDGE_FEATURES__.chat;
+  const state = {
+    activeSessionId: 's1',
+    messages: [],
+    chatItems: [],
+    queued: [],
+    attachments: [],
+    sessions: [{ id: 's1', title: '新对话' }],
+    busy: false,
+    thinking: { active: false },
+  };
+  const sessionStates = {
+    s1: { queued: state.queued, busy: false, remoteTurnActive: false },
+  };
+  const invokes = [];
+  const sceneEvents = [];
+  const context = {
+    state,
+    invoke(command, args) {
+      invokes.push({ command, args });
+      if (options.failChat && command === 'chat') {
+        return Promise.reject(new Error('admission failed'));
+      }
+      return Promise.resolve(null);
+    },
+    notify() {},
+    TAURI: { event: { emit() {} } },
+    sessionStates,
+    turnUsageDirty: {},
+    personaPlaceholderTitles: {},
+    renderMarkdown(text) { return String(text || ''); },
+    safeConsoleInfo() {},
+    bt(key) { return key; },
+    runSyncOnSession(_sid, fn) { fn(); },
+    startThinking() { state.thinking = { active: true }; },
+    stopThinking() { state.thinking = { active: false }; },
+    ensureSessionBufferLoaded() { return Promise.resolve(); },
+    ensureSession() { state.activeSessionId = 's1'; return Promise.resolve('s1'); },
+    getBuffer(sid) { return sessionStates[sid]; },
+    recordPinvouSceneForMessage(sid, pos, scene) {
+      // 走 bridge.js 里真实的白名单门禁：未登记的 scene 会被丢弃为空字符串且不记录，
+      // 与 bridge.js:recordPinvouSceneForMessage 的行为保持一致。
+      const normalized = tauriNormalizeSceneRegex.test(String(scene || '').trim()) ? scene : '';
+      if (!normalized) return;
+      const existing = sceneEvents.findIndex(event => event.sid === sid && event.pos === pos);
+      if (existing >= 0) sceneEvents.splice(existing, 1);
+      sceneEvents.push({ sid, scene: normalized, pos });
+    },
+    reconcileRemoteTurn() { return Promise.resolve(true); },
+    markRemoteTurn() {},
+    clearAttachments() {},
+    isScheduledRunSession() { return false; },
+    basename(value) { return path.basename(String(value || '')); },
+    extractArtifactPath() { return ''; },
+    parseScheduledTaskDraftFromText() { return null; },
+    autoCreateScheduledTaskDraft() { return null; },
+    currentStreamText: '',
+    currentStreamId: 0,
+    pendingAssistantText: '',
+    pendingAssistantBlocks: [],
+    itemIdSeq: 0,
+  };
+  return { feature: factory(context), state, sessionStates, invokes, sceneEvents };
+}
+
+const results = [];
+function rec(name, pass, detail = '') {
+  results.push({ name, pass });
+  console.log(`${pass ? '✅' : '❌'} ${name}${detail ? '  ' + detail : ''}`);
+}
+
+// eslint-disable-next-line unicorn/prefer-top-level-await -- smoke script keeps its existing async main() structure
+(async () => {
+  {
+    const { feature, state, invokes, sceneEvents } = createFeature();
+    await feature.doSendFor('s1', '模型 payload', '用户可见文本', [], { pinvouScene: 'work:document-writing' }, false, true);
+    const user = state.chatItems.find(item => item.type === 'user');
+    const chatInvoke = invokes.find(item => item.command === 'chat');
+    rec('发送时用户气泡带 scene，但 messages 不写展示字段',
+      user &&
+        user.pinvouScene === 'work:document-writing' &&
+        state.messages[0] &&
+        !Object.prototype.hasOwnProperty.call(state.messages[0], 'pinvouScene') &&
+        sceneEvents.length === 1 &&
+        sceneEvents[0].pos === 0 &&
+        sceneEvents[0].scene === 'work:document-writing' &&
+        chatInvoke &&
+        chatInvoke.args.message === '模型 payload',
+      JSON.stringify({ user, message: state.messages[0], sceneEvents, invokes }));
+  }
+
+  {
+    const { feature, state, invokes, sceneEvents } = createFeature();
+    await feature.sendMessage('运动', {
+      pinvouScene: 'work:personal-workbench',
+      pinvouPayloadText: '隐藏默认专家 prompt\n\n用户需求：\n运动',
+    });
+    const user = state.chatItems.find(item => item.type === 'user');
+    const chatInvoke = invokes.find(item => item.command === 'chat');
+    const messageText = state.messages[0] &&
+      state.messages[0].content &&
+      state.messages[0].content[0] &&
+      state.messages[0].content[0].text;
+    rec('个人工作台隐藏 payload 只进模型请求，不进入用户气泡和 messages',
+      user &&
+        user.text === '运动' &&
+        user.pinvouScene === 'work:personal-workbench' &&
+        messageText === '运动' &&
+        chatInvoke &&
+        chatInvoke.args.message === '隐藏默认专家 prompt\n\n用户需求：\n运动' &&
+        sceneEvents.length === 1 &&
+        sceneEvents[0].scene === 'work:personal-workbench',
+      JSON.stringify({ user, message: state.messages[0], chatInvoke, sceneEvents }));
+  }
+
+  {
+    const { feature, state, sceneEvents } = createFeature({ failChat: true });
+    let rejected = false;
+    try {
+      await feature.doSendFor(
+        's1',
+        '失败 payload',
+        '失败消息',
+        [],
+        { pinvouScene: 'design:poster' },
+        false,
+        true,
+      );
+    } catch {
+      rejected = true;
+    }
+    rec('发送准入失败时不提交 scene sidecar',
+      rejected &&
+        state.messages.length === 0 &&
+        !state.chatItems.some(item => item.type === 'user') &&
+        sceneEvents.length === 0,
+      JSON.stringify({ rejected, messages: state.messages, chatItems: state.chatItems, sceneEvents }));
+  }
+
+  {
+    const { feature, state, invokes, sceneEvents } = createFeature();
+    state.queued.push(
+      { id: 1, text: 'payload 1', displayText: '第一条\n\n📎 ["first.pdf"]', attachments: [{ basename: 'first.pdf' }], meta: { pinvouScene: 'design:poster' }, restrictTools: false },
+      { id: 2, text: 'payload 2', displayText: '第二条\n\n📎 ["second.png"]', attachments: [{ basename: 'second.png' }], meta: { pinvouScene: 'design:poster' }, restrictTools: true },
+    );
+    feature.flushQueued('s1');
+    await Promise.resolve();
+    const firstUsers = state.chatItems.filter(item => item.type === 'user');
+    const firstInvokes = invokes.filter(item => item.command === 'chat');
+    const firstPass =
+      state.queued.length === 1 && state.queued[0].id === 2 &&
+      firstUsers.length === 1 && firstUsers[0].text === '第一条\n\n📎 ["first.pdf"]' &&
+      firstUsers[0].pinvouScene === 'design:poster' &&
+      firstInvokes.length === 1 && firstInvokes[0].args.message === 'payload 1' &&
+      firstInvokes[0].args.attachments.length === 1 &&
+      firstInvokes[0].args.attachments[0].basename === 'first.pdf' &&
+      firstInvokes[0].args.restrictTools === false;
+
+    state.busy = false;
+    feature.flushQueued('s1');
+    await Promise.resolve();
+    const users = state.chatItems.filter(item => item.type === 'user');
+    const chatInvokes = invokes.filter(item => item.command === 'chat');
+    rec('queued 多条同一 scene 按 FIFO 分成独立 turn 并各自保留标签',
+      firstPass &&
+        state.queued.length === 0 &&
+        users.length === 2 && users[1].text === '第二条\n\n📎 ["second.png"]' &&
+        users[1].pinvouScene === 'design:poster' &&
+        chatInvokes.length === 2 && chatInvokes[1].args.message === 'payload 2' &&
+        chatInvokes[1].args.attachments.length === 1 &&
+        chatInvokes[1].args.attachments[0].basename === 'second.png' &&
+        chatInvokes[1].args.restrictTools === true &&
+        sceneEvents.length === 2 &&
+        sceneEvents.every(event => event.scene === 'design:poster'),
+      JSON.stringify({ users, chatInvokes, queued: state.queued, sceneEvents }));
+  }
+
+  {
+    const { feature, state, invokes, sceneEvents } = createFeature();
+    state.queued.push(
+      { id: 1, text: 'payload 1', displayText: '第一条', attachments: [], meta: { pinvouScene: 'design:poster' }, restrictTools: false },
+      { id: 2, text: 'payload 2', displayText: '第二条', attachments: [], meta: { pinvouScene: 'design:data-visualization' }, restrictTools: false },
+    );
+    feature.flushQueued('s1');
+    await Promise.resolve();
+    state.busy = false;
+    feature.flushQueued('s1');
+    await Promise.resolve();
+    const users = state.chatItems.filter(item => item.type === 'user');
+    const chatInvokes = invokes.filter(item => item.command === 'chat');
+    rec('queued 多条不同 scene 按 FIFO 分发且标签互不污染',
+      state.queued.length === 0 &&
+        users.length === 2 &&
+        users[0].text === '第一条' && users[0].pinvouScene === 'design:poster' &&
+        users[1].text === '第二条' && users[1].pinvouScene === 'design:data-visualization' &&
+        chatInvokes.length === 2 &&
+        chatInvokes[0].args.message === 'payload 1' &&
+        chatInvokes[1].args.message === 'payload 2' &&
+        sceneEvents.length === 2,
+      JSON.stringify({ users, chatInvokes, sceneEvents }));
+  }
+
+  {
+    const { feature, state } = createFeature({ failChat: true });
+    state.queued.push(
+      { id: 1, text: 'payload 1', displayText: '第一条', attachments: [], meta: null, restrictTools: false },
+      { id: 2, text: 'payload 2', displayText: '第二条', attachments: [], meta: null, restrictTools: false },
+    );
+    feature.flushQueued('s1');
+    await new Promise(resolve => { setImmediate(resolve); });
+    rec('queued 队首发送失败时按原顺序回队且不吞后续消息',
+      state.queued.length === 2 &&
+        state.queued[0].id === 1 && state.queued[1].id === 2 &&
+        !state.chatItems.some(item => item.type === 'user'),
+      JSON.stringify({ queued: state.queued, chatItems: state.chatItems }));
+  }
+
+  rec('附件-only 发送也会按当前专业子模式创建 scene meta',
+    /if \(visibleOutgoing \|\| hasReadyAttachment\)/.test(chatViewSource) &&
+      // The scene prompt is built from the mention-stripped body (the
+      // injection block is a machine contract, re-prepended onto
+      // pinvouPayloadText instead of sandwiching inside scene boilerplate).
+      /const scenePrompt = sceneBody \|\| t\.uiChatScenes\.attachmentPrompt;/.test(chatViewSource) &&
+      /\}, \[activeSessionId, dataVisualizationSceneActive, documentWritingSceneActive, hasReadyAttachment, personalWorkbenchSceneActive, pptDesignSceneActive, sessionMentionEnabled, t, visualPosterSceneActive\]\);/.test(chatViewSource),
+    'ChatView sendChatMessage contract');
+
+  // The real source of both bridges is extracted and executed rather than shape-matching
+  // the catch: shape assertions cannot tell "migration write inside the try" from
+  // "outside the try", and the latter would let a write failure escape to the bare-await
+  // switchToSessionInternal, escalating a decorative tag's write failure into the whole
+  // session failing to open.
+  const tauriSceneSync = extractSceneSyncBlock(tauriBridgeSource);
+  const webSceneSync = extractSceneSyncBlock(webBridgeSource);
+  rec('scene sidecar 同步在两个宿主上逐字节同一，避免二次漂移',
+    tauriSceneSync !== '' && tauriSceneSync === webSceneSync,
+    'tauri/web scene sidecar sync must stay byte-identical');
+
+  for (const [host, block] of [['tauri', tauriSceneSync], ['web', webSceneSync]]) {
+    const read = await runSceneSync(block, { readFails: true });
+    rec(`${host}: scene sidecar 读失败时上报后降级到本地缓存`,
+      !read.threw && JSON.stringify(read.value) === JSON.stringify(CACHED_SCENE_EVENTS) &&
+        read.warnings.some(text => text.includes('read failed')),
+      JSON.stringify(read));
+    const write = await runSceneSync(block, { saveFails: true });
+    rec(`${host}: scene sidecar 迁移写失败时上报后降级，绝不抛给会话切换`,
+      !write.threw && JSON.stringify(write.value) === JSON.stringify(CACHED_SCENE_EVENTS) &&
+        write.warnings.some(text => text.includes('migration write failed')),
+      JSON.stringify(write));
+  }
+
+  const tauriSteeredSync = extractSteeredSyncBlock(tauriBridgeSource);
+  const tauriSidecarReporters = extractSidecarReporters(tauriBridgeSource);
+  rec('steered sidecar 同步块与上报助手存在于 tauri 桥源码',
+    tauriSteeredSync !== '' && tauriSidecarReporters !== '',
+    'tauri steered sidecar block + reporters');
+  {
+    const cached = [{ pos: 3, text: '调整一下' }];
+    const read = await runSteeredSync(tauriSidecarReporters, tauriSteeredSync, { readFails: true, cachedEvents: cached });
+    rec('tauri: steered 读失败时上报后降级到本地缓存',
+      !read.threw && JSON.stringify(read.value) === JSON.stringify(cached) &&
+        read.warnings.some(text => text.includes('read failed')),
+      JSON.stringify(read));
+    const write = await runSteeredSync(tauriSidecarReporters, tauriSteeredSync, { saveFails: true, cachedEvents: cached });
+    rec('tauri: steered 迁移写失败时上报后降级，绝不抛给会话切换',
+      !write.threw && JSON.stringify(write.value) === JSON.stringify(cached) &&
+        write.warnings.some(text => text.includes('migration write failed')),
+      JSON.stringify(write));
+  }
+
+  // Persona/review sidecars have no local cache: read failure must report and
+  // degrade to [] (never throw across the bare await in the switch path).
+  const sharedPersonaReviewLoaders = extractSharedPersonaReviewLoaders(sharedBaseSource);
+  rec('persona/review sidecar 读取助手已合并进共享基座，两个宿主均委托同一实现',
+    sharedPersonaReviewLoaders !== '' &&
+      /function loadPersonaEventsForSession\(sid\) \{ return pinvouSharedtauriSessions\(\)\.loadPersonaEventsForSession\(sid\); \}/.test(tauriSessionsSource) &&
+      /function loadPinvouReviewsForSession\(sid\) \{ return pinvouSharedtauriSessions\(\)\.loadPinvouReviewsForSession\(sid\); \}/.test(tauriSessionsSource) &&
+      /function loadPersonaEventsForSession\(sid\) \{ return pinvouSharedweb\(\)\.loadPersonaEventsForSession\(sid\); \}/.test(webBridgeSource) &&
+      /function loadPinvouReviewsForSession\(sid\) \{ return pinvouSharedweb\(\)\.loadPinvouReviewsForSession\(sid\); \}/.test(webBridgeSource),
+    'shared persona-review loaders + per-host delegation pins');
+  {
+    const ok = await runPersonaReviewLoaders(tauriSidecarReporters, sharedPersonaReviewLoaders, {});
+    rec('persona/review 读取成功路径保持原值(null 归一为 [])',
+      JSON.stringify(ok.persona) === JSON.stringify([{ pos: 0, kind: 'equip' }]) &&
+        JSON.stringify(ok.reviews) === '[]' && ok.warnings.length === 0,
+      JSON.stringify(ok));
+    const failed = await runPersonaReviewLoaders(tauriSidecarReporters, sharedPersonaReviewLoaders, { readFails: true });
+    rec('persona/review 读失败时逐项上报后降级为 []，绝不抛给会话切换',
+      JSON.stringify(failed.persona) === '[]' && JSON.stringify(failed.reviews) === '[]' &&
+        failed.warnings.some(text => text.includes('persona events read failed')) &&
+        failed.warnings.some(text => text.includes('pinvou reviews read failed')),
+      JSON.stringify(failed));
+  }
+
+  rec('scene sidecar 通过 session 后端在 Tauri/Web 间共享并保留本地迁移缓存',
+    /get_session_pinvou_scene_events/.test(tauriBridgeSource) &&
+      /save_session_pinvou_scene_events/.test(tauriBridgeSource) &&
+      /syncPinvouSceneEventsForSession/.test(tauriBridgeSource) &&
+      /get_session_pinvou_scene_events/.test(webBridgeSource) &&
+      /save_session_pinvou_scene_events/.test(webBridgeSource) &&
+      /syncPinvouSceneEventsForSession/.test(webBridgeSource) &&
+      /pub async fn save_session_pinvou_scene_events/.test(sessionsRustSource) &&
+      /pub async fn get_session_pinvou_scene_events/.test(sessionsRustSource),
+    'shared session scene sidecar contract');
+
+  rec('三个场景白名单(Tauri/Web/Rust)必须同时登记 work:personal-workbench，否则 sidecar 重载后会丢标签',
+    tauriNormalizeSceneRegexSource.includes('work:personal-workbench') &&
+      webNormalizeSceneRegexSource.includes('work:personal-workbench') &&
+      /Some\(scene @ \("work:document-writing" \| "work:personal-workbench"\)\)/.test(sessionsRustSource),
+    'normalize allowlist must register work:personal-workbench across tauri bridge, web bridge and Rust backend');
+
+  rec('三个场景白名单(Tauri/Web/Rust)必须同时登记 design:ppt，否则 sidecar 重载后会丢标签',
+    tauriNormalizeSceneRegexSource.includes('design:ppt') &&
+      webNormalizeSceneRegexSource.includes('design:ppt') &&
+      /Some\(scene @ \("design:poster" \| "design:data-visualization" \| "design:ppt"\)\)/.test(sessionsRustSource),
+    'normalize allowlist must register design:ppt across tauri bridge, web bridge and Rust backend');
+
+  const failed = results.filter(item => !item.pass);
+  if (failed.length) {
+    console.error(`\n❌ FAIL ${failed.length}/${results.length}`);
+    process.exit(1);
+  }
+  console.log(`\n✅ ALL ${results.length} PASS`);
+})();

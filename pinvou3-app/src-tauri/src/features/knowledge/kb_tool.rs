@@ -1,0 +1,919 @@
+//! Agentic RAG: `kb_search` 工具——AI 自主调用检索本会话挂载的知识集。
+//!
+//! 取代注入式(每条消息自动注入片段):由 LLM 自己决定何时查/查什么。工具 per-session
+//! 构造(持 `session_id`),`execute` 时查该会话挂载的知识集,复用
+//! [`L1Store::retrieve_for_chat_multi_outcome`]。
+//! 经底座 `EngineConfig.extra_tools` 注入(spawn_for_session)。配套 Self-RAG 自检引导见
+//! `commands::build_kb_agentic_guide`。
+
+use async_trait::async_trait;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::future::join_all;
+use serde_json::{Value, json};
+use tauri::{AppHandle, Manager};
+use tokio::time::{Duration, timeout};
+
+use deepseek_tui::tools::spec::{ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec};
+
+use super::Document;
+use crate::features::{
+    knowledge::KnowledgeService, remote_knowledge::RemoteKnowledgeService, sessions::SessionStore,
+};
+
+/// 工具单次检索 top-K(精排;太多稀释小模型注意力)。
+const KB_INJECT_TOP_K: usize = 5;
+/// 返回片段总字符上限,超出截断(保证至少第一条)。~6K 字符 ≈ 5K token。
+const KB_INJECT_MAX_CHARS: usize = 6_000;
+/// `kb_open_source` 默认/最大返回 chunk 数。索引切块约 600 字符，8 块仍远低于单次
+/// 工具结果预算，避免把整份工作簿重新灌入上下文。
+const KB_OPEN_DEFAULT_CHUNKS: usize = 3;
+const KB_OPEN_MAX_CHUNKS: usize = 8;
+/// 单个远程来源不能无限拖住本地及其他健康来源。超时只降级该来源。
+const KB_REMOTE_SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
+/// 自愈重载 embedding 模型（~570MB 磁盘读 + ONNX 会话创建）的限时：超时本次
+/// 检索降级纯全文，后台加载不受影响（下次检索恢复语义）。慢盘冷读按分钟级
+/// 余量取 120s。
+const KB_MODEL_RELOAD_TIMEOUT_SECS: u64 = 120;
+
+/// kb_search 语义降级的模型可见披露：四条触发路径（重载失败 / 重载超时 / 模型
+/// 未就绪（未安装或平台不支持）/ 查询向量计算失败）共用同一句式，差异只在括号内
+/// 的原因。单独成函数便于测试钉住文案（缺披露时模型会把关键词结果当全量作答）。
+fn semantic_degraded_warning(reason: &str) -> String {
+    format!("语义检索暂不可用（{reason}），本次为关键词检索，结果可能不全")
+}
+
+/// 「模型未就绪且重载被跳过」的降级原因按能力位区分：本地嵌入不支持的平台
+/// （loongarch64）模型永远无法安装，说「未安装」会诱导模型建议用户下载——
+/// 而下载命令在能力闸处必然被拒；受支持平台保持既有「未安装」文案不变。
+fn semantic_not_ready_reason(local_embed_supported: bool) -> &'static str {
+    if local_embed_supported {
+        "嵌入模型未安装"
+    } else {
+        "本平台不支持本地嵌入模型"
+    }
+}
+
+fn source_ref(document_id: i64, ord: i64) -> String {
+    format!("kbdoc:{document_id}:chunk:{}", ord.max(0))
+}
+
+fn parse_source_ref(value: &str) -> Option<(i64, i64)> {
+    let mut parts = value.trim().split(':');
+    let prefix = parts.next()?;
+    let document_id = parts.next()?.parse::<i64>().ok()?;
+    let chunk_label = parts.next()?;
+    let ord = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some()
+        || prefix != "kbdoc"
+        || chunk_label != "chunk"
+        || document_id <= 0
+        || ord < 0
+    {
+        return None;
+    }
+    Some((document_id, ord))
+}
+
+fn remote_source_ref(server_id: &str, collection_id: i64, document_id: i64, ord: i64) -> String {
+    format!(
+        "kbremote:{}:{collection_id}:{document_id}:chunk:{}",
+        URL_SAFE_NO_PAD.encode(server_id.as_bytes()),
+        ord.max(0)
+    )
+}
+
+fn parse_remote_source_ref(value: &str) -> Option<(String, i64, i64, i64)> {
+    let mut parts = value.trim().split(':');
+    if parts.next()? != "kbremote" {
+        return None;
+    }
+    let server_id = String::from_utf8(URL_SAFE_NO_PAD.decode(parts.next()?).ok()?).ok()?;
+    let collection_id = parts.next()?.parse::<i64>().ok()?;
+    let document_id = parts.next()?.parse::<i64>().ok()?;
+    if parts.next()? != "chunk" {
+        return None;
+    }
+    let ord = parts.next()?.parse::<i64>().ok()?;
+    if parts.next().is_some()
+        || server_id.is_empty()
+        || collection_id <= 0
+        || document_id <= 0
+        || ord < 0
+    {
+        return None;
+    }
+    Some((server_id, collection_id, document_id, ord))
+}
+
+struct UnifiedHit {
+    collection_name: String,
+    document_name: String,
+    source_path: String,
+    source_ref: String,
+    text: String,
+    score: f64,
+}
+
+fn source_rank_score(rank: usize) -> f64 {
+    1.0 / (rank as f64 + 1.0)
+}
+
+fn build_unified_context_block(hits: &[UnifiedHit], warnings: &[String]) -> String {
+    let mut out = "在本会话启用的本地与远程知识集中检索到以下相关片段(已统一排序)。请严格基于这些片段作答并注明来源文件；上下文不足时可再次调用 `kb_search`，或用 `source_ref` 调用 `kb_open_source`。对于 XLSX/DOCX/PPTX 等二进制来源，禁止用 `read` 直接读取或用 `bash` 全量展开。\n\n".to_string();
+    if !warnings.is_empty() {
+        out.push_str("部分来源暂时不可用：");
+        out.push_str(&warnings.join("；"));
+        out.push_str("。以下结果仍可正常使用。\n\n");
+    }
+    let mut spent = 0usize;
+    for (index, hit) in hits.iter().enumerate() {
+        let text = hit.text.trim();
+        if spent > 0 && spent + text.len() > KB_INJECT_MAX_CHARS {
+            out.push_str(&format!(
+                "(还有 {} 条相关片段因长度限制未展开)\n",
+                hits.len() - index
+            ));
+            break;
+        }
+        out.push_str(&format!(
+            "### [{}] {}\n知识库: 《{}》\nsource_ref: `{}`\n来源: `{}`\n{}\n\n",
+            index + 1,
+            hit.document_name,
+            hit.collection_name,
+            hit.source_ref,
+            hit.source_path,
+            text
+        ));
+        spent += text.len();
+    }
+    out
+}
+
+/// 本地与远程两臂共用的 chunk 窗口收尾：把窗口内 chunk 拼成
+/// `## chunk <ord>` 文本，块间分隔由 `block_gap` 决定（本地臂沿用
+/// 空一行，远程臂沿用无分隔），并按最后一块的下一序号算出
+/// 续读游标与截断标记。返回 `(content, next_start_chunk, truncated)`；
+/// 外壳 JSON 字段两臂各自保留（本地 `kb_source` / 远程 `kb_remote_source`
+/// 的身份与来源字段不同）。
+fn finalize_source_window<'a>(
+    chunks: impl IntoIterator<Item = (i64, &'a str)>,
+    total_chunks: i64,
+    block_gap: &str,
+) -> (String, Option<i64>, bool) {
+    let mut content = String::new();
+    let mut last_ord: Option<i64> = None;
+    for (ord, text) in chunks {
+        if !content.is_empty() {
+            content.push_str(block_gap);
+        }
+        content.push_str(&format!("## chunk {ord}\n{}\n", text.trim()));
+        last_ord = Some(ord);
+    }
+    let next_start_chunk = last_ord
+        .map(|ord| ord + 1)
+        .filter(|next| *next < total_chunks);
+    let truncated = next_start_chunk.is_some();
+    (content, next_start_chunk, truncated)
+}
+
+fn render_source_window(
+    source_ref_value: &str,
+    document: &Document,
+    chunks: &[(i64, String)],
+) -> Value {
+    let (content, next_start_chunk, truncated) = finalize_source_window(
+        chunks.iter().map(|(ord, text)| (*ord, text.as_str())),
+        document.n_chunks,
+        "\n",
+    );
+    json!({
+        "type": "kb_source",
+        "source_ref": source_ref_value,
+        "name": document.name,
+        "path": document.path,
+        "collectionId": document.collection_id,
+        "collectionName": document.coll_name,
+        "extension": document.ext,
+        "start_chunk": chunks.first().map(|(ord, _)| *ord),
+        "shown_chunks": chunks.len(),
+        "total_chunks": document.n_chunks,
+        "next_start_chunk": next_start_chunk,
+        "truncated": truncated,
+        "content": content,
+    })
+}
+
+fn load_source_window(
+    l1: &super::l1::L1Store,
+    collection_id: i64,
+    document_id: i64,
+    start_ord: i64,
+    max_chunks: usize,
+    source_ref_value: &str,
+) -> rusqlite::Result<Option<Value>> {
+    let Some(document) = l1.document_in_collection(collection_id, document_id)? else {
+        return Ok(None);
+    };
+    let chunks = l1.document_chunk_window(collection_id, document_id, start_ord, max_chunks)?;
+    Ok(Some(render_source_window(
+        source_ref_value,
+        &document,
+        &chunks,
+    )))
+}
+
+/// AI 可调的本地知识检索工具。per-session 构造,`execute` 查该会话挂载的知识集。
+pub struct KbSearchTool {
+    app: AppHandle,
+    session_id: String,
+}
+
+impl KbSearchTool {
+    pub fn new(app: AppHandle, session_id: String) -> Self {
+        Self { app, session_id }
+    }
+}
+
+#[async_trait]
+impl ToolSpec for KbSearchTool {
+    fn name(&self) -> &str {
+        "kb_search"
+    }
+
+    fn description(&self) -> &str {
+        "检索本会话挂载的本地与远程知识集(用户自己的文档/资料),返回带出处的片段。\
+         当用户问题涉及这些资料时,先用本工具检索,再严格基于返回片段作答。"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "检索词或问题(自然语言或关键词均可)"
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![ToolCapability::ReadOnly]
+    }
+
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let query = input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return Err(ToolError::missing_field("query"));
+        }
+        // 本地与远程挂载都是软依赖；两类来源可以在同一会话同时启用。
+        let (collection_ids, remote_mounts) = self
+            .app
+            .try_state::<SessionStore>()
+            .map(|store| {
+                (
+                    store.mounted_collection_ids(&self.session_id),
+                    store
+                        .mounted_remote_collections(&self.session_id)
+                        .into_iter()
+                        .filter(|collection| collection.enabled)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        if collection_ids.is_empty() && remote_mounts.is_empty() {
+            return Ok(ToolResult::success(
+                "本会话未启用任何知识集，无法检索。请提示用户在输入框上方挂载并启用本地或远程知识集后再试。",
+            ));
+        }
+
+        let mut unified = Vec::new();
+        let mut warnings = Vec::new();
+
+        if !collection_ids.is_empty() {
+            if let Some(kb) = self.app.try_state::<KnowledgeService>() {
+                // 模型可能已被空闲卸载（卸载不刷新工具门控，门控只在发消息时快
+                // 照式重算）：挂载存在即真实使用意图，先重载模型再检索，本会话
+                // 后续轮次恢复语义检索。重载走 MODEL_LOAD 租约（model_download
+                // 统一协调）：并发 kb_search 等待先行加载后短路，不重复读
+                // ~570MB，也不与模型下载的目录替换竞态。外层限时兜底，超时/
+                // 失败均降级纯全文，不阻断本次检索。
+                // 本地嵌入不支持的平台（loongarch64）即使残留模型目录（peer
+                // 安装/恢复的旧状态）也不必尝试重载：stub embedder 在触盘前
+                // 就返回显式错误，跳过可省去每次检索的完整性探测 + 租约 +
+                // spawn_blocking + 错误日志这条纯开销路径。
+                if !kb.semantic_ready()
+                    && crate::platform::capabilities::current().local_embed_supported
+                    && super::model_download::model_installed()
+                {
+                    let reload =
+                        super::model_download::reload_installed_embedder_leased(kb.inner());
+                    match timeout(Duration::from_secs(KB_MODEL_RELOAD_TIMEOUT_SECS), reload).await {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => {
+                            // 外层 installed 检查通过、租约内复查却发现目录缺失/
+                            // 不完整（TOCTOU）：与「未安装」同因同果，同一口径披露。
+                            eprintln!("[knowledge] kb_search 前复查发现嵌入模型缺失（降级纯全文）");
+                            warnings.push(semantic_degraded_warning("嵌入模型未安装"));
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!(
+                                "[knowledge] kb_search 前重载模型失败（降级纯全文）: {error}"
+                            );
+                            warnings.push(semantic_degraded_warning("嵌入模型加载失败"));
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "[knowledge] kb_search 前重载模型超时（{}s，降级纯全文；后台加载继续，下次检索恢复语义）",
+                                KB_MODEL_RELOAD_TIMEOUT_SECS
+                            );
+                            warnings.push(semantic_degraded_warning("嵌入模型加载超时"));
+                        }
+                    }
+                } else if !kb.semantic_ready() {
+                    warnings.push(semantic_degraded_warning(semantic_not_ready_reason(
+                        crate::platform::capabilities::current().local_embed_supported,
+                    )));
+                }
+                let l1 = kb.l1().clone();
+                let q = query.clone();
+                let local_ids = collection_ids.clone();
+                match tauri::async_runtime::spawn_blocking(move || {
+                    let outcome =
+                        l1.retrieve_for_chat_multi_outcome(&local_ids, &q, KB_INJECT_TOP_K)?;
+                    let collections: Vec<(i64, String)> = local_ids
+                        .into_iter()
+                        .map(|collection_id| {
+                            let name = l1
+                                .collection_name(collection_id)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_else(|| format!("#{collection_id}"));
+                            (collection_id, name)
+                        })
+                        .collect();
+                    Ok::<_, rusqlite::Error>((
+                        outcome.hits,
+                        collections,
+                        outcome.embed_query_failed,
+                    ))
+                })
+                .await
+                {
+                    Ok(Ok((hits, collections, embed_query_failed))) => {
+                        if embed_query_failed {
+                            // 模型挂载着但本次查询向量算不出来（l1 侧已 eprintln）：
+                            // 本次静默降级纯 FTS，与其它降级路径同一口径披露。
+                            warnings.push(semantic_degraded_warning("嵌入调用失败"));
+                        }
+                        for (rank, scoped) in hits.into_iter().enumerate() {
+                            let hit = scoped.hit;
+                            let name = scoped
+                                .collection_ids
+                                .iter()
+                                .find_map(|id| {
+                                    collections
+                                        .iter()
+                                        .find(|(candidate, _)| candidate == id)
+                                        .map(|(_, name)| name.clone())
+                                })
+                                .unwrap_or_else(|| "本地知识库".to_string());
+                            unified.push(UnifiedHit {
+                                collection_name: name,
+                                document_name: hit.doc_name,
+                                source_path: hit.doc_path,
+                                source_ref: source_ref(hit.document_id, hit.ord),
+                                text: hit.text,
+                                // Local and remote engines expose scores on different scales.
+                                // Fuse their independently ranked result lists instead of
+                                // comparing incomparable raw values.
+                                score: source_rank_score(rank),
+                            });
+                        }
+                    }
+                    Ok(Err(error)) => warnings.push(format!("本地知识库：{error}")),
+                    Err(error) => warnings.push(format!("本地知识库任务失败：{error}")),
+                }
+            } else {
+                warnings.push("本地知识库服务不可用".to_string());
+            }
+        }
+
+        if !remote_mounts.is_empty() {
+            if let Some(remote) = self.app.try_state::<RemoteKnowledgeService>() {
+                let mut by_server = std::collections::BTreeMap::<String, Vec<i64>>::new();
+                for mount in remote_mounts {
+                    by_server
+                        .entry(mount.server_id)
+                        .or_default()
+                        .push(mount.collection_id);
+                }
+                let requests = by_server.into_iter().map(|(server_id, ids)| {
+                    let query = query.clone();
+                    let remote = remote.clone();
+                    async move {
+                        let result = match timeout(KB_REMOTE_SOURCE_TIMEOUT, async {
+                            // Collection labels and retrieval are independent requests; doing
+                            // them together removes one network round trip from every search.
+                            let (collections, hits) = tokio::try_join!(
+                                remote.collections(&server_id, false),
+                                remote.search(&server_id, ids, query, KB_INJECT_TOP_K),
+                            )?;
+                            Ok::<_, String>((collections, hits))
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(format!(
+                                "检索超过 {} 秒，已跳过该来源",
+                                KB_REMOTE_SOURCE_TIMEOUT.as_secs()
+                            )),
+                        };
+                        (server_id, result)
+                    }
+                });
+                for (server_id, result) in join_all(requests).await {
+                    match result {
+                        Ok((collections, hits)) => {
+                            let server_name = remote
+                                .connection(&server_id)
+                                .map(|connection| connection.name)
+                                .unwrap_or_else(|_| server_id.clone());
+                            for (rank, hit) in hits.into_iter().enumerate() {
+                                let collection_name = collections
+                                    .iter()
+                                    .find(|collection| collection.id == hit.collection_id)
+                                    .map(|collection| collection.name.clone())
+                                    .unwrap_or_else(|| format!("#{}", hit.collection_id));
+                                unified.push(UnifiedHit {
+                                    collection_name: format!("{server_name} / {collection_name}"),
+                                    document_name: hit.document_name.clone(),
+                                    source_path: format!(
+                                        "remote://{server_name}/{}",
+                                        hit.document_name
+                                    ),
+                                    source_ref: remote_source_ref(
+                                        &server_id,
+                                        hit.collection_id,
+                                        hit.document_id,
+                                        hit.ord,
+                                    ),
+                                    text: hit.text,
+                                    score: source_rank_score(rank),
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            let name = remote
+                                .connection(&server_id)
+                                .map(|connection| connection.name)
+                                .unwrap_or(server_id);
+                            warnings.push(format!("{name}：{error}"));
+                        }
+                    }
+                }
+            } else {
+                warnings.push("远程知识库连接服务不可用".to_string());
+            }
+        }
+
+        unified.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.document_name.cmp(&right.document_name))
+        });
+        unified.truncate(KB_INJECT_TOP_K);
+
+        if unified.is_empty() {
+            let unavailable = if warnings.is_empty() {
+                String::new()
+            } else {
+                format!(" 部分来源不可用：{}。", warnings.join("；"))
+            };
+            return Ok(ToolResult::success(format!(
+                "在已启用知识集中未找到与「{query}」相关的内容。{unavailable}如无其他依据，请如实告知用户未检索到，不要编造。"
+            )));
+        }
+        Ok(ToolResult::success(build_unified_context_block(
+            &unified, &warnings,
+        )))
+    }
+}
+
+/// 查看 `kb_search` 命中的同一份知识文档的相邻 chunk。工具只接受受控的
+/// `source_ref`，并用 session 当前挂载的 collection id 再校验，不接受任意文件路径。
+pub struct KbOpenSourceTool {
+    app: AppHandle,
+    session_id: String,
+}
+
+impl KbOpenSourceTool {
+    pub fn new(app: AppHandle, session_id: String) -> Self {
+        Self { app, session_id }
+    }
+}
+
+#[async_trait]
+impl ToolSpec for KbOpenSourceTool {
+    fn name(&self) -> &str {
+        "kb_open_source"
+    }
+
+    fn description(&self) -> &str {
+        "查看 `kb_search` 返回的某个本地或远程知识来源的相邻内容。只接受检索结果中的 `source_ref`,\
+         不接受文件路径;默认从命中 chunk 的前一块开始返回 3 块。对于 XLSX/DOCX/PPTX 等\
+         来源使用本工具,不要用 `read` 直接读取或用 `bash` 全量展开。需要定位其他内容时先再次\
+         调用 `kb_search`,再打开它返回的新 `source_ref`。"
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "source_ref": {
+                    "type": "string",
+                    "description": "kb_search 返回的来源引用,例如 kbdoc:128:chunk:3"
+                },
+                "start_chunk": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "可选,从指定 chunk 序号开始分页;默认展开命中位置附近"
+                },
+                "max_chunks": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": KB_OPEN_MAX_CHUNKS,
+                    "description": "最多返回多少个 chunk,默认 3,最大 8"
+                }
+            },
+            "required": ["source_ref"]
+        })
+    }
+
+    fn capabilities(&self) -> Vec<ToolCapability> {
+        vec![ToolCapability::ReadOnly]
+    }
+
+    fn supports_parallel(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
+        let source_ref_value = input
+            .get("source_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if source_ref_value.is_empty() {
+            return Err(ToolError::missing_field("source_ref"));
+        }
+        let remote_reference = parse_remote_source_ref(&source_ref_value);
+        let local_reference = parse_source_ref(&source_ref_value);
+        let (document_id, anchor_ord) = remote_reference
+            .as_ref()
+            .map(|(_, _, document_id, ord)| (*document_id, *ord))
+            .or(local_reference)
+            .ok_or_else(|| {
+                ToolError::invalid_input(
+                    "source_ref 格式无效；请原样使用 kb_search 返回的引用".to_string(),
+                )
+            })?;
+        let start_ord = match input.get("start_chunk") {
+            Some(value) => value.as_i64().filter(|v| *v >= 0).ok_or_else(|| {
+                ToolError::invalid_input("start_chunk 必须是大于等于 0 的整数".to_string())
+            })?,
+            None => anchor_ord.saturating_sub(1),
+        };
+        let max_chunks = match input.get("max_chunks") {
+            Some(value) => value.as_u64().filter(|v| *v > 0).ok_or_else(|| {
+                ToolError::invalid_input("max_chunks 必须是大于 0 的整数".to_string())
+            })? as usize,
+            None => KB_OPEN_DEFAULT_CHUNKS,
+        }
+        .min(KB_OPEN_MAX_CHUNKS);
+
+        if let Some((server_id, collection_id, document_id, _)) = remote_reference {
+            let mounted = self
+                .app
+                .try_state::<SessionStore>()
+                .map(|store| {
+                    store
+                        .mounted_remote_collections(&self.session_id)
+                        .into_iter()
+                        .any(|collection| {
+                            collection.enabled
+                                && collection.server_id == server_id
+                                && collection.collection_id == collection_id
+                        })
+                })
+                .unwrap_or(false);
+            if !mounted {
+                return Ok(ToolResult::success(
+                    "该远程 source_ref 不属于本会话当前启用的知识集。请重新调用 kb_search。",
+                ));
+            }
+            let Some(remote) = self.app.try_state::<RemoteKnowledgeService>() else {
+                return Ok(ToolResult::success("远程知识库连接服务不可用。"));
+            };
+            let window = remote
+                .source_window(
+                    &server_id,
+                    pinvou_knowledge::model::SourceWindowRequest {
+                        collection_id,
+                        document_id,
+                        start_ord,
+                        limit: max_chunks,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    ToolError::execution_failed(format!("kb_open_source remote failed: {error}"))
+                })?;
+            let (content, next_start_chunk, truncated) = finalize_source_window(
+                window
+                    .chunks
+                    .iter()
+                    .map(|chunk| (chunk.ord, chunk.text.as_str())),
+                window.document.n_chunks,
+                "",
+            );
+            let rendered = json!({
+                "type": "kb_remote_source",
+                "source_ref": source_ref_value,
+                "name": window.document.name,
+                "serverId": server_id,
+                "collectionId": collection_id,
+                "start_chunk": window.chunks.first().map(|chunk| chunk.ord),
+                "shown_chunks": window.chunks.len(),
+                "total_chunks": window.document.n_chunks,
+                "next_start_chunk": next_start_chunk,
+                "truncated": truncated,
+                "content": content,
+            });
+            return ToolResult::json(&rendered).map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "serialize remote kb_open_source result: {error}"
+                ))
+            });
+        }
+
+        let collection_ids = self
+            .app
+            .try_state::<SessionStore>()
+            .map(|store| store.mounted_collection_ids(&self.session_id))
+            .unwrap_or_default();
+        if collection_ids.is_empty() {
+            return Ok(ToolResult::success(
+                "本会话未启用任何本地知识集,无法打开来源。请先挂载并启用知识集。",
+            ));
+        }
+        let Some(kb) = self.app.try_state::<KnowledgeService>() else {
+            return Ok(ToolResult::success("本地知识库服务不可用。"));
+        };
+        let l1 = kb.l1().clone();
+        let source_ref_for_query = source_ref_value.clone();
+        let loaded =
+            tauri::async_runtime::spawn_blocking(move || -> rusqlite::Result<Option<Value>> {
+                for collection_id in collection_ids {
+                    if let Some(rendered) = load_source_window(
+                        &l1,
+                        collection_id,
+                        document_id,
+                        start_ord,
+                        max_chunks,
+                        &source_ref_for_query,
+                    )? {
+                        return Ok(Some(rendered));
+                    }
+                }
+                Ok(None)
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("kb_open_source join failed: {e}")))?
+            .map_err(|e| {
+                ToolError::execution_failed(format!("kb_open_source query failed: {e}"))
+            })?;
+
+        let Some(rendered) = loaded else {
+            return Ok(ToolResult::success(
+                "该 source_ref 不属于本会话当前启用的知识集,或文档尚未解析完成。请重新调用 kb_search。",
+            ));
+        };
+        ToolResult::json(&rendered).map_err(|e| {
+            ToolError::execution_failed(format!("serialize kb_open_source result: {e}"))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::import_jobs::ImportJobStore;
+    use super::super::l1::{ImportIngestOutcome, L1Store};
+    use super::super::store::Store;
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn remote_source_reference_round_trips_without_exposing_paths() {
+        let reference = remote_source_ref("cube/server:1", 7, 42, 3);
+        assert!(!reference.contains("cube/server:1"));
+        assert_eq!(
+            parse_remote_source_ref(&reference),
+            Some(("cube/server:1".to_string(), 7, 42, 3))
+        );
+        assert!(parse_remote_source_ref("kbremote:bad:7:42:chunk:-1").is_none());
+    }
+
+    /// 语义降级披露文案钉死：四条触发路径（重载失败/超时、模型未安装、查询向量
+    /// 计算失败）共用同一句式，只差括号内原因。去掉披露时模型会把纯 FTS 的
+    /// 部分结果当全量作答，空结果脚本又会教它断言「未找到」——双重误导。
+    #[test]
+    fn semantic_degraded_warning_pins_disclosure_copy() {
+        assert_eq!(
+            semantic_degraded_warning("嵌入模型未安装"),
+            "语义检索暂不可用（嵌入模型未安装），本次为关键词检索，结果可能不全"
+        );
+        for reason in ["嵌入模型加载失败", "嵌入模型加载超时", "嵌入调用失败"]
+        {
+            let warning = semantic_degraded_warning(reason);
+            assert!(
+                warning.starts_with("语义检索暂不可用（")
+                    && warning.contains("），本次为关键词检索，结果可能不全"),
+                "降级披露句式漂移: {warning}"
+            );
+        }
+    }
+
+    /// 「模型未就绪且重载被跳过」的降级原因按能力位双向钉死：受支持平台保持
+    /// 既有「未安装」文案；不支持平台（loongarch64）必须如实表达平台限制——
+    /// 模型永远无法安装，「未安装」会诱导模型建议一次必然被下载能力闸拒绝的
+    /// 下载。两个方向都保留 FTS 降级披露句式。
+    #[test]
+    fn semantic_not_ready_reason_is_capability_aware() {
+        assert_eq!(semantic_not_ready_reason(true), "嵌入模型未安装");
+        assert_eq!(
+            semantic_degraded_warning(semantic_not_ready_reason(false)),
+            "语义检索暂不可用（本平台不支持本地嵌入模型），本次为关键词检索，结果可能不全"
+        );
+    }
+
+    /// The kb_search (production unified search) result header must also carry
+    /// the binary-source prohibition: when the snippets look insufficient the
+    /// model tries to fully expand XLSX/DOCX/PPTX via read/bash. The rule used to
+    /// exist only in the kb_open_source description and the system reminder
+    /// (regression: the production result header missed it).
+    #[test]
+    fn unified_context_block_forbids_binary_source_expansion() {
+        let unified = vec![UnifiedHit {
+            collection_name: "硬件资料".to_string(),
+            document_name: "散热报告.xlsx".to_string(),
+            source_path: "/docs/散热报告.xlsx".to_string(),
+            source_ref: "kbdoc:42:chunk:3".to_string(),
+            text: "CPU 峰值温度 78℃".to_string(),
+            score: 1.0,
+        }];
+        let block = build_unified_context_block(&unified, &[]);
+        assert!(block.contains("严格基于这些片段作答"));
+        assert!(block.contains("kb_open_source"));
+        assert!(
+            block.contains("XLSX/DOCX/PPTX 等二进制来源")
+                && block.contains("禁止用 `read` 直接读取")
+                && block.contains("用 `bash` 全量展开"),
+            "unified search result header must carry the binary-source prohibition: {block}"
+        );
+        // The prohibition survives warnings: it lives inside the fixed header
+        // text and warnings are appended after it, so they cannot displace it.
+        let with_warnings = build_unified_context_block(&unified, &["远程服务离线".to_string()]);
+        assert!(with_warnings.contains("部分来源暂时不可用"));
+        assert!(with_warnings.contains("禁止用 `read` 直接读取"));
+    }
+
+    #[test]
+    fn kb_source_ref_roundtrips_and_rejects_forgery() {
+        let value = source_ref(128, 3);
+        assert_eq!(value, "kbdoc:128:chunk:3");
+        assert_eq!(parse_source_ref(&value), Some((128, 3)));
+        for invalid in [
+            "",
+            "kbdoc:0:chunk:3",
+            "kbdoc:128:chunk:-1",
+            "kbdoc:128:path:3",
+            "kbdoc:128:chunk:3:extra",
+            "/tmp/report.xlsx",
+        ] {
+            assert_eq!(parse_source_ref(invalid), None, "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn kb_open_source_window_is_bounded_and_pageable() {
+        let document = Document {
+            id: 128,
+            collection_id: 7,
+            coll_name: Some("散热".to_string()),
+            path: "/docs/report.xlsx".to_string(),
+            name: "report.xlsx".to_string(),
+            ext: Some("xlsx".to_string()),
+            size: 1024,
+            mtime: 1,
+            parse_status: "parsed".to_string(),
+            n_chunks: 6,
+        };
+        let chunks = vec![
+            (2, "SSD主控 | 75.2 | 85".to_string()),
+            (3, "SSD颗粒 | 73.7 | 85".to_string()),
+            (4, "CPU_DTS | 76.9 | 100".to_string()),
+        ];
+        let rendered = render_source_window("kbdoc:128:chunk:3", &document, &chunks);
+        assert_eq!(rendered["type"], "kb_source");
+        assert_eq!(rendered["collectionId"], 7);
+        assert_eq!(rendered["collectionName"], "散热");
+        assert_eq!(rendered["shown_chunks"], 3);
+        assert_eq!(rendered["next_start_chunk"], 5);
+        assert_eq!(rendered["truncated"], true);
+        assert!(rendered["content"].as_str().unwrap().contains("SSD主控"));
+        assert!(rendered["content"].as_str().unwrap().contains("SSD颗粒"));
+    }
+
+    /// 真实模拟二进制来源链路：XLSX 建索引 → kb_search 命中 → source_ref →
+    /// kb_open_source 展开已解析 chunk。整个打开阶段不再次读取原始工作簿。
+    #[test]
+    fn kb_open_source_simulates_search_then_open_for_xlsx() {
+        let store = Store::open_in_memory().unwrap();
+        let l1 = L1Store::new(store.conn_arc());
+        let mounted = l1.create_collection("散热报告", None, None).unwrap();
+        let other = l1.create_collection("其他资料", None, None).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-fixtures/multi_sheet.xlsx");
+
+        // The production ingest path goes through the resumable import job
+        // state machine; the direct single-file helper no longer exists.
+        let jobs = ImportJobStore::new(store.conn_arc());
+        let job_id = jobs
+            .create(mounted, std::slice::from_ref(&fixture))
+            .unwrap();
+        jobs.prepare_items(&job_id, std::slice::from_ref(&fixture))
+            .unwrap();
+        let item = jobs.claim_next(&job_id).unwrap().unwrap();
+        assert!(matches!(
+            l1.ingest_import_item(&job_id, item.id, mounted, &fixture, &AtomicBool::new(false)),
+            ImportIngestOutcome::Completed
+        ));
+        let hits = l1
+            .retrieve_for_chat_multi_outcome(&[mounted], "83.6", 5)
+            .unwrap()
+            .hits;
+        let hit = hits
+            .first()
+            .expect("kb_search should hit non-first XLSX sheet");
+        let reference = source_ref(hit.hit.document_id, hit.hit.ord);
+        let (document_id, anchor_ord) = parse_source_ref(&reference).unwrap();
+
+        let opened = load_source_window(
+            &l1,
+            mounted,
+            document_id,
+            anchor_ord.saturating_sub(1),
+            KB_OPEN_DEFAULT_CHUNKS,
+            &reference,
+        )
+        .unwrap()
+        .expect("mounted source should open");
+        assert_eq!(opened["extension"], "xlsx");
+        assert_eq!(opened["source_ref"], reference);
+        assert!(opened["content"].as_str().unwrap().contains("83.6"));
+        if std::env::var_os("PINVOU_SHOW_KB_OPEN_SOURCE").is_some() {
+            println!(
+                "kb_search source_ref = {reference}\nkb_open_source result = {}",
+                serde_json::to_string_pretty(&opened).unwrap()
+            );
+        }
+        assert!(
+            load_source_window(
+                &l1,
+                other,
+                document_id,
+                0,
+                KB_OPEN_DEFAULT_CHUNKS,
+                &reference,
+            )
+            .unwrap()
+            .is_none(),
+            "source_ref must not cross the mounted collection boundary"
+        );
+    }
+}

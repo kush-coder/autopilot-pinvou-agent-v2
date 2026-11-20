@@ -1,0 +1,1177 @@
+//! Per-session runtime mode state machine + 类型定义。
+//!
+//! `SessionModeState` 等 session 域聚合类型（persona/knowledge/multi-agent 等
+//! 特性字段）原先在 `core/mode_state.rs`，违反 `core/README.md` 的"feature 内部
+//! 类型不入 core"准则，Wave 3 将其定义迁回此文件（行为 impl 一直在此），并由
+//! `features::sessions` 正式 re-export，消费方一律从
+//! `crate::features::sessions::{...}` 导入。跨层协议类型仍定义在
+//! `core/mode_state.rs`：其中 `SerializableMode` 经 `features::sessions`
+//! re-export（`mod.rs` 的 `pub use`），`ModeLane`/`ModeDefaultsView` 由消费方
+//! 直接从 `crate::core::mode_state` 导入，不经 features 转出。
+//!
+//! These methods drive the `mode_states` map (mode, pending Plan ticket
+//! + claim-in-flight, persona, mounted collection). The durable subset:
+//! the per-session MODE is persisted to the `_session_mode_states.json`
+//! sidecar (with the legacy `_code_mode_states.json` migrated on load)
+//! and `_multi_agent.json` carries the multi-agent flags — the mode and
+//! both multi-agent flags survive a restart, and reopening a session
+//! restores its own last mode. What stays in memory is interaction state
+//! that must reset on a bounce: the pending Plan ticket and its
+//! claim-in-flight, persona, and the mounted knowledge collection
+//! (model selections are persisted in their own sidecars — see
+//! [`super::sidecars`], which lists all five durable sidecar files).
+
+use serde::{Deserialize, Serialize};
+
+use anyhow::{Context, Result, bail};
+
+use crate::core::mode_state::{ModeDefaultsView, ModeLane, SerializableMode};
+
+use super::SessionStore;
+use super::injections::{PendingPlanClaim, PendingTurnInjections};
+use crate::platform::prefs::{CodePermissionPrefs, UserPrefs};
+use std::collections::HashMap;
+use std::io::ErrorKind;
+
+// ── 类型定义（session 域聚合，由 sessions 正式 re-export） ──
+
+/// A knowledge collection mounted into a session with an enabled flag, so the
+/// UI can toggle a mount on/off without losing its position in the ordered
+/// list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MountedCollection {
+    pub collection_id: i64,
+    pub enabled: bool,
+}
+
+/// 会话挂载的远程知识集。服务器 ID 与服务端集合 ID 共同构成稳定身份。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MountedRemoteCollection {
+    pub server_id: String,
+    pub collection_id: i64,
+    pub enabled: bool,
+}
+
+/// Revisioned snapshot of every mounted collection for one session. The
+/// revision bumps on any mutation so the Tauri boundary can publish a single
+/// revisioned event that lets concurrent clients reconcile out-of-order
+/// updates.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MountedCollectionsSnapshot {
+    pub revision: u64,
+    pub collections: Vec<MountedCollection>,
+}
+
+/// 单 session 的 mode 状态。前端通过 `get_mode_state` 拉取，
+/// `set_plan_mode_next` / `accept_plan` 等命令修改。
+///
+/// 底座 `AppMode` 非 Serialize，经 `SerializableMode` 镜像单向序列化给前端;
+/// SessionModeState 不需要从前端 deserialize 回来(它通过 set_*_state 命令逐字段写)。
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionModeState {
+    /// Side B 卡片池:当前加持的专家卡 id(远端 persona 体系)。
+    #[serde(default)]
+    pub active_persona: Option<String>,
+    /// Side B:待一次性注入的人设 body。
+    #[serde(default, skip)]
+    pub pending_persona_body: Option<String>,
+    /// 当前激活 mode。`build_send_message_op` 用这个值。
+    pub mode: SerializableMode,
+    /// 当前可操作方案的服务端 ticket。新 plan_ready 会替换旧 ticket；
+    /// accept/discard 必须 compare-and-consume，防多端旧卡重复执行。
+    #[serde(default)]
+    pub pending_plan_id: Option<String>,
+    /// accept 已原子 claim、但 Engine mailbox 尚未确认的 ticket。
+    /// 仅用于进程内失败回滚，不暴露给前端。
+    #[serde(skip)]
+    pub(crate) plan_claim_in_flight: Option<String>,
+    /// 该 session 挂载的本地知识集 id(会话级粘连)。`None` = 未挂载。
+    /// 挂载生效走 Agentic RAG:engine 注入 `kb_search` 工具,由模型自主检索,
+    /// 不再按消息自动注入片段(注入式已废弃,见 `commands::chat`)。与
+    /// `active_persona` 一样仅驻内存,不落盘——重启 app 后回到未挂载。
+    #[serde(default)]
+    pub mounted_collection: Option<i64>,
+    /// 多知识库挂载事实源。旧单库字段保留给旧前端/远程端兼容读取。
+    #[serde(default)]
+    pub mounted_collections: Vec<MountedCollection>,
+    /// 远程知识集挂载，与本地挂载可以同时启用并由检索工具统一合并。
+    #[serde(default)]
+    pub mounted_remote_collections: Vec<MountedRemoteCollection>,
+    /// 仅驻内存的并发版本号；通过专用 snapshot 命令对外提供，不混入 mode_state 协议。
+    #[serde(skip)]
+    pub mounted_collections_revision: u64,
+    /// 多智能体模式开关（ADR-0006）：模型列表下方的会话级开关。开启后本会话
+    /// 装配专家名册：引擎生成时注入一次蜂群契约（委派与否由模型按收益判断），
+    /// 每轮仅附专家候选提醒；关闭停止注入并回收引擎，取消仍在后台运行的
+    /// 子智能体（工具面不随开关变化，与主线一致）。会话级记忆，经
+    /// `sessions/_multi_agent.json` sidecar 持久化，重启不丢。
+    #[serde(default)]
+    pub multi_agent: bool,
+}
+
+impl Default for SessionModeState {
+    fn default() -> Self {
+        Self {
+            mode: SerializableMode::Yolo,
+            pending_plan_id: None,
+            plan_claim_in_flight: None,
+            active_persona: None,
+            pending_persona_body: None,
+            mounted_collection: None,
+            mounted_collections: Vec::new(),
+            mounted_remote_collections: Vec::new(),
+            mounted_collections_revision: 0,
+            multi_agent: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod type_tests {
+    use super::*;
+    use deepseek_tui::AppMode;
+
+    #[test]
+    fn default_is_yolo() {
+        let s = SessionModeState::default();
+        assert_eq!(s.mode, SerializableMode::Yolo);
+    }
+
+    #[test]
+    fn mode_round_trips_to_app_mode() {
+        assert!(matches!(
+            SerializableMode::Plan.to_app_mode(),
+            AppMode::Plan
+        ));
+        assert!(matches!(
+            SerializableMode::Yolo.to_app_mode(),
+            AppMode::Agent
+        ));
+    }
+
+    #[test]
+    fn serializes_to_snake_case() {
+        let s = SessionModeState {
+            mode: SerializableMode::Plan,
+            pending_plan_id: Some("plan-1".to_string()),
+            plan_claim_in_flight: None,
+            active_persona: None,
+            pending_persona_body: None,
+            mounted_collection: None,
+            mounted_collections: Vec::new(),
+            mounted_remote_collections: Vec::new(),
+            mounted_collections_revision: 0,
+            multi_agent: false,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"mode\":\"plan\""));
+        assert!(json.contains("\"pending_plan_id\":\"plan-1\""));
+        assert!(!json.contains("plan_claim_in_flight"));
+    }
+}
+
+/// Fold a mode state's collections into one effective list: the multi-mount
+/// list is the source of truth; when it is empty, the legacy single-mount
+/// field is promoted into a one-element list (old sessions only carry
+/// `mounted_collection`).
+fn folded_collections(state: &SessionModeState) -> Vec<MountedCollection> {
+    if !state.mounted_collections.is_empty() {
+        state.mounted_collections.clone()
+    } else {
+        state
+            .mounted_collection
+            .map(|collection_id| MountedCollection {
+                collection_id,
+                enabled: true,
+            })
+            .into_iter()
+            .collect()
+    }
+}
+
+// ── SessionStore 行为 impl ──
+
+impl SessionStore {
+    /// The session's entry in the durable `_session_mode_states.json`, if any.
+    ///
+    /// This — not [`Self::mode_state`]'s resolved fallback — is what a failed
+    /// run's mode restore must put back: the fallback is process-relative (a
+    /// headless process installs no code-session predicate, so it resolves
+    /// Yolo for a code session whose GUI default is Plan), and durably pinning
+    /// that misresolution is exactly the unsafe reopen divergence the Plan
+    /// persist exists to prevent.
+    ///
+    /// Reads the FILE, not the boot-time cache. The cache is this process's
+    /// view from startup, so against a live GUI it goes stale the moment the
+    /// user switches a mode — and the restore would then write that stale
+    /// value back over the newer one, or (when the cache never had an entry)
+    /// clear a mode the GUI had just set. Both are the divergence above, only
+    /// caused by the code meant to prevent it. The cache remains the fallback
+    /// for an unreadable file, where a stale answer still beats inventing an
+    /// absence.
+    pub fn durable_mode_entry(&self, id: &str) -> Option<SerializableMode> {
+        let file = crate::platform::paths::sessions_root().join("_session_mode_states.json");
+        match std::fs::read_to_string(&file) {
+            // A parse failure falls through to the cache rather than
+            // reporting an absence the file does not actually state.
+            Ok(content) => {
+                if let Ok(mut entries) = serde_json::from_str::<
+                    std::collections::HashMap<String, SerializableMode>,
+                >(&content)
+                {
+                    return entries.remove(id);
+                }
+            }
+            // Absent is authoritative — the mutation path removes the file
+            // when its last entry goes away.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => {}
+        }
+        self.session_mode_states.read().get(id).cloned()
+    }
+
+    pub fn mode_state(&self, id: &str) -> SessionModeState {
+        self.mode_states
+            .read()
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| SessionModeState {
+                mode: self.resolved_default_mode(id),
+                ..SessionModeState::default()
+            })
+    }
+
+    pub(crate) fn is_code_session(&self, id: &str) -> bool {
+        self.code_session_predicate
+            .read()
+            .as_ref()
+            .is_some_and(|predicate| predicate(id))
+    }
+
+    /// Default mode resolution when no entry exists: code sessions, or plain chat
+    /// sessions bound to a user working directory (a real directory means
+    /// mis-operation and injection surface; the safety posture follows the
+    /// binding, not the mode), fall back to the global `code_permission.last_mode`
+    /// (None = the user has never used it → read-only Plan on first use);
+    /// unbound plain sessions default to Yolo (the work lane's global default is
+    /// applied by the frontend at session materialization; the backend no longer
+    /// distinguishes a plain-side lane — design merged into work, see
+    /// `set_mode_default`).
+    pub(crate) fn resolved_default_mode(&self, id: &str) -> SerializableMode {
+        if self.is_code_session(id) || self.session_workspace_binding(id).is_some() {
+            self.code_permission
+                .read()
+                .last_mode
+                .unwrap_or(SerializableMode::Plan)
+        } else {
+            SerializableMode::Yolo
+        }
+    }
+
+    pub(crate) fn mode_state_entry<'m>(
+        states: &'m mut HashMap<String, SessionModeState>,
+        id: &str,
+        default_mode: SerializableMode,
+    ) -> &'m mut SessionModeState {
+        states
+            .entry(id.to_string())
+            .or_insert_with(|| SessionModeState {
+                mode: default_mode,
+                ..SessionModeState::default()
+            })
+    }
+
+    /// 设置 mode。砍 PlanPhase 后是 Plan/Yolo 唯一 setter(流转命令都调它),
+    /// changes only mode, leaving other fields untouched.
+    ///
+    /// Per-session persistence (two-lane semantics): every session writes
+    /// `_session_mode_states.json` (reopening restores its own last mode);
+    /// global lane defaults are **no longer** updated here — they are written
+    /// only by an explicit draft-state switch via `set_mode_default`.
+    /// ACP 会话不经此命令（有自己的权限模式）。落盘失败只记日志不打断交互
+    /// ——内存切换已生效，落盘只做尽力持久化。
+    pub fn set_mode(&self, id: &str, mode: SerializableMode) -> Result<()> {
+        // One critical section for the in-memory switch and the durable RMW,
+        // same as set_multi_agent (a concurrent purge or headless Plan
+        // persist must not interleave its file RMW with this one).
+        let _io = self.session_mode_states_io.lock();
+        self.set_mode_in_memory(id, mode.clone());
+        if let Err(error) = Self::apply_session_mode_mutation_locked(&[(id.to_string(), mode)], &[])
+        {
+            // The session id is deliberately kept out of the message, matching
+            // persist_accepted_yolo_mode below: boot logs persist to disk and
+            // the CodeQL cleartext-logging gate flags ids on stderr.
+            eprintln!("[sessions] persist mode failed: {error:#}");
+        }
+        Ok(())
+    }
+
+    /// In-memory half of [`Self::set_mode`]: switches the session's live
+    /// state and the durable-read cache (`session_mode_states`) without
+    /// touching the sidecar file.
+    fn set_mode_in_memory(&self, id: &str, mode: SerializableMode) {
+        {
+            let mut m = self.mode_states.write();
+            let entry = m.entry(id.to_string()).or_default();
+            entry.mode = mode;
+            entry.pending_plan_id = None;
+            entry.plan_claim_in_flight = None;
+        }
+        self.session_mode_states
+            .write()
+            .insert(id.to_string(), mode);
+    }
+
+    /// [`Self::set_mode`] for headless runners: additionally requires the
+    /// durable `_session_mode_states.json` write to land. A caller that
+    /// reports success while the mode would not survive the process hands
+    /// back a session that reopens in the stale mode (Plan → Yolo is the
+    /// unsafe divergence), so the runner treats a failed persist as a
+    /// failed run. The interactive GUI keeps the lenient [`Self::set_mode`]
+    /// path, where the in-memory switch already took effect.
+    pub fn set_mode_and_persist(&self, id: &str, mode: SerializableMode) -> Result<()> {
+        let _io = self.session_mode_states_io.lock();
+        self.set_mode_in_memory(id, mode.clone());
+        Self::apply_session_mode_mutation_locked(&[(id.to_string(), mode)], &[])
+            .context("persist session mode states")
+    }
+
+    /// Removes the session's durable mode entry and resets the in-memory
+    /// caches to the resolved default. The restore half of a Plan persist
+    /// whose run never started on a session that had no durable entry:
+    /// re-persisting a resolved default would freeze a value the session
+    /// was only borrowing (and in a headless process that resolution can
+    /// not even see the GUI's code-session default), so restoring the
+    /// pre-run state means removing the entry the failed run added.
+    pub fn clear_mode_and_persist(&self, id: &str) -> Result<()> {
+        // Resolved BEFORE the io lock: `resolved_default_mode` invokes the
+        // host-registered code-session predicate and reads the workspace
+        // binding sidecar, so computing it under the mode-states lock would
+        // hold that lock across an extension callback and disk I/O — and a
+        // predicate that ever touches a mode writer would deadlock on a
+        // non-reentrant mutex. The value does not depend on the removal.
+        let default = self.resolved_default_mode(id);
+        let _io = self.session_mode_states_io.lock();
+        Self::apply_session_mode_mutation_locked(&[], &[id.to_string()])
+            .context("persist session mode states")?;
+        if let Some(entry) = self.mode_states.write().get_mut(id) {
+            entry.mode = default.clone();
+            entry.pending_plan_id = None;
+            entry.plan_claim_in_flight = None;
+        }
+        self.session_mode_states.write().remove(id);
+        Ok(())
+    }
+
+    pub fn set_multi_agent(&self, id: &str, enabled: bool) -> Result<()> {
+        // Resolved BEFORE the io lock, mirroring `clear_mode_and_persist`:
+        // `resolved_default_mode` invokes the host-registered code-session
+        // predicate and reads the workspace binding sidecar, so computing it
+        // under the multi-agent lock would hold that lock across an extension
+        // callback — and a predicate that ever touches a mode or multi-agent
+        // writer would deadlock on a non-reentrant mutex.
+        let default = self.resolved_default_mode(id);
+        let _io = self.multi_agent_flags_io.lock();
+        let previous = {
+            let mut m = self.mode_states.write();
+            // 与本文件其他 setter 同惯例：物化条目时用解析出的默认 mode，
+            // 不得 or_default()——那会把从未切换过 mode 的 code 会话从
+            // Plan 只读默认静默翻成 Yolo 自动批准。
+            let entry = Self::mode_state_entry(&mut m, id, default);
+            let previous = entry.multi_agent;
+            entry.multi_agent = enabled;
+            previous
+        };
+        if let Err(error) = Self::apply_multi_agent_mutation_locked(&[(id, enabled)], &[]) {
+            let mut m = self.mode_states.write();
+            if let Some(entry) = m.get_mut(id) {
+                entry.multi_agent = previous;
+            }
+            return Err(error).context("persist multi-agent flag");
+        }
+        Ok(())
+    }
+
+    /// Boot-only whole-list rewrite of `_multi_agent.json` from the
+    /// multi-agent flag snapshot, used after ghost cleanup re-derives the
+    /// full id list from the file just read plus the sessions directory.
+    /// Production single-flag mutations must use
+    /// `apply_multi_agent_mutation_locked` so entries another process added
+    /// after this one booted are preserved instead of reverted by a stale
+    /// snapshot.
+    ///
+    /// Takes the store's `multi_agent_flags_io` mutex itself (the contract
+    /// the former `save_multi_agent_flags_locked` left to its caller): the
+    /// durable whole-list write must not interleave with a concurrent id-level
+    /// read-modify-write, or the older snapshot lands last and resurrects
+    /// removed flags.
+    pub fn save_multi_agent_flags(&self) -> Result<()> {
+        let _io = self.multi_agent_flags_io.lock();
+        let file = crate::platform::paths::sessions_root().join("_multi_agent.json");
+        let mut ids: Vec<String> = {
+            let m = self.mode_states.read();
+            m.iter()
+                .filter(|(_, state)| state.multi_agent)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        ids.sort();
+        if ids.is_empty() {
+            return match std::fs::remove_file(&file) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error).context("remove _multi_agent.json"),
+            };
+        }
+        let json = serde_json::to_string_pretty(&ids).context("serialize multi-agent flags")?;
+        crate::platform::filesystem::atomic_write_private(&file, json.as_bytes())
+            .context("persist _multi_agent.json failed")
+    }
+
+    /// Apply id-level enable/disable mutations directly to the
+    /// `_multi_agent.json` id list, keeping entries written by another
+    /// process after this one booted (same rationale as
+    /// [`Self::apply_session_mode_mutation`]).
+    ///
+    /// The `_locked` suffix is the caller contract shared with the boot-time
+    /// whole-list rewrite [`Self::save_multi_agent_flags`] (which takes the
+    /// same mutex itself): the durable read-modify-write must run under the
+    /// store's `multi_agent_flags_io` mutex, or a concurrent save's older
+    /// snapshot lands last and resurrects removed flags.
+    pub(crate) fn apply_multi_agent_mutation_locked(
+        upserts: &[(&str, bool)],
+        removes: &[&str],
+    ) -> Result<()> {
+        crate::features::sessions::sidecars::mutate_json_list_file(
+            "_multi_agent.json",
+            |ids: &mut Vec<String>| {
+                let mut changed = false;
+                for (id, enabled) in upserts {
+                    let exists = ids.iter().any(|entry| entry == id);
+                    if *enabled && !exists {
+                        ids.push((*id).to_string());
+                        ids.sort();
+                        changed = true;
+                    } else if !*enabled && exists {
+                        ids.retain(|entry| entry != id);
+                        changed = true;
+                    }
+                }
+                for id in removes {
+                    let before = ids.len();
+                    ids.retain(|entry| entry != id);
+                    changed |= ids.len() != before;
+                }
+                changed
+            },
+        )
+    }
+
+    pub fn load_multi_agent_flags(&self) {
+        let file = crate::platform::paths::sessions_root().join("_multi_agent.json");
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            return;
+        };
+        let ids: Vec<String> = match serde_json::from_str(&content) {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!("[sessions] load_multi_agent_flags failed: {e}");
+                return;
+            }
+        };
+        let sessions_dir = self.manager.sessions_dir().to_path_buf();
+        let mut ghosts = false;
+        {
+            let mut m = self.mode_states.write();
+            for id in ids {
+                if sessions_dir.join(format!("{id}.json")).is_file() {
+                    // 同 set_multi_agent：物化条目用解析出的默认 mode，
+                    // 避免 or_default() 把 code 会话翻成 Yolo。
+                    Self::mode_state_entry(&mut m, &id, self.resolved_default_mode(&id))
+                        .multi_agent = true;
+                } else {
+                    ghosts = true;
+                }
+            }
+        }
+        if ghosts {
+            if let Err(error) = self.save_multi_agent_flags() {
+                eprintln!(
+                    "[sessions] rewrite _multi_agent.json after ghost cleanup failed: {error:#}"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn register_pending_plan(
+        &self,
+        id: &str,
+        plan_id: String,
+    ) -> Option<SessionModeState> {
+        let default_mode = self.resolved_default_mode(id);
+        let mut states = self.mode_states.write();
+        let entry = Self::mode_state_entry(&mut states, id, default_mode);
+        if entry.mode != SerializableMode::Plan || entry.plan_claim_in_flight.is_some() {
+            return None;
+        }
+        entry.pending_plan_id = Some(plan_id);
+        Some(entry.clone())
+    }
+
+    pub(crate) fn claim_pending_plan(&self, id: &str, plan_id: &str) -> Result<PendingPlanClaim> {
+        let accepted_state = {
+            let default_mode = self.resolved_default_mode(id);
+            let mut states = self.mode_states.write();
+            let entry = Self::mode_state_entry(&mut states, id, default_mode);
+            if entry.mode != SerializableMode::Plan
+                || entry.pending_plan_id.as_deref() != Some(plan_id)
+                || entry.plan_claim_in_flight.is_some()
+            {
+                bail!("plan_not_active");
+            }
+            entry.mode = SerializableMode::Yolo;
+            entry.pending_plan_id = None;
+            entry.plan_claim_in_flight = Some(plan_id.to_string());
+            entry.clone()
+        };
+        Ok(PendingPlanClaim {
+            store: self.clone(),
+            session_id: id.to_string(),
+            plan_id: plan_id.to_string(),
+            accepted_state,
+            settled: false,
+        })
+    }
+
+    pub(crate) fn finish_pending_plan_claim(&self, id: &str, plan_id: &str) {
+        let mut states = self.mode_states.write();
+        let Some(entry) = states.get_mut(id) else {
+            return;
+        };
+        if entry.plan_claim_in_flight.as_deref() == Some(plan_id) {
+            entry.plan_claim_in_flight = None;
+        }
+    }
+
+    pub(crate) fn restore_pending_plan_claim(&self, id: &str, plan_id: &str) -> Result<()> {
+        let default_mode = self.resolved_default_mode(id);
+        let mut states = self.mode_states.write();
+        let entry = Self::mode_state_entry(&mut states, id, default_mode);
+        if entry.mode != SerializableMode::Yolo
+            || entry.pending_plan_id.is_some()
+            || entry.plan_claim_in_flight.as_deref() != Some(plan_id)
+        {
+            bail!("restore plan claim conflict");
+        }
+        entry.mode = SerializableMode::Plan;
+        entry.pending_plan_id = Some(plan_id.to_string());
+        entry.plan_claim_in_flight = None;
+        Ok(())
+    }
+
+    pub(crate) fn discard_pending_plan(&self, id: &str, plan_id: &str) -> Result<SessionModeState> {
+        let default_mode = self.resolved_default_mode(id);
+        let mut states = self.mode_states.write();
+        let entry = Self::mode_state_entry(&mut states, id, default_mode);
+        if entry.mode != SerializableMode::Plan
+            || entry.pending_plan_id.as_deref() != Some(plan_id)
+            || entry.plan_claim_in_flight.is_some()
+        {
+            bail!("plan_not_active");
+        }
+        entry.pending_plan_id = None;
+        Ok(entry.clone())
+    }
+
+    pub(crate) fn take_pending_turn_injections(&self, id: &str) -> PendingTurnInjections {
+        let persona = self.mode_states.write().get_mut(id).and_then(|state| {
+            state
+                .pending_persona_body
+                .take()
+                .map(|body| (state.active_persona.clone(), body))
+        });
+        PendingTurnInjections {
+            store: self.clone(),
+            session_id: id.to_string(),
+            persona,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn restore_pending_turn_injections(
+        &self,
+        id: &str,
+        persona: Option<(Option<String>, String)>,
+    ) {
+        let Some((persona_id, body)) = persona else {
+            return;
+        };
+        let mut states = self.mode_states.write();
+        let Some(state) = states.get_mut(id) else {
+            return;
+        };
+        if state.active_persona == persona_id && state.pending_persona_body.is_none() {
+            state.pending_persona_body = Some(body);
+        }
+    }
+
+    /// Test-only granular setter; production paths must publish through the
+    /// atomic `set_persona` so persona id and one-shot body never tear.
+    #[cfg(test)]
+    pub fn set_active_persona(&self, id: &str, persona_id: Option<String>) {
+        let default_mode = self.resolved_default_mode(id);
+        Self::mode_state_entry(&mut self.mode_states.write(), id, default_mode).active_persona =
+            persona_id;
+    }
+
+    /// Publish the selected persona and its one-shot body as one state change.
+    pub fn set_persona(&self, id: &str, persona_id: Option<String>, pending_body: Option<String>) {
+        let default_mode = self.resolved_default_mode(id);
+        let mut states = self.mode_states.write();
+        let state = Self::mode_state_entry(&mut states, id, default_mode);
+        state.active_persona = persona_id;
+        state.pending_persona_body = pending_body;
+    }
+
+    pub fn active_persona_id(&self, id: &str) -> Option<String> {
+        self.mode_states.read().get(id)?.active_persona.clone()
+    }
+
+    /// Test-only granular setter; production paths must publish through the
+    /// atomic `set_persona` so persona id and one-shot body never tear.
+    #[cfg(test)]
+    pub fn set_pending_persona_body(&self, id: &str, body: Option<String>) {
+        let default_mode = self.resolved_default_mode(id);
+        Self::mode_state_entry(&mut self.mode_states.write(), id, default_mode)
+            .pending_persona_body = body;
+    }
+
+    /// Clear a deleted persona and its one-shot body from every session that
+    /// still references it. Returning the affected IDs lets callers publish a
+    /// presentation update for each session after the atomic state change.
+    pub fn remove_persona_from_all(&self, persona_id: &str) -> Vec<String> {
+        let mut states = self.mode_states.write();
+        let mut changed = Vec::new();
+        for (session_id, state) in states.iter_mut() {
+            if state.active_persona.as_deref() != Some(persona_id) {
+                continue;
+            }
+            state.active_persona = None;
+            state.pending_persona_body = None;
+            changed.push(session_id.clone());
+        }
+        changed.sort();
+        changed
+    }
+
+    pub fn set_mounted_collection(&self, id: &str, collection_id: Option<i64>) {
+        let mounted = collection_id
+            .filter(|collection_id| *collection_id > 0)
+            .map(|collection_id| MountedCollection {
+                collection_id,
+                enabled: true,
+            })
+            .into_iter()
+            .collect();
+        self.set_mounted_collections(id, mounted);
+    }
+
+    pub fn set_mounted_collections(
+        &self,
+        id: &str,
+        collections: Vec<MountedCollection>,
+    ) -> MountedCollectionsSnapshot {
+        self.update_mounted_collections(id, |_| collections)
+    }
+
+    pub fn add_mounted_collection(
+        &self,
+        id: &str,
+        collection_id: i64,
+    ) -> MountedCollectionsSnapshot {
+        self.update_mounted_collections(id, |mut collections| {
+            if let Some(collection) = collections
+                .iter_mut()
+                .find(|collection| collection.collection_id == collection_id)
+            {
+                collection.enabled = true;
+            } else {
+                collections.push(MountedCollection {
+                    collection_id,
+                    enabled: true,
+                });
+            }
+            collections
+        })
+    }
+
+    pub fn set_mounted_collection_enabled(
+        &self,
+        id: &str,
+        collection_id: i64,
+        enabled: bool,
+    ) -> MountedCollectionsSnapshot {
+        self.update_mounted_collections(id, |mut collections| {
+            if let Some(collection) = collections
+                .iter_mut()
+                .find(|collection| collection.collection_id == collection_id)
+            {
+                collection.enabled = enabled;
+            }
+            collections
+        })
+    }
+
+    pub fn remove_mounted_collection(
+        &self,
+        id: &str,
+        collection_id: i64,
+    ) -> MountedCollectionsSnapshot {
+        self.update_mounted_collections(id, |mut collections| {
+            collections.retain(|collection| collection.collection_id != collection_id);
+            collections
+        })
+    }
+
+    /// Remove one local collection from every in-memory session. Shares the
+    /// generic "sweep all sessions" core with the remote-collection family;
+    /// only the per-session removal and its snapshot write-back differ.
+    pub fn remove_mounted_collection_from_all(
+        &self,
+        collection_id: i64,
+    ) -> Vec<(String, MountedCollectionsSnapshot)> {
+        let mut states = self.mode_states.write();
+        Self::remove_from_all_sessions_where(&mut states, |state| {
+            let mut collections = folded_collections(state);
+            let previous_len = collections.len();
+            collections.retain(|collection| collection.collection_id != collection_id);
+            (collections.len() != previous_len).then(|| {
+                state.mounted_collection = collections
+                    .iter()
+                    .find(|collection| collection.enabled)
+                    .map(|collection| collection.collection_id);
+                state.mounted_collections = collections.clone();
+                state.mounted_collections_revision =
+                    state.mounted_collections_revision.wrapping_add(1).max(1);
+                MountedCollectionsSnapshot {
+                    revision: state.mounted_collections_revision,
+                    collections,
+                }
+            })
+        })
+    }
+
+    pub(crate) fn update_mounted_collections<F>(
+        &self,
+        id: &str,
+        update: F,
+    ) -> MountedCollectionsSnapshot
+    where
+        F: FnOnce(Vec<MountedCollection>) -> Vec<MountedCollection>,
+    {
+        let default_mode = self.resolved_default_mode(id);
+        let mut states = self.mode_states.write();
+        let state = Self::mode_state_entry(&mut states, id, default_mode);
+        let current = folded_collections(state);
+        let mut normalized = Vec::new();
+        for collection in update(current) {
+            if collection.collection_id <= 0
+                || normalized.iter().any(|mounted: &MountedCollection| {
+                    mounted.collection_id == collection.collection_id
+                })
+            {
+                continue;
+            }
+            normalized.push(collection);
+        }
+        let legacy = normalized
+            .iter()
+            .find(|collection| collection.enabled)
+            .map(|collection| collection.collection_id);
+        state.mounted_collection = legacy;
+        state.mounted_collections = normalized.clone();
+        state.mounted_collections_revision =
+            state.mounted_collections_revision.wrapping_add(1).max(1);
+        MountedCollectionsSnapshot {
+            revision: state.mounted_collections_revision,
+            collections: normalized,
+        }
+    }
+
+    pub fn mounted_collections(&self, id: &str) -> Vec<MountedCollection> {
+        self.mounted_collections_snapshot(id).collections
+    }
+
+    pub fn mounted_collections_snapshot(&self, id: &str) -> MountedCollectionsSnapshot {
+        let states = self.mode_states.read();
+        let Some(state) = states.get(id) else {
+            return MountedCollectionsSnapshot {
+                revision: 0,
+                collections: Vec::new(),
+            };
+        };
+        let collections = folded_collections(state);
+        MountedCollectionsSnapshot {
+            revision: state.mounted_collections_revision,
+            collections,
+        }
+    }
+
+    pub fn mounted_collection_ids(&self, id: &str) -> Vec<i64> {
+        self.mounted_collections(id)
+            .into_iter()
+            .filter(|collection| collection.enabled)
+            .map(|collection| collection.collection_id)
+            .collect()
+    }
+
+    pub fn mounted_collection(&self, id: &str) -> Option<i64> {
+        self.mounted_collection_ids(id).into_iter().next()
+    }
+
+    pub fn mounted_remote_collections(&self, id: &str) -> Vec<MountedRemoteCollection> {
+        self.mode_states
+            .read()
+            .get(id)
+            .map(|state| state.mounted_remote_collections.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn add_mounted_remote_collection(
+        &self,
+        id: &str,
+        server_id: String,
+        collection_id: i64,
+    ) -> Vec<MountedRemoteCollection> {
+        self.update_mounted_remote_collections(id, |mut collections| {
+            if let Some(collection) = collections.iter_mut().find(|collection| {
+                collection.server_id == server_id && collection.collection_id == collection_id
+            }) {
+                collection.enabled = true;
+            } else {
+                collections.push(MountedRemoteCollection {
+                    server_id,
+                    collection_id,
+                    enabled: true,
+                });
+            }
+            collections
+        })
+    }
+
+    pub fn set_mounted_remote_collection_enabled(
+        &self,
+        id: &str,
+        server_id: &str,
+        collection_id: i64,
+        enabled: bool,
+    ) -> Vec<MountedRemoteCollection> {
+        self.update_mounted_remote_collections(id, |mut collections| {
+            if let Some(collection) = collections.iter_mut().find(|collection| {
+                collection.server_id == server_id && collection.collection_id == collection_id
+            }) {
+                collection.enabled = enabled;
+            }
+            collections
+        })
+    }
+
+    pub fn remove_mounted_remote_collection(
+        &self,
+        id: &str,
+        server_id: &str,
+        collection_id: i64,
+    ) -> Vec<MountedRemoteCollection> {
+        self.update_mounted_remote_collections(id, |mut collections| {
+            collections.retain(|collection| {
+                collection.server_id != server_id || collection.collection_id != collection_id
+            });
+            collections
+        })
+    }
+
+    /// Shared core for the "remove from every session" collection sweeps (the
+    /// local `MountedCollection` snapshot family and the remote
+    /// `MountedRemoteCollection` family): runs `sweep` on every in-memory
+    /// session, skips sessions where it reports no change (`None`), and
+    /// returns the changed session ids (sorted) with the sweep's per-session
+    /// result. Sessions without a match are left untouched.
+    fn remove_from_all_sessions_where<R>(
+        states: &mut HashMap<String, SessionModeState>,
+        mut sweep: impl FnMut(&mut SessionModeState) -> Option<R>,
+    ) -> Vec<(String, R)> {
+        let mut changed = Vec::new();
+        for (session_id, state) in states.iter_mut() {
+            if let Some(result) = sweep(state) {
+                changed.push((session_id.clone(), result));
+            }
+        }
+        changed.sort_by(|left, right| left.0.cmp(&right.0));
+        changed
+    }
+
+    /// Remote-collection specialization of [`Self::remove_from_all_sessions_where`]:
+    /// drops mounts matching `should_remove` from all in-memory sessions and
+    /// returns the changed session ids (sorted) with their post-removal
+    /// collections. Sessions without a match are left untouched.
+    fn remove_mounted_remote_collections_where(
+        states: &mut HashMap<String, SessionModeState>,
+        should_remove: impl Fn(&MountedRemoteCollection) -> bool,
+    ) -> Vec<(String, Vec<MountedRemoteCollection>)> {
+        Self::remove_from_all_sessions_where(states, |state| {
+            let previous_len = state.mounted_remote_collections.len();
+            state
+                .mounted_remote_collections
+                .retain(|collection| !should_remove(collection));
+            (state.mounted_remote_collections.len() != previous_len)
+                .then(|| state.mounted_remote_collections.clone())
+        })
+    }
+
+    /// Remove one remote collection from every in-memory session.
+    pub fn remove_mounted_remote_collection_from_all(
+        &self,
+        server_id: &str,
+        collection_id: i64,
+    ) -> Vec<(String, Vec<MountedRemoteCollection>)> {
+        let mut states = self.mode_states.write();
+        Self::remove_mounted_remote_collections_where(&mut states, |collection| {
+            collection.server_id == server_id && collection.collection_id == collection_id
+        })
+    }
+
+    /// Remove every mount belonging to a disconnected remote server from all sessions.
+    pub fn remove_remote_server_mounts(
+        &self,
+        server_id: &str,
+    ) -> Vec<(String, Vec<MountedRemoteCollection>)> {
+        let mut states = self.mode_states.write();
+        Self::remove_mounted_remote_collections_where(&mut states, |collection| {
+            collection.server_id == server_id
+        })
+    }
+
+    fn update_mounted_remote_collections<F>(
+        &self,
+        id: &str,
+        update: F,
+    ) -> Vec<MountedRemoteCollection>
+    where
+        F: FnOnce(Vec<MountedRemoteCollection>) -> Vec<MountedRemoteCollection>,
+    {
+        let default_mode = self.resolved_default_mode(id);
+        let mut states = self.mode_states.write();
+        let state = Self::mode_state_entry(&mut states, id, default_mode);
+        let mut normalized = Vec::new();
+        for collection in update(state.mounted_remote_collections.clone()) {
+            if collection.server_id.trim().is_empty()
+                || collection.collection_id <= 0
+                || normalized.iter().any(|mounted: &MountedRemoteCollection| {
+                    mounted.server_id == collection.server_id
+                        && mounted.collection_id == collection.collection_id
+                })
+            {
+                continue;
+            }
+            normalized.push(collection);
+        }
+        state.mounted_remote_collections = normalized.clone();
+        normalized
+    }
+
+    // ===================== per-session mode 持久化（所有会话） =====================
+
+    /// Apply id-level mode upserts/removes directly to
+    /// `_session_mode_states.json`, leaving every entry this process never
+    /// touched exactly as another process wrote it. The in-memory map is a
+    /// boot-time snapshot plus this process's own changes, so rewriting it
+    /// wholesale onto the shared store would silently revert a mode switch
+    /// persisted by a concurrent GUI/headless process after this one booted
+    /// — e.g. a headless Plan run flipping a just-GUI-set Yolo session back.
+    ///
+    /// 原子写 + 失败可见：直接 `std::fs::write` 在进程中断时可能留下截断文件，
+    /// 而 `load_session_mode_states` 对损坏文件是静默跳过——一次中断写入会让所有
+    /// per-session mode 记录永久丢失，表现为「显式切过 mode，重启后回 Plan」。
+    ///
+    /// The `_locked` suffix is the caller contract shared with the other
+    /// sidecar mutators: the durable RMW must run under the store's
+    /// `session_mode_states_io` mutex (`set_mode`, `set_mode_and_persist`,
+    /// `persist_accepted_yolo_mode`, and the retention purge all do), or two
+    /// concurrent RMWs interleave and the later write lands over the earlier
+    /// one's change.
+    pub(crate) fn apply_session_mode_mutation_locked(
+        upserts: &[(String, SerializableMode)],
+        removes: &[String],
+    ) -> Result<()> {
+        crate::features::sessions::sidecars::mutate_json_map_file(
+            "_session_mode_states.json",
+            |entries: &mut std::collections::HashMap<String, SerializableMode>| {
+                let mut changed = false;
+                for (id, mode) in upserts {
+                    if entries.get(id) != Some(mode) {
+                        entries.insert(id.clone(), mode.clone());
+                        changed = true;
+                    }
+                }
+                for id in removes {
+                    changed |= entries.remove(id).is_some();
+                }
+                changed
+            },
+        )
+    }
+
+    /// Restore every session's per-session mode at boot: merge into
+    /// `mode_states`, so reopening a session restores the mode it last
+    /// explicitly used.
+    ///
+    /// Compatibility: when the new file is absent, fall back to reading the
+    /// legacy `_code_mode_states.json` (a remnant of the code-session-only
+    /// era) and **immediately persist it into the new file** to complete the
+    /// migration; the old file is not deleted.
+    ///
+    /// Materializing the legacy map here is load-bearing, not tidiness. Every
+    /// durable mode write is now an id-level read-modify-write against
+    /// `_session_mode_states.json` (`apply_session_mode_mutation_locked`),
+    /// and an absent file starts that RMW from an empty map. So without this
+    /// step the first mode switch after an upgrade would write a single-entry
+    /// file, and because the legacy fallback above is keyed on the new file
+    /// being absent, it would never be consulted again: every pre-upgrade
+    /// per-session mode silently lost, and a session the user had pinned to
+    /// Plan reopening under `resolved_default_mode` — the exact reopen
+    /// divergence this persistence exists to prevent. (The whole-map writer
+    /// this replaced completed the migration implicitly by rewriting the
+    /// in-memory map on every save.)
+    pub fn load_session_mode_states(&self) {
+        let states_file = crate::platform::paths::sessions_root().join("_session_mode_states.json");
+        let legacy_file = crate::platform::paths::sessions_root().join("_code_mode_states.json");
+        let (source, from_legacy) = if states_file.exists() {
+            (states_file, false)
+        } else if legacy_file.exists() {
+            (legacy_file, true)
+        } else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&source) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let modes: std::collections::HashMap<String, SerializableMode> =
+            match serde_json::from_str(&content) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[sessions] load_session_mode_states failed: {e}");
+                    return;
+                }
+            };
+        if from_legacy && !modes.is_empty() {
+            let upserts: Vec<(String, SerializableMode)> = modes
+                .iter()
+                .map(|(id, mode)| (id.clone(), mode.clone()))
+                .collect();
+            // Boot-time, before any writer can race: the io mutex exists for
+            // concurrent mutators and there are none yet.
+            if let Err(error) = Self::apply_session_mode_mutation_locked(&upserts, &[]) {
+                // Keep booting with the in-memory map: the modes are still
+                // correct for this run, and the next boot retries the
+                // migration. Residual: if a LATER mode write in this run
+                // succeeds, it creates the new file and the absence-keyed
+                // legacy fallback never fires again — modes that only lived
+                // in the legacy file are then lost at the next restart. Both
+                // this failure and that later write are logged; closing the
+                // window needs migration-retry state that outlives the boot
+                // attempt.
+                eprintln!("[sessions] migrate _code_mode_states.json failed: {error:#}");
+            }
+        }
+        {
+            let mut persisted = self.session_mode_states.write();
+            *persisted = modes.clone();
+        }
+        let mut states = self.mode_states.write();
+        for (id, mode) in modes {
+            states.entry(id).or_default().mode = mode;
+        }
+    }
+
+    pub fn code_permission_prefs(&self) -> CodePermissionPrefs {
+        *self.code_permission.read()
+    }
+
+    /// View of the per-lane global default modes (in-memory mirror; the disk
+    /// truth for work lives in settings.json `mode_defaults.work`, for code in
+    /// `code_permission.last_mode`).
+    pub fn mode_defaults(&self) -> ModeDefaultsView {
+        let defaults = self.mode_defaults.read();
+        ModeDefaultsView {
+            work: defaults.work,
+            code: self.code_permission.read().last_mode,
+        }
+    }
+
+    /// An explicit draft-state switch writes the matching lane's global
+    /// default mode (two-lane semantics: switches in already-materialized
+    /// sessions never touch this). Updates the in-memory mirror first
+    /// (effective immediately for this run), then persists settings.json in a
+    /// field-level transaction; a write failure only logs (same tolerance as
+    /// set_mode).
+    pub fn set_mode_default(&self, lane: ModeLane, mode: SerializableMode) {
+        match lane {
+            ModeLane::Code => {
+                self.code_permission.write().last_mode = Some(mode);
+            }
+            ModeLane::Work => {
+                self.mode_defaults.write().work = Some(mode);
+            }
+        }
+        if let Err(error) = UserPrefs::update_transaction(|prefs| {
+            match lane {
+                ModeLane::Code => prefs.code_permission.last_mode = Some(mode),
+                ModeLane::Work => prefs.mode_defaults.work = Some(mode),
+            }
+            Ok(())
+        }) {
+            eprintln!("[sessions] persist mode default for {lane:?} failed: {error}");
+        }
+    }
+
+    /// After the accept flow (`claim_pending_plan` switching to Yolo) is
+    /// confirmed and committed, records the task-level switch in per-session
+    /// persistence: writes `_session_mode_states.json` (reopening the session,
+    /// or switching away and back, restores Yolo). Global lane defaults are
+    /// **not** updated (two-lane semantics: a switch in an
+    /// already-materialized session writes only that session's own record).
+    ///
+    /// Called only from `PendingPlanClaim::commit` (engine commit confirmed):
+    /// the mode is remembered once the task actually starts executing; a
+    /// failed commit rolls back via `restore_pending_plan_claim` without
+    /// touching disk, and the in-memory return to Plan stays consistent with
+    /// disk.
+    pub(crate) fn persist_accepted_yolo_mode(&self, id: &str) {
+        let _io = self.session_mode_states_io.lock();
+        self.session_mode_states
+            .write()
+            .insert(id.to_string(), SerializableMode::Yolo);
+        if let Err(error) = Self::apply_session_mode_mutation_locked(
+            &[(id.to_string(), SerializableMode::Yolo)],
+            &[],
+        ) {
+            // The session id is deliberately kept out of the message: boot
+            // logs persist to disk and must not accumulate raw session
+            // identifiers (CodeQL cleartext-logging gate).
+            eprintln!("[sessions] persist accepted yolo mode failed: {error:#}");
+        }
+    }
+
+    pub fn confirm_code_yolo(&self) -> Result<CodePermissionPrefs, String> {
+        UserPrefs::update_transaction(|prefs| {
+            prefs.code_permission.yolo_confirmed = true;
+            Ok(())
+        })?;
+        self.code_permission.write().yolo_confirmed = true;
+        Ok(self.code_permission_prefs())
+    }
+}

@@ -1,0 +1,1460 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use agent_backend_api::{
+    AgentBackendError, AgentRunObserver, AgentSessionHandle, AgentTaskInput, AgentTaskOutcome,
+    AttachmentHandle, HeadlessAgentBackend, PrepareRequest, PrivateInputHandle,
+    PrivateInputResolver, PrivateOutputHandle, ResolvedAttachmentSource, ResolvedPrivateInput,
+    SafeAgentEvent, SafeModelRequestMetric, SafeUsageMetrics, SecretOutput, SecretText,
+};
+use async_trait::async_trait;
+use benchmark_core::{
+    BenchmarkAdapter, BenchmarkDescriptor, BenchmarkId, BenchmarkPlan, BenchmarkService,
+    BenchmarkTask, CompletedRun, ExecutionKind, ExecutionRequest, ModelIdentity, NativeAgentRunner,
+    OfficialScoreReport, OutputContract, PreparedTask, RunContext, RunManifest, RunStore, Split,
+    SubmissionArtifact, TaskRunner, TaskSelection, TaskStatus, ToolPolicyId, VerifiedDataset,
+};
+
+fn temp_base(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("pinvou-core-{name}-{nonce}"));
+    fs::create_dir(&path).unwrap();
+    path
+}
+
+fn descriptor() -> BenchmarkDescriptor {
+    BenchmarkDescriptor::new(
+        BenchmarkId::new("smoke"),
+        "smoke/v1",
+        "dataset-sha-123",
+        "scorer-sha-123",
+        vec![Split::new("smoke")],
+        ExecutionKind::NativeTurn,
+    )
+}
+
+fn manifest(run_id: &str) -> RunManifest {
+    RunManifest::new(
+        run_id,
+        &descriptor(),
+        Split::new("smoke"),
+        ModelIdentity::new("fixture", "mock-model").unwrap(),
+        ToolPolicyId::new("smoke/v1"),
+        1,
+    )
+    .unwrap()
+}
+
+/// The exact JSON shape a schema-1 build wrote: no `schema_version` bump and
+/// no deadline-mode key at all.
+fn legacy_manifest_json() -> &'static str {
+    r#"{
+        "schema_version": 1, "run_id": "run-legacy", "benchmark": "smoke",
+        "adapter_version": "smoke/v1", "dataset_revision": "dataset-sha-123",
+        "scorer_revision": "scorer-sha-123", "split": "smoke",
+        "model": {"provider": "fixture", "model": "mock-model"},
+        "tool_policy": "smoke/v1", "concurrency": 1, "pass": 1,
+        "created_at_ms": 0
+    }"#
+}
+
+#[test]
+fn manifest_records_the_harness_deadline_mode_and_reads_old_manifests() {
+    // The mode is machine-readable in the manifest so an unbounded run (no
+    // harness wall-clock deadline) stays distinguishable from a bounded one
+    // — the two are not score-comparable.
+    let bounded = RunManifest::new(
+        "run-bounded",
+        &descriptor().with_harness_deadline_secs(Some(600)),
+        Split::new("smoke"),
+        ModelIdentity::new("fixture", "mock-model").unwrap(),
+        ToolPolicyId::new("smoke/v1"),
+        1,
+    )
+    .unwrap();
+    assert_eq!(bounded.harness_deadline_secs(), Some(600));
+    let json = serde_json::to_value(&bounded).unwrap();
+    assert_eq!(json["harness_deadline_secs"], 600);
+    assert_eq!(json["schema_version"], 2);
+    // Within the current format the recorded mode joins the resume identity:
+    // a bounded manifest matches the one descriptor declaring the same bound
+    // and no other.
+    assert!(bounded.matches_resume(
+        &descriptor().with_harness_deadline_secs(Some(600)),
+        "smoke",
+        &ModelIdentity::new("fixture", "mock-model").unwrap(),
+        "smoke/v1"
+    ));
+
+    let unbounded = RunManifest::new(
+        "run-unbounded",
+        &descriptor(), // BenchmarkDescriptor::new defaults to None
+        Split::new("smoke"),
+        ModelIdentity::new("fixture", "mock-model").unwrap(),
+        ToolPolicyId::new("smoke/v1"),
+        1,
+    )
+    .unwrap();
+    assert_eq!(unbounded.harness_deadline_secs(), None);
+    // `None` serializes as an explicit `null`, not a missing key: a
+    // manifest written by this version stays distinguishable from a legacy
+    // manifest, whose key is absent entirely (and whose real mode is
+    // unrecoverable). A missing key must never be misread as a bounded
+    // 0-second deadline either.
+    let json = serde_json::to_value(&unbounded).unwrap();
+    // Indexing a missing key also yields `Null`, so pin the key's presence
+    // itself: a future `skip_serializing_if` would otherwise silently
+    // collapse the current format back into the legacy shape.
+    assert!(
+        json.as_object()
+            .unwrap()
+            .contains_key("harness_deadline_secs")
+    );
+    assert_eq!(json["harness_deadline_secs"], serde_json::Value::Null);
+
+    // Manifests written before the field existed (schema 1) keep
+    // deserializing so old scores stay readable and scoreable. Schema is what
+    // makes them detectably legacy and keeps the unrecoverable legacy mode
+    // enforceable: this fixture matches the current descriptor on every
+    // recoverable dimension, and this descriptor's deadline is `None`, so a
+    // schema-2 manifest with an explicit `null` would be the current
+    // unbounded format — only the schema version tells the two apart, and
+    // only the current version may resume.
+    let legacy: RunManifest = serde_json::from_str(legacy_manifest_json()).unwrap();
+    assert_eq!(legacy.harness_deadline_secs(), None);
+    assert!(legacy.matches_contract(&descriptor(), "smoke", "smoke/v1", 1));
+    assert!(!legacy.matches_resume(
+        &descriptor(),
+        "smoke",
+        &ModelIdentity::new("fixture", "mock-model").unwrap(),
+        "smoke/v1"
+    ));
+}
+
+/// `Some(0)` is not a mode: validate must reject it at creation time instead
+/// of writing a manifest whose tasks would all time out instantly.
+#[test]
+fn manifest_rejects_a_zero_second_harness_deadline() {
+    let error = RunManifest::new(
+        "run-zero-deadline",
+        &descriptor().with_harness_deadline_secs(Some(0)),
+        Split::new("smoke"),
+        ModelIdentity::new("fixture", "mock-model").unwrap(),
+        ToolPolicyId::new("smoke/v1"),
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), "invalid_manifest");
+}
+
+fn task(id: &str) -> BenchmarkTask {
+    BenchmarkTask::new(
+        id,
+        None,
+        ExecutionRequest::native_turn(
+            PrivateInputHandle::new(format!("private-{id}")),
+            vec![],
+            Some(Duration::from_secs(5)),
+            ToolPolicyId::new("smoke/v1"),
+            OutputContract::new("text/v1"),
+        ),
+    )
+}
+
+fn attachment_task(id: &str) -> BenchmarkTask {
+    BenchmarkTask::new(
+        id,
+        None,
+        ExecutionRequest::native_turn(
+            PrivateInputHandle::new(format!("private-{id}")),
+            vec![AttachmentHandle::new(format!("attachment-{id}"))],
+            Some(Duration::from_secs(5)),
+            ToolPolicyId::new("smoke/v1"),
+            OutputContract::new("text/v1"),
+        ),
+    )
+}
+
+#[test]
+fn manifest_is_immutable_and_rejects_secret_shaped_model_identity() {
+    let base = temp_base("manifest");
+    let store = RunStore::create(&base, &manifest("run-1")).unwrap();
+    let manifest_text = fs::read_to_string(store.manifest_path()).unwrap();
+    assert!(!manifest_text.to_ascii_lowercase().contains("token"));
+
+    let error = RunStore::create(&base, &manifest("run-1")).unwrap_err();
+    assert_eq!(error.code(), "run_exists");
+    assert_eq!(
+        fs::read_to_string(store.manifest_path()).unwrap(),
+        manifest_text
+    );
+
+    let error = ModelIdentity::new("fixture", "api_key=secret").unwrap_err();
+    assert_eq!(error.code(), "unsafe_persistence");
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn resume_manifest_match_rejects_every_pinned_contract_dimension() {
+    let expected = manifest("run-resume-contract");
+    let expected_descriptor = descriptor();
+    let expected_model = ModelIdentity::new("fixture", "mock-model").unwrap();
+    assert!(expected.matches_resume(&expected_descriptor, "smoke", &expected_model, "smoke/v1"));
+
+    let mutations = [
+        ("schema_version", serde_json::json!(1)),
+        ("concurrency", serde_json::json!(2)),
+        ("pass", serde_json::json!(2)),
+        ("benchmark", serde_json::json!("other")),
+        ("adapter_version", serde_json::json!("smoke/v2")),
+        ("dataset_revision", serde_json::json!("dataset-sha-456")),
+        ("scorer_revision", serde_json::json!("scorer-sha-456")),
+        ("split", serde_json::json!("validation")),
+        (
+            "model",
+            serde_json::json!({"provider": "fixture", "model": "other-model"}),
+        ),
+        ("tool_policy", serde_json::json!("smoke/v2")),
+        // The recorded deadline mode joins the resume identity: a bounded
+        // manifest must not resume against this unbounded descriptor.
+        ("harness_deadline_secs", serde_json::json!(600)),
+    ];
+    for (field, replacement) in mutations {
+        let mut stored = serde_json::to_value(&expected).unwrap();
+        stored[field] = replacement;
+        let stored: RunManifest = serde_json::from_value(stored).unwrap();
+        assert!(
+            !stored.matches_resume(&expected_descriptor, "smoke", &expected_model, "smoke/v1"),
+            "resume unexpectedly accepted changed {field}"
+        );
+    }
+
+    // The join reads both sides: the recorded mode must also be rejected
+    // against a bounded descriptor it does not exactly meet. Without these
+    // mirror cases a variant-only comparison (`is_some() == is_some()`) or a
+    // one-sided `stored.is_none()` escape hatch passes the whole suite.
+    let bounded = descriptor().with_harness_deadline_secs(Some(600));
+    let with_deadline = |run_id: &str, deadline: serde_json::Value| -> RunManifest {
+        let mut value = serde_json::to_value(manifest(run_id)).unwrap();
+        value["harness_deadline_secs"] = deadline;
+        serde_json::from_value(value).unwrap()
+    };
+    // The one descriptor declaring the same bound still resumes.
+    assert!(
+        with_deadline("run-join-600", serde_json::json!(600)).matches_resume(
+            &bounded,
+            "smoke",
+            &expected_model,
+            "smoke/v1"
+        )
+    );
+    // An unbounded record must not resume a bounded descriptor, and neither
+    // may a differently bounded one: the recorded bound is part of the
+    // identity, not just its presence.
+    assert!(
+        !with_deadline("run-join-none", serde_json::Value::Null).matches_resume(
+            &bounded,
+            "smoke",
+            &expected_model,
+            "smoke/v1"
+        )
+    );
+    assert!(
+        !with_deadline("run-join-300", serde_json::json!(300)).matches_resume(
+            &bounded,
+            "smoke",
+            &expected_model,
+            "smoke/v1"
+        )
+    );
+}
+
+#[test]
+fn gaia_manifest_contract_rejects_every_non_model_dimension() {
+    let expected = manifest("gaia-contract");
+    let expected_descriptor = descriptor();
+    assert!(expected.matches_contract(&expected_descriptor, "smoke", "smoke/v1", 1));
+
+    let mutations = [
+        ("schema_version", serde_json::json!(3)),
+        ("concurrency", serde_json::json!(2)),
+        ("pass", serde_json::json!(2)),
+        ("benchmark", serde_json::json!("other")),
+        ("adapter_version", serde_json::json!("smoke/v2")),
+        ("dataset_revision", serde_json::json!("dataset-sha-456")),
+        ("scorer_revision", serde_json::json!("scorer-sha-456")),
+        ("split", serde_json::json!("validation")),
+        ("tool_policy", serde_json::json!("smoke/v2")),
+    ];
+    for (field, replacement) in mutations {
+        let mut stored = serde_json::to_value(&expected).unwrap();
+        stored[field] = replacement;
+        let stored: RunManifest = serde_json::from_value(stored).unwrap();
+        assert!(
+            !stored.matches_contract(&expected_descriptor, "smoke", "smoke/v1", 1),
+            "contract unexpectedly accepted changed {field}"
+        );
+    }
+
+    let mut changed_model = serde_json::to_value(&expected).unwrap();
+    changed_model["model"] = serde_json::json!({"provider": "other", "model": "arbitrary"});
+    let changed_model: RunManifest = serde_json::from_value(changed_model).unwrap();
+    assert!(changed_model.matches_contract(&expected_descriptor, "smoke", "smoke/v1", 1));
+}
+
+#[test]
+fn terminal_event_requires_a_durable_outcome_and_resume_skips_it() {
+    let base = temp_base("ordering");
+    let store = RunStore::create(&base, &manifest("run-1")).unwrap();
+    store.plan_tasks(["done", "pending"]).unwrap();
+    let error = store.mark_completed("done").unwrap_err();
+    assert_eq!(error.code(), "outcome_not_durable");
+
+    store
+        .record_outcome(benchmark_core::TaskOutcome::new(
+            "done",
+            TaskStatus::Completed,
+            None,
+            vec![],
+            1,
+        ))
+        .unwrap();
+    store.mark_completed("done").unwrap();
+
+    let recovered = store.recover().unwrap();
+    assert_eq!(recovered.completed_task_ids(), &["done"]);
+    assert_eq!(recovered.runnable_task_ids(), &["pending"]);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[derive(Default)]
+struct MockState {
+    prepared: Vec<String>,
+    prepared_tool_policies: Vec<Option<String>>,
+    prepared_attachment_names: Vec<String>,
+    run: Vec<String>,
+    run_output_contracts: Vec<Option<String>>,
+    closed: usize,
+    active: usize,
+    max_active: usize,
+    cancelled: usize,
+}
+
+enum BackendBehavior {
+    Completed,
+    /// Sleeps 50ms in `run` — proves the `None`-deadline pass-through (the
+    /// harness must not impose its own `task_timeout` for unbounded GAIA
+    /// runs; a `Some` deadline that short would cut it off).
+    SlowRun,
+    CloseFailed,
+    Failed,
+    FailedModelRequestTimeout,
+    FailFirst,
+    Pending,
+    PendingPrepare,
+    PendingResolveOutput,
+    PendingClose,
+    ResolveFailed,
+    MissingFinalAnswer,
+    PendingCleanup,
+}
+
+struct MockBackend {
+    state: Mutex<MockState>,
+    behavior: BackendBehavior,
+}
+
+struct AttachmentResolver {
+    fail: bool,
+}
+
+struct PendingAttachmentResolver;
+
+#[async_trait]
+impl PrivateInputResolver for PendingAttachmentResolver {
+    async fn resolve(
+        &self,
+        _handle: &PrivateInputHandle,
+    ) -> Result<ResolvedPrivateInput, AgentBackendError> {
+        Ok(ResolvedPrivateInput::new(
+            SecretText::new("private"),
+            vec![],
+        ))
+    }
+
+    async fn resolve_attachment(
+        &self,
+        _handle: &AttachmentHandle,
+    ) -> Result<ResolvedAttachmentSource, AgentBackendError> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl PrivateInputResolver for AttachmentResolver {
+    async fn resolve(
+        &self,
+        _handle: &PrivateInputHandle,
+    ) -> Result<ResolvedPrivateInput, AgentBackendError> {
+        Ok(ResolvedPrivateInput::new(
+            SecretText::new("private"),
+            vec![],
+        ))
+    }
+
+    async fn resolve_attachment(
+        &self,
+        _handle: &AttachmentHandle,
+    ) -> Result<ResolvedAttachmentSource, AgentBackendError> {
+        if self.fail {
+            Err(AgentBackendError::Operation("PRIVATE_PATH".into()))
+        } else {
+            Ok(ResolvedAttachmentSource::new(
+                PathBuf::from("C:/private/PRIVATE_ATTACHMENT.txt"),
+                "attachment.txt",
+            ))
+        }
+    }
+}
+
+impl Default for MockBackend {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(MockState::default()),
+            behavior: BackendBehavior::Completed,
+        }
+    }
+}
+
+impl MockBackend {
+    fn with_behavior(behavior: BackendBehavior) -> Self {
+        Self {
+            state: Mutex::new(MockState::default()),
+            behavior,
+        }
+    }
+}
+
+#[async_trait]
+impl HeadlessAgentBackend for MockBackend {
+    async fn prepare(
+        &self,
+        request: PrepareRequest,
+    ) -> Result<AgentSessionHandle, AgentBackendError> {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.prepared.push(request.task_id().into());
+            state.prepared_tool_policies.push(
+                request
+                    .tool_policy()
+                    .map(|policy| policy.as_str().to_owned()),
+            );
+            state.prepared_attachment_names.extend(
+                request
+                    .resolved_attachments()
+                    .iter()
+                    .map(|source| source.suggested_name().to_owned()),
+            );
+        }
+        if matches!(self.behavior, BackendBehavior::PendingPrepare) {
+            return std::future::pending().await;
+        }
+        Ok(AgentSessionHandle::new(request.task_id()))
+    }
+
+    async fn run(
+        &self,
+        _session: &AgentSessionHandle,
+        task: AgentTaskInput,
+        _private_inputs: Arc<dyn PrivateInputResolver>,
+        observer: Arc<dyn AgentRunObserver>,
+    ) -> Result<AgentTaskOutcome, AgentBackendError> {
+        if matches!(self.behavior, BackendBehavior::SlowRun) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            state.active += 1;
+            state.max_active = state.max_active.max(state.active);
+            state.run.push(task.task_id().into());
+            state.run_output_contracts.push(
+                task.output_contract()
+                    .map(|contract| contract.as_str().to_owned()),
+            );
+            state.active -= 1;
+        }
+        observer.on_event(&SafeAgentEvent::tool_finished_with_code(
+            task.task_id(),
+            "web_search",
+            true,
+            Duration::from_millis(3),
+            None::<String>,
+        ));
+        observer.on_event(&SafeAgentEvent::tool_finished_with_code(
+            task.task_id(),
+            "api_key=PRIVATE_TOOL",
+            false,
+            Duration::from_millis(4),
+            Some("missing_action"),
+        ));
+        if matches!(self.behavior, BackendBehavior::CloseFailed) {
+            observer.on_event(&SafeAgentEvent::tool_finished_with_code(
+                task.task_id(),
+                "api_key=PRIVATE_TOOL",
+                false,
+                Duration::from_millis(1),
+                Some("Backend exploded: HTTP 500\u{0}"),
+            ));
+        }
+        match self.behavior {
+            BackendBehavior::CloseFailed => {
+                Ok(AgentTaskOutcome::completed(Duration::from_millis(2))
+                    .with_private_output(PrivateOutputHandle::new(format!(
+                        "prediction-{}",
+                        task.task_id()
+                    )))
+                    .with_usage(SafeUsageMetrics::new(100, 20, 70, 30))
+                    .with_model_request_metrics(vec![SafeModelRequestMetric::new(
+                        800,
+                        Some(90),
+                        100,
+                        20,
+                    )]))
+            }
+            BackendBehavior::Completed
+            | BackendBehavior::SlowRun
+            | BackendBehavior::PendingPrepare
+            | BackendBehavior::PendingResolveOutput
+            | BackendBehavior::PendingClose => {
+                Ok(AgentTaskOutcome::completed(Duration::from_millis(2))
+                    .with_private_output(PrivateOutputHandle::new(format!(
+                        "prediction-{}",
+                        task.task_id()
+                    )))
+                    .with_usage(SafeUsageMetrics::new(100, 20, 70, 30)))
+            }
+            BackendBehavior::Failed => Err(AgentBackendError::Operation(
+                "provider secret must not escape".into(),
+            )),
+            BackendBehavior::FailedModelRequestTimeout => Ok(AgentTaskOutcome::failed(
+                Duration::from_millis(7),
+                "model_request_timeout",
+            )
+            .with_usage(SafeUsageMetrics::new(11, 22, 33, 44))
+            .with_model_request_metrics(vec![SafeModelRequestMetric::new(900, Some(120), 11, 22)])),
+            BackendBehavior::FailFirst if task.task_id() == "first" => {
+                Err(AgentBackendError::Operation("private failure".into()))
+            }
+            BackendBehavior::FailFirst => Ok(AgentTaskOutcome::completed(Duration::from_millis(2))),
+            BackendBehavior::Pending => std::future::pending().await,
+            BackendBehavior::PendingCleanup => std::future::pending().await,
+            BackendBehavior::ResolveFailed => {
+                Ok(AgentTaskOutcome::completed(Duration::from_millis(2))
+                    .with_private_output(PrivateOutputHandle::new("missing"))
+                    .with_usage(SafeUsageMetrics::new(100, 20, 70, 30))
+                    .with_model_request_metrics(vec![SafeModelRequestMetric::new(
+                        800,
+                        Some(90),
+                        100,
+                        20,
+                    )]))
+            }
+            BackendBehavior::MissingFinalAnswer => {
+                Err(AgentBackendError::Operation("missing_final_answer".into()))
+            }
+        }
+    }
+
+    async fn cancel(&self, _session: &AgentSessionHandle) -> Result<(), AgentBackendError> {
+        self.state.lock().unwrap().cancelled += 1;
+        if matches!(self.behavior, BackendBehavior::PendingCleanup) {
+            return std::future::pending().await;
+        }
+        Ok(())
+    }
+
+    async fn resolve_output(
+        &self,
+        _handle: &PrivateOutputHandle,
+    ) -> Result<SecretOutput, AgentBackendError> {
+        if matches!(self.behavior, BackendBehavior::ResolveFailed) {
+            return Err(AgentBackendError::Operation(
+                "private resolver secret".into(),
+            ));
+        }
+        if matches!(self.behavior, BackendBehavior::PendingResolveOutput) {
+            return std::future::pending().await;
+        }
+        Ok(SecretOutput::new(SecretText::new(
+            "PRIVATE_ANSWER_SENTINEL",
+        )))
+    }
+
+    async fn close(&self, _session: AgentSessionHandle) -> Result<(), AgentBackendError> {
+        self.state.lock().unwrap().closed += 1;
+        if matches!(self.behavior, BackendBehavior::CloseFailed) {
+            return Err(AgentBackendError::Operation("close teardown secret".into()));
+        }
+        if matches!(
+            self.behavior,
+            BackendBehavior::PendingCleanup | BackendBehavior::PendingClose
+        ) {
+            return std::future::pending().await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn native_turn_forwards_the_validated_tool_policy_to_prepare() {
+    let base = temp_base("tool-policy-forwarding");
+    let backend = Arc::new(MockBackend::default());
+    let runner = NativeAgentRunner::new(backend.clone());
+
+    runner
+        .run_task(&task("policy-probe"), &RunContext::new("policy-probe"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backend.state.lock().unwrap().prepared_tool_policies,
+        [Some("smoke/v1".to_owned())]
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn native_turn_forwards_the_validated_output_contract_to_run() {
+    let base = temp_base("output-contract-forwarding");
+    let backend = Arc::new(MockBackend::default());
+    let runner = NativeAgentRunner::new(backend.clone());
+
+    runner
+        .run_task(
+            &task("output-contract-probe"),
+            &RunContext::new("output-contract-probe"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backend.state.lock().unwrap().run_output_contracts,
+        [Some("text/v1".to_owned())]
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn unsafe_native_tool_policy_is_rejected_before_backend_or_outcome_processing() {
+    let base = temp_base("unsafe-tool-policy");
+    let backend = Arc::new(MockBackend::default());
+    let runner = NativeAgentRunner::new(backend.clone());
+    let unsafe_task = BenchmarkTask::new(
+        "unsafe-policy",
+        None,
+        ExecutionRequest::native_turn(
+            PrivateInputHandle::new("private-unsafe-policy"),
+            vec![],
+            Some(Duration::from_secs(5)),
+            ToolPolicyId::new("api_key=PRIVATE_SENTINEL"),
+            OutputContract::new("text/v1"),
+        ),
+    );
+
+    let error = runner
+        .run_task(&unsafe_task, &RunContext::new("unsafe-policy"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code(), "unsupported_tool_policy");
+    let state = backend.state.lock().unwrap();
+    assert!(state.prepared.is_empty());
+    assert!(state.run.is_empty());
+    assert_eq!(state.closed, 0);
+    drop(state);
+    assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resolution_happens_before_prepare_and_failure_is_safe() {
+    let base = temp_base("attachment-resolution");
+    let backend = Arc::new(MockBackend::default());
+    let runner = NativeAgentRunner::with_private_inputs(
+        backend.clone(),
+        Arc::new(AttachmentResolver { fail: true }),
+    );
+    let error = runner
+        .run_task(&attachment_task("probe"), &RunContext::new("probe"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "attachment_resolution_failed");
+    let service = BenchmarkService::native_with_private_inputs(
+        &base,
+        backend.clone(),
+        Arc::new(AttachmentResolver { fail: true }),
+    )
+    .unwrap();
+    let summary = service
+        .run(
+            manifest("attachment-failed"),
+            &BenchmarkPlan::new(vec![attachment_task("one")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Failed);
+    assert_eq!(
+        summary.outcomes()[0].failure_category(),
+        Some(&benchmark_core::SafeFailureCategory::Infrastructure)
+    );
+    assert_eq!(
+        summary.outcomes()[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::AttachmentResolutionFailed)
+    );
+    assert!(backend.state.lock().unwrap().prepared.is_empty());
+    let persisted =
+        fs::read_to_string(base.join("eval/runs/attachment-failed/predictions.jsonl")).unwrap();
+    assert!(!persisted.contains("PRIVATE_PATH"));
+    assert!(!persisted.contains("PRIVATE_ATTACHMENT"));
+
+    let success_backend = Arc::new(MockBackend::default());
+    let success_runner = NativeAgentRunner::with_private_inputs(
+        success_backend.clone(),
+        Arc::new(AttachmentResolver { fail: false }),
+    );
+    success_runner
+        .run_task(&attachment_task("success"), &RunContext::new("success"))
+        .await
+        .unwrap();
+    assert_eq!(
+        success_backend
+            .state
+            .lock()
+            .unwrap()
+            .prepared_attachment_names,
+        ["attachment.txt"]
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn attachment_resolution_consumes_the_same_task_deadline() {
+    let base = temp_base("attachment-deadline");
+    let backend = Arc::new(MockBackend::default());
+    let runner = NativeAgentRunner::with_private_inputs(
+        backend.clone(),
+        Arc::new(PendingAttachmentResolver),
+    );
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        runner.run_task(
+            &BenchmarkTask::new(
+                "attachment-timeout",
+                None,
+                ExecutionRequest::native_turn(
+                    PrivateInputHandle::new("private"),
+                    vec![AttachmentHandle::new("attachment")],
+                    Some(Duration::from_millis(5)),
+                    ToolPolicyId::new("smoke/v1"),
+                    OutputContract::new("text/v1"),
+                ),
+            ),
+            &RunContext::new("attachment-timeout"),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.code(), "task_timeout");
+    assert!(backend.state.lock().unwrap().prepared.is_empty());
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn service_runs_native_tasks_serially_closes_sessions_and_resumes_without_reexecution() {
+    let base = temp_base("service");
+    let backend = Arc::new(MockBackend::default());
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let plan = BenchmarkPlan::new(vec![task("one"), task("two")]);
+
+    let first = service.run(manifest("run-1"), &plan).await.unwrap();
+    assert_eq!(first.completed(), 2);
+    let resumed = service.resume("run-1", &plan).await.unwrap();
+    assert_eq!(resumed.completed(), 2);
+
+    let state = backend.state.lock().unwrap();
+    assert_eq!(state.prepared, ["one", "two"]);
+    assert_eq!(state.run, ["one", "two"]);
+    assert_eq!(state.closed, 2);
+    assert_eq!(state.max_active, 1);
+    assert_eq!(
+        first.outcomes()[0].tool_observations()[0].canonical_name,
+        "web_search"
+    );
+    assert_eq!(
+        first.outcomes()[0]
+            .private_output()
+            .unwrap()
+            .text()
+            .expose_to_backend(),
+        "PRIVATE_ANSWER_SENTINEL"
+    );
+    let persisted = fs::read_to_string(base.join("eval/runs/run-1/predictions.jsonl")).unwrap();
+    assert!(!persisted.contains("PRIVATE_ANSWER_SENTINEL"));
+    assert!(!persisted.contains("PRIVATE_TOOL"));
+    assert!(persisted.contains("[redacted-tool]"));
+    assert_eq!(first.outcomes()[0].usage().unwrap().cache_hit_tokens, 70);
+    assert_eq!(resumed.outcomes()[0].usage().unwrap().cache_miss_tokens, 30);
+    drop(state);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn generic_resume_completes_a_plan_interrupted_during_planning() {
+    let base = temp_base("resume-partial-plan");
+    let plan = BenchmarkPlan::new(vec![task("first"), task("second")]);
+    let store = RunStore::create(&base, &manifest("run-partial-plan")).unwrap();
+    store.plan_tasks(["first"]).unwrap();
+
+    let backend = Arc::new(MockBackend::default());
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let resumed = service.resume("run-partial-plan", &plan).await.unwrap();
+
+    assert_eq!(resumed.completed(), 2);
+    assert_eq!(backend.state.lock().unwrap().run, ["first", "second"]);
+    assert!(store.recover().unwrap().runnable_task_ids().is_empty());
+    fs::remove_dir_all(base).unwrap();
+}
+
+fn short_task(id: &str) -> BenchmarkTask {
+    BenchmarkTask::new(
+        id,
+        None,
+        ExecutionRequest::native_turn(
+            PrivateInputHandle::new(format!("private-{id}")),
+            vec![],
+            Some(Duration::from_millis(5)),
+            ToolPolicyId::new("smoke/v1"),
+            OutputContract::new("text/v1"),
+        ),
+    )
+}
+
+#[tokio::test]
+async fn native_timeout_cancels_and_closes_exactly_once_with_safe_error() {
+    let base = temp_base("timeout");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::Pending));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let summary = service
+        .run(
+            manifest("run-timeout"),
+            &BenchmarkPlan::new(vec![short_task("slow")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Timeout);
+    assert_eq!(
+        summary.outcomes()[0].failure_category(),
+        Some(&benchmark_core::SafeFailureCategory::Timeout)
+    );
+    assert_eq!(
+        summary.outcomes()[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::TaskTimeout)
+    );
+    let reopened = RunStore::open(&base, "run-timeout")
+        .unwrap()
+        .read_outcomes()
+        .unwrap();
+    assert_eq!(
+        reopened[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::TaskTimeout)
+    );
+    let state = backend.state.lock().unwrap();
+    assert_eq!(state.cancelled, 1);
+    assert_eq!(state.closed, 1);
+    drop(state);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn single_deadline_covers_prepare_output_resolution_and_normal_close() {
+    for (name, behavior, expected_cancel, minimum_close) in [
+        ("prepare", BackendBehavior::PendingPrepare, 0, 0),
+        ("output", BackendBehavior::PendingResolveOutput, 1, 1),
+        ("close", BackendBehavior::PendingClose, 1, 2),
+    ] {
+        let base = temp_base(name);
+        let backend = Arc::new(MockBackend::with_behavior(behavior));
+        let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+        let summary = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.run(
+                manifest(&format!("run-{name}")),
+                &BenchmarkPlan::new(vec![short_task(name)]),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(summary.outcomes()[0].status(), TaskStatus::Timeout);
+        assert_eq!(
+            summary.outcomes()[0].failure_category(),
+            Some(&benchmark_core::SafeFailureCategory::Timeout)
+        );
+        assert_eq!(
+            summary.outcomes()[0].failure_reason(),
+            Some(benchmark_core::SafeFailureReason::TaskTimeout),
+            "{name}"
+        );
+        let state = backend.state.lock().unwrap();
+        assert_eq!(state.cancelled, expected_cancel, "{name}");
+        assert!(state.closed >= minimum_close, "{name}");
+        drop(state);
+        fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_run_error_still_closes_once_without_leaking_backend_error() {
+    let base = temp_base("run-error");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::Failed));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let summary = service
+        .run(
+            manifest("run-error"),
+            &BenchmarkPlan::new(vec![task("failed")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Failed);
+    assert_eq!(
+        summary.outcomes()[0].failure_category(),
+        Some(&benchmark_core::SafeFailureCategory::Infrastructure)
+    );
+    assert_eq!(
+        summary.outcomes()[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::IntegrationLifecycleFailed)
+    );
+    assert_eq!(summary.outcomes()[0].tool_observations().len(), 2);
+    assert_eq!(
+        summary.outcomes()[0].tool_observations()[1].canonical_name,
+        "[redacted-tool]"
+    );
+    assert_eq!(
+        summary.outcomes()[0].tool_observations()[1]
+            .failure_code
+            .as_deref(),
+        Some("missing_action")
+    );
+    let state = backend.state.lock().unwrap();
+    assert_eq!(state.cancelled, 0);
+    assert_eq!(state.closed, 1);
+    drop(state);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn failed_case_is_terminal_and_does_not_block_the_next_case_or_resume() {
+    let base = temp_base("continue");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::FailFirst));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let plan = BenchmarkPlan::new(vec![task("first"), task("second")]);
+    let summary = service.run(manifest("run-continue"), &plan).await.unwrap();
+    assert_eq!(summary.outcomes().len(), 2);
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Failed);
+    assert_eq!(summary.outcomes()[1].status(), TaskStatus::Completed);
+    let calls = backend.state.lock().unwrap().run.len();
+    let resumed = service.resume("run-continue", &plan).await.unwrap();
+    assert_eq!(resumed.outcomes().len(), 2);
+    assert_eq!(backend.state.lock().unwrap().run.len(), calls);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn private_output_resolution_failure_is_invalid_output_after_close() {
+    let base = temp_base("resolve-failed");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::ResolveFailed));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let summary = service
+        .run(
+            manifest("run-resolve"),
+            &BenchmarkPlan::new(vec![task("one")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Failed);
+    assert_eq!(
+        summary.outcomes()[0].failure_category(),
+        Some(&benchmark_core::SafeFailureCategory::InvalidOutput)
+    );
+    let usage = summary.outcomes()[0]
+        .usage()
+        .expect("usage preserved on resolution failure");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
+    assert_eq!(summary.outcomes()[0].model_request_observations().len(), 1);
+    assert_eq!(backend.state.lock().unwrap().closed, 1);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn backend_close_failure_keeps_usage_and_sanitized_tool_codes() {
+    let base = temp_base("close-failed");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::CloseFailed));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let summary = service
+        .run(
+            manifest("run-close"),
+            &BenchmarkPlan::new(vec![task("one")]),
+        )
+        .await
+        .unwrap();
+    let outcome = &summary.outcomes()[0];
+    assert_eq!(outcome.status(), TaskStatus::Failed);
+    assert_eq!(
+        outcome.failure_reason(),
+        Some(benchmark_core::SafeFailureReason::BackendCloseFailed)
+    );
+    let usage = outcome.usage().expect("usage preserved on close failure");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
+    assert_eq!(outcome.model_request_observations().len(), 1);
+    assert_eq!(
+        outcome.model_request_observations()[0].request_duration_ms,
+        800
+    );
+    let tools = outcome.tool_observations();
+    assert_eq!(tools.len(), 3);
+    assert_eq!(
+        tools[2].failure_code.as_deref(),
+        Some("unclassified"),
+        "non-snake-case backend codes must not reach the persisted record"
+    );
+
+    let reopened = RunStore::open(&base, "run-close")
+        .unwrap()
+        .read_outcomes()
+        .unwrap();
+    assert_eq!(reopened[0].failure_reason(), outcome.failure_reason());
+    assert_eq!(reopened[0].model_request_observations().len(), 1);
+    assert!(reopened[0].usage().is_some());
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn close_timeout_keeps_usage_and_measures_elapsed_before_cleanup() {
+    let base = temp_base("close-timeout");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::PendingClose));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(15),
+        service.run(
+            manifest("run-close-timeout"),
+            &BenchmarkPlan::new(vec![short_task("slow")]),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let outcome = &summary.outcomes()[0];
+    assert_eq!(outcome.status(), TaskStatus::Timeout);
+    assert_eq!(
+        outcome.failure_reason(),
+        Some(benchmark_core::SafeFailureReason::TaskTimeout)
+    );
+    let usage = outcome.usage().expect("usage preserved on close timeout");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
+    assert!(
+        outcome.elapsed_ms() < 10_000,
+        "cleanup must not inflate elapsed"
+    );
+    assert_eq!(backend.state.lock().unwrap().cancelled, 1);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn resolve_timeout_keeps_usage() {
+    let base = temp_base("resolve-timeout");
+    let backend = Arc::new(MockBackend::with_behavior(
+        BackendBehavior::PendingResolveOutput,
+    ));
+    let service = BenchmarkService::native(&base, backend).unwrap();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(15),
+        service.run(
+            manifest("run-resolve-timeout"),
+            &BenchmarkPlan::new(vec![short_task("slow")]),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let outcome = &summary.outcomes()[0];
+    assert_eq!(outcome.status(), TaskStatus::Timeout);
+    let usage = outcome.usage().expect("usage preserved on resolve timeout");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (100, 20));
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn missing_final_answer_reason_survives_store_reopen() {
+    let base = temp_base("missing-final-answer");
+    let backend = Arc::new(MockBackend::with_behavior(
+        BackendBehavior::MissingFinalAnswer,
+    ));
+    let service = BenchmarkService::native(&base, backend).unwrap();
+    let summary = service
+        .run(
+            manifest("run-missing-final-answer"),
+            &BenchmarkPlan::new(vec![task("one")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.outcomes()[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::MissingFinalAnswer)
+    );
+
+    let reopened = RunStore::open(&base, "run-missing-final-answer")
+        .unwrap()
+        .read_outcomes()
+        .unwrap();
+    assert_eq!(
+        reopened[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::MissingFinalAnswer)
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn backend_failed_outcome_with_model_request_timeout_keeps_usage_and_timeout_status() {
+    let base = temp_base("model-request-timeout-outcome");
+    let backend = Arc::new(MockBackend::with_behavior(
+        BackendBehavior::FailedModelRequestTimeout,
+    ));
+    let service = BenchmarkService::native(&base, backend).unwrap();
+    let summary = service
+        .run(
+            manifest("run-model-request-timeout"),
+            &BenchmarkPlan::new(vec![task("one")]),
+        )
+        .await
+        .unwrap();
+    let outcome = &summary.outcomes()[0];
+    assert_eq!(outcome.status(), TaskStatus::Timeout);
+    assert_eq!(
+        outcome.failure_reason(),
+        Some(benchmark_core::SafeFailureReason::ModelRequestTimeout)
+    );
+    assert_eq!(
+        outcome.failure_category(),
+        Some(&benchmark_core::SafeFailureCategory::Timeout)
+    );
+    let usage = outcome.usage().expect("usage preserved on failed outcome");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (11, 22));
+    assert_eq!((usage.cache_hit_tokens, usage.cache_miss_tokens), (33, 44));
+    assert_eq!(outcome.model_request_observations().len(), 1);
+    assert_eq!(
+        outcome.model_request_observations()[0].request_duration_ms,
+        900
+    );
+    assert_eq!(outcome.model_request_observations()[0].ttft_ms, Some(120));
+
+    let reopened = RunStore::open(&base, "run-model-request-timeout")
+        .unwrap()
+        .read_outcomes()
+        .unwrap();
+    assert_eq!(reopened[0].status(), TaskStatus::Timeout);
+    assert_eq!(
+        reopened[0].failure_reason(),
+        Some(benchmark_core::SafeFailureReason::ModelRequestTimeout)
+    );
+    assert!(reopened[0].usage().is_some());
+    assert_eq!(reopened[0].model_request_observations().len(), 1);
+    assert_eq!(
+        reopened[0].model_request_observations()[0].request_duration_ms,
+        900
+    );
+    assert_eq!(
+        reopened[0].model_request_observations()[0].ttft_ms,
+        Some(120)
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[tokio::test]
+async fn timeout_cleanup_is_bounded_and_attempts_cancel_and_close() {
+    let base = temp_base("bounded-cleanup");
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::PendingCleanup));
+    let service = BenchmarkService::native(&base, backend.clone()).unwrap();
+    let summary = tokio::time::timeout(
+        Duration::from_secs(5),
+        service.run(
+            manifest("run-cleanup"),
+            &BenchmarkPlan::new(vec![short_task("slow")]),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Timeout);
+    let state = backend.state.lock().unwrap();
+    assert_eq!(state.cancelled, 1);
+    assert_eq!(state.closed, 1);
+    drop(state);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn external_harness_is_contract_only() {
+    let base = temp_base("external");
+    let backend = Arc::new(MockBackend::default());
+    let service = BenchmarkService::native(&base, backend).unwrap();
+    let external = BenchmarkTask::new(
+        "external",
+        None,
+        ExecutionRequest::external_harness(
+            benchmark_core::VerifiedArtifact::new("workspace"),
+            "sha256:0123456789abcdef",
+            vec!["runner".into()],
+            Duration::from_secs(5),
+        ),
+    );
+    let summary = futures::executor::block_on(
+        service.run(manifest("run-1"), &BenchmarkPlan::new(vec![external])),
+    )
+    .unwrap();
+    assert_eq!(summary.outcomes()[0].status(), TaskStatus::Failed);
+    fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn report_is_published_without_temporary_files() {
+    let base = temp_base("report");
+    let store = RunStore::create(&base, &manifest("run-1")).unwrap();
+    let artifact =
+        benchmark_core::publish_markdown_report(&store, "# Smoke\n\ncompleted: 0\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(artifact.path()).unwrap(),
+        "# Smoke\n\ncompleted: 0\n"
+    );
+    assert!(!Path::new(&format!("{}.tmp", artifact.path().display())).exists());
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// `timeout: None` (the GAIA lane default) must run the future unbounded: the
+/// harness imposes no `task_timeout` of its own and the run is bounded only by
+/// the engine's own limits. Contrast with the `Some`-deadline tests above,
+/// where the same slow backend is cut off at the deadline.
+#[tokio::test]
+async fn unbounded_deadline_runs_without_a_harness_task_timeout() {
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::SlowRun));
+    let runner = NativeAgentRunner::new(backend);
+    let outcome = runner
+        .run_task(
+            &BenchmarkTask::new(
+                "unbounded",
+                None,
+                ExecutionRequest::native_turn(
+                    PrivateInputHandle::new("private"),
+                    vec![],
+                    None,
+                    ToolPolicyId::new("smoke/v1"),
+                    OutputContract::new("text/v1"),
+                ),
+            ),
+            &RunContext::new("unbounded"),
+        )
+        .await
+        .expect("no harness timeout for a None deadline");
+    assert_eq!(outcome.status(), TaskStatus::Completed);
+}
+
+/// The contrast the None-lane pin claims: the SAME slow backend cut off by a
+/// finite deadline does time out. Without this, `None` silently acquiring a
+/// default deadline longer than the sleep would pass both tests.
+#[tokio::test]
+async fn some_deadline_cuts_off_the_same_slow_backend() {
+    let backend = Arc::new(MockBackend::with_behavior(BackendBehavior::SlowRun));
+    let runner = NativeAgentRunner::new(backend);
+    let outcome = runner
+        .run_task(
+            &BenchmarkTask::new(
+                "some-deadline-slow",
+                None,
+                ExecutionRequest::native_turn(
+                    PrivateInputHandle::new("private"),
+                    vec![],
+                    Some(Duration::from_millis(10)),
+                    ToolPolicyId::new("smoke/v1"),
+                    OutputContract::new("text/v1"),
+                ),
+            ),
+            &RunContext::new("some-deadline-slow"),
+        )
+        .await
+        .expect("the harness machinery itself must not fail");
+    assert_eq!(outcome.status(), TaskStatus::Timeout);
+}
+
+/// Minimal adapter so `resume_adapter`'s manifest gates can be exercised end
+/// to end. `verify_dataset` reports the descriptor's own revision so the
+/// dataset check never fires before the manifest gates under test.
+struct ResumeProbeAdapter {
+    descriptor: BenchmarkDescriptor,
+}
+
+impl BenchmarkAdapter for ResumeProbeAdapter {
+    fn descriptor(&self) -> &BenchmarkDescriptor {
+        &self.descriptor
+    }
+
+    fn verify_dataset(&self, dataset_root: &Path) -> benchmark_core::Result<VerifiedDataset> {
+        Ok(VerifiedDataset::new(
+            self.descriptor.dataset_revision().to_owned(),
+            dataset_root,
+        ))
+    }
+
+    fn plan(
+        &self,
+        _dataset: &VerifiedDataset,
+        _selection: &TaskSelection,
+    ) -> benchmark_core::Result<BenchmarkPlan> {
+        Ok(BenchmarkPlan::new(vec![task("one")]))
+    }
+
+    fn prepare_task(
+        &self,
+        task: &BenchmarkTask,
+        _run: &RunContext,
+    ) -> benchmark_core::Result<PreparedTask> {
+        Ok(PreparedTask::new(task.clone()))
+    }
+
+    fn score(&self, _run: &CompletedRun) -> benchmark_core::Result<OfficialScoreReport> {
+        Ok(OfficialScoreReport::partial(
+            1,
+            1,
+            "unspecified",
+            "unspecified",
+        ))
+    }
+
+    fn write_submission(
+        &self,
+        _run: &CompletedRun,
+        destination: &Path,
+    ) -> benchmark_core::Result<SubmissionArtifact> {
+        Ok(SubmissionArtifact::new(destination))
+    }
+}
+
+/// A legacy (schema 1) manifest matches the current descriptor on every
+/// recoverable dimension, so the schema version is the only thing that can —
+/// and must — stop an incompatible resume while the stored scores stay
+/// readable.
+#[tokio::test]
+async fn resume_adapter_rejects_a_legacy_manifest_as_incompatible() {
+    let base = temp_base("legacy-resume-rejected");
+    let store = RunStore::create(&base, &manifest("run-legacy")).unwrap();
+    fs::write(store.manifest_path(), legacy_manifest_json()).unwrap();
+
+    let adapter = ResumeProbeAdapter {
+        descriptor: descriptor(),
+    };
+    let stored = RunStore::open(&base, "run-legacy").unwrap();
+    let stored_manifest = stored.read_manifest().unwrap();
+    assert!(stored_manifest.matches_contract(adapter.descriptor(), "smoke", "smoke/v1", 1));
+
+    let expected = manifest("run-legacy");
+    let dataset = Arc::new(adapter.verify_dataset(&base).unwrap());
+    let service = BenchmarkService::native(&base, Arc::new(MockBackend::default())).unwrap();
+    let error = service
+        .resume_adapter(
+            "run-legacy",
+            &expected,
+            &adapter,
+            &dataset,
+            &TaskSelection::all(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "resume_manifest_mismatch");
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// The deadline join compares values through the service gates, not just
+/// variant presence: an unbounded record and a differently bounded record
+/// must both fail to resume against a bounded descriptor. Without the
+/// differently-bounded case, a variant-only `matches_expected` comparison
+/// (`is_some() == is_some()`) passes the whole suite.
+#[tokio::test]
+async fn resume_adapter_rejects_a_differently_bounded_deadline_join() {
+    for (name, stored_deadline) in [
+        ("run-join-unbounded", serde_json::Value::Null),
+        ("run-join-300", serde_json::json!(300)),
+    ] {
+        let mut value = serde_json::to_value(manifest(name)).unwrap();
+        value["harness_deadline_secs"] = stored_deadline;
+        let stored_manifest: RunManifest = serde_json::from_value(value).unwrap();
+        let base = temp_base(name);
+        RunStore::create(&base, &stored_manifest).unwrap();
+
+        let adapter = ResumeProbeAdapter {
+            descriptor: descriptor().with_harness_deadline_secs(Some(600)),
+        };
+        let expected = RunManifest::new(
+            name,
+            adapter.descriptor(),
+            Split::new("smoke"),
+            ModelIdentity::new("fixture", "mock-model").unwrap(),
+            ToolPolicyId::new("smoke/v1"),
+            1,
+        )
+        .unwrap();
+        let dataset = Arc::new(adapter.verify_dataset(&base).unwrap());
+        let service = BenchmarkService::native(&base, Arc::new(MockBackend::default())).unwrap();
+        let error = service
+            .resume_adapter(name, &expected, &adapter, &dataset, &TaskSelection::all())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "resume_manifest_mismatch", "{name}");
+        fs::remove_dir_all(base).unwrap();
+    }
+}
+
+/// The rejection above must not spill over to current-format runs: an
+/// unbounded (explicit-null deadline) schema-2 manifest resumes normally.
+#[tokio::test]
+async fn resume_adapter_accepts_a_current_unbounded_manifest() {
+    let base = temp_base("current-unbounded-resume");
+    let store = RunStore::create(&base, &manifest("run-current")).unwrap();
+    store.plan_tasks(["one"]).unwrap();
+
+    let adapter = ResumeProbeAdapter {
+        descriptor: descriptor(),
+    };
+    let stored = RunStore::open(&base, "run-current").unwrap();
+    let stored_manifest = stored.read_manifest().unwrap();
+    let dataset = Arc::new(adapter.verify_dataset(&base).unwrap());
+    let service = BenchmarkService::native(&base, Arc::new(MockBackend::default())).unwrap();
+    let summary = service
+        .resume_adapter(
+            "run-current",
+            &stored_manifest,
+            &adapter,
+            &dataset,
+            &TaskSelection::all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.completed(), 1);
+    fs::remove_dir_all(base).unwrap();
+}

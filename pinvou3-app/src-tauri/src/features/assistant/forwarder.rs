@@ -1,0 +1,2990 @@
+//! 引擎事件转发器:消费 ACP 事件流并转为前端 chat 事件。
+//!
+//! 从 engine.rs 抽离的 `spawn_event_forwarder` —— 1342 行的事件处理闭包,
+//! 负责把引擎 AgentEvent 逐条翻译为 Tauri emit + 会话状态更新。
+//! 纯文件提取,不改任何并发/控制流/事件序列语义。通过 `use super::*`
+//! 复用 engine.rs 的全部导入与类型。
+
+use super::*;
+
+use crate::features::assistant::engine_pool::{EnginePool, stamp_steer_generation};
+use deepseek_tui::session_manager::SavedSession;
+
+/// Own persistence and notification on the blocking worker, rather than on
+/// the cancellable forwarder awaiting it. Reclaim can retire queued saves;
+/// once admitted, a save always publishes its exact durable revision before
+/// the replacement engine can read its baseline.
+fn persist_chat_snapshot(
+    store: &SessionStore,
+    session_id: &str,
+    state: &ChatEngineState,
+    writer_active: &AtomicBool,
+    committed: impl FnOnce(&str, usize, usize),
+) -> Result<Option<(SavedSession, Option<String>)>> {
+    let mut revision = None;
+    let saved = store.persist_chat_engine_state_with_commit(
+        session_id,
+        state,
+        || writer_active.load(Ordering::Acquire),
+        |saved| {
+            revision = transcript_revision(&saved.messages).ok();
+            if let Some(revision) = revision.as_deref() {
+                committed(
+                    revision,
+                    saved.messages.len(),
+                    count_context_updates(&saved.messages),
+                );
+            }
+        },
+    )?;
+    Ok(saved.map(|saved| (saved, revision)))
+}
+
+/// [`persist_chat_snapshot`] for the optimistic admission fallback, which
+/// has no engine snapshot: the revision-guarded display write and its
+/// notification share one blocking transaction, and a writer retired before
+/// admission is skipped — the reclaiming owner re-persists and publishes the
+/// fallback itself.
+fn persist_admitted_display_snapshot(
+    store: &SessionStore,
+    session_id: &str,
+    baseline_revision: &str,
+    display_message: Message,
+    edit_last: bool,
+    writer_active: &AtomicBool,
+    committed: impl FnOnce(&str, usize, usize),
+) -> Result<Option<(SavedSession, Option<String>)>> {
+    let mut revision = None;
+    let saved = store.persist_admitted_chat_display_with_commit(
+        session_id,
+        baseline_revision,
+        display_message,
+        edit_last,
+        || writer_active.load(Ordering::Acquire),
+        |saved| {
+            revision = transcript_revision(&saved.messages).ok();
+            if let Some(revision) = revision.as_deref() {
+                committed(
+                    revision,
+                    saved.messages.len(),
+                    count_context_updates(&saved.messages),
+                );
+            }
+        },
+    )?;
+    Ok(saved.map(|saved| (saved, revision)))
+}
+
+/// Summary detail line for the persistent startup timeline describing a
+/// terminal MCP session-boot receipt. `enabled_servers` counts only enabled
+/// servers: disabled ones are configuration state, not boot participants, and
+/// would make the `failed=` ratio unreadable. The startup channel redacts,
+/// flattens, and bounds the returned string before writing, so this only
+/// formats.
+fn mcp_boot_summary_detail(
+    session_id: &str,
+    generation: u64,
+    enabled_servers: usize,
+    failure_count: usize,
+) -> String {
+    format!(
+        "sid={session_id} generation={generation} servers={enabled_servers} failed={failure_count}"
+    )
+}
+
+/// One startup-timeline detail line per failed server of a terminal MCP
+/// session-boot event. A server counts as failed when it is enabled but did
+/// not reach a ready connection; disabled servers are configuration state,
+/// not boot failures. When the engine snapshot carries no error text the
+/// reason is recorded as `unknown`; a server waiting on OAuth is flagged
+/// `auth_required=true` so "needs login" stays distinguishable from "broken".
+fn mcp_boot_failure_details(
+    session_id: &str,
+    generation: u64,
+    snapshot: &deepseek_tui::mcp::McpManagerSnapshot,
+) -> Vec<String> {
+    snapshot
+        .servers
+        .iter()
+        .filter(|server| server.enabled && !server.connected)
+        .map(|server| {
+            let auth_flag = if server.auth_required {
+                " auth_required=true"
+            } else {
+                ""
+            };
+            format!(
+                "sid={session_id} generation={generation} server={}{auth_flag} error={}",
+                server.name,
+                server.error.as_deref().unwrap_or("unknown"),
+            )
+        })
+        .collect()
+}
+
+/// Volatility-stripped identity of a receipt's failure set: one
+/// `(server, auth_required, error)` triple per enabled-but-unconnected
+/// server. The engine stamps every receipt with a fresh generation, so the
+/// rendered lines can never be compared across turns; the signature is what
+/// actually identifies "the same failures again".
+fn mcp_boot_failure_signature(
+    snapshot: &deepseek_tui::mcp::McpManagerSnapshot,
+) -> Vec<(String, bool, String)> {
+    let mut signature: Vec<(String, bool, String)> = snapshot
+        .servers
+        .iter()
+        .filter(|server| server.enabled && !server.connected)
+        .map(|server| {
+            (
+                server.name.clone(),
+                server.auth_required,
+                server
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+            )
+        })
+        .collect();
+    // Sorted before the equality compare in `mcp_boot_persistence`, so only
+    // content changes count as "changed" and trigger a re-persist. The engine
+    // already orders its snapshot by server name; the sort here is a local
+    // invariant that keeps the dedupe decision correct regardless of that
+    // upstream ordering, instead of silently depending on it.
+    signature.sort();
+    signature
+}
+
+/// Decide what a terminal MCP session-boot receipt persists to the startup
+/// timeline: `Some((summary line, per-server failure lines))` for a finished
+/// boot whose failure set differs from `last_persisted_failure_set`, `None`
+/// for progress events, for boots where every enabled server reached a ready
+/// connection, and for receipts repeating the failure set that was already
+/// persisted. The engine emits a terminal receipt on every real turn (the
+/// turn registry refresh reconnects and re-reports), so without the dedupe a
+/// session with one persistently broken server would append near-identical
+/// lines to `startup.log` on every turn; a healthy boot clears the memory so
+/// a later re-failure persists again. Unit-tested in isolation, and exercised
+/// together with the persistence glue through
+/// `record_mcp_session_boot` (see that function for the coverage boundary).
+fn mcp_boot_persistence(
+    session_id: &str,
+    generation: u64,
+    finished: bool,
+    snapshot: &deepseek_tui::mcp::McpManagerSnapshot,
+    last_persisted_failure_set: &mut Option<Vec<(String, bool, String)>>,
+) -> Option<(String, Vec<String>)> {
+    if !finished {
+        return None;
+    }
+    let failure_set = mcp_boot_failure_signature(snapshot);
+    if failure_set.is_empty() {
+        // Healthy boot: forget the previously persisted failures so a later
+        // re-failure of the same servers persists again.
+        *last_persisted_failure_set = None;
+        return None;
+    }
+    if last_persisted_failure_set.as_ref() == Some(&failure_set) {
+        return None;
+    }
+    let failures = mcp_boot_failure_details(session_id, generation, snapshot);
+    let enabled_servers = snapshot.servers.iter().filter(|s| s.enabled).count();
+    *last_persisted_failure_set = Some(failure_set);
+    Some((
+        mcp_boot_summary_detail(session_id, generation, enabled_servers, failures.len()),
+        failures,
+    ))
+}
+
+/// The `Event::McpSessionBoot` arm's body: destructure the event and, for a
+/// terminal receipt, decide whether it persists (`mcp_boot_persistence`) and
+/// write it to the startup timeline (`persist_mcp_boot_receipt`). Takes the
+/// whole event so the field forwarding the arm used to do by hand — the one
+/// production step between the engine event and the persistence decision — is
+/// part of this function and exercised against the real `startup.log` by
+/// `mcp_boot_receipt_persists_through_the_startup_timeline`. The remaining
+/// untested seam is the one-line `match` arm that hands the event over here.
+fn record_mcp_session_boot(
+    session_id: &str,
+    event: &deepseek_tui::core::events::Event,
+    last_persisted_failure_set: &mut Option<Vec<(String, bool, String)>>,
+) {
+    let Event::McpSessionBoot {
+        generation,
+        snapshot,
+        finished,
+        ..
+    } = event
+    else {
+        // Unreachable from the only production call site (the arm
+        // pre-matches the variant); surface future mis-wiring loudly in
+        // debug builds instead of silently dropping the receipt.
+        debug_assert!(
+            false,
+            "record_mcp_session_boot called with a non-McpSessionBoot event"
+        );
+        return;
+    };
+    // Same enabled-only denominator the persisted summary uses.
+    let enabled_total = snapshot.servers.iter().filter(|s| s.enabled).count();
+    if let Some((summary, failure_details)) = mcp_boot_persistence(
+        session_id,
+        *generation,
+        *finished,
+        snapshot,
+        last_persisted_failure_set,
+    ) {
+        persist_mcp_boot_receipt(
+            session_id,
+            *generation,
+            &summary,
+            &failure_details,
+            enabled_total,
+        );
+    } else {
+        log::debug!(
+            "[pinvou3][chat] mcp session boot sid={} generation={} finished={}",
+            session_id,
+            generation,
+            finished
+        );
+    }
+}
+
+/// Turn a `mcp_boot_persistence` verdict into startup-timeline writes (the
+/// persistence half of `record_mcp_session_boot`).
+fn persist_mcp_boot_receipt(
+    session_id: &str,
+    generation: u64,
+    summary: &str,
+    failure_details: &[String],
+    enabled_total: usize,
+) {
+    log::warn!(
+        "[pinvou3][chat] mcp session boot sid={} generation={} failed={}/{}",
+        session_id,
+        generation,
+        failure_details.len(),
+        enabled_total
+    );
+    crate::platform::startup::mark_with_detail("rust", "mcp_session_boot:finished", summary);
+    for detail in failure_details {
+        crate::platform::startup::mark_with_detail(
+            "rust",
+            "mcp_session_boot:server_failed",
+            detail,
+        );
+    }
+}
+
+/// 后台 task：持续读 rx_event 转 Tauri emit。
+///
+/// 关键点：监听 `Event::ApprovalRequired` 并主动 `approve_tool_call`。
+/// 注意底座语义：`auto_approve = true` 时 `registered_tool_approval_required`
+/// 会直接**旁路**可绕过的 Required 审批、不发事件（turn_loop.rs，非绕过名单仅
+/// rlm_eval / rlm / start_mcp_server）。因此本臂对普通会话只在 auto_approve 关闭的
+/// 场景（例如定时任务按 profile）收到事件；普通会话仍沿用既有批准策略。
+///
+/// Plan ready 触发：监听 `update_plan` 工具结果 + TurnComplete，
+/// 若 active session mode=Plan + 本 turn 调过 update_plan + plan 非空 →
+/// 登记待决 plan（PlanPhase 已砍，不设 phase）+ emit `chat:plan_ready` 含 plan snapshot。
+///
+/// **多引擎并发**:每个 session 一个独立 engine + 一个独立 forwarder,所以这里捕获
+/// 的 `session_id` 唯一标识本 forwarder 服务的 session。**所有 emit 的 payload 都带
+/// `session_id`**,前端按它把事件分流到对应 session 的缓冲;TurnComplete 里的 mode
+/// 判据(plan_ready)也全部基于本 `session_id`,不再读全局 `store.active_id()`
+/// (并发下 active 会变,读全局会把判据算到错误 session 上)。返回 forwarder 的
+/// `JoinHandle`,EnginePool 回收 session 时 `abort()` 它。
+pub(crate) fn spawn_event_forwarder(
+    app: AppHandle,
+    handle: EngineHandle,
+    store: SessionStore,
+    bridge: Pinvou3Bridge,
+    execution_workspace: PathBuf,
+    session_id: String,
+    turn_events: broadcast::Sender<EngineTurnSignal>,
+    scheduled_profile: Option<ScheduledRunProfile>,
+    scheduled_base_total_tokens: Option<u64>,
+    scheduled_unattended: Arc<AtomicBool>,
+    turn_lifecycle: Arc<TurnLifecycle>,
+    shell_manager: SharedShellManager,
+    turn_shell_tasks: TurnShellTaskRegistry,
+    steer_id_generation: u64,
+    transcript_writer_active: Arc<AtomicBool>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    let approve_handle = handle.clone();
+    let plan_tracker: Arc<Mutex<TurnPlanTracker>> =
+        Arc::new(Mutex::new(TurnPlanTracker::default()));
+    let shell_output = crate::features::assistant::shell_output::ShellOutputMonitor::spawn(
+        app.clone(),
+        &shell_manager,
+        session_id.clone(),
+    );
+    tauri::async_runtime::spawn(async move {
+        let mut tool_inputs: std::collections::HashMap<String, (String, serde_json::Value)> =
+            std::collections::HashMap::new();
+        let mut turn_tracker = TurnCompletionTracker::default();
+        let mut scheduled_engine_total_tokens = 0_u64;
+        let mut scheduled_persistence_error: Option<String> = None;
+        // The snapshot is Arc-shared: the full transcript carried by the
+        // SessionUpdated event is no longer deep-copied just to retain the
+        // terminal snapshot; TurnComplete only clones the Arc.
+        let mut latest_chat_engine_state: Option<Arc<ChatEngineState>> = None;
+        let mut chat_persistence_error: Option<String> = None;
+        // Transcript revision cache of the last successfully persisted
+        // snapshot: Some only while "the latest snapshot persisted cleanly
+        // and no newer snapshot has arrived since". The terminal arm uses it
+        // to detect that the terminal persist would write content identical
+        // to the last per-message persist, skip the duplicate write, and
+        // reuse the revision (see the TurnComplete arm); any newer snapshot,
+        // persist failure, or hash failure clears it.
+        let mut last_persisted_chat_revision: Option<String> = None;
+        let mut active_transcript_seen = false;
+        // Last parent-request input the engine reported for the live turn,
+        // from this session's most recent parent `TurnUsage` event.
+        // `TurnComplete` usage is the billing aggregate
+        // (`TurnContext::add_usage` sums input_tokens over every request of
+        // the turn), so the frontend usage meter must skip it on
+        // multi-request turns and needs the per-request value to stay live:
+        // chat:usage fires once per turn, and any tool call of that turn
+        // latches the bridge's cumulative-input guard until the next send —
+        // without this field the meter only ever refreshed through a
+        // compaction. Parent requests are told apart from the other
+        // TurnUsage producers by `request_ms`: the parent emission always
+        // sets `Some`, while reviewer consults and programmatic REPL-child
+        // folds set `None` — and either can be the LAST TurnUsage of a
+        // normally-completing turn (an inline REPL FINAL fold breaks right
+        // after its fold; a guardian review of the final tool batch is left
+        // last by the terminal step-loop breaks; a cancel landing in the
+        // same window does the same on any turn), so the tracker must ignore
+        // them and keep the last parent value. Subagent usage rides
+        // SubAgentMailbox, never TurnUsage.
+        let mut latest_reported_input_tokens: Option<u32> = None;
+        // A typed preflight rejection completes the admitted lifecycle without
+        // changing engine history. Preserve that distinction through
+        // `chat:done` so the UI rolls back its optimistic edit.
+        let mut active_operation_rejected = false;
+        // app 侧自测推理指标累加器(TTFT/生成速度/累计tokens/KV)。try_state:headless
+        // harness / 测试可能没 manage MonitorState,拿不到就整块跳过,不 panic。
+        let self_metrics = app
+            .try_state::<crate::features::monitor::MonitorState>()
+            .map(|s| s.self_metrics());
+        // Manual-compaction in-flight flag (review #484 round-18 M2): compact_now
+        // sets it at enqueue; this forwarder clears it on terminal compaction
+        // events (the Started arm re-sets it idempotently). Compaction takes no
+        // turn reservation, so the turn-side busy probe cannot see it — the event
+        // source must do this teardown, or align's busy fence would misjudge forever.
+        // try_state: headless harness / tests may not manage EnginePool — skip when
+        // absent; engine reclamation also removes the entry, leaving no sticky busy
+        // flag (same defensive shape as self_metrics above).
+        let engine_pool = app
+            .try_state::<EnginePool>()
+            .map(|pool| pool.inner().clone());
+        let mut current_turn_id: Option<String> = None;
+        let mut startup_first_output_recorded = false;
+        // Dedupe memory for MCP boot receipts: the engine re-reports on every
+        // real turn, so only failure-set changes are persisted (see
+        // `mcp_boot_persistence`). The memory lives per forwarder task, i.e.
+        // per engine incarnation: an evicted or rebuilt engine starts with a
+        // fresh forwarder, so a persistent failure re-persists once per engine
+        // rebuild (bounded per lifecycle), not per turn.
+        let mut last_mcp_boot_failure_set: Option<Vec<(String, bool, String)>> = None;
+        #[cfg(feature = "benchmark-hooks")]
+        let mut first_delta_done: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        #[cfg(feature = "benchmark-hooks")]
+        let mut benchmark_tool_started_at: std::collections::HashMap<
+            String,
+            std::time::Instant,
+        > = std::collections::HashMap::new();
+        let mut rx = handle.rx_event.write().await;
+        while let Some(event) = rx.recv().await {
+            match event {
+                Event::TurnStarted {
+                    turn_id,
+                    submission_id,
+                    ..
+                } => {
+                    startup_first_output_recorded = false;
+                    // New turn owns the occupancy window: a turn where the
+                    // provider never reported usage must not inherit the
+                    // previous turn's value (the payload field stays null and
+                    // the frontend keeps its last good number).
+                    latest_reported_input_tokens = None;
+                    // Publish admission from the authoritative engine event,
+                    // before this serial forwarder can observe any delta or
+                    // terminal event for the same turn. Reclaim uses the same
+                    // emission gate, so it cannot overtake this pair.
+                    let admitted =
+                        turn_lifecycle.emit_started_admission(&app, &session_id, turn_id.clone());
+                    // 消费 pending_cancel（无论 admitted 与否，防止跨轮泄漏）。
+                    // The engine has already installed this turn's bound
+                    // token before `TurnStarted` runs; if a cancel armed its
+                    // marker earlier, the replayed cancel now hits this
+                    // turn's active token.
+                    // pending_cancel carries the arming-time epoch, steer
+                    // disposition mode, and submission correlation token:
+                    // only an arriving `TurnStarted` that echoes the armed
+                    // submission token consumes the replay here — a stale arm
+                    // from another submission can never match (#254), and
+                    // the arming-time epoch is deliberately not consulted,
+                    // because an unrelated autonomous turn can run its full
+                    // start→terminal lifecycle inside the target's
+                    // submit→TurnStarted window and advance the epoch before
+                    // the target's own echo arrives (issue #254 review
+                    // round). The replay must call cancel_with_mode with the
+                    // arming-time mode — the mode-less cancel() hard-codes
+                    // StopDropInbox and would lose ⚡'s keepInbox semantics on
+                    // the replay path. The host app stamps every
+                    // submitted op with a correlation id — echoed back
+                    // verbatim by the foundation — and leaves
+                    // runtime self-started turns (idle sub-agent completion /
+                    // shell wake / goal continuation) untagged, so a
+                    // self-started follow-up whose `TurnStarted` overtakes
+                    // the submitted turn's can neither consume the replay nor
+                    // redirect its cancel onto itself; the replay stays armed
+                    // until the submitted turn's own `TurnStarted` arrives.
+                    let pending_cancel =
+                        turn_lifecycle.take_pending_cancel(submission_id.as_deref());
+                    if !admitted {
+                        continue;
+                    }
+                    if let Some((_, mode)) = pending_cancel {
+                        // Replay bound to the engine slot's turn identity
+                        // (issue #254): by the time `TurnStarted` arrives the
+                        // engine has installed this turn's fresh token, so
+                        // the replay hits exactly this turn's active token.
+                        // If the engine self-started yet another turn inside
+                        // this narrow window (a self-started continuation
+                        // chain), the slot identity no longer matches,
+                        // `cancel_turn` returns false and the replay is
+                        // dropped wholesale — the old turn's stop does not
+                        // chase the newer turn, and no steer disposition or
+                        // cancel reason is published for it either.
+                        let replayed = approve_handle.cancel_turn(
+                            &turn_id,
+                            deepseek_tui::core::engine::CancelReason::User,
+                            mode,
+                        );
+                        if !replayed {
+                            // Arbitration, not failure: the slot moved on to
+                            // a newer turn, which is the designed wholesale
+                            // drop — debug-level so field logs stay quiet.
+                            log::debug!(
+                                "[pinvou3][chat] stop replay dropped: slot no longer holds turn {turn_id} (sid={session_id})"
+                            );
+                        }
+                    }
+                    active_transcript_seen = false;
+                    active_operation_rejected = false;
+                    chat_persistence_error = None;
+                    current_turn_id = Some(turn_id.clone());
+                    if let Err(error) = turn_shell_tasks.bind_or_prepare_turn(&turn_id).await {
+                        log::error!(
+                            "[pinvou3][chat] failed to bind shell task scope sid={} turn={}: {error:#}",
+                            session_id,
+                            turn_id
+                        );
+                    }
+                    let _ = turn_events.send(turn_tracker.on_started(turn_id));
+                    // 本轮起始打点(TTFT 起点)。底座已发此事件,原先落 `_` 被忽略。
+                    if let Some(m) = &self_metrics {
+                        m.on_turn_started(&session_id);
+                    }
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        crate::features::assistant::timing::record_engine_turn_started(&session_id);
+                    }
+                }
+                Event::MessageDelta { content, .. } => {
+                    if !content.is_empty() && !startup_first_output_recorded {
+                        crate::features::assistant::timing::record_first_output(&session_id);
+                        startup_first_output_recorded = true;
+                    }
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        crate::features::assistant::timing::record_first_message_delta(&session_id);
+                        if let Some(turn_id) = &current_turn_id {
+                            if first_delta_done.insert(turn_id.clone()) {
+                                crate::features::assistant::timing::record_milestone(
+                                    &session_id,
+                                    "first_delta",
+                                );
+                            }
+                        }
+                    }
+                    if let Some(m) = &self_metrics {
+                        m.on_message_delta(&session_id, content.chars().count());
+                    }
+                    crate::features::memory::append_turn_assistant(&session_id, &content);
+                    let payload = json!({ "session_id": session_id, "text": content });
+                    let _ = app.emit("chat:delta", payload.clone());
+                    crate::features::remote_control::forward_app_event(&app, "chat:delta", payload);
+                }
+                Event::ThinkingStarted { index } => {
+                    let payload = json!({ "session_id": session_id, "index": index });
+                    let _ = app.emit("chat:reasoning_start", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:reasoning_start",
+                        payload,
+                    );
+                }
+                Event::ThinkingDelta { index, content } => {
+                    // 只转发底座已经识别为 ThinkingDelta 的独立思考内容。普通
+                    // MessageDelta 不做启发式猜测，避免把最终回答误折叠成思考。
+                    let payload =
+                        json!({ "session_id": session_id, "index": index, "text": content });
+                    let _ = app.emit("chat:reasoning_delta", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:reasoning_delta",
+                        payload,
+                    );
+                }
+                Event::ThinkingComplete { index } => {
+                    let payload = json!({ "session_id": session_id, "index": index });
+                    let _ = app.emit("chat:reasoning_done", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:reasoning_done",
+                        payload,
+                    );
+                }
+                Event::ToolCallStarted { id, name, input } => {
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        benchmark_tool_started_at.insert(id.clone(), std::time::Instant::now());
+                        crate::features::assistant::timing::record_tool_started(&session_id, &name);
+                        crate::features::assistant::timing::record_milestone_meta(
+                            &session_id,
+                            "tool_call_started",
+                            json!({ "tool_name": &name, "tool_id": &id }),
+                        );
+                    }
+                    if let Some(m) = &self_metrics {
+                        m.on_tool(&session_id); // 本轮有工具 → 收尾跳过 TTFT/TPS(D2)
+                    }
+                    crate::features::memory::record_turn_tool_start(&session_id, &name, &input);
+                    shell_output.tool_started(&id, &name, &input);
+                    tool_inputs.insert(id.clone(), (name.clone(), input.clone()));
+                    let payload =
+                        json!({ "session_id": session_id, "id": id, "name": name, "args": input });
+                    let _ = app.emit("chat:tool_start", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:tool_start",
+                        payload,
+                    );
+                }
+                Event::ToolCallComplete { id, name, result } => {
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        let elapsed_ms = benchmark_tool_started_at.remove(&id).map(|started| {
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                        });
+                        crate::features::assistant::timing::record_milestone_meta(
+                            &session_id,
+                            "tool_call_completed",
+                            json!({
+                                "tool_name": &name,
+                                "tool_id": &id,
+                                "elapsed_ms": elapsed_ms,
+                            }),
+                        );
+                    }
+                    // 携带 metadata 让前端识别 careful hook 拦截 (safety_level=="dangerous")
+                    let (output, success, metadata) = tool_call_result_parts(result);
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        crate::features::assistant::timing::record_tool_completed(
+                            &session_id,
+                            &name,
+                            success,
+                        );
+                    }
+                    let background_task_id =
+                        if crate::features::assistant::shell_output::is_shell_execution_tool(&name)
+                            && metadata
+                                .as_ref()
+                                .and_then(|value| value.get("status"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("Running")
+                        {
+                            metadata
+                                .as_ref()
+                                .and_then(|value| value.get("task_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        } else {
+                            None
+                        };
+                    if let (Some(turn_id), Some(task_id)) =
+                        (current_turn_id.as_deref(), background_task_id.as_deref())
+                    {
+                        if !turn_shell_tasks.register_task(turn_id, task_id) {
+                            log::warn!(
+                                "[pinvou3][chat] shell task has no root-turn scope sid={} turn={} task={}",
+                                session_id,
+                                turn_id,
+                                task_id
+                            );
+                        }
+                    }
+                    shell_output.tool_completed(&id, background_task_id.as_deref());
+                    let tracked_input = tool_inputs
+                        .remove(&id)
+                        .map(|(_, input)| input)
+                        .unwrap_or(serde_json::Value::Null);
+                    if success {
+                        if let Some(profile) = scheduled_profile.as_ref() {
+                            let artifact_store = store.clone();
+                            let artifact_session_id = session_id.clone();
+                            let artifact_workspace = profile.workspace.clone();
+                            let artifact_name = name.clone();
+                            let artifact_input = tracked_input.clone();
+                            let artifact_output = output.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                persist_successful_tool_artifact(
+                                    &artifact_store,
+                                    &artifact_session_id,
+                                    &artifact_workspace,
+                                    &artifact_name,
+                                    &artifact_input,
+                                    &artifact_output,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => eprintln!(
+                                    "[pinvou3-app] scheduled artifact persistence skipped: {error:#}"
+                                ),
+                                Err(error) => eprintln!(
+                                    "[pinvou3-app] scheduled artifact persistence task failed: {error}"
+                                ),
+                            }
+                        }
+                    }
+                    crate::features::memory::record_turn_tool_complete(
+                        &session_id,
+                        &name,
+                        &tracked_input,
+                        success,
+                    );
+                    // Plan 类工具结果：标记 + 缓存 snapshot（两层）+ 实时 emit 给前端 chip 进度区
+                    if success
+                        && (name == "update_plan"
+                            || name == "checklist_write"
+                            || name == "todo_write")
+                    {
+                        let mut tracker = plan_tracker.lock();
+                        tracker.plan_tool_used = true;
+                        // 上游格式："Plan/Todo ... updated: ...\n{json}"——切第一个 '\n' 后是 json
+                        if let Some(json_part) = output.find('\n').map(|i| &output[i + 1..]) {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_part) {
+                                if name == "update_plan" {
+                                    tracker.last_plan_snapshot = Some(v);
+                                } else {
+                                    tracker.last_todos_snapshot = Some(v);
+                                }
+                            }
+                        }
+                        // emit chat:plan_snapshot 实时更新 chip 进度——跟 plan_ready 解耦,
+                        // 后者是状态转移信号(Planning→Ready 弹卡片),这个是数据更新信号(刷新 chip)。
+                        // **只 emit 本次工具改的那个 snapshot**,另一个置 null——这样前端只更新对应
+                        // 的时间戳,pickProgressItems 才能正确按时间挑最新的(否则两个 ts 总相等)。
+                        let (plan_emit, todos_emit) = if name == "update_plan" {
+                            (tracker.last_plan_snapshot.clone(), None)
+                        } else {
+                            (None, tracker.last_todos_snapshot.clone())
+                        };
+                        drop(tracker);
+                        let payload = json!({
+                            "session_id": session_id,
+                            "plan_snapshot": plan_emit,
+                            "todos_snapshot": todos_emit,
+                        });
+                        let _ = app.emit("chat:plan_snapshot", payload.clone());
+                        crate::features::remote_control::forward_app_event(
+                            &app,
+                            "chat:plan_snapshot",
+                            payload,
+                        );
+                    }
+                    let payload = json!({
+                        "session_id": session_id,
+                        "id": id,
+                        "name": name,
+                        "output": output,
+                        "success": success,
+                        "metadata": metadata,
+                    });
+                    // request_user_input 收口：submit/cancel 已由底座转为工具结果。
+                    if name == "request_user_input" {
+                        crate::features::assistant::pending_user_input::clear(&session_id, &id);
+                    }
+                    let _ = app.emit("chat:tool_end", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:tool_end",
+                        payload,
+                    );
+                }
+                Event::UserInputRequired { id, request } => {
+                    if scheduled_profile.is_some() && scheduled_unattended.load(Ordering::Acquire) {
+                        // 定时任务没有前台操作者；不能把底座卡在等待输入的超时上。
+                        let h = approve_handle.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = h.cancel_user_input(id).await {
+                                eprintln!(
+                                    "[pinvou3-app] cancel scheduled user input failed: {error:#}"
+                                );
+                            }
+                        });
+                    } else {
+                        // 普通对话继续交给前端或远程控制端处理。登记 pending，
+                        // 供前端 remount 后经 get_pending_user_inputs 恢复确认卡。
+                        let payload = json!({
+                            "session_id": session_id,
+                            "id": id,
+                            "questions": request.questions,
+                        });
+                        crate::features::assistant::pending_user_input::record(
+                            &session_id,
+                            &id,
+                            payload["questions"].clone(),
+                        );
+                        let _ = app.emit("chat:user_input_required", payload.clone());
+                        crate::features::remote_control::forward_app_event(
+                            &app,
+                            "chat:user_input_required",
+                            payload,
+                        );
+                        // Raise a desktop notification while the task parks in
+                        // the background waiting for a reply (mutable in
+                        // Settings); the unattended scheduled branch already
+                        // cancelled the input above, so it never gets here.
+                        crate::features::assistant::engine_support::maybe_notify_input_needed(
+                            &app,
+                            &session_id,
+                            &id,
+                        );
+                    }
+                }
+                Event::SessionUpdated {
+                    session_id: event_session_id,
+                    messages,
+                    system_prompt,
+                    model,
+                    workspace,
+                } => {
+                    if event_session_id != session_id {
+                        let mismatch = format!(
+                            "Engine session id mismatch: expected {session_id}, got {event_session_id}"
+                        );
+                        if scheduled_profile.is_some() {
+                            scheduled_persistence_error = Some(mismatch);
+                        } else {
+                            chat_persistence_error = Some(mismatch);
+                        }
+                        continue;
+                    }
+                    if let Some(profile) = scheduled_profile.as_ref() {
+                        let state = ScheduledEngineState {
+                            messages,
+                            system_prompt,
+                            model,
+                            mode: profile.execution_mode(),
+                            token_accounting: ScheduledTokenAccounting::PreservePersisted,
+                        };
+                        let store_for_save = store.clone();
+                        let session_for_save = session_id.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            store_for_save.persist_scheduled_engine_state(&session_for_save, state)
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => scheduled_persistence_error = None,
+                            Ok(Err(error)) => {
+                                scheduled_persistence_error = Some(format!("{error:#}"));
+                            }
+                            Err(error) => {
+                                scheduled_persistence_error = Some(format!(
+                                    "scheduled transcript persistence task failed: {error}"
+                                ));
+                            }
+                        }
+                    } else {
+                        let (messages, matched_active_rule) =
+                            turn_lifecycle.sanitize_messages(messages);
+                        active_transcript_seen |= matched_active_rule;
+                        let state = Arc::new(ChatEngineState {
+                            messages,
+                            system_prompt,
+                            model,
+                            workspace,
+                        });
+                        // Invalidate the revision cache before persisting:
+                        // the latest content is not durable yet, and the
+                        // stale cache must not let the terminal arm mistake
+                        // it for "the latest snapshot is already persisted".
+                        last_persisted_chat_revision = None;
+                        latest_chat_engine_state = Some(Arc::clone(&state));
+                        let store_for_save = store.clone();
+                        let session_for_save = session_id.clone();
+                        let app_for_save = app.clone();
+                        let writer_for_save = transcript_writer_active.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            persist_chat_snapshot(
+                                &store_for_save,
+                                &session_for_save,
+                                &state,
+                                &writer_for_save,
+                                |revision, message_count, context_updates_total| {
+                                    emit_transcript_committed(
+                                        &app_for_save,
+                                        &session_for_save,
+                                        revision.to_owned(),
+                                        "engine_state_update",
+                                        message_count,
+                                        context_updates_total,
+                                    );
+                                },
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some((_, revision)))) => {
+                                chat_persistence_error = None;
+                                // The revision is computed once for this
+                                // persist and cached for the terminal arm to
+                                // reuse (on Err the cache stays None and the
+                                // terminal arm falls back to the original
+                                // persist path), so identical content is not
+                                // hashed a second time.
+                                last_persisted_chat_revision = revision;
+                            }
+                            // A retired writer must neither persist nor
+                            // notify: the session is being reclaimed and its
+                            // replacement owns the transcript now.
+                            Ok(Ok(None)) => continue,
+                            Ok(Err(error)) => {
+                                chat_persistence_error = Some(format!("{error:#}"));
+                            }
+                            Err(error) => {
+                                chat_persistence_error = Some(format!(
+                                    "chat transcript persistence task failed: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Event::ApprovalRequired {
+                    id,
+                    tool_name,
+                    approval_force_prompt,
+                    ..
+                } => {
+                    // 多智能体会话与普通对话共用同一套审批语义（ADR-0006）：
+                    // 只有无人值守的初始定时执行使用任务保存的批准策略；
+                    // 其余会话按普通对话处理。
+                    let should_approve = if scheduled_profile.is_some()
+                        && scheduled_unattended.load(Ordering::Acquire)
+                    {
+                        scheduled_tool_should_auto_approve(
+                            scheduled_profile.as_ref(),
+                            approval_force_prompt,
+                        )
+                    } else {
+                        true
+                    };
+                    eprintln!(
+                        "[pinvou3-app] {} tool {} id={}",
+                        if should_approve {
+                            "auto-approving"
+                        } else {
+                            "denying"
+                        },
+                        tool_name,
+                        id
+                    );
+                    let h = approve_handle.clone();
+                    let id_clone = id.clone();
+                    tokio::spawn(async move {
+                        let result = if should_approve {
+                            h.approve_tool_call(id_clone).await
+                        } else {
+                            h.deny_tool_call(id_clone).await
+                        };
+                        if let Err(e) = result {
+                            eprintln!("[pinvou3-app] scheduled approval decision failed: {e:#}");
+                        }
+                    });
+                    // 不重复 emit chat:tool_start —— 上游 ToolCallStarted（带完整 input）
+                    // 已先于 ApprovalRequired fire，前端已收到正确的 args。
+                    // 之前在此 emit 会用 args=null 覆盖前端 toolMeta，导致产物路径丢失。
+                }
+                // Main-side cleanup: CodeWhale-native workflow events are
+                // managed by the foundation itself; the app only consumes the
+                // generic subagent events (AgentSpawned no longer registers a
+                // role).
+                Event::AgentSpawned { .. } => {}
+                // Mid-turn inject delivery confirmation (P0-A): after the
+                // engine appends the steer message to the transcript it emits
+                // SteerCommitted (carrying the enqueue-time steer_id), which
+                // the frontend uses to turn the matching queued chip into a
+                // bubble; SteerDropped is only emitted when the engine drops
+                // it. The frontend no longer guesses via
+                // chat:transcript_committed + load_session message counting.
+                // The raw id is stamped with this engine build's steer-id
+                // generation — the same stamp `EnginePool::steer` puts on the
+                // id it returned — because the foundation's ordinal ids reset
+                // on engine rebuild and must stay unambiguous per session
+                // (see stamp_steer_generation in engine_pool.rs).
+                Event::SteerCommitted { steer_id } => {
+                    let steer_id = stamp_steer_generation(steer_id_generation, &steer_id);
+                    // Cross-session steered delivery finalizes in-flight only
+                    // on commit (done marker + spool removal — closes the
+                    // post-steer-Ok loss window). Fanned out through the
+                    // steer_outcomes hook; assistant never depends back on
+                    // the consumer feature. The hook runs INLINE on this
+                    // event loop and performs bounded spool IO (two capped
+                    // reads + marker write + removal, ~µs–ms on a healthy
+                    // fs) before the emit — accepted: steer terminals are
+                    // rare and one forwarder per engine keeps the stall
+                    // scoped to that engine.
+                    crate::features::assistant::steer_outcomes::resolve_steer_outcome(
+                        &steer_id, true,
+                    );
+                    let payload = json!({
+                        "session_id": session_id,
+                        "steer_id": steer_id,
+                    });
+                    let _ = app.emit("chat:steer_committed", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:steer_committed",
+                        payload,
+                    );
+                }
+                Event::SteerDropped { steer_id } => {
+                    let steer_id = stamp_steer_generation(steer_id_generation, &steer_id);
+                    // The engine dropped the steer: revoke the in-flight
+                    // registration; the message stays queued for redelivery.
+                    crate::features::assistant::steer_outcomes::resolve_steer_outcome(
+                        &steer_id, false,
+                    );
+                    let payload = json!({
+                        "session_id": session_id,
+                        "steer_id": steer_id,
+                    });
+                    let _ = app.emit("chat:steer_dropped", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:steer_dropped",
+                        payload,
+                    );
+                }
+                Event::WorkflowUi { .. } => {}
+                Event::AgentProgress {
+                    owner_session_id,
+                    id,
+                    status,
+                    activity,
+                    ..
+                } if owner_session_id == session_id => {
+                    let payload = json!({
+                        "session_id": session_id,
+                        "agent_id": id,
+                        "status": status,
+                        // 结构化生命周期态（与 worker ledger 同一词表）：展示层
+                        // 不得从自由文本 progress 短语反推状态，否则台账令牌与
+                        // 实时短语互相覆盖，运行中子智能体的状态标签来回闪烁。
+                        "worker_status": deepseek_tui::tools::subagent::agent_worker_status_name(
+                            activity.worker_status,
+                        ),
+                    });
+                    // Web 端没有 chat:tool_start 的子智能体等价事件， bridge 靠该进展
+                    // 文本调度 shell 快照轮询（发现子 agent 的后台任务），必须转发。
+                    let _ = app.emit("multiagent:agent_progress", payload.clone());
+                    let _ = crate::features::remote_control::forward_app_event(
+                        &app,
+                        "multiagent:agent_progress",
+                        payload,
+                    );
+                }
+                Event::AgentProgress { .. } => {}
+                // mailbox 信封同时维护 Shell scope 与通用子智能体审计。
+                Event::SubAgentMailbox {
+                    owner_session_id,
+                    message,
+                    ..
+                } if owner_session_id == session_id => {
+                    use deepseek_tui::tools::subagent::{AgentWorkerStatus, MailboxMessage as MM};
+                    // 审计是应用账本：绑了项目目录的原生代码会话写会话私有目录，
+                    // 不污染用户项目；其余会话账本根与执行根相同，行为不变。
+                    let ws = bridge.audit_workspace(&session_id, &execution_workspace);
+                    match message {
+                        MM::Started { agent_id, .. } => {
+                            if let Some(turn_id) = current_turn_id.as_deref() {
+                                turn_shell_tasks.register_agent(turn_id, &agent_id);
+                            }
+                        }
+                        MM::ChildSpawned {
+                            parent_id,
+                            child_id,
+                        } => {
+                            if !turn_shell_tasks.register_child_agent(&parent_id, &child_id) {
+                                log::warn!(
+                                    "[pinvou3][chat] child agent has no parent shell scope sid={} parent={} child={}",
+                                    session_id,
+                                    parent_id,
+                                    child_id
+                                );
+                            }
+                        }
+                        MM::TokenUsage {
+                            agent_id, usage, ..
+                        } => {
+                            crate::features::assistant::audit::append(
+                                &ws,
+                                "token",
+                                &agent_id,
+                                json!({
+                                    "agent_id": agent_id,
+                                    "input": usage.input_tokens,
+                                    "output": usage.output_tokens,
+                                }),
+                            );
+                        }
+                        MM::ToolCallStarted {
+                            agent_id,
+                            tool_name,
+                            step,
+                        } => {
+                            let payload = json!({
+                                "session_id": session_id,
+                                "agent_id": agent_id,
+                                "status": format!("🔧 {tool_name} (step {step})"),
+                                // 与 AgentProgress 臂同词表：工具执行中。经
+                                // agent_worker_status_name 派生而非手写字面量，
+                                // 底座改词表时两臂一起变而非静默分叉。
+                                "worker_status": deepseek_tui::tools::subagent::agent_worker_status_name(
+                                    AgentWorkerStatus::RunningTool,
+                                ),
+                            });
+                            // 同 AgentProgress：Web 端靠它发现子 agent 的后台 shell 任务。
+                            let _ = app.emit("multiagent:agent_progress", payload.clone());
+                            let _ = crate::features::remote_control::forward_app_event(
+                                &app,
+                                "multiagent:agent_progress",
+                                payload,
+                            );
+                        }
+                        MM::Completed { agent_id, summary } => {
+                            turn_shell_tasks.complete_agent(&agent_id);
+                            crate::features::assistant::audit::append(
+                                &ws,
+                                "agent_done",
+                                &agent_id,
+                                json!({
+                                    "agent_id": agent_id,
+                                    "summary": crate::platform::strings::truncate_utf8(&summary, 600),
+                                }),
+                            );
+                        }
+                        MM::Failed { agent_id, error } => {
+                            turn_shell_tasks.complete_agent(&agent_id);
+                            crate::features::assistant::audit::append(
+                                &ws,
+                                "agent_failed",
+                                &agent_id,
+                                json!({
+                                    "agent_id": agent_id,
+                                    "error": crate::platform::strings::truncate_utf8(&error, 600),
+                                }),
+                            );
+                        }
+                        MM::Cancelled { agent_id } => {
+                            turn_shell_tasks.complete_agent(&agent_id);
+                        }
+                        MM::Interrupted { agent_id, .. } => {
+                            // CodeWhale 当前不保留可原位恢复的 live task；中断后只能基于
+                            // checkpoint 重新派发，因此它对本轮 Shell scope 同样是终态。
+                            turn_shell_tasks.complete_agent(&agent_id);
+                        }
+                        _ => {}
+                    }
+                }
+                Event::SubAgentMailbox { .. } => {}
+                Event::AgentComplete {
+                    owner_session_id,
+                    id,
+                    result,
+                } if owner_session_id == session_id => {
+                    let failed = result.contains(r#""event":"subagent.failed""#);
+                    let payload = json!({
+                        "session_id": session_id,
+                        "agent_id": id,
+                        "failed": failed,
+                    });
+                    let _ = app.emit("multiagent:agent_complete", payload);
+                }
+                Event::AgentComplete { .. } => {}
+                Event::TurnComplete {
+                    usage,
+                    status,
+                    error,
+                    tool_catalog,
+                    turn_id: _,
+                    submission_id: _,
+                    compaction_id: _,
+                    base_url: _,
+                    // CodeWhale#142 adds the terminal error's producer
+                    // source; the forwarder surfaces only usage/status/error.
+                    error_source: _,
+                } => {
+                    #[cfg(not(feature = "benchmark-hooks"))]
+                    let _ = &tool_catalog;
+                    #[cfg(feature = "benchmark-hooks")]
+                    let authorized_tool_catalog = crate::features::assistant::timing::eval_observation_enabled(&session_id)
+                        .then(|| {
+                            tool_catalog.as_ref().and_then(|catalog| {
+                                serde_json::to_vec(catalog).ok().map(|catalog_json| {
+                                    crate::features::assistant::timing::ToolCatalogSummary::from_serialized_catalog(
+                                        catalog.len(),
+                                        &catalog_json,
+                                    )
+                                })
+                            })
+                        })
+                        .flatten();
+                    let shell_turn_id = current_turn_id.clone();
+                    #[cfg(feature = "benchmark-hooks")]
+                    if let Some(turn_id) = shell_turn_id.as_ref() {
+                        first_delta_done.remove(turn_id);
+                    }
+                    let shell_interrupted = status == TurnOutcomeStatus::Interrupted;
+                    let operation_rejected = std::mem::take(&mut active_operation_rejected);
+                    let mut shell_cleanup_failed = false;
+                    let mut terminal_status = status;
+                    // The chat:done error text goes through the same Rust
+                    // redaction layer (one line of defense shared with the
+                    // Error event's transient/fatal paths).
+                    let mut terminal_error =
+                        error.map(|error| crate::platform::credential_store::redact_secret(&error));
+                    if let Some(base_total_tokens) = scheduled_base_total_tokens {
+                        scheduled_engine_total_tokens = scheduled_engine_total_tokens
+                            .saturating_add(u64::from(usage.input_tokens))
+                            .saturating_add(u64::from(usage.output_tokens));
+                        let store_for_save = store.clone();
+                        let session_for_save = session_id.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            store_for_save.persist_scheduled_token_total(
+                                &session_for_save,
+                                base_total_tokens,
+                                scheduled_engine_total_tokens,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(save_error)) => {
+                                scheduled_persistence_error = Some(format!("{save_error:#}"));
+                            }
+                            Err(join_error) => {
+                                scheduled_persistence_error = Some(format!(
+                                    "scheduled token persistence task failed: {join_error}"
+                                ));
+                            }
+                        }
+                        if let Some(save_error) = scheduled_persistence_error.take() {
+                            terminal_status = TurnOutcomeStatus::Failed;
+                            terminal_error = Some(match terminal_error {
+                                Some(engine_error) => format!(
+                                    "{engine_error}; scheduled conversation persistence failed: {save_error}"
+                                ),
+                                None => format!(
+                                    "Scheduled conversation persistence failed: {save_error}"
+                                ),
+                            });
+                        }
+                    } else {
+                        let terminal_save = if operation_rejected {
+                            // Rejection must win over both an engine snapshot
+                            // and the optimistic admission fallback.
+                            None
+                        } else if active_transcript_seen {
+                            // The terminal snapshot shares one Arc with the
+                            // last SessionUpdated persist, so its content can
+                            // no longer change; a revision-cache hit means
+                            // this exact content already persisted cleanly and
+                            // another load→serialize→write would be pure
+                            // duplication. Skip the write and re-emit the
+                            // terminal_fallback event with the cached revision
+                            // (payload identical to the original path, event
+                            // sequence unchanged); on a cache miss (the last
+                            // persist/hash failed) keep the original terminal
+                            // persist retry, still mapping a failure to the
+                            // Failed terminal state.
+                            match last_persisted_chat_revision.take() {
+                                Some(revision) => {
+                                    let (message_count, context_updates_total) =
+                                        latest_chat_engine_state.as_ref().map_or((0, 0), |state| {
+                                            (
+                                                state.messages.len(),
+                                                count_context_updates(&state.messages),
+                                            )
+                                        });
+                                    emit_transcript_committed(
+                                        &app,
+                                        &session_id,
+                                        revision,
+                                        "terminal_fallback",
+                                        message_count,
+                                        context_updates_total,
+                                    );
+                                    None
+                                }
+                                None => latest_chat_engine_state.clone().map(|state| {
+                                    let store_for_save = store.clone();
+                                    let session_for_save = session_id.clone();
+                                    let app_for_save = app.clone();
+                                    let writer_for_save = transcript_writer_active.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        persist_chat_snapshot(
+                                            &store_for_save,
+                                            &session_for_save,
+                                            &state,
+                                            &writer_for_save,
+                                            |revision, message_count, context_updates_total| {
+                                                emit_transcript_committed(
+                                                    &app_for_save,
+                                                    &session_for_save,
+                                                    revision.to_owned(),
+                                                    "terminal_fallback",
+                                                    message_count,
+                                                    context_updates_total,
+                                                );
+                                            },
+                                        )
+                                    })
+                                }),
+                            }
+                        } else {
+                            turn_lifecycle.active_transcript_fallback().map(|fallback| {
+                                let store_for_save = store.clone();
+                                let session_for_save = session_id.clone();
+                                let app_for_save = app.clone();
+                                let writer_for_save = transcript_writer_active.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    persist_admitted_display_snapshot(
+                                        &store_for_save,
+                                        &session_for_save,
+                                        &fallback.baseline_revision,
+                                        fallback.display_message,
+                                        fallback.operation == TranscriptOperation::EditLast,
+                                        &writer_for_save,
+                                        |revision, message_count, context_updates_total| {
+                                            emit_transcript_committed(
+                                                &app_for_save,
+                                                &session_for_save,
+                                                revision.to_owned(),
+                                                "terminal_fallback",
+                                                message_count,
+                                                context_updates_total,
+                                            );
+                                        },
+                                    )
+                                })
+                            })
+                        };
+                        if let Some(save_task) = terminal_save {
+                            match save_task.await {
+                                // Both save arms published their durable
+                                // revision on the blocking worker.
+                                Ok(Ok(Some(_))) => {
+                                    chat_persistence_error = None;
+                                }
+                                // The retired writer published nothing: the
+                                // reclaiming owner emits the terminal now.
+                                Ok(Ok(None)) => continue,
+                                Ok(Err(save_error)) => {
+                                    chat_persistence_error = Some(format!("{save_error:#}"));
+                                }
+                                Err(join_error) => {
+                                    chat_persistence_error = Some(format!(
+                                        "chat transcript persistence task failed: {join_error}"
+                                    ));
+                                }
+                            }
+                        }
+                        if let Some(save_error) = chat_persistence_error.take() {
+                            terminal_status = TurnOutcomeStatus::Failed;
+                            terminal_error = Some(match terminal_error {
+                                Some(engine_error) => format!(
+                                    "{engine_error}; chat conversation persistence failed: {save_error}"
+                                ),
+                                None => {
+                                    format!("Chat conversation persistence failed: {save_error}")
+                                }
+                            });
+                        }
+                    }
+                    // TurnComplete closes the snapshot ownership window. Edit
+                    // preflight rejection has no TurnStarted, so retaining a
+                    // prior turn's state here could otherwise make that later
+                    // rejection repersist a stale snapshot.
+                    active_transcript_seen = false;
+                    latest_chat_engine_state = None;
+                    // The revision cache belongs to the same turn's
+                    // ownership window as the snapshot; clear it together so
+                    // a later turn cannot misread "the latest snapshot is
+                    // already persisted".
+                    last_persisted_chat_revision = None;
+                    // Keep the shell scope cancellable throughout persistence.
+                    // Final cleanup runs before terminal admission is claimed;
+                    // Engine reclaim can therefore still win an await race and
+                    // close the same scope without leaving the UI permanently
+                    // busy. The cleanup itself executes on blocking workers.
+                    if let Some(turn_id) = shell_turn_id.as_deref() {
+                        match turn_shell_tasks
+                            .finalize_turn(turn_id, shell_interrupted)
+                            .await
+                        {
+                            Ok(report) => {
+                                if !report.killed.is_empty() {
+                                    log::info!(
+                                        "[pinvou3][chat] finalized {} interrupted shell task(s) sid={} turn={}",
+                                        report.killed.len(),
+                                        session_id,
+                                        turn_id
+                                    );
+                                }
+                                if let Some(cleanup_error) = report.failure_summary() {
+                                    shell_cleanup_failed = true;
+                                    log::error!(
+                                        "[pinvou3][chat] shell cleanup remained incomplete sid={} turn={}: {}",
+                                        session_id,
+                                        turn_id,
+                                        cleanup_error
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::error!(
+                                    "[pinvou3][chat] failed to finalize shell task scope sid={} turn={}: {error:#}",
+                                    session_id,
+                                    turn_id
+                                );
+                                shell_cleanup_failed = true;
+                            }
+                        }
+                    }
+                    // Persistence above can change the authoritative outcome and
+                    // may await. Claim only after that result is known, but before
+                    // every completion-only side effect below. If reclaim won
+                    // during the await, this late TurnComplete is discarded.
+                    let Some(_) = turn_lifecycle.claim_terminal_with_admission(&app, &session_id)
+                    else {
+                        continue;
+                    };
+                    // 单独发 usage 给前端 token 进度条
+                    let payload = json!({
+                        "session_id": session_id,
+                        // Billing aggregate summed over the turn's requests;
+                        // consumers that must not see the overshooting sum read
+                        // context_input_tokens instead. Kept byte-identical for
+                        // self_metrics, scheduled-run totals and remote stats.
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "context_window": bridge.usage_context_window(),
+                        // Last reported parent-request input = real context
+                        // occupancy at turn end (see the tracker declaration);
+                        // null when the provider never reported usage.
+                        "context_input_tokens": latest_reported_input_tokens,
+                    });
+                    let _ = app.emit("chat:usage", payload.clone());
+                    crate::features::remote_control::forward_app_event(&app, "chat:usage", payload);
+                    // app 侧自测:用精确 usage 收尾本轮。部分远端模型会流式返回文本,
+                    // 但最终 usage.output_tokens 为 0,因此不能用 output_tokens 门控收尾。
+                    if let Some(m) = &self_metrics {
+                        m.on_turn_complete(
+                            &session_id,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.prompt_cache_hit_tokens,
+                            usage.prompt_cache_miss_tokens,
+                        );
+                    }
+                    // turn end:取出 tracker 快照,然后重置(下个 turn 重新累积)。
+                    // 用独立 block 把 parking_lot guard 的生命周期限死在这里:下方
+                    // H1 harness 段有 .await(spawn_blocking),guard 是 !Send,若跨
+                    // await 会让整个 forwarder future 变 !Send(tauri::spawn 要求 Send)。
+                    let (plan_used, plan_snapshot, todos_snapshot) = {
+                        let mut tracker = plan_tracker.lock();
+                        let plan_used = tracker.plan_tool_used;
+                        let plan_snapshot = tracker.last_plan_snapshot.take();
+                        let todos_snapshot = tracker.last_todos_snapshot.take();
+                        *tracker = TurnPlanTracker::default();
+                        (plan_used, plan_snapshot, todos_snapshot)
+                    };
+
+                    // 先完成权威时间线，再发 chat:done。前端终态事件会据此重新
+                    // 读取整份时间线，补齐后台运行/页面恢复期间漏掉的本地事件。
+                    // 收尾只走 observation 版一次:tool_calls/catalog 摘要随
+                    // assistant_done 落盘;若先前再用 usage 版收尾会先 pop 掉
+                    // 队首活跃轮,排队双轮场景错配下一轮的时间线。
+                    let status_text = format!("{terminal_status:?}");
+                    let timing_usage = Some(crate::features::assistant::timing::TurnUsage {
+                        input_tokens: u64::from(usage.input_tokens),
+                        output_tokens: u64::from(usage.output_tokens),
+                        cache_hit_tokens: u64::from(usage.prompt_cache_hit_tokens.unwrap_or(0)),
+                        cache_miss_tokens: u64::from(usage.prompt_cache_miss_tokens.unwrap_or(0)),
+                        cache_write_tokens: u64::from(usage.prompt_cache_write_tokens.unwrap_or(0)),
+                        reasoning_tokens: u64::from(usage.reasoning_tokens.unwrap_or(0)),
+                        // 与 chat:usage 同一来源：代码页 hydration 回填用量 chip 分母。
+                        context_window: u64::from(bridge.usage_context_window()),
+                    });
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        crate::features::assistant::timing::finish_turn_with_observation(
+                            &session_id,
+                            &status_text,
+                            terminal_error.as_deref(),
+                            timing_usage,
+                            authorized_tool_catalog,
+                        );
+                    } else {
+                        crate::features::assistant::timing::finish_turn_with_usage(
+                            &session_id,
+                            &status_text,
+                            terminal_error.as_deref(),
+                            timing_usage,
+                        );
+                    }
+                    #[cfg(not(feature = "benchmark-hooks"))]
+                    crate::features::assistant::timing::finish_turn_with_usage(
+                        &session_id,
+                        &status_text,
+                        terminal_error.as_deref(),
+                        timing_usage,
+                    );
+
+                    {
+                        // 多引擎:mode 判据基于本 forwarder 的 session_id,不读全局 active。
+                        let active_id = session_id.clone();
+                        let state = store.mode_state(&active_id);
+
+                        // ── plan_ready 触发(Plan + 调过 plan 类工具) ──
+                        // 底座式:Plan 模式调过 update_plan = 出方案 → 弹决策卡。不再设 phase
+                        // (已砍 PlanPhase),mode 留 Plan 直到用户 accept/discard 切 Yolo。
+                        // 修订(还在 Plan 时再调 update_plan)天然幂等:再弹一张新卡。
+                        if plan_used && state.mode == SerializableMode::Plan {
+                            if let Some(plan_id) = current_turn_id.clone() {
+                                if let Some(mode_state) =
+                                    store.register_pending_plan(&active_id, plan_id.clone())
+                                {
+                                    let payload = json!({
+                                        "session_id": active_id.clone(),
+                                        "plan_id": plan_id,
+                                        "plan_snapshot": plan_snapshot.clone(),
+                                        "todos_snapshot": todos_snapshot.clone(),
+                                        "mode_state": mode_state,
+                                    });
+                                    let _ = app.emit("chat:plan_ready", payload.clone());
+                                    crate::features::remote_control::forward_app_event(
+                                        &app,
+                                        "chat:plan_ready",
+                                        payload,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Publish the claimed
+                        // terminal first so a concurrent Engine eviction cannot
+                        // abort this forwarder and leave the frontend permanently
+                        // busy. Reclaim now observes the lifecycle as terminal and
+                        // cannot publish a conflicting Interrupted outcome.
+                        //
+                        // P0-B: finish_terminal_emission must run before the
+                        // emit so that when chat:done arrives the reserve gate
+                        // is already reopened (contract: chat:done ⇒ slot
+                        // released) and the frontend's interruptAndSend needs
+                        // no fixed sleep. The generation is read before finish
+                        // (it returns to None afterwards). The emit stays
+                        // before the harness await: the harness section can be
+                        // interrupted by engine eviction, and the terminal
+                        // must go out first or the frontend stays busy
+                        // forever.
+                        let generation = turn_lifecycle.current_turn_generation().unwrap_or(0);
+                        turn_lifecycle.finish_terminal_emission();
+                        emit_chat_terminal(
+                            &app,
+                            &session_id,
+                            generation,
+                            terminal_status,
+                            terminal_error.clone(),
+                            shell_cleanup_failed,
+                            operation_rejected,
+                        );
+
+                        // ── [回归底座式] M2 自驱 + M3 文本兜底已彻底砍掉 ──
+                        // M2:执行不自动续跑,回底座由用户驱动。M3(Plan 写了方案没调
+                        // update_plan 的救援)放弃不做:底座 update_plan→plan_ready→方案卡
+                        // 这条链已可靠,漏的少数"光说不出卡"由 composer chip 手切 + plan_stuck
+                        // 卡兜底,不值得用噪音判据再造一层。
+                    }
+                    if crate::features::memory::memory_enabled() {
+                        // Round-15 MAJOR-4: the capture is still taken so it
+                        // does not accumulate in the process-level store, but
+                        // the review below is gated on memory_review_in_scope
+                        // — aux side-chat turns must never reach it.
+                        let capture = crate::features::memory::take_turn_capture(&session_id);
+                        if should_spawn_memory_review(true, &session_id, capture.is_some()) {
+                            if let Some(capture) = capture {
+                                let app_clone = app.clone();
+                                let bridge_clone = bridge.clone();
+                                let sid_clone = session_id.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    match crate::features::memory::review_turn_candidates_with_llm(
+                                        &bridge_clone,
+                                        &capture,
+                                        &sid_clone,
+                                    )
+                                    .await
+                                    {
+                                        Ok(outcome) => {
+                                            let mut events = outcome.events;
+                                            events.extend(outcome.pending.into_iter().filter_map(
+                                                |item| {
+                                                    (item.status == "pending_confirm").then(|| {
+                                                        crate::features::memory::MemoryWriteEvent {
+                                                            kind: item.kind,
+                                                            action: "pending".to_string(),
+                                                            id: item.id,
+                                                            text: item.content,
+                                                        }
+                                                    })
+                                                },
+                                            ));
+                                            if !events.is_empty() {
+                                                let _ = app_clone.emit(
+                                                    "chat:memory_write",
+                                                    json!({
+                                                        "session_id": sid_clone,
+                                                        "events": events,
+                                                    }),
+                                                );
+                                                match crate::features::memory::runtime_snapshot(
+                                                    &sid_clone,
+                                                ) {
+                                                    Ok(snapshot) => {
+                                                        let _ = app_clone.emit(
+                                                        "chat:memory",
+                                                        json!({
+                                                            "session_id": sid_clone,
+                                                            "items": snapshot.items,
+                                                            "runtime_path": snapshot.runtime_path,
+                                                        }),
+                                                    );
+                                                    }
+                                                    Err(err) => eprintln!(
+                                                        "[pinvou3-app] refresh memory runtime after review failed for session {sid_clone}: {err}"
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            eprintln!(
+                                                "[pinvou3-app] memory llm review failed for session {sid_clone}: {err:#}"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    maybe_notify_task_completed(
+                        &app,
+                        &session_id,
+                        current_turn_id.take(),
+                        terminal_status,
+                        terminal_error.as_deref(),
+                    );
+                    if let Some(signal) = turn_tracker.on_terminal(terminal_status, terminal_error)
+                    {
+                        let _ = turn_events.send(signal);
+                    }
+                }
+                Event::CompactionStarted {
+                    id, message, auto, ..
+                } => {
+                    // Idempotently re-set the in-flight flag (review #484 round-18 M2): already
+                    // set at enqueue; covers auto-compaction paths bypassing pool.compact_now.
+                    if let Some(pool) = &engine_pool {
+                        pool.set_compaction_in_flight(&session_id, true);
+                    }
+                    let payload = json!({ "session_id": session_id, "phase": "start", "id": id, "auto": auto, "message": message });
+                    let _ = app.emit("chat:compaction", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:compaction",
+                        payload,
+                    );
+                }
+                Event::CompactionCompleted {
+                    id,
+                    message,
+                    auto,
+                    messages_before,
+                    messages_after,
+                    post_input_tokens,
+                    ..
+                } => {
+                    let payload = json!({
+                        "session_id": session_id,
+                        "phase": "done",
+                        "id": id,
+                        "auto": auto,
+                        "message": message,
+                        "messages_before": messages_before,
+                        "messages_after": messages_after,
+                        // Conservative post-compaction context estimate for refreshing the
+                        // usage chip before the next authoritative chat:usage event.
+                        "post_tokens": post_input_tokens,
+                    });
+                    let _ = app.emit("chat:compaction", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:compaction",
+                        payload,
+                    );
+                    // Compaction does not call start_turn, and its TurnComplete carries zero
+                    // usage. Persist this estimate separately so hydration does not restore
+                    // the stale pre-compaction value.
+                    if let Some(tokens) = post_input_tokens.filter(|tokens| *tokens > 0) {
+                        crate::features::assistant::timing::record_context_snapshot(
+                            &session_id,
+                            tokens,
+                            u64::from(bridge.usage_context_window()),
+                        );
+                    }
+                    // Compaction terminal state: release the in-flight flag (review #484
+                    // round-18 M2), through which align's busy fence sees the recovery.
+                    if let Some(pool) = &engine_pool {
+                        pool.set_compaction_in_flight(&session_id, false);
+                    }
+                }
+                Event::CompactionCancelled { id, message, auto } => {
+                    // Cancellation is a terminal compaction phase just like done/fail.
+                    // Forward the stable id so both UI lanes can settle the exact
+                    // in-flight card instead of leaving the manual compact action locked.
+                    // Terminal state: synchronously release the in-flight flag
+                    // (review #484 round-18 M2).
+                    if let Some(pool) = &engine_pool {
+                        pool.set_compaction_in_flight(&session_id, false);
+                    }
+                    let payload = json!({
+                        "session_id": session_id,
+                        "phase": "cancel",
+                        "id": id,
+                        "auto": auto,
+                        "message": message,
+                    });
+                    let _ = app.emit("chat:compaction", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:compaction",
+                        payload,
+                    );
+                }
+                Event::CompactionFailed { id, message, auto } => {
+                    // A terminal failure likewise releases the in-flight flag
+                    // (review #484 round-18 M2).
+                    if let Some(pool) = &engine_pool {
+                        pool.set_compaction_in_flight(&session_id, false);
+                    }
+                    let payload = json!({ "session_id": session_id, "phase": "fail", "id": id, "auto": auto, "message": message });
+                    let _ = app.emit("chat:compaction", payload.clone());
+                    crate::features::remote_control::forward_app_event(
+                        &app,
+                        "chat:compaction",
+                        payload,
+                    );
+                }
+                Event::Error { envelope, .. } => {
+                    // Edit preflight failures are non-terminal advisories until
+                    // the paired TurnComplete, but their typed code tells the
+                    // terminal path not to persist the optimistic fallback.
+                    if !envelope.recoverable && envelope.code.starts_with("edit_last_turn_") {
+                        active_operation_rejected = true;
+                    }
+                    // 可恢复错误(如 SSE idle timeout、瞬态工具失败)turn 不会结束——
+                    // 引擎会 retry / 继续跑后续步骤。绝不能发 chat:done,否则前端
+                    // setBusy(false) 把"思考中"指示器掐掉,而引擎还在干活,看着像卡死
+                    // (且会误触发 flush/closeBubble/plan_phase 收尾)。只飘个 advisory。
+                    // 仅 recoverable==false(致命)才是真结束 → chat:done。
+                    if envelope.recoverable {
+                        // Error text crosses the webview boundary through
+                        // the Rust redaction layer first (Bearer/sk-/long
+                        // random tokens); the frontend's
+                        // redactTechnicalDetail is the second line, but the
+                        // Rust pass guarantees the first-hand text is
+                        // already redacted before persistence/screenshots.
+                        // The structured code/category are passed through
+                        // untouched so the frontend can retain controlled
+                        // error semantics beyond string classification (the
+                        // streaming path currently emits mostly the generic
+                        // "transient", which alone must not drive
+                        // model-service classification).
+                        let payload = json!({
+                            "session_id": session_id,
+                            "error": crate::platform::credential_store::redact_secret(&envelope.message),
+                            "code": envelope.code,
+                            "category": envelope.category.to_string(),
+                        });
+                        let _ = app.emit("chat:transient_error", payload.clone());
+                        crate::features::remote_control::forward_app_event(
+                            &app,
+                            "chat:transient_error",
+                            payload,
+                        );
+                    } else {
+                        // 底座在致命 Error 后仍会发权威 TurnComplete(Failed)。这里只缓存
+                        // 文本；完成、持久化和 chat:done 全部由 TurnComplete 单点处理。
+                        turn_tracker.on_fatal_error(
+                            crate::platform::credential_store::redact_secret(&envelope.message),
+                        );
+                    }
+                }
+                Event::TurnUsage {
+                    usage,
+                    duration_ms,
+                    first_token_ms,
+                    request_ms,
+                    ..
+                } => {
+                    // 常规构建也消费引擎计时字段。监控 TTFT/TPS 以引擎为权威源
+                    // (first_token_ms 从请求派发点起表,含真实网络首字节),并附
+                    // 该调用的 output_tokens:TPS 分子与生成窗口按调用严格配对,
+                    // 无工具多调用轮(续跑/reprompt)逐条累加。墙钟 Instant 重测
+                    // 含转发/分发延迟,仅作引擎未上报完整对时的回落。
+                    // benchmark-hooks 的 eval 里程碑照旧,与 self_metrics 互不影响。
+                    // Per-request occupancy bookkeeping for the usage meter:
+                    // keep the freshest reported PARENT input (parent-only via
+                    // `request_ms` — the consult/fold producers set None and
+                    // can outlast the parent stream at turn end), and a
+                    // zero/absent report must not clobber an earlier value.
+                    if usage.input_tokens > 0 && request_ms.is_some() {
+                        latest_reported_input_tokens = Some(usage.input_tokens);
+                    }
+                    if let Some(m) = &self_metrics {
+                        m.on_engine_usage(
+                            &session_id,
+                            first_token_ms,
+                            request_ms,
+                            usage.output_tokens,
+                        );
+                    }
+                    #[cfg(feature = "benchmark-hooks")]
+                    if crate::features::assistant::timing::eval_observation_enabled(&session_id) {
+                        // benchmark-core's stable product contract predates the
+                        // v0.9.12 event rename. Prefer the whole-request clock and
+                        // fall back to stream duration only for emitters that cannot
+                        // measure dispatch; TTFT remains honestly optional.
+                        let request_duration_ms = request_ms.unwrap_or(duration_ms);
+                        crate::features::assistant::timing::record_milestone_meta(
+                            &session_id,
+                            "model_request_metric",
+                            json!({
+                                "request_duration_ms": request_duration_ms,
+                                "ttft_ms": first_token_ms,
+                                "stream_duration_ms": duration_ms,
+                                "input_tokens": usage.input_tokens,
+                                "output_tokens": usage.output_tokens,
+                                "cache_hit_tokens": usage.prompt_cache_hit_tokens,
+                                "cache_miss_tokens": usage.prompt_cache_miss_tokens,
+                            }),
+                        );
+                    }
+                    #[cfg(not(feature = "benchmark-hooks"))]
+                    let _ = duration_ms;
+                }
+                Event::ToolGateDecision {
+                    agent_id,
+                    tool_id,
+                    tool_name,
+                    gate,
+                    decision,
+                    risk,
+                    reason,
+                } => {
+                    // These receipts are deliberately emitted only for decisions a
+                    // person would otherwise never see. Keep them user-visible in
+                    // both desktop and remote lanes; the foundation already bounds
+                    // and strips controls from `reason`, and the host redacts secrets
+                    // once more before crossing the WebView boundary.
+                    let payload = json!({
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "tool_id": tool_id,
+                        "tool_name": tool_name,
+                        "gate": gate.as_str(),
+                        "decision": decision.as_str(),
+                        "risk": risk,
+                        "reason": crate::platform::credential_store::redact_secret(&reason),
+                    });
+                    // Desktop-only lane: "chat:tool_gate_decision" is not in
+                    // the Web access event policy, so forwarding it would only
+                    // produce rejected-event log spam when a WebUI client is
+                    // connected.
+                    let _ = app.emit("chat:tool_gate_decision", payload);
+                }
+                // v0.9.12 events with no Pinvou host projection. Keep these arms
+                // explicit: adding another foundation event must fail this match at
+                // compile time instead of disappearing into a catch-all.
+                Event::MessageStarted { .. }
+                | Event::MessageComplete { .. }
+                | Event::ToolCallHeartbeat
+                | Event::ToolRequestSnapshot { .. }
+                | Event::RouteDispatched { .. }
+                | Event::GoalUpdated { .. }
+                | Event::GoalContinuationWaiting { .. }
+                | Event::GoalContinuationWaitEnded { .. }
+                | Event::PurgeStarted { .. }
+                | Event::PurgeCompleted { .. }
+                | Event::PurgeFailed { .. }
+                | Event::SubAgentFollowUp { .. }
+                | Event::AgentList { .. }
+                | Event::RequestManifestReady { .. }
+                | Event::PauseEvents { .. }
+                | Event::ResumeEvents
+                | Event::ElevationRequired { .. }
+                | Event::LspRepairUpdate { .. }
+                | Event::AdvisoryNote { .. }
+                | Event::PrefixCacheChange { .. } => {}
+                // Connector readiness is owned by Pinvou's marketplace state. The
+                // Engine event is intentionally observed only for diagnostics until
+                // that UI adopts the generation-based v0.9.12 snapshot protocol.
+                // The terminal boot receipt is additionally persisted through
+                // the startup timeline (`~/.pinvou3/logs/startup.log`) so it
+                // stays visible independent of the rotating app log.
+                // The engine re-reports the receipt on every real turn; only a
+                // changed failure set is persisted.
+                Event::McpSessionBoot { .. } => {
+                    record_mcp_session_boot(&session_id, &event, &mut last_mcp_boot_failure_set);
+                }
+                Event::ToolProjectionWarning {
+                    provider,
+                    omitted_tool_count,
+                    ..
+                } => {
+                    log::warn!(
+                        "[pinvou3][chat] provider {} omitted {} incompatible tools for sid={}",
+                        provider,
+                        omitted_tool_count,
+                        session_id
+                    );
+                }
+                Event::Status { message } => {
+                    log::debug!(
+                        "[pinvou3][chat] engine status sid={}: {}",
+                        session_id,
+                        message
+                    );
+                }
+            }
+        }
+        let stopped_error = "Engine event stream stopped before a terminal event".to_string();
+        let mut shell_cleanup_failed = false;
+        {
+            // The stream can stop before `TurnStarted` bound the provisional
+            // submission scope; close the active scope too, otherwise the next
+            // `prepare_turn` keeps bailing on "scope already active".
+            let finalize = match current_turn_id.as_deref() {
+                Some(turn_id) => turn_shell_tasks.finalize_turn(turn_id, true).await,
+                None => turn_shell_tasks.finalize_active_scope(true).await,
+            };
+            match finalize {
+                Ok(report) => {
+                    if let Some(error) = report.failure_summary() {
+                        shell_cleanup_failed = true;
+                        log::error!(
+                            "[pinvou3][chat] shell cleanup remained incomplete after event stream stop sid={} turn={:?}: {}",
+                            session_id,
+                            current_turn_id,
+                            error
+                        );
+                    }
+                }
+                Err(error) => {
+                    shell_cleanup_failed = true;
+                    log::error!(
+                        "[pinvou3][chat] failed to close shell task scope after event stream stop sid={} turn={:?}: {error:#}",
+                        session_id,
+                        current_turn_id
+                    );
+                }
+            }
+        }
+        // 事件流中断/停止不经过 TurnComplete：清掉本轮 self_metrics 打点与 memory
+        // turn capture，否则 inflight / turn_capture_store 会按 session 永久驻留。
+        if let Some(m) = &self_metrics {
+            m.on_turn_aborted(&session_id);
+        }
+        crate::features::memory::discard_turn_capture(&session_id);
+        match finish_reclaimed_lifecycle_turn(
+            &turn_lifecycle,
+            &app,
+            &store,
+            &session_id,
+            TurnOutcomeStatus::Failed,
+            Some(stopped_error.clone()),
+            shell_cleanup_failed,
+            active_operation_rejected,
+        )
+        .await
+        {
+            Some(EmittedTerminal {
+                turn_id: Some(turn_id),
+            }) => {
+                let _ = turn_events.send(EngineTurnSignal::Terminal {
+                    turn_id,
+                    status: TurnOutcomeStatus::Failed,
+                    error: Some(stopped_error),
+                });
+            }
+            Some(EmittedTerminal { turn_id: None }) | None => {
+                let _ = turn_events.send(EngineTurnSignal::ForwarderStopped {
+                    error: stopped_error,
+                });
+            }
+        }
+        eprintln!(
+            "[pinvou3-app] event forwarder stopped for session {session_id} (engine shut down?)"
+        );
+    })
+}
+
+/// Whether a finished turn of this session may feed the global memory review
+/// pipeline. Aux side-chat turns are excluded (PR #433 round-15 MAJOR-4):
+/// auto-applied review candidates write into the global memory profile, and
+/// `render_memory_block()` injects that profile into *every* session's
+/// runtime prompt, main tasks included — so reviewing aux Q&A would
+/// re-route it (quoted main-task excerpts included) back into the main
+/// task's context, making the "answers never enter the main task's context"
+/// isolation promise only softly true. It would also cost a hidden extra LLM
+/// review call per aux turn and emit `chat:memory_write` / `chat:memory`
+/// events no first-party consumer handles for aux sessions. The turn capture
+/// itself is still taken at the call site so it does not accumulate in the
+/// process-level store.
+fn memory_review_in_scope(session_id: &str) -> bool {
+    crate::features::sessions::aux_side_effect_exclusion(session_id)
+}
+
+/// The full "spawn the memory review for this turn" decision, centralized so
+/// it is unit-testable without an AppHandle (round-16 B6): memory must be
+/// enabled, the session must be in scope (never aux — round-15 MAJOR-4), and
+/// there must be a capture to review. The call site delegates to this so the
+/// wiring and the tested decision are the same expression.
+fn should_spawn_memory_review(enabled: bool, session_id: &str, capture_present: bool) -> bool {
+    enabled && memory_review_in_scope(session_id) && capture_present
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{memory_review_in_scope, should_spawn_memory_review};
+
+    /// Round-15 MAJOR-4: aux sessions are out of scope for the global memory
+    /// review; every other session class keeps the existing behavior.
+    #[test]
+    fn memory_review_skips_aux_sessions_only() {
+        assert!(!memory_review_in_scope(
+            "aux-019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a"
+        ));
+        assert!(!memory_review_in_scope(
+            "AUX-019F8E2A-7B1C-7D3E-8F4A-5B6C7D8E9F0A"
+        ));
+        assert!(memory_review_in_scope(
+            "019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a"
+        ));
+        assert!(memory_review_in_scope(
+            "sched-019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a"
+        ));
+    }
+
+    /// Round-16 B6: the spawn decision the call site delegates to, exercised
+    /// as one composition — an aux session must never reach the review even
+    /// with memory enabled and a capture present. Weakening any conjunct
+    /// (dropping the scope gate, the enabled gate, or the capture gate)
+    /// flips one of these assertions; the call site calls this exact
+    /// function, so the wiring and the tested decision cannot drift apart.
+    #[test]
+    fn memory_review_spawn_decision_keeps_aux_out_when_enabled_with_capture() {
+        assert!(!should_spawn_memory_review(
+            true,
+            "aux-019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a",
+            true
+        ));
+        assert!(!should_spawn_memory_review(
+            true,
+            "AUX-019F8E2A-7B1C-7D3E-8F4A-5B6C7D8E9F0A",
+            true
+        ));
+        assert!(should_spawn_memory_review(
+            true,
+            "019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a",
+            true
+        ));
+        assert!(!should_spawn_memory_review(
+            false,
+            "019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a",
+            true
+        ));
+        assert!(!should_spawn_memory_review(
+            true,
+            "019f8e2a-7b1c-7d3e-8f4a-5b6c7d8e9f0a",
+            false
+        ));
+    }
+}
+
+#[cfg(test)]
+mod transcript_commit_tests {
+    use super::{persist_admitted_display_snapshot, persist_chat_snapshot};
+    use crate::features::sessions::{ChatEngineState, SessionStore, transcript_revision};
+    use crate::platform::paths::tests::{ENV_LOCK, EnvVarGuard};
+    use deepseek_tui::models::{ContentBlock, Message};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn message(role: &str, text: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    // Keep the test home isolated until both the detached writer and baseline
+    // reader finish; neither worker tries to acquire ENV_LOCK.
+    #[allow(clippy::await_holding_lock)]
+    async fn aborted_forwarder_still_notifies_an_admitted_runtime_append() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: all test home mutations use ENV_LOCK.
+        unsafe { std::env::set_var("PINVOU3_HOME", tmp.path()) };
+        let store = SessionStore::boot_with_scheduled_root(tmp.path().join("scheduled")).unwrap();
+        let session = store
+            .create_new("/model".into(), None, tmp.path().into())
+            .unwrap();
+        let id = session.metadata.id;
+        let mut messages = vec![
+            message("user", "synthetic task"),
+            message("assistant", "synthetic answer"),
+        ];
+        store.update_messages(&id, messages.clone()).unwrap();
+        let terminal_revision = transcript_revision(&messages).unwrap();
+        let mut runtime = message(
+            "user",
+            "<codewhale:runtime_event kind=\"mcp_boot_failed\" visibility=\"internal\">\nSynthetic startup receipt\n</codewhale:runtime_event>",
+        );
+        runtime.content.push(ContentBlock::Text {
+            text: "<turn_meta>\nInput provenance: runtime (non-authoritative)\n</turn_meta>".into(),
+            cache_control: None,
+        });
+        messages.push(runtime);
+        let state = ChatEngineState {
+            messages: messages.clone(),
+            system_prompt: None,
+            model: "/model".into(),
+            workspace: tmp.path().into(),
+        };
+        let active = Arc::new(AtomicBool::new(true));
+        let (written_tx, written_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (notified_tx, notified_rx) = tokio::sync::oneshot::channel();
+        let worker_store = store.clone();
+        let worker_id = id.clone();
+        let worker_active = active.clone();
+        let forwarder = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                persist_chat_snapshot(
+                    &worker_store,
+                    &worker_id,
+                    &state,
+                    &worker_active,
+                    |revision, count, _context_updates_total| {
+                        written_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        notified_tx.send((revision.to_owned(), count)).unwrap();
+                    },
+                )
+            })
+            .await
+        });
+        written_rx.await.unwrap();
+        // The worker already committed under the mutation gate. Reclaim
+        // aborts its async waiter but must not split write from notification.
+        active.store(false, Ordering::Release);
+        forwarder.abort();
+        assert!(forwarder.await.unwrap_err().is_cancelled());
+        let (baseline_tx, mut baseline_rx) = tokio::sync::oneshot::channel();
+        let baseline_store = store.clone();
+        let baseline_id = id.clone();
+        let reader = tokio::task::spawn_blocking(move || {
+            baseline_tx
+                .send(baseline_store.load_for_engine_spawn(&baseline_id).unwrap())
+                .unwrap();
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut baseline_rx)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        let marker = notified_rx.await.unwrap();
+        let baseline = baseline_rx.await.unwrap();
+        reader.await.unwrap();
+        assert_eq!(
+            marker,
+            (transcript_revision(&messages).unwrap(), messages.len())
+        );
+        assert_ne!(marker.0, terminal_revision);
+        assert_eq!(baseline.messages, messages);
+        assert_eq!(store.load(&id).unwrap().messages, messages);
+        // The same strict equality the frontend uses now succeeds.
+        assert_eq!(marker.0, transcript_revision(&baseline.messages).unwrap());
+
+        // The replacement's later turn must survive a queued old snapshot.
+        let mut replacement_messages = messages.clone();
+        replacement_messages.push(message("user", "synthetic next task"));
+        let replacement_revision = store
+            .compare_and_swap_messages(&id, &marker.0, replacement_messages.clone())
+            .unwrap();
+        let stale = ChatEngineState {
+            messages,
+            system_prompt: None,
+            model: "/model".into(),
+            workspace: tmp.path().into(),
+        };
+        assert!(
+            persist_chat_snapshot(&store, &id, &stale, &active, |_, _, _| panic!(
+                "retired writer emitted"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(store.load(&id).unwrap().messages, replacement_messages);
+        // The revision check refuses a stale CAS before the overwrite guard
+        // runs; a CAS at the current revision that drops every message must
+        // be refused by the truncating-overwrite guard itself.
+        assert!(
+            store
+                .compare_and_swap_messages(&id, &marker.0, vec![])
+                .is_err()
+        );
+        assert!(
+            store
+                .compare_and_swap_messages(&id, &replacement_revision, vec![])
+                .is_err()
+        );
+        assert_eq!(
+            transcript_revision(&store.load(&id).unwrap().messages).unwrap(),
+            replacement_revision
+        );
+    }
+
+    #[test]
+    fn display_fallback_publishes_in_transaction_and_refuses_retired_writers() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK held.
+        unsafe { std::env::set_var("PINVOU3_HOME", tmp.path()) };
+        let store = SessionStore::boot_with_scheduled_root(tmp.path().join("scheduled")).unwrap();
+        let session = store
+            .create_new("/model".into(), None, tmp.path().into())
+            .unwrap();
+        let id = session.metadata.id;
+        let messages = vec![
+            message("user", "synthetic task"),
+            message("assistant", "synthetic answer"),
+        ];
+        store.update_messages(&id, messages.clone()).unwrap();
+        let baseline = transcript_revision(&messages).unwrap();
+
+        // Retired before admission: nothing persists, nothing notifies.
+        assert!(
+            persist_admitted_display_snapshot(
+                &store,
+                &id,
+                &baseline,
+                message("user", "synthetic next task"),
+                false,
+                &AtomicBool::new(false),
+                |_, _, _| panic!("retired fallback writer emitted"),
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(store.load(&id).unwrap().messages, messages);
+
+        // Admitted: the write and its marker land together.
+        let mut marker = None;
+        let (saved, revision) = persist_admitted_display_snapshot(
+            &store,
+            &id,
+            &baseline,
+            message("user", "synthetic next task"),
+            false,
+            &AtomicBool::new(true),
+            |revision, count, _context_updates_total| marker = Some((revision.to_owned(), count)),
+        )
+        .unwrap()
+        .unwrap();
+        let mut appended = messages.clone();
+        appended.push(message("user", "synthetic next task"));
+        let appended_revision = transcript_revision(&appended).unwrap();
+        assert_eq!(saved.messages, appended);
+        assert_eq!(revision.as_deref(), Some(appended_revision.as_str()));
+        assert_eq!(marker, Some((appended_revision.clone(), appended.len())));
+        assert_eq!(store.load(&id).unwrap().messages, appended);
+
+        // A stale baseline is a no-op that still publishes the durable
+        // revision, so the caller only ever learns the revision on disk.
+        let mut marker = None;
+        let (_, revision) = persist_admitted_display_snapshot(
+            &store,
+            &id,
+            &baseline,
+            message("user", "synthetic stale task"),
+            false,
+            &AtomicBool::new(true),
+            |revision, count, _context_updates_total| marker = Some((revision.to_owned(), count)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revision.as_deref(), Some(appended_revision.as_str()));
+        assert_eq!(marker, Some((appended_revision, appended.len())));
+        assert_eq!(store.load(&id).unwrap().messages, appended);
+    }
+
+    /// The committed callback's context_update total must come from the
+    /// persisted messages via `count_context_updates` — zeroing the pass-through
+    /// (or dropping it from a persist arm) would silently blind the frontend's
+    /// authoritative resync while every unit test of the counter itself stays
+    /// green (review r2 M1 wiring pin).
+    #[test]
+    fn persist_snapshot_forwards_context_update_total() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK held.
+        unsafe { std::env::set_var("PINVOU3_HOME", tmp.path()) };
+        let store = SessionStore::boot_with_scheduled_root(tmp.path().join("scheduled")).unwrap();
+        let session = store
+            .create_new("/model".into(), None, tmp.path().into())
+            .unwrap();
+        let id = session.metadata.id;
+        let drift = "<context_update>\nSession context changed since it was pinned; the pinned system prompt is unchanged. Delta (+ added, - removed):\n- stale line\n</context_update>";
+        let messages = vec![
+            message("user", "synthetic task"),
+            message("user", drift),
+            message("assistant", "synthetic answer"),
+        ];
+        store.update_messages(&id, messages.clone()).unwrap();
+        let active = AtomicBool::new(true);
+        let state = ChatEngineState {
+            messages,
+            system_prompt: None,
+            model: "/model".into(),
+            workspace: tmp.path().into(),
+        };
+        let mut observed = None;
+        persist_chat_snapshot(
+            &store,
+            &id,
+            &state,
+            &active,
+            |revision, count, context_updates_total| {
+                observed = Some((revision.to_owned(), count, context_updates_total));
+            },
+        )
+        .unwrap()
+        .expect("persist succeeds");
+        let (revision, count, total) = observed.expect("committed callback must fire");
+        assert_eq!(count, 3);
+        assert_eq!(total, 1, "exactly the canonical drift delta must count");
+        assert!(!revision.is_empty());
+        // A transcript without a drift delta reports zero — the counter is the
+        // canonical-shape count, not a message tally.
+        let plain = ChatEngineState {
+            messages: vec![message("user", "synthetic task")],
+            system_prompt: None,
+            model: "/model".into(),
+            workspace: tmp.path().into(),
+        };
+        let mut plain_total = None;
+        persist_chat_snapshot(
+            &store,
+            &id,
+            &plain,
+            &active,
+            |_, _, context_updates_total| {
+                plain_total = Some(context_updates_total);
+            },
+        )
+        .unwrap()
+        .expect("plain persist succeeds");
+        assert_eq!(plain_total, Some(0));
+    }
+
+    /// Every `emit_transcript_committed` call site must forward the computed
+    /// `context_updates_total` rather than discard it: the frontend's
+    /// authoritative resync trusts that field, and an arm that renames the
+    /// callback parameter to `_...` / emits a literal 0 blinds the resync for
+    /// that arm's commits while every counter unit test stays green (r8:
+    /// mutation-proven unpinned for three of the five arms; the helper-level
+    /// pin above only covers `persist_chat_snapshot` itself). Anchored on the
+    /// per-arm origin string (unique in production source) with a window that
+    /// must carry the parameter name as the emitted argument.
+    fn assert_commit_arm_forwards_total(source: &str, origin: &str, label: &str) {
+        let mut cursor = 0;
+        let mut arms = 0;
+        while let Some(found) = source[cursor..].find(origin) {
+            let start = cursor + found;
+            let window_end = (start + origin.len() + 400).min(source.len());
+            let window = &source[start..window_end];
+            assert!(
+                // 两种合法转发形态：闭包参数直传（`context_updates_total,`）
+                // 或原地重算（`count_context_updates(...)`，reclaimed 臂）。
+                window.contains("context_updates_total,")
+                    || window.contains("count_context_updates("),
+                "{label}: the {origin} commit arm must forward the computed context_updates_total"
+            );
+            assert!(
+                !window.contains("_context_updates_total"),
+                "{label}: the {origin} commit arm must not discard the total into an ignored parameter"
+            );
+            assert!(
+                !window.contains("context_updates_total: 0"),
+                "{label}: the {origin} commit arm must not emit a hardcoded zero total"
+            );
+            arms += 1;
+            cursor = start + origin.len();
+        }
+        assert!(
+            arms > 0,
+            "{label}: expected at least one {origin} commit arm"
+        );
+    }
+
+    #[test]
+    fn all_transcript_commit_arms_forward_the_computed_total() {
+        // Forwarder: slice at the first test module (the anchors below also
+        // appear in this test module's own string literals, and the guard must
+        // bite on the real emit sites only). Engine: searched whole — its
+        // first cfg(test) block sits BEFORE the reclaimed-fallback arm, and the
+        // origin literal is unique to the production emit site.
+        let forwarder = include_str!("forwarder.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        let engine = include_str!("engine.rs");
+        // mid-turn engine_state_update arm + both terminal_fallback persist
+        // callbacks + the terminal cache-hit re-emit all carry the same origin
+        // string in forwarder.rs; the reclaimed-fallback arm lives in engine.rs.
+        // Anchors include the emit-literal quote+comma so prose comments that
+        // mention the origin name are not mistaken for arms.
+        assert_commit_arm_forwards_total(forwarder, "\"engine_state_update\",", "forwarder");
+        assert_commit_arm_forwards_total(forwarder, "\"terminal_fallback\",", "forwarder");
+        assert_commit_arm_forwards_total(engine, "\"reclaimed_fallback\",", "engine");
+    }
+
+    #[test]
+    fn failed_runtime_snapshot_does_not_publish_a_commit() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: ENV_LOCK held.
+        unsafe { std::env::set_var("PINVOU3_HOME", tmp.path()) };
+        let store = SessionStore::boot_with_scheduled_root(tmp.path().join("scheduled")).unwrap();
+        let state = ChatEngineState {
+            messages: vec![],
+            system_prompt: None,
+            model: "/model".into(),
+            workspace: tmp.path().into(),
+        };
+        assert!(
+            persist_chat_snapshot(
+                &store,
+                "missing",
+                &state,
+                &AtomicBool::new(true),
+                |_, _, _| panic!("failed writer emitted")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod transcript_persist_pins {
+    //! The forwarder is the only place the engine's writer flag reaches the
+    //! save arms, and `transcript_commit_tests` drives the persist helpers
+    //! directly with their own flags — a regression that hands an arm a
+    //! fresh always-true atomic would ship green. Pin the plumbing instead.
+
+    /// The production `spawn_event_forwarder` body with line comments
+    /// stripped first, then closed `/* … */` spans removed with
+    /// nesting-depth tracking (newline count preserved; an unterminated
+    /// `/*` is kept verbatim), so prose that mentions a needle verbatim
+    /// cannot satisfy a pin in either comment kind.
+    pub(super) fn forwarder_body() -> String {
+        forwarder_body_from_src(include_str!("forwarder.rs"))
+    }
+
+    /// [`forwarder_body`] against a caller-supplied source, so the strip
+    /// caliber itself is testable against mutated sources.
+    fn forwarder_body_from_src(src: &str) -> String {
+        let signature = "pub(crate) fn spawn_event_forwarder(";
+        let start = src.find(signature).expect("the forwarder fn must exist");
+        let rest = &src[start + signature.len()..];
+        let end = ["\nfn ", "\npub(crate) fn ", "\npub fn ", "\n#[cfg(test)]"]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .map_or(src.len(), |offset| start + signature.len() + offset);
+        let without_line_comments = src[start..end]
+            .split('\n')
+            .map(|line| {
+                line.split("//")
+                    .next()
+                    .expect("split always yields one item")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        strip_block_comments(&without_line_comments)
+    }
+
+    /// Newline-preserving removal of closed `/* … */` spans, tracking
+    /// nesting depth: Rust block comments nest, so a span's balancing
+    /// close is the `*/` that returns the depth to zero, not the first
+    /// `*/` seen (review JensenChen28 4525154638, same scanner class as
+    /// the shared `comment_filtered`). Runs after the line-comment pass,
+    /// so a `//`-commented-out `/*` marker cannot make this eat live
+    /// code; the needle set of every pin below lives in code, never in a
+    /// block comment.
+    fn strip_block_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let mut rest = src;
+        while let Some(open) = rest.find("/*") {
+            let after_open = &rest[open + 2..];
+            let mut depth = 1usize;
+            let mut scan = 0usize;
+            let mut close_end = None;
+            while depth > 0 {
+                let next_open = after_open[scan..].find("/*").map(|rel| scan + rel);
+                let next_close = after_open[scan..].find("*/").map(|rel| scan + rel);
+                match (next_open, next_close) {
+                    (Some(open_at), Some(close_at)) if open_at < close_at => {
+                        depth += 1;
+                        scan = open_at + 2;
+                    }
+                    (_, Some(close_at)) => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close_end = Some(close_at + 2);
+                        } else {
+                            scan = close_at + 2;
+                        }
+                    }
+                    (Some(open_at), None) => {
+                        depth += 1;
+                        scan = open_at + 2;
+                    }
+                    (None, None) => break,
+                }
+            }
+            match close_end {
+                Some(end) => {
+                    out.push_str(&rest[..open]);
+                    let inner = &after_open[..end - 2];
+                    for _ in 0..inner.matches('\n').count() {
+                        out.push('\n');
+                    }
+                    rest = &after_open[end..];
+                }
+                None => {
+                    // Unterminated block: keep it verbatim, scan past the marker.
+                    out.push_str(&rest[..open + 2]);
+                    rest = after_open;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn every_save_arm_moves_a_clone_of_the_engine_writer_flag() {
+        let body = forwarder_body();
+        assert!(
+            body.contains("transcript_writer_active: Arc<AtomicBool>,"),
+            "the forwarder must take the engine's writer flag"
+        );
+        // Mid-turn engine snapshot, terminal engine snapshot, and the
+        // admission fallback each clone the parameter — never a fresh atomic.
+        assert_eq!(
+            body.matches("let writer_for_save = transcript_writer_active.clone();")
+                .count(),
+            3,
+            "every save arm must clone the engine's writer flag"
+        );
+        assert_eq!(
+            body.matches("&writer_for_save,").count(),
+            3,
+            "every save arm must hand its clone to the persist helper"
+        );
+        assert_eq!(
+            body.matches("persist_chat_snapshot(").count(),
+            2,
+            "both engine snapshot arms must persist through persist_chat_snapshot"
+        );
+        assert_eq!(
+            body.matches("persist_admitted_display_snapshot(").count(),
+            1,
+            "the admission fallback must persist through persist_admitted_display_snapshot"
+        );
+        assert!(
+            !body.contains("AtomicBool::new("),
+            "no save arm may mint its own writer flag"
+        );
+        assert!(
+            !body.contains(".persist_admitted_chat_display(")
+                && !body.contains(".persist_chat_engine_state"),
+            "the forwarder must not bypass the commit-callback helpers"
+        );
+    }
+
+    #[test]
+    fn nested_block_commented_forwarder_body_keeps_no_needle_alive() {
+        // Nesting depth (review JensenChen28 4525154638, same scanner class
+        // as the shared comment_filtered): Rust block comments nest, so the
+        // first `*/` must not close the outer span — a compiling mutation
+        // wrapping the persist plumbing in an outer comment with an inner
+        // `/* … */` would otherwise keep the needle alive past the inner
+        // close.
+        let mutated = "pub(crate) fn spawn_event_forwarder(\n    transcript_writer_active: Arc<AtomicBool>,\n) {\n    /* outer\n    /* inner */\n    let writer_for_save = transcript_writer_active.clone();\n    */\n}\n\n#[cfg(test)]";
+        let body = forwarder_body_from_src(mutated);
+        assert!(
+            !body.contains("let writer_for_save = transcript_writer_active.clone();"),
+            "a needle behind a nested block-comment span must be removed",
+        );
+        assert!(
+            !body.contains("*/"),
+            "the balancing close must be consumed with the span",
+        );
+    }
+
+    #[test]
+    fn engine_usage_wiring_feeds_self_metrics_once() {
+        // 监控 TTFT/TPS 的引擎计时接线只有这一处。self_metrics 的单元测试只覆盖
+        // 累加器本体——换位突变(request_ms 当 ttft)或删掉整行调用都让它们全绿,
+        // 故在此钉死调用形状(参数顺序 = 引擎字段顺序 + per-call 输出 tokens)。
+        // 去空白后匹配且不依赖尾逗号:rustfmt 把超宽调用折成多行,或将来折回
+        // 单行(尾逗号消失)都不影响判定。
+        let body = forwarder_body();
+        let flattened: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            flattened
+                .matches(
+                    "m.on_engine_usage(&session_id,first_token_ms,request_ms,usage.output_tokens"
+                )
+                .count(),
+            1,
+            "TurnUsage must feed SelfMetrics exactly once, args in engine field order + per-call output_tokens"
+        );
+    }
+}
+
+#[cfg(test)]
+mod usage_occupancy_pins {
+    //! The chat page's usage meter receives `chat:usage` exactly once per
+    //! turn (TurnComplete), and its cumulative-input guard skips that event
+    //! on every tool-using turn. The per-request `context_input_tokens`
+    //! field is therefore the only live occupancy source, so its plumbing —
+    //! tracker refresh on TurnUsage, reset on TurnStarted, payload emission
+    //! on TurnComplete — is pinned here (same source-pin approach as the
+    //! other forwarder wiring pins above; no test drives the event loop,
+    //! and the comment stripper keeps prose mentions from satisfying a
+    //! needle).
+
+    #[test]
+    fn turn_usage_tracks_the_freshest_reported_parent_input() {
+        let flattened: String = super::transcript_persist_pins::forwarder_body()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flattened
+                .matches(
+                    "ifusage.input_tokens>0&&request_ms.is_some(){latest_reported_input_tokens=Some(usage.input_tokens);}"
+                )
+                .count(),
+            1,
+            "TurnUsage must refresh the occupancy tracker exactly once, gated to parent requests (`request_ms` is Some) and zero-guarded so an unreported call cannot clobber an earlier value"
+        );
+        // The TurnStarted arm owns the reset: a turn whose provider never
+        // reported usage must emit a null field, not the previous turn's
+        // value. The arm-scoped count alone cannot see a reset drifting into
+        // ANOTHER arm, so first pin the whole-body count, then scope it to
+        // exactly the TurnStarted arm (same arm-boundary caliber as
+        // input_notification_pins).
+        let reset = "latest_reported_input_tokens=None;";
+        assert_eq!(
+            flattened.matches(reset).count(),
+            1,
+            "the occupancy reset must exist exactly once in the whole forwarder body (a second reset anywhere is a semantics change)"
+        );
+        let arm_marker = "Event::TurnStarted{";
+        let arm_start = flattened
+            .find(arm_marker)
+            .expect("the TurnStarted arm must exist");
+        let body_at = arm_start + arm_marker.len();
+        let arm_end = flattened[body_at..]
+            .find("Event::")
+            .map_or(flattened.len(), |offset| body_at + offset);
+        assert_eq!(
+            flattened[arm_start..arm_end].matches(reset).count(),
+            1,
+            "exactly the TurnStarted arm may reset the occupancy tracker"
+        );
+    }
+
+    #[test]
+    fn turn_complete_payload_carries_the_occupancy_field_without_touching_billing() {
+        let flattened: String = super::transcript_persist_pins::forwarder_body()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            flattened
+                .matches(r#""context_input_tokens":latest_reported_input_tokens,"#)
+                .count(),
+            1,
+            "chat:usage must carry the per-request occupancy exactly once, sourced from the tracker"
+        );
+        // The billing aggregate keeps feeding self_metrics: swapping it for
+        // the tracker would silently reshape scheduled-run totals and remote
+        // stats (turn.usage stays the summed billing view everywhere else).
+        assert!(
+            flattened.contains("m.on_turn_complete(&session_id,usage.input_tokens"),
+            "self_metrics must keep consuming the billing aggregate, not the occupancy tracker"
+        );
+    }
+}
+
+#[cfg(test)]
+mod input_notification_pins {
+    //! The input-needed desktop notification rides the interactive
+    //! `UserInputRequired` arm only. Deleting the call leaves every suite
+    //! green (`dead_code` is allowed and no test drives the forwarder's
+    //! event loop), so the wiring shape is pinned here — same reasoning as
+    //! `transcript_persist_pins` above, reusing its comment-stripped fn-body
+    //! extraction (test code is cut off, so the pin cannot match itself).
+
+    #[test]
+    fn interactive_input_arm_fires_the_desktop_notification_once() {
+        // Match after comment-stripping and whitespace removal: prose mentions
+        // of the call shape must not satisfy the pin, and rustfmt wrapping must
+        // not matter (same approach as engine_usage_wiring_feeds_self_metrics_once).
+        let flattened: String = super::transcript_persist_pins::forwarder_body()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let call = "engine_support::maybe_notify_input_needed(";
+        assert_eq!(
+            flattened.matches(call).count(),
+            1,
+            "exactly the interactive UserInputRequired arm must fire the input-needed notification"
+        );
+        let call_at = flattened.find(call).expect("count above proves presence");
+        // Argument order is semantics: (&app, &session_id, &id) — keys are
+        // filed as (session, input), and swapping arguments would silently
+        // lose the per-session dedup pruning. Matched after whitespace
+        // removal, without relying on a trailing comma: rustfmt wrapping or
+        // collapsing to one line (which drops the trailing comma) must not
+        // change the verdict.
+        let after_args = &flattened[call_at + call.len()..];
+        assert!(
+            after_args.starts_with("&app,&session_id,&id,)")
+                || after_args.starts_with("&app,&session_id,&id)"),
+            "the wiring must pass (&app, &session_id, &id) — argument order is the dedup semantics",
+        );
+        let arm_start = flattened[..call_at]
+            .rfind("Event::UserInputRequired")
+            .expect("the notification call must live inside the UserInputRequired arm");
+        let arm_end = flattened[call_at..]
+            .find("Event::")
+            .map_or(flattened.len(), |offset| call_at + offset);
+        let arm = &flattened[arm_start..arm_end];
+        // The unattended leg cancels the input first; the attended leg emits
+        // first and notifies second: the two legs are mutually exclusive, and
+        // the notification must not fall into the unattended leg (an order
+        // swap turns this pin red).
+        let cancel_at = arm
+            .find("cancel_user_input(")
+            .expect("the unattended leg must cancel the parked input");
+        let emit_at = arm
+            .find(r#"emit("chat:user_input_required""#)
+            .expect("the attended leg must emit to the frontend");
+        let call_in_arm = call_at - arm_start;
+        assert!(
+            cancel_at < emit_at && emit_at < call_in_arm,
+            "the unattended cancel must precede the attended emit, and the notification must follow it inside the same arm"
+        );
+    }
+}
+
+#[cfg(test)]
+mod mcp_boot_persistence_tests {
+    use super::{mcp_boot_failure_details, mcp_boot_persistence, mcp_boot_summary_detail};
+    use deepseek_tui::mcp::{McpManagerSnapshot, McpServerCapabilityMetadata, McpServerSnapshot};
+
+    fn server(
+        name: &str,
+        enabled: bool,
+        connected: bool,
+        error: Option<&str>,
+    ) -> McpServerSnapshot {
+        McpServerSnapshot {
+            name: name.to_string(),
+            enabled,
+            required: false,
+            transport: "stdio".to_string(),
+            command_or_url: format!("/usr/bin/{name}"),
+            connect_timeout: 10,
+            execute_timeout: 60,
+            read_timeout: 30,
+            connected,
+            error: error.map(str::to_string),
+            auth_required: false,
+            capability_metadata: McpServerCapabilityMetadata::NotObserved,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            prompts: Vec::new(),
+        }
+    }
+
+    fn snapshot(servers: Vec<McpServerSnapshot>) -> McpManagerSnapshot {
+        McpManagerSnapshot {
+            config_path: std::path::PathBuf::from("/tmp/mcp.json"),
+            config_exists: true,
+            reload_required: false,
+            servers,
+        }
+    }
+
+    #[test]
+    fn failed_servers_are_listed_with_engine_reported_reasons() {
+        let snap = snapshot(vec![
+            server("fs", true, true, None),
+            server("git", true, false, Some("connection refused")),
+        ]);
+        assert_eq!(
+            mcp_boot_failure_details("sess-1", 7, &snap),
+            vec!["sid=sess-1 generation=7 server=git error=connection refused"]
+        );
+    }
+
+    #[test]
+    fn enabled_server_without_error_text_is_reported_as_unknown() {
+        let snap = snapshot(vec![server("search", true, false, None)]);
+        assert_eq!(
+            mcp_boot_failure_details("sess-1", 3, &snap),
+            vec!["sid=sess-1 generation=3 server=search error=unknown"]
+        );
+    }
+
+    #[test]
+    fn connected_and_disabled_servers_are_not_boot_failures() {
+        let snap = snapshot(vec![
+            server("fs", true, true, None),
+            server("off", false, false, Some("disabled")),
+        ]);
+        assert!(mcp_boot_failure_details("sess-1", 1, &snap).is_empty());
+    }
+
+    #[test]
+    fn summary_detail_counts_enabled_and_failed_servers() {
+        assert_eq!(
+            mcp_boot_summary_detail("sess-1", 9, 5, 2),
+            "sid=sess-1 generation=9 servers=5 failed=2"
+        );
+    }
+
+    #[test]
+    fn auth_required_failures_are_flagged_as_needing_login() {
+        let mut pending = server("git", true, false, Some("oauth pending"));
+        pending.auth_required = true;
+        let snap = snapshot(vec![pending]);
+        assert_eq!(
+            mcp_boot_failure_details("sess-1", 4, &snap),
+            vec!["sid=sess-1 generation=4 server=git auth_required=true error=oauth pending"]
+        );
+    }
+
+    #[test]
+    fn only_terminal_boots_with_failures_are_persisted() {
+        let failed = snapshot(vec![server("git", true, false, Some("connection refused"))]);
+        let healthy = snapshot(vec![server("fs", true, true, None)]);
+        let mut last = None;
+
+        // Progress receipts and finished healthy boots are not persisted.
+        assert_eq!(
+            mcp_boot_persistence("sess-1", 1, false, &failed, &mut last),
+            None
+        );
+        assert_eq!(
+            mcp_boot_persistence("sess-1", 2, true, &healthy, &mut last),
+            None
+        );
+
+        // A finished boot with failures persists one summary + one line per failure.
+        let (summary, details) = mcp_boot_persistence("sess-1", 3, true, &failed, &mut last)
+            .expect("terminal failure must persist");
+        assert_eq!(summary, "sid=sess-1 generation=3 servers=1 failed=1");
+        assert_eq!(
+            details,
+            vec!["sid=sess-1 generation=3 server=git error=connection refused"]
+        );
+    }
+
+    #[test]
+    fn a_changed_failure_set_persists_again() {
+        let failed = snapshot(vec![server("git", true, false, Some("connection refused"))]);
+        let mut pending = server("git", true, false, Some("oauth pending"));
+        pending.auth_required = true;
+        let mut last = None;
+        assert!(mcp_boot_persistence("sess-1", 1, true, &failed, &mut last).is_some());
+        // Different server set, auth flag, or error text is a state change.
+        assert!(mcp_boot_persistence("sess-1", 2, true, &failed, &mut last).is_none());
+        assert!(
+            mcp_boot_persistence("sess-1", 3, true, &snapshot(vec![pending]), &mut last).is_some()
+        );
+    }
+
+    #[test]
+    fn recovery_resets_the_dedupe_memory() {
+        let failed = snapshot(vec![server("git", true, false, Some("connection refused"))]);
+        let healthy = snapshot(vec![server("git", true, true, None)]);
+        let mut last = None;
+        assert!(mcp_boot_persistence("sess-1", 1, true, &failed, &mut last).is_some());
+        assert_eq!(
+            mcp_boot_persistence("sess-1", 2, true, &healthy, &mut last),
+            None
+        );
+        assert!(last.is_none(), "a healthy boot must reset the memory");
+        // A re-failure after recovery is a state change and persists again.
+        assert!(mcp_boot_persistence("sess-1", 3, true, &failed, &mut last).is_some());
+    }
+
+    #[test]
+    fn summary_denominator_counts_only_enabled_servers() {
+        let snap = snapshot(vec![
+            server("fs", true, true, None),
+            server("git", true, false, Some("connection refused")),
+            server("off1", false, false, Some("disabled")),
+            server("off2", false, false, Some("disabled")),
+        ]);
+        let mut last = None;
+        let (summary, details) = mcp_boot_persistence("sess-1", 5, true, &snap, &mut last)
+            .expect("failure must persist");
+        assert_eq!(
+            summary, "sid=sess-1 generation=5 servers=2 failed=1",
+            "disabled servers are configuration, not boot participants"
+        );
+        assert_eq!(details.len(), 1);
+    }
+
+    #[test]
+    fn identical_failure_set_in_different_order_persists_once() {
+        let mut alpha = server("alpha", true, false, Some("down"));
+        alpha.auth_required = true;
+        let beta = server("beta", true, false, Some("port changed"));
+        // The engine's snapshot iterates a HashMap, so a config swap can hand
+        // back the same failure set in a different order.
+        let first = snapshot(vec![alpha.clone(), beta.clone()]);
+        let second = snapshot(vec![beta, alpha]);
+        let mut last = None;
+        assert!(mcp_boot_persistence("sess-1", 1, true, &first, &mut last).is_some());
+        assert!(
+            mcp_boot_persistence("sess-1", 2, true, &second, &mut last).is_none(),
+            "an order-only change must not re-persist"
+        );
+    }
+
+    /// The arm's body, driven end to end: a terminal failure receipt must land in
+    /// the real `startup.log` (summary + per-server lines), and a repeated receipt
+    /// must add nothing. The test calls the arm's body (`record_mcp_session_boot`)
+    /// with real `Event::McpSessionBoot` values, so swapping the decision, the
+    /// persistence glue, or the event destructuring/forwarding — or breaking the
+    /// hand-off between them — turns this red. The only wiring outside its reach
+    /// is the one-line `match` arm that hands the event to that function.
+    #[test]
+    fn mcp_boot_receipt_persists_through_the_startup_timeline() {
+        use crate::platform::paths::tests::{ENV_LOCK, EnvVarGuard, unique_suffix};
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Restores the host's PINVOU3_HOME (present or absent) on drop, panic paths included.
+        let _env = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-fwd-timeline-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: holding platform::paths::tests::ENV_LOCK; env writes serialized in-process.
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+        crate::platform::startup::init();
+        let log_path = tmp.join("logs").join("startup.log");
+
+        let boot_event = |generation: u64| {
+            let snap = snapshot(vec![
+                server("fs", true, true, None),
+                server("git", true, false, Some("connection refused")),
+                server("off", false, false, Some("disabled")),
+            ]);
+            deepseek_tui::core::events::Event::McpSessionBoot {
+                generation,
+                snapshot: snap,
+                connecting: Vec::new(),
+                finished: true,
+            }
+        };
+        let mut last = None;
+        super::record_mcp_session_boot("sess-tl", &boot_event(4), &mut last);
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log.contains("mcp_session_boot:finished | sid=sess-tl generation=4 servers=2 failed=1"),
+            "summary line missing from the timeline: {log}"
+        );
+        assert!(
+            log.contains("mcp_session_boot:server_failed | sid=sess-tl generation=4 server=git error=connection refused"),
+            "failure line missing from the timeline: {log}"
+        );
+
+        // The dedupe contract holds through the real sink: a repeat writes nothing.
+        let before = std::fs::read(&log_path).unwrap();
+        super::record_mcp_session_boot("sess-tl", &boot_event(5), &mut last);
+        assert_eq!(std::fs::read(&log_path).unwrap(), before);
+    }
+}

@@ -1,0 +1,349 @@
+use std::fmt;
+
+pub(crate) const GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS: &[&str] = &[
+    "read",
+    "list_dir",
+    "file_search",
+    "grep_files",
+    "Web",
+    "image_analyze",
+];
+
+pub(crate) const GAIA_OFFLINE_V1_ALLOWED_TOOLS: &[&str] =
+    &["read", "list_dir", "file_search", "grep_files"];
+
+/// The headless read-only-web face: the same 6 tools as the GAIA public-web
+/// policy. Deliberately NOT named "product" — the real product surface is
+/// `tool_policy::PINVOU3_ALLOWED_TOOLS`; a headless task that wants the full
+/// product face passes no eval policy at all (see `product_runtime::mod`).
+pub(crate) const PRODUCT_V1_ALLOWED_TOOLS: &[&str] = GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EvalToolPolicy {
+    ProductV1,
+    GaiaPublicWebV1,
+    GaiaOfflineV1,
+    GaiaFinalAnswerOnlyV1,
+}
+
+impl EvalToolPolicy {
+    pub(crate) fn allows(self, tool: &str) -> bool {
+        match self {
+            Self::ProductV1 => PRODUCT_V1_ALLOWED_TOOLS.contains(&tool),
+            Self::GaiaPublicWebV1 => GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS.contains(&tool),
+            Self::GaiaOfflineV1 => GAIA_OFFLINE_V1_ALLOWED_TOOLS.contains(&tool),
+            Self::GaiaFinalAnswerOnlyV1 => false,
+        }
+    }
+
+    pub(crate) fn model_reminder(self) -> &'static str {
+        match self {
+            Self::ProductV1 => {
+                "<system-reminder>Evaluation tool contract: answer directly without tools by default. The only callable tools are exactly `read`, `list_dir`, `file_search`, `grep_files`, `Web`, and `image_analyze`; never invent or call weather, date, time, browser, web_search, fetch_url, read_file, `File`, or other tool names. Use `Web` only when the question requires current or external public information. In that case, make exactly one `Web` call promptly, with `action: \"search\"` and a concise `query`; use its result to answer and do not perform follow-up Web calls. Never call a file tool unless the user message includes an attachment; copy the exact attachment path shown in the message. Every `Web` call must include the `action` field. If a tool fails, do not retry it; always produce a concise final answer from available evidence and state the limitation.</system-reminder>"
+            }
+            Self::GaiaPublicWebV1 => {
+                "<system-reminder>GAIA evaluation tool contract: answer directly without tools when the answer is already known. The only callable tools are exactly `read`, `list_dir`, `file_search`, `grep_files`, `Web`, and `image_analyze`; never invent or call weather, date, time, browser, web_search, fetch_url, read_file, `File`, or other tool names. For public evidence, use `Web` with `action: \"search\"` and a concise `query`; use `action: \"fetch\"` with a result URL when the source page must be inspected. Every JSONPath in Web `fields` must start with `$`. If fetch reports JavaScript-only or unreadable content, search for the exact page title or an alternate authoritative source instead of retrying the same URL. Multiple Web calls are allowed when a task genuinely requires multi-step research; stop as soon as the evidence determines the answer. Do not repeat an unchanged failed call. Never call a file tool unless the user message includes an attachment, and copy the exact attachment path shown in the user message instead of guessing a basename or `/dev/stdin`. Every `Web` call must include the `action` field. Always finish with a concise final answer and state any evidence limitation.</system-reminder>"
+            }
+            Self::GaiaOfflineV1 => {
+                "<system-reminder>Evaluation tool contract: the only callable tools are exactly `read`, `list_dir`, `file_search`, and `grep_files`. Never invent or call `File`, read_file, browser, web, search, date, time, or other tool names. Use a file tool only when the user message includes an attachment, and copy the exact attachment path shown in the message. Do not retry an unchanged failed call.</system-reminder>"
+            }
+            Self::GaiaFinalAnswerOnlyV1 => {
+                "<system-reminder>GAIA final-answer recovery: all tools are disabled. Do not request or describe a tool call. Use only evidence already present in the conversation. Respond with exactly one non-empty line in the form `FINAL ANSWER: <answer>` and no additional text.</system-reminder>"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvalTurnPolicy {
+    pub id: EvalToolPolicy,
+    pub allowed_tools: &'static [&'static str],
+}
+
+static GAIA_PUBLIC_WEB_V1: EvalTurnPolicy = EvalTurnPolicy {
+    id: EvalToolPolicy::GaiaPublicWebV1,
+    allowed_tools: GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS,
+};
+
+static PRODUCT_V1: EvalTurnPolicy = EvalTurnPolicy {
+    id: EvalToolPolicy::ProductV1,
+    allowed_tools: PRODUCT_V1_ALLOWED_TOOLS,
+};
+
+static GAIA_OFFLINE_V1: EvalTurnPolicy = EvalTurnPolicy {
+    id: EvalToolPolicy::GaiaOfflineV1,
+    allowed_tools: GAIA_OFFLINE_V1_ALLOWED_TOOLS,
+};
+
+static GAIA_FINAL_ANSWER_ONLY_V1: EvalTurnPolicy = EvalTurnPolicy {
+    id: EvalToolPolicy::GaiaFinalAnswerOnlyV1,
+    allowed_tools: &[],
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EvalToolPolicyError;
+
+impl EvalToolPolicyError {
+    pub(crate) const fn code(self) -> &'static str {
+        "unsupported_tool_policy"
+    }
+}
+
+impl fmt::Display for EvalToolPolicyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for EvalToolPolicyError {}
+
+pub(crate) fn resolve_eval_policy(
+    policy_id: &str,
+) -> Result<&'static EvalTurnPolicy, EvalToolPolicyError> {
+    match policy_id {
+        // Canonical id. The face is the 6-tool read-only web set, not the
+        // 28-tool product surface; the former "pinvou-product" name made
+        // benchmark scores read as product capability. The full-product
+        // equivalent is running without an eval policy.
+        "pinvou-read-only-web/v1" => Ok(&PRODUCT_V1),
+        // Deprecated alias: kept resolving so stored pinvou-cli smoke/resume
+        // state and older benchmark configs keep working. Do not new-use it.
+        "pinvou-product/v1" => Ok(&PRODUCT_V1),
+        "pinvou-gaia-public-web/v1" => Ok(&GAIA_PUBLIC_WEB_V1),
+        "pinvou-gaia-offline/v1" => Ok(&GAIA_OFFLINE_V1),
+        "pinvou-gaia-final-answer-only/v1" => Ok(&GAIA_FINAL_ANSWER_ONLY_V1),
+        _ => Err(EvalToolPolicyError),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EvalToolPolicy, GAIA_OFFLINE_V1_ALLOWED_TOOLS, GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS,
+        PRODUCT_V1_ALLOWED_TOOLS, resolve_eval_policy,
+    };
+    use crate::features::assistant::tool_policy::is_pinvou3_allowed;
+    use deepseek_tui::config::VisionModelConfig;
+    use deepseek_tui::tools::registry::ToolRegistryBuilder;
+    use deepseek_tui::tools::spec::ToolContext;
+    use std::collections::HashSet;
+
+    fn verified_product_catalog_snapshot() -> Vec<String> {
+        ToolRegistryBuilder::new()
+            .with_file_tools()
+            .with_search_tools()
+            .with_web_tools()
+            .with_vision_tools(
+                VisionModelConfig {
+                    model: "catalog-fixture".to_string(),
+                    api_key: None,
+                    base_url: None,
+                },
+                None,
+            )
+            .build(ToolContext::new(
+                std::env::temp_dir().join("pinvou-gaia-catalog-fixture"),
+            ))
+            .to_api_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
+    #[test]
+    fn resolves_registered_eval_profiles() {
+        assert_eq!(
+            resolve_eval_policy("pinvou-read-only-web/v1").unwrap().id,
+            EvalToolPolicy::ProductV1
+        );
+        // Deprecated alias must keep resolving to the same policy.
+        assert_eq!(
+            resolve_eval_policy("pinvou-product/v1").unwrap(),
+            resolve_eval_policy("pinvou-read-only-web/v1").unwrap()
+        );
+        assert_eq!(
+            resolve_eval_policy("pinvou-gaia-public-web/v1").unwrap().id,
+            EvalToolPolicy::GaiaPublicWebV1
+        );
+        assert_eq!(
+            resolve_eval_policy("pinvou-gaia-offline/v1").unwrap().id,
+            EvalToolPolicy::GaiaOfflineV1
+        );
+        assert_eq!(
+            resolve_eval_policy("pinvou-gaia-final-answer-only/v1")
+                .unwrap()
+                .id,
+            EvalToolPolicy::GaiaFinalAnswerOnlyV1
+        );
+        assert_eq!(
+            resolve_eval_policy("unknown/v1").unwrap_err().code(),
+            "unsupported_tool_policy"
+        );
+    }
+
+    #[test]
+    fn resolved_policy_fields_match_their_id_arms() {
+        // Production gating consumes `EvalTurnPolicy.allowed_tools` (the
+        // field) while the per-id contract lives in the enum arm; a static
+        // initializer that drifts from its id must fail here. Probes include
+        // tools no eval policy may allow ("File", "web_search").
+        const PROBES: [&str; 8] = [
+            "read",
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "Web",
+            "image_analyze",
+            "File",
+            "web_search",
+        ];
+        let policies = [
+            resolve_eval_policy("pinvou-read-only-web/v1").unwrap(),
+            resolve_eval_policy("pinvou-gaia-public-web/v1").unwrap(),
+            resolve_eval_policy("pinvou-gaia-offline/v1").unwrap(),
+            resolve_eval_policy("pinvou-gaia-final-answer-only/v1").unwrap(),
+        ];
+        for policy in policies {
+            for tool in PROBES {
+                assert_eq!(
+                    policy.allowed_tools.contains(&tool),
+                    policy.id.allows(tool),
+                    "{policy:?}: field and id arm disagree on {tool:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn profiles_have_exact_network_separation() {
+        let product = resolve_eval_policy("pinvou-read-only-web/v1").unwrap();
+        let public = resolve_eval_policy("pinvou-gaia-public-web/v1").unwrap();
+        let offline = resolve_eval_policy("pinvou-gaia-offline/v1").unwrap();
+
+        let final_only = resolve_eval_policy("pinvou-gaia-final-answer-only/v1").unwrap();
+        assert!(final_only.allowed_tools.is_empty());
+        assert!(!final_only.id.allows("read"));
+        assert!(product.id.allows("read"));
+        assert!(!product.id.allows("File"));
+        assert!(product.id.allows("Web"));
+        assert!(product.id.allows("image_analyze"));
+        assert!(public.id.allows("Web"));
+        assert!(!offline.id.allows("Web"));
+        assert!(!offline.id.allows("image_analyze"));
+        assert!(EvalToolPolicy::ProductV1.allows("Web"));
+        assert!(!EvalToolPolicy::ProductV1.allows("web_search"));
+        assert!(
+            EvalToolPolicy::ProductV1
+                .model_reminder()
+                .contains("make exactly one `Web` call promptly")
+        );
+        assert!(
+            EvalToolPolicy::GaiaPublicWebV1
+                .model_reminder()
+                .contains("Multiple Web calls are allowed")
+        );
+        assert!(
+            EvalToolPolicy::GaiaPublicWebV1
+                .model_reminder()
+                .contains("`action: \"fetch\"`")
+        );
+        assert!(
+            EvalToolPolicy::GaiaOfflineV1
+                .model_reminder()
+                .contains("only callable tools are exactly `read`")
+        );
+        assert!(
+            EvalToolPolicy::GaiaFinalAnswerOnlyV1
+                .model_reminder()
+                .contains("exactly one non-empty line")
+        );
+    }
+
+    /// The per-turn tool-call cap is gone everywhere (claim: benchmark-hooks
+    /// pin of 8, `PINVOU3_MAX_TOOL_CALLS`, eval arming, and the GAIA
+    /// reminder's 8-call sentence). The removal of the reminder sentence is
+    /// pinned as an ABSENCE here — the old presence-assert was deleted
+    /// without a replacement, so re-adding any call-budget wording to an
+    /// eval reminder would otherwise regress silently. "tool call" alone is
+    /// not forbidden wording: the final-answer policy legitimately says
+    /// "do not request or describe a tool call" (tools are disabled there,
+    /// no budget is involved).
+    #[test]
+    fn no_eval_model_reminder_couples_to_a_tool_call_budget() {
+        for policy in [
+            EvalToolPolicy::ProductV1,
+            EvalToolPolicy::GaiaPublicWebV1,
+            EvalToolPolicy::GaiaOfflineV1,
+            EvalToolPolicy::GaiaFinalAnswerOnlyV1,
+        ] {
+            let reminder = policy.model_reminder();
+            for forbidden in [
+                "never exceed 8 total tool calls",
+                "at most 8",
+                "no more than",
+                "call budget",
+                "tool-call budget",
+                "tool calls remaining",
+                "budget of",
+            ] {
+                assert!(
+                    !reminder.to_lowercase().contains(forbidden),
+                    "{policy:?} reminder must not couple to a per-turn tool-call budget \
+                     (found {forbidden:?}): {reminder}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn profile_snapshots_are_unique_and_exist_in_the_product_catalog() {
+        let catalog = verified_product_catalog_snapshot();
+
+        assert_eq!(
+            GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS,
+            &[
+                "read",
+                "list_dir",
+                "file_search",
+                "grep_files",
+                "Web",
+                "image_analyze"
+            ]
+        );
+        assert_eq!(
+            GAIA_OFFLINE_V1_ALLOWED_TOOLS,
+            &["read", "list_dir", "file_search", "grep_files"]
+        );
+        assert_eq!(PRODUCT_V1_ALLOWED_TOOLS, GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS);
+
+        for profile in [
+            PRODUCT_V1_ALLOWED_TOOLS,
+            GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS,
+            GAIA_OFFLINE_V1_ALLOWED_TOOLS,
+        ] {
+            assert_eq!(
+                profile.len(),
+                profile.iter().copied().collect::<HashSet<_>>().len()
+            );
+            for &name in profile {
+                assert_eq!(
+                    catalog
+                        .iter()
+                        .filter(|actual| actual.as_str() == name)
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        // The upstream read-only builder registers this compatibility helper.
+        // The product allowlist admits it (the spillover recovery footer
+        // teaches it by name), but the eval profiles stay exact read-only
+        // minimal surfaces: eval inputs are untrusted and a stored tool
+        // result must never become an eval-side retrieval channel.
+        assert!(is_pinvou3_allowed("retrieve_tool_result"));
+        assert!(!PRODUCT_V1_ALLOWED_TOOLS.contains(&"retrieve_tool_result"));
+        assert!(!GAIA_PUBLIC_WEB_V1_ALLOWED_TOOLS.contains(&"retrieve_tool_result"));
+        assert!(!GAIA_OFFLINE_V1_ALLOWED_TOOLS.contains(&"retrieve_tool_result"));
+    }
+}

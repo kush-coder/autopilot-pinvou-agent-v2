@@ -1,0 +1,236 @@
+//! 共享的推理 dialect 检测。
+//!
+//! Wave 3 合并：review 与 memory 此前各维护一份 reasoning-dialect 检测，
+//! 行为不等价（review 7 厂商簇 + 剥 `/v1`，memory 仅 2 簇 + model 回退）。
+//! 用户决策：以 review 覆盖面为准修正 memory 缺口。
+//!
+//! 此模块提供：
+//! - [`ReasoningDialect`]：统一的 dialect 枚举（含仅由 preset/provider 判定的
+//!   `VllmChatTemplate` 变体）
+//! - [`reasoning_dialect_from_base_url`]：URL 嗅探（7 厂商簇 + 剥 `/v1`）
+//! - [`kimi_supports_disabled_thinking`]：Kimi 模型门控
+//! - [`apply_reasoning_dialect_controls`]：按 dialect 写入请求体的共享 match
+//!
+//! feature wrapper（`memory_review_reasoning_dialect`，memory/voice 线）仍保留
+//! 自己的 preset 分发逻辑，URL 回退统一委托此模块。品悟审查线自 2026-11-06 起
+//! 改走 `features/review` 的 `apply_review_thinking_controls`（永不关闭口径），
+//! 不再经本模块。
+
+use serde_json::{Value, json};
+
+/// 推理 dialect 枚举。
+///
+/// `None / ThinkingDisabled / QwenEnableThinking / Minimax` 可由
+/// [`reasoning_dialect_from_base_url`] 从 URL 嗅探得出。
+///
+/// `VllmChatTemplate` 只能由调用方按 `provider`/`preset`（`vllm` / `tachyon` /
+/// `LocalVllm`）判定，永远不来自 URL 嗅探；它留在统一枚举里是为了让
+/// 各 feature 的 dispatch 直接返回本类型，免去各自的本地枚举与 `From` 转换。
+/// Tachyon（驭光）的 off 开关与 vLLM 逐字节相同（`enable_thinking=false`），
+/// 共用此变体。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningDialect {
+    None,
+    ThinkingDisabled,
+    QwenEnableThinking,
+    VllmChatTemplate,
+    Minimax,
+}
+
+/// Kimi 模型是否支持 disabled thinking。
+///
+/// kimi-k2.5 / kimi-k2.6 支持；thinking 变体和 k2.7 不支持。
+pub fn kimi_supports_disabled_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    (model.contains("kimi-k2.5") || model.contains("kimi-k2.6"))
+        && !model.contains("thinking")
+        && !model.contains("k2.7")
+}
+
+/// 从 base_url 嗅探 reasoning dialect（OpenAI-compatible 回退路径）。
+///
+/// 规范化：trim + 剥尾部 `/`、`/chat/completions`、`/v1`，再小写。
+/// 覆盖 7 个厂商簇：deepseek、dashscope(qwen)、moonshot(kimi)、volces/doubao、
+/// minimax、bigmodel/glm/z.ai、xiaomimimo(mimo)。
+pub fn reasoning_dialect_from_base_url(base_url: &str, model: &str) -> ReasoningDialect {
+    let normalized = base_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches("/v1")
+        .to_ascii_lowercase();
+
+    // api.deepseeki.com used to be sniffed alongside the official domain; it
+    // was removed on 2026-09-11: the official documentation never listed the
+    // domain, and the community reported it as a non-resolvable unofficial
+    // domain (deepseek-ai/awesome-deepseek-agent#311),
+    // so it must no longer force thinking off the way the official DeepSeek
+    // endpoint does.
+    if normalized.contains("api.deepseek.com") {
+        ReasoningDialect::ThinkingDisabled
+    } else if normalized.contains("dashscope.aliyuncs.com") {
+        ReasoningDialect::QwenEnableThinking
+    } else if normalized.contains("moonshot.cn") || normalized.contains("moonshot.ai") {
+        if kimi_supports_disabled_thinking(model) {
+            ReasoningDialect::ThinkingDisabled
+        } else {
+            ReasoningDialect::None
+        }
+    } else if normalized.contains("volces.com")
+        || normalized.contains("volcengine")
+        || normalized.contains("byteplus.com")
+    {
+        ReasoningDialect::ThinkingDisabled
+    } else if normalized.contains("minimax.chat") || normalized.contains("minimaxi.com") {
+        ReasoningDialect::Minimax
+    } else if normalized.contains("bigmodel.cn") || normalized.contains("z.ai") {
+        ReasoningDialect::ThinkingDisabled
+    } else if normalized.contains("xiaomimimo.com") {
+        ReasoningDialect::ThinkingDisabled
+    } else {
+        ReasoningDialect::None
+    }
+}
+
+/// 按 dialect 把推理控制字段写进 OpenAI 兼容 chat/completions 请求体。
+///
+/// review 与 memory 此前各维护一份字节等价的 match（仅枚举名不同），现统一至此；
+/// 各 feature 先经自己的 preset dispatch 判定 dialect，再调用本函数落盘请求体。
+pub fn apply_reasoning_dialect_controls(body: &mut Value, dialect: ReasoningDialect) {
+    match dialect {
+        ReasoningDialect::ThinkingDisabled => {
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        ReasoningDialect::QwenEnableThinking => {
+            body["enable_thinking"] = json!(false);
+        }
+        ReasoningDialect::VllmChatTemplate => {
+            body["chat_template_kwargs"] = json!({ "enable_thinking": false });
+        }
+        ReasoningDialect::Minimax => {
+            body["thinking"] = json!({ "type": "disabled" });
+            body["reasoning_split"] = json!(true);
+        }
+        ReasoningDialect::None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The aux one-shot body builders pin "no sampling parameters" at
+    /// construction; this pins the post-builder mutator. Dialect controls
+    /// only ever add thinking-related fields — a future vendor control must
+    /// not sneak a sampling parameter back into an aux body after the
+    /// builder runs, where no body-level pin would see it.
+    #[test]
+    fn reasoning_controls_never_write_sampling_parameters() {
+        let source = include_str!("reasoning_dialect.rs");
+        let start = source
+            .find("pub fn apply_reasoning_dialect_controls")
+            .expect("applier definition present");
+        let region = &source[start
+            ..source[start..]
+                .find("#[cfg(test)]")
+                .expect("test module present")
+                + start];
+        assert!(
+            !region.contains("\"temperature\""),
+            "reasoning dialect controls must not write a temperature field"
+        );
+        assert!(
+            !region.contains("\"top_p\""),
+            "reasoning dialect controls must not write a top_p field"
+        );
+    }
+
+    #[test]
+    fn deepseek_strips_v1_suffix() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://api.deepseek.com/v1", ""),
+            ReasoningDialect::ThinkingDisabled
+        );
+    }
+
+    #[test]
+    fn deepseeki_unofficial_domain_is_not_detected() {
+        // api.deepseeki.com is an unofficial domain (never listed in the
+        // official documentation; sniffing removed on 2026-09-11): it must no
+        // longer return ThinkingDisabled as the official DeepSeek endpoint
+        // would; fall through to None so the model default applies.
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://api.deepseeki.com/chat/completions", ""),
+            ReasoningDialect::None
+        );
+    }
+
+    #[test]
+    fn qwen_dashscope_detected() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://dashscope.aliyuncs.com", ""),
+            ReasoningDialect::QwenEnableThinking
+        );
+    }
+
+    #[test]
+    fn moonshot_kimi_k26_supports_disabled() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://moonshot.cn", "kimi-k2.6"),
+            ReasoningDialect::ThinkingDisabled
+        );
+    }
+
+    #[test]
+    fn moonshot_kimi_k27_does_not_support() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://moonshot.cn", "kimi-k2.7"),
+            ReasoningDialect::None
+        );
+    }
+
+    #[test]
+    fn doubao_volcengine_detected() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://ark.volces.com/api/v3", ""),
+            ReasoningDialect::ThinkingDisabled
+        );
+    }
+
+    #[test]
+    fn minimax_detected() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://api.minimax.chat/v1", ""),
+            ReasoningDialect::Minimax
+        );
+    }
+
+    #[test]
+    fn glm_bigmodel_detected() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://open.bigmodel.cn", ""),
+            ReasoningDialect::ThinkingDisabled
+        );
+    }
+
+    #[test]
+    fn mimo_xiaomimimo_detected() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://api.xiaomimimo.com", ""),
+            ReasoningDialect::ThinkingDisabled
+        );
+    }
+
+    #[test]
+    fn unknown_url_returns_none() {
+        assert_eq!(
+            reasoning_dialect_from_base_url("https://api.openai.com", ""),
+            ReasoningDialect::None
+        );
+    }
+
+    #[test]
+    fn kimi_thinking_variant_excluded() {
+        assert!(!kimi_supports_disabled_thinking("kimi-k2.6-thinking"));
+    }
+}

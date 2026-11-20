@@ -1,0 +1,20 @@
+{
+  "id": "yuandian-mcp",
+  "name": "华宇元典法律数据",
+  "description": "法律法规、案例文书、企业司法风险与法律检索数据查询",
+  "version": "1.0.0",
+  "icon": "book-open",
+  "category": "法律数据",
+  "mcp_tools": [],
+  "command": "",
+  "args": [],
+  "servers": [
+    {
+      "name": "yuandian_mcp",
+      "url": "https://open.chineselaw.com/mcp",
+      "scopes": ["mcp"],
+      "oauth_resource": "https://open.chineselaw.com/mcp"
+    }
+  ],
+  "pip_dependencies": []
+}

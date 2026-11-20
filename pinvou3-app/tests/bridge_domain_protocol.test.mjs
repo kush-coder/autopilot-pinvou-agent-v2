@@ -1,0 +1,603 @@
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
+import { desktopBridgeApi } from './bridge_domain_contract.mjs';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const bridgeRoot = path.join(root, 'src', 'platform', 'tauri');
+
+function read(relativePath) {
+  return fs.readFileSync(path.join(bridgeRoot, relativePath), 'utf8');
+}
+
+function extractCalls(source, callee) {
+  const calls = [];
+  const needle = `${callee}(`;
+  let cursor = 0;
+  while ((cursor = source.indexOf(needle, cursor)) !== -1) {
+    const previous = source[cursor - 1] || '';
+    if (/[A-Za-z0-9_$]/.test(previous)) {
+      cursor += needle.length;
+      continue;
+    }
+    let index = cursor + needle.length;
+    let depth = 1;
+    let quote = null;
+    let escaped = false;
+    let lineComment = false;
+    let blockComment = false;
+    for (; index < source.length && depth > 0; index += 1) {
+      const char = source[index];
+      const next = source[index + 1];
+      if (lineComment) {
+        if (char === '\n') lineComment = false;
+        continue;
+      }
+      if (blockComment) {
+        if (char === '*' && next === '/') { blockComment = false; index += 1; }
+        continue;
+      }
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (char === '\\') escaped = true;
+        else if (char === quote) quote = null;
+        continue;
+      }
+      if (char === '/' && next === '/') { lineComment = true; index += 1; continue; }
+      if (char === '/' && next === '*') { blockComment = true; index += 1; continue; }
+      if (char === '"' || char === "'" || char === '`') { quote = char; continue; }
+      if (char === '(') depth += 1;
+      else if (char === ')') depth -= 1;
+    }
+    assert.equal(depth, 0, `unclosed ${callee} call near offset ${cursor}`);
+    calls.push(source.slice(cursor, index).replace(/\s+/g, ' ').trim());
+    cursor = index;
+  }
+  return calls;
+}
+
+const protocolSources = {
+  orchestration: ['bridge.js'],
+  artifacts: ['bridge/artifact-tracker.js', 'bridge/artifacts.js'],
+  auxChat: ['bridge/aux-chat.js'],
+  chat: ['bridge/chat.js', 'bridge/chat-events.js', 'bridge/terminal.js'],
+  dependencies: ['bridge/dependencies.js'],
+  interaction: ['bridge/interaction.js'],
+  knowledge: ['bridge/knowledge-model.js'],
+  memory: ['bridge/memory.js'],
+  monitor: ['bridge/monitor.js'],
+  personas: ['bridge/personas.js'],
+  remoteControl: ['bridge/remote-control.js'],
+  scheduled: ['bridge/scheduled.js'],
+  sessions: ['bridge/sessions.js'],
+  settings: ['bridge/settings.js'],
+  updater: ['bridge/updater.js'],
+  voice: ['bridge/voice.js'],
+  multiAgent: ['bridge/multiagent.js'],
+  projects: ['bridge/projects.js'],
+  computerUse: ['bridge/computer_use.js'],
+};
+
+const expectedProtocolHashes = {
+  // Aux-chat domain debut: three commands — get_or_create_aux_session /
+  // discard_aux_session (since removed with its dead frontend chain) /
+  // chat(restrictTools:true); buffer loading reuses the
+  // ensureSessionBufferLoaded injected by the sessions domain (the
+  // load_session hash is accounted in the sessions domain).
+  // Recomputed for M6: the domain gains reset() invoking the atomic
+  // reset_aux_session command (one discard+recreate round trip instead of the
+  // two independent invokes the frontend used to sequence).
+  // Recomputed for M7: the lane-identical bodies (ensure/snapshot/reset)
+  // moved into the shared lane's auxChat cluster; this file keeps only
+  // the desktop send dispatch (the chat invoke below), so the aux
+  // management invokes now hash under the shared base.
+  auxChat: '559070c284d5738a8fb60664487eb1ce96e766b92fcd786e8baa9dc7a8d461a8',
+  // Batch-A dead-code/dedup sweep: byte-identical helpers shared between the web and
+  // tauri lanes moved verbatim into src/shared/bridge-shared-helpers.js (loaded by
+  // index.html before both bridges). The moved bodies carry their invoke( calls with
+  // them, so per-domain captures shrink by exactly the relocated call sites — every
+  // dropped signature still executes at runtime via the shared payload, and the
+  // command + payload text of each invoke is unchanged. Hashes below marked
+  // "Recomputed for the shared-helper dedup" reflect that relocation only.
+  // New domain: computer-use consent commands/events (desktop-only; the web
+  // RPC allowlist excludes them, same policy as browser:*).
+  // Recomputed when the 30s deny-suppression cooldown was removed: a deny now
+  // only closes its own dialog and fresh requests re-prompt immediately (no
+  // invoke/listen call-set change; comment wording is part of the digest).
+  // Recomputed when the deny()/grant_required handler comments were updated
+  // for the mainstream narrowing (no deny-cooldown memory, no idle-expired
+  // grant re-arm; comment wording inside the listen callback span is part of
+  // the digest). Recomputed again when the confirm_required handler's
+  // type-preview comment was corrected to the shipped contract (full text
+  // rides for every non-password Type action, short texts included).
+  // Recomputed for the fresh-review fixes: the grant/confirm_required inert branches
+  // now re-read authoritative status (other-window enable gap) and sameRequest compares
+  // the typed-text preview (comment and expression wording inside the callback spans
+  // is part of the digest; no invoke/listen call-set change).
+  // Recomputed for the structured confirm payload: confirm_required builds the
+  // request via buildConfirmRequest (action/button/click_count/point/text_preview/
+  // text_preview_truncated passthrough + summary fallback) and dismissConfirm was
+  // removed (no invoke/listen call-set change; listener body wording is part of
+  // the digest).
+  // Recomputed for the round-15 fix wave: secure-target chord masking (the
+  // chord_masked_chars passthrough in buildConfirmRequest), the
+  // background-session refresh guard, and the inert-branch optional chaining
+  // inside the listener callback spans (no invoke/listen call-set change).
+  // Recomputed for the permission onboarding row: the new
+  // computer_use_permission_status invoke (settings permissionStatus) joins
+  // the domain's call set.
+  // Recomputed again for the dead-code sweep: the zero-caller getStatus
+  // wrapper (computer_use_get_status invoke) was removed — refreshStatus
+  // owns the status read path.
+  // Recomputed for the virtual-display preference: the domain gains the
+  // computer_use_set_virtual_display_preference invoke (the settings row's
+  // "prefer isolated virtual display" switch; desktop-only, off the web
+  // access-policy allowlist like the rest of the domain).
+  computerUse: '6e06e71458a8f8e347e83abda1fc39cd04ecbf80c78168abf43f3d8873cf0d75',
+  multiAgent: '36821de03628eaa4ec3926b925fc96443ee1657c9dd43c67cbda13a7177ea9ba',
+  // Recomputed for the subagent status flicker fix: the agent_progress listen
+  // forwards the structured worker_status token (same vocabulary as the
+  // worker ledger) alongside the legacy free-text phrase — no new invoke or
+  // listen entries, payload-internal edit only.
+  // Recomputed for the shared-helper dedup combined with the rebind wave's
+  // workspace_binding redaction and retry-payload changes (see batch note
+  // above; recomputed against the merged tree). Verified unchanged by the
+  // #576 merge: the dead-code cleanup's markResolved removal lives in the
+  // shared payload, not in bridge.js's invoke/listen surface.
+  // Recomputed for the lane-merge residual wave: persistMessagesFor (the
+  // save_session_artifacts + rename_session invokes) joined the shared base.
+  orchestration: '921bb6314f6bfaf67b2d52d9b049055382c134aea391b2109b9ae159aa65c014',
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Recomputed for the dead-code cleanup: the caller-less openInSystem /
+  // openExternalUrl wrappers (open_in_system / open_external_url invokes) were
+  // removed; artifact external-open traffic goes through openArtifactExternal
+  // (open_artifact_window / open_in_system) and the whitelisted
+  // openUserExternalUrl, so the runtime command surface is unchanged.
+  // Recomputed against the #463-merge tree (the rebind wave's artifact-path
+  // redaction composes with the cleanup). Recomputed again for the Linux
+  // clipboard-image paste fallback: artifacts.js gains the
+  // addPasteImageFromClipboard invoke wrapping the paste_clipboard_image
+  // command (the native layer reads the WebKitGTK-invisible clipboard image
+  // and saves it server-side; web lane intentionally has no such backend).
+  // Recomputed for the lane-merge residual wave: listDeliverableIndex
+  // (list_deliverable_index, list_workspace_files) and reconcileArtifacts
+  // (list_workspace_files, save_session_artifacts) joined the shared base.
+  artifacts: 'a0f801d8ec9ceece9c4b542a7ce2706aafeec8a8511a4cf3904f77151005f4a2',
+  // Recomputed for #308 follow-ups: prefillComposer(text, append) recovery
+  // entry + comment translations touching `invoke(` mentions (the extractor
+  // scans raw source, so comment wording is part of the digest). Recomputed
+  // again for the eighth-review fixes: zap resend gating on the in-flight
+  // steer settlement, the per-sid zap entry guard, and the accompanying
+  // comment wording. And again for the streaming-freeze follow-ups: the
+  // settlement side table (a Promise on the queued chip poisoned the
+  // subscription snapshot), steeredMidTurn bubble markers, and the hydration
+  // envelope strip. And again for the r13 follow-ups: the transcript
+  // fallback's legacy-chip pre-check (chat-events.js) and the zap
+  // skip-resend settlement helper (chat.js). And again for the steer
+  // persistence alignment: the steered-messages sidecar save/get invokes
+  // (bridge.js) and the position-capture load_session (chat.js). And again
+  // for the background-task indicator: the multiagent:agent_progress listen
+  // that schedules the shell snapshot poll for sub-agent spawned tasks
+  // (chat-events.js). Recomputed for explicit artifact presentation: a
+  // successful present_artifact tool_end now emits a session-scoped request
+  // that opens the preview even when the existing card is updated in place.
+  // And again for the model-service error notices: chat-events.js gains
+  // chat:transient_error redaction/listener body changes (the extractor
+  // scans raw source, so comment wording is part of the digest). Recomputed
+  // on the latest-main rebase: main's shell-task isolation changes touched
+  // the same listeners, and the PR's developer comments were translated to
+  // English, both of which shift the raw-source digest. Recomputed for the
+  // v0.9.12 rereview fix that persists toolName/reason/risk with each
+  // ToolGateDecision so history replay retains the structured audit detail.
+  // Recomputed again when the shell background-task projection learned the
+  // canonical v0.9.12 `bash` name while retaining legacy replay aliases. And
+  // again for the streaming markdown render throttle: the chat:delta /
+  // chat:tool_start / chat:done listener bodies gained the trailing-edge
+  // render flush/schedule plus the unpaired-toolMeta terminal sweep — no new
+  // invoke or listen entries, only body-internal edits, so this is a
+  // capture-text refresh. Recomputed again for the chat:tool_end listener
+  // bodies emitting the final stream html via flushPendingStreamRender
+  // before resetting the stream state (same throttle invariant, still no new
+  // invoke or listen entries). Recomputed again for the review-follow-up
+  // comment translations inside the captured listener bodies (same
+  // capture-text refresh; the comment-stripped signature list is
+  // byte-identical to the previous state). Recomputed for the audit dead-code
+  // cleanup: persistMessages factory removed, the steer watchdog timeout-map
+  // scaffold extracted behind the same arm/clear/purge/isArmed entry points,
+  // and the never-emitted remote_control:mobile_user_message / vllm-setup:phase
+  // listeners dropped. The captured surface shrank by persistMessages'
+  // save_session_messages/save_session_artifacts/rename_session invokes, the
+  // terminal.js cancel_shell_task invoke, and the two dead listeners.
+  // save_session_artifacts/rename_session stay reachable via bridge.js
+  // orchestration paths (the session-switch persist flow issues both), while
+  // save_session_messages had no remaining caller, so its Rust command is
+  // retired with it; the exposed bridge.chat API is unchanged).
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Retired with the behavior telemetry client: the trackSceneBehavior helper
+  // (scene_triggered track_behavior_event invoke) was removed, so the chat
+  // surface is one invoke smaller.
+  // Recomputed for per-frame stream notification coalescing; event names and
+  // invoke shapes remain unchanged.
+  // Recomputed for the coalescing hardening: chat:done cancels its session's
+  // pending notify frame, frame publishes contain subscriber throws, and the
+  // flush helper documents its runSyncOnSession extent contract.
+  // Recomputed for review follow-up: chat:delta records the first bubble's
+  // successfully rendered text for per-bubble preview reuse. Event names,
+  // invoke shapes and authoritative payload handling remain unchanged.
+  // Recomputed for the lane-merge wave 4: summonPinvou (summon_pinvou invoke)
+  // and resolvePinvouReview moved into the shared tauriChat/web cluster;
+  // chat.js keeps the transport-legit send path. Command surface unchanged.
+  // Recomputed for the FFE4-1 dispatch-helper unification: the
+  // remote_control:tools_changed listener now dispatches through
+  // window.PinvouToolStoreEvents.notifyComposerToolsChanged (shared
+  // tool-store-events.js), and the wave-5 chat-events DI pairs
+  // (recordTurnStarted/stream-notify/reasoning/flush families) moved into
+  // the shared tauriChatEvents/web cluster with unchanged event surface.
+  // Recomputed twice on this branch's base: #748 routes background
+  // tool-delta publications through the existing terminal timer inside the
+  // captured listener, and the eslint-plugin-unicorn 78 wave converts the
+  // chat:transcript_committed guard clause in the same body (chat-events.js).
+  // Event names, invoke shapes and authoritative payload handling remain
+  // unchanged; publication timing is intentional.
+  // Recomputed for the repo-wide stale-comment cleanup: wording-only comment
+  // edits inside the captured chat-events.js listener spans (stale tool_start
+  // line number, three deleted English captions) — chat.js spans and the
+  // command surface unchanged. Recomputed again in round 3: the present_artifact
+  // comment now carries the web lane's exact `chat:tool_start` token so both
+  // bridge lanes read byte-identically.
+  // Recomputed for the PR #834 review-fix wave: the chat:compaction listener
+  // now stores a timestamp (not a boolean) at start so the read side can
+  // expire a lost-terminal in-flight flag with the same 15-minute backstop
+  // as the Rust MAX_COMPACTION_LATCH_AGE latch, and the comment wording no
+  // longer calls post_tokens "accurate" (Rust emits a conservative estimate).
+  // Event names, invoke shapes and the payload contract unchanged; the web
+  // twin carries the identical body.
+  // Recomputed for review 5874108926 follow-up: the chat:compaction
+  // marker-maintenance block also records the persistent per-session
+  // compactionStarts signal (no invoke/listen surface change — the body
+  // text is part of the pinned call argument).
+  // Recomputed again for review 5876783763: the marker-maintenance block
+  // also advances the monotonic compactionSeq counter (no invoke/listen
+  // surface change).
+  // Recomputed for the #835 rebase onto 60d4f3796: the chat:transcript_committed
+  // context_update ordinal resync block (review r2 fix wave) now rides the
+  // same merged listen bodies (no invoke/listen surface change).
+  // Recomputed for the r7 fix wave: the chat:compaction listener body gains
+  // the counter-baseline reset on a real rewrite (after < before: clear the
+  // session buffer's pending and the stale per-bubble runtimeContextUpdates-
+  // Before vintage so the authoritative resync heals from a consistent
+  // baseline; implemented in bridge-messages next to the other counter
+  // primitives). Same event surface — no new invoke or listen entries; the
+  // edit lives inside the existing listen(...) body.
+  // Stream bubbles now carry htmlSource for native selection provenance.
+  // This additive local state field is inside the hashed delta listener;
+  // invoke payloads and event names are unchanged.
+  // Recomputed for the usage-meter occupancy fix: the chat:usage listener
+  // body gains the per-request context_input_tokens consumption ahead of the
+  // cumulative-input dirty guard (chat:usage fires once per turn at
+  // TurnComplete and any tool_start latches the guard until the next send —
+  // without the per-request field the meter froze at "—/…·0%" on every
+  // tool-using conversation). Same event surface — no new invoke or listen
+  // entries.
+  chat: '3ae60b4537777a45fe6f5ae954a3e8b75822c00bb61b073c7348a4ec584d08a0',
+  // Recomputed for the shared-helper dedup (see batch note above).
+  dependencies: 'bcc3fb2ec60c5e80df5ac86bc8b4e14c810aa449d5ee5f4e3bc8ab1f32ffdff3',
+  // Recomputed for #445 round-8: exitPlanToYolo accepts an explicit target
+  // session id (the YOLO gate passes the adjudicated sid), so the
+  // exit_plan_to_yolo invoke payload text changes from
+  // { sessionId: state.activeSessionId } to { sessionId: sid } — same
+  // command surface, no new invoke or listen entries.
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Recomputed for the lane-merge residual wave: toggleSuperPerm
+  // (set_super_permission, get_super_permission_status) joined the shared base.
+  interaction: 'a4c231e1119499eae66fe3e0e36d9604393b85468398a062b1e271e5e2f19b20',
+  // Recomputed for the shared-helper dedup (see batch note above).
+  knowledge: 'f9e241acb18d04c8d5d7d71b18d3d0350c3264bbc50e896b0f21b0e036286868',
+  // memory recomputed for the memory-maintenance feature: organize_memory +
+  // get_memory_organize_history invokes added to bridge/memory.js.
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Recomputed again for the dead-code sweep: the dead deleteMemoryPreference facade
+  // (delete_memory_preference invoke) was removed; deleteMemoryItem('preference', ...)
+  // still routes to the same command, so the backend surface is unchanged.
+  // Recomputed for the lane-merge wave 2: applyMemoryOverview / loadMemoryOverview /
+  // updateMemoryItem / deleteMemoryItem and the F-XT7-6 resolveMemoryCandidate core
+  // (confirm/ignore/never invokes) moved into the shared tauriMemory/web cluster;
+  // memory.js keeps saveMemoryProfilePatch + organizeMemory and the 2-line trio
+  // wrappers. Runtime command surface unchanged.
+  memory: 'ca88a71d9f0f9b15f1df52cf80218694f76b2295add98e65a0d167fc88b627c8',
+  // Recomputed for the lane-merge wave 1: pollMonitor (get_monitor_snapshot
+  // invoke) moved verbatim into the shared tauriMonitor/web cluster of
+  // bridge-shared-helpers.js; monitor.js keeps only pollBackendStatus.
+  monitor: 'e63e8d5d4edf813640e08c9951a12abdbc3cad4991763d3dd956e883e277fb1c',
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Recomputed for the lane-merge wave 3: equipPersona (equip_persona /
+  // rename_session invokes) moved into the shared tauriPersonas/web cluster;
+  // personas.js keeps unequipPersona and the syncActivePersona read path.
+  personas: 'b3b4f526f422dfc503d3ef972cfac2c3c53679c1ae4636a726ca652841ef1a0e',
+  // Recomputed for the voice error-code relay: web_access_rpc_respond gains
+  // errorCode/errorCategory so structured VoiceCommandError identity reaches
+  // the browser lane's trilingual mapping instead of only the message text.
+  // Recomputed again for the dead-code sweep: the JS-side resetWebRelayAddress
+  // facade (web_access_reset_relay invoke) was removed — no production caller,
+  // and the Rust command is removed in parallel by the backend sweep.
+  // Recomputed again for the dead-code sweep: the JS-side setWebRelayAddress
+  // facade (web_access_set_relay invoke) was removed — no production caller
+  // (tests/remote_control_race.test.mjs relay tests removed with it).
+  // Recomputed again for the dead-code sweep: the zero-caller
+  // getWebRelaySettings wrapper (web_access_relay_settings invoke) was
+  // removed — desktop SettingsView reads the webAccess state slice instead.
+  // Recomputed for the folder-consent revoke: the desktop-only
+  // web_access_revoke_host_workspace invoke joined remote-control.js
+  // (main-WebView gated, absent from the Web access policy).
+  remoteControl: '13375be842a5dd9a595f120c8b078573d061329d5b44cff7e1eaa271e7d39b0d',
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Recomputed for the lane-merge wave 3: createScheduledTask
+  // (create_scheduled_task), autoCreateScheduledTaskDraft,
+  // parseScheduledTaskDraftFromText and parseLooseJsonObject moved into the
+  // shared tauriScheduled/web cluster; every dropped signature still executes
+  // via the shared payload with unchanged command + payload text.
+  scheduled: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+  // Recomputed for one-click full-fidelity session log export: the tauri
+  // sessions bridge gains the export_session_archive invoke wrapping the
+  // export_session command (web lane intentionally has no such backend).
+  // Recomputed again for the normal-chat draft workspace selector:
+  // create_session now carries the optional workspacePath payload
+  // (bridge/sessions.js). Recomputed again for workspace-bound sessions:
+  // get_session_workspace_binding query + bound-draft staged mode application
+  // (set_plan_mode_next / exit_plan_to_yolo) at materialization.
+  // Recomputed again for the single-entry workspace picker: create_session now
+  // also carries the keychain snapshot (workspaceRoots) and project ownership
+  // (projectId) captured from the draft, and the draft staging gains
+  // draftWorkspaceRoots/draftProjectId (bridge/sessions.js).
+  // Recomputed for the shared-helper dedup (see batch note above).
+  // Recomputed again for review #463 round-13: the workspace_rebound
+  // mark-stamp block moved verbatim into the shared
+  // applyWorkspaceReboundMark (it was byte-duplicated with the web lane),
+  // so the session:list_changed listener body shrinks to the delegation —
+  // no new invoke or listen entries (the extractor scans raw source, so
+  // body/comment text is part of the digest).
+  // Recomputed for the sidecar read-failure surfacing (main #596): the
+  // persona/review reads moved into local loadPersonaEventsForSession /
+  // loadPinvouReviewsForSession helpers so a corrupt sidecar is reported
+  // before degrading to []; same two commands, no new invoke or listen
+  // entries (the switch-path occurrences now pass sessionId: sid like the
+  // hydration ones). Recomputed for the rebase union: this PR's
+  // create_session workspaceRoots/projectId and draft staging merged with
+  // main's sidecar-helper wave (#596), aux-session surface and the
+  // #713/#735/#701 lane merges; the pin below is the extractor's output on
+  // the merged bridge/sessions.js (rebase onto main @ 88bff8582).
+  sessions: 'acee7f6975f19302026d6619618aadf8619e51684b271d024aa705e6c1efcd17',
+  // Recomputed for the dead-code cleanup: the dead saveSettingsAndRestart
+  // wrapper (save_settings_and_restart invoke) was removed — no production
+  // caller; the plain saveSettings + restart_app path stays the update route.
+  // Recomputed for the preinstalled-model startup removal (the #504 merge
+  // tree): the detect_local_vllm_setup / bootstrap_local_vllm /
+  // decline_local_vllm_setup invokes left with the dead one-click setup
+  // chain; main's cleanup already covered the same wrapper removal.
+  // Recomputed for the built-in feature toggles hook (#585 merge tree):
+  // settings.js gains the list_builtin_features / set_builtin_feature_enabled
+  // invoke wrappers (list_builtin_features is consumed by ChatView's
+  // session-mention gate, PR #586; the setter is the contract hook for future
+  // feature settings pages). Recomputed again for the review fix:
+  // set_builtin_feature_enabled sends `{ featureId: id, enabled }` — the Rust
+  // command's parameter is `feature_id` (app/commands/builtin.rs) and Tauri
+  // v2 maps camelCase JS keys to snake_case. The merged surface is main's.
+  // Recomputed for the global bring-to-front shortcut: settings.js gains the
+  // set_global_shortcut_config invoke (the dedicated command owns both the
+  // plugin registration and the prefs persistence; update_settings stays
+  // untouched).
+  // Recomputed for the keyless-aware tier probe: probe_local_server_kind's
+  // invoke payload gains `noAuth` (the form's keyless posture suppresses the
+  // retained form key and the saved-credential fallback for the automatic
+  // probe, same caliber as the two test commands).
+  settings: 'cded938320d66a29d605f1a3c2fb0f880f489409861bfc7c24d741f1c6e67fd1',
+  // Recomputed for the reintroduced update:progress listener: the 200 ms
+  // download-progress coalescing machinery (trailing throttle, completion
+  // flush, cancel/failure cleanup) is back as the frontend contract for the
+  // backend resuming `update:progress` emission; completion still flips
+  // updateProgress to 100 in downloadAndInstallUpdate.
+  // tests/updater_progress_state.test.mjs re-pins the machinery.
+  updater: '30a3762ee45f378d476efec934dc4be50522a02a5b9a97111191496510d4d7d4',
+  // Recomputed for the comment-only English translation of the voice bridge
+  // (PR-added Chinese comments inside the postprocess_voice_text invoke
+  // span are part of the hashed source; no invoke/listen surface changed).
+  // Recomputed again for the recording-ownership port: the voice feature now
+  // owns an operation lifecycle (operationId submission gates) and claims the
+  // Rust recording ownership (set_voice_shortcut_recording with a token)
+  // before opening the microphone (command set unchanged; listener bodies and
+  // comment wording are part of the digest). The behavior-event emitter drop
+  // is not part of this PR: #616's telemetry-client retirement on main already
+  // removed the track_behavior_event call sites, while the terminal
+  // bookkeeping state machine stays (command set still unchanged).
+  voice: 'fe52e3a89d3f95932444d23eff68e8685d20e754fb402959388930093a34a10b',
+  // Recomputed for the rebind carryover feed-back (review #463 F-Major):
+  // rebind_workspace_root gains the optional previousPostBusySessionIds
+  // payload — the dialog's previous report fed back on retry, honored by the
+  // backend only as a reporting reclassification inside its own to-lane
+  // retry population. Same command surface, no new invoke or listen entries.
+  // Recomputed again after the single-entry workspace picker merge: on top of
+  // the rebind carryover feed-back the domain also gains
+  // ensure_folder_projects / update_project(roots, lastPrimaryRoot) /
+  // projects_set_never_materialize / align_session_to_project
+  // (bridge/projects.js).
+  projects: 'b7b41e3f15a938ab4a5cad8e28e70efe031f382cdced92a4022badf9119027d1',};
+
+for (const [domain, files] of Object.entries(protocolSources)) {
+  const signatures = files.flatMap(file => {
+    const source = read(file);
+    return [
+      ...extractCalls(source, 'invoke').map(call => `${file}:invoke:${call}`),
+      ...extractCalls(source, 'listen').map(call => `${file}:listen:${call}`),
+    ];
+  });
+  const hash = crypto.createHash('sha256').update(signatures.join('\n')).digest('hex');
+  if (!expectedProtocolHashes[domain]) console.log(`${domain}: ${hash}`);
+  else assert.equal(hash, expectedProtocolHashes[domain], `${domain} bridge protocol changed`);
+}
+
+// The shared payload base carries the invoke/listen bodies that the batch dedup
+// relocated out of the per-lane files, so the domain hashes above no longer
+// cover that text. Hash the shared file's surface with the same extractor to
+// pin payload edits inside the shared base the same way the lane files are.
+// Recomputed for M7: the auxChat cluster joined the shared base (the
+// get_or_create_aux_session / reset_aux_session invokes
+// moved here from the per-lane aux bridge copies).
+// Recomputed for the dead-code sweep: the zero-caller raw
+// getEffectiveModelConfig, compactNow, and auxChat.discard facades were
+// removed (loadEffectiveModelConfig / auxChatReset own those flows).
+// Recomputed for the lane-merge wave 1: the monitor poll cluster
+// (get_monitor_snapshot invoke inside pollMonitor) joined the shared base.
+// Recomputed for the lane-merge wave 2: the memory overview/update/delete
+// invokes and the confirm/ignore/never pending-memory trio joined it.
+// Recomputed for the lane-merge wave 3: the scheduled create/parse cluster and
+// the personas equip flow joined it.
+// Recomputed for the lane-merge wave 4: the voice-operation state machine
+// block, encodeWav, and the Pinvou summon/resolve review flow joined it.
+// Recomputed for the lane-merge wave 5: the subscription-state value
+// reconciler, the rerenderFromMessages core, the chat-events DI families and
+// the F-FE13-2 assistant_done timeline builder joined the shared base (the
+// builder ships on the static surface, so no signature moved).
+// Recomputed for the lane-merge residual waves: the chat tool-guard/relay
+// trios (no signature motion), userMessageDisplayText, persistMessagesFor
+// (save_session_artifacts + rename_session), the session sidecar loaders
+// (get_session_persona_events / get_session_pinvou_reviews), toggleSuperPerm
+// (set/get super permission) and the artifact reconcile/deliverable-index
+// pair (list_workspace_files, save_session_artifacts, list_deliverable_index)
+// joined the shared base.
+// Recomputed for the pinvu review save chain (r7 audit): the
+// save_session_pinvou_reviews invoke now captures the owning session id at
+// record time (sid) instead of reading state.activeSessionId at fire time, so
+// the queued write cannot drift into a session the user switched to while the
+// chain was pending (r5 m6 fix); the invoke/listen command set is unchanged.
+// Recomputed for the kb_model_cancel port on top of the keyless-probe-posture
+// wave: the shared-base knowledge helper gained invoke("kb_model_cancel")
+// (cancelKbModel; facade-only — same policy-denied-on-web shape as
+// checkDependencies), and the two test_model_connection /
+// test_image_input_capability invokes carry the form's noAuth posture arg.
+// Recomputed again for the endpoint model auto-discovery wave on top of the
+// kb_model_cancel port: the probeEndpointModels shared facade joined the
+// shared base (invoke-only, settings cluster).
+const expectedSharedBaseHash = 'ecc2aadcfdf6ed68114d524bdebc8161973f2005aeccc6428183bb6ddfb6ee5d';
+const sharedBaseSource = fs.readFileSync(path.join(root, 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8');
+const sharedBaseSignatures = [
+  ...extractCalls(sharedBaseSource, 'invoke').map(call => `shared/bridge-shared-helpers.js:invoke:${call}`),
+  ...extractCalls(sharedBaseSource, 'listen').map(call => `shared/bridge-shared-helpers.js:listen:${call}`),
+];
+const sharedBaseHash = crypto.createHash('sha256').update(sharedBaseSignatures.join('\n')).digest('hex');
+if (!expectedSharedBaseHash) console.log(`sharedBase: ${sharedBaseHash} (${sharedBaseSignatures.length} signatures)`);
+else assert.equal(sharedBaseHash, expectedSharedBaseHash, 'shared bridge payload protocol changed');
+
+const featureRegistry = new Proxy({}, {
+  get() {
+    return () => new Proxy({}, { get: () => function () {} });
+  },
+});
+const windowObject = {
+  __TAURI__: {
+    core: { invoke: async () => null },
+    event: { listen: async () => function () {} },
+    dialog: { open: async () => null },
+  },
+  __PINVOU_TAURI_BRIDGE_FEATURES__: featureRegistry,
+  location: { search: '' },
+  performance: { now: () => 0 },
+  setTimeout,
+  clearTimeout,
+};
+const context = vm.createContext({
+  window: windowObject,
+  document: { readyState: 'loading', addEventListener() {} },
+  console,
+  setTimeout,
+  clearTimeout,
+  structuredClone,
+  URL,
+  Blob,
+});
+// bridge.js delegates shared helpers to window.PinvouBridgeShared; index.html loads
+// the shared payload before the bridges, so the harness loads it first too.
+vm.runInContext(fs.readFileSync(path.join(root, 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8'),
+  context, { filename: 'shared/bridge-shared-helpers.js' });
+vm.runInContext(read('bridge.js'), context, { filename: 'bridge.js' });
+
+const api = windowObject.TauriBridge;
+assert.deepEqual(Object.keys(api).sort(), ['available', ...Object.keys(desktopBridgeApi)].sort()); // eslint-disable-line unicorn/require-array-sort-compare -- lexicographic string order is the assertion's expectation
+for (const [domain, methods] of Object.entries(desktopBridgeApi)) {
+  assert.deepEqual(Object.keys(api[domain]).sort(), methods.sort(), `${domain} API surface changed`); // eslint-disable-line unicorn/require-array-sort-compare -- lexicographic string order is the assertion's expectation
+}
+assert.equal(api.sendMessage, undefined, 'flat compatibility facade must not return');
+assert.equal(api.getState, undefined, 'flat state facade must not return');
+
+function sourceFiles(directory) {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(absolute);
+    return /\.(?:js|jsx)$/.test(entry.name) ? [absolute] : [];
+  });
+}
+for (const file of sourceFiles(path.join(root, 'src'))) {
+  if (file.startsWith(bridgeRoot)) continue;
+  const source = fs.readFileSync(file, 'utf8');
+  assert.doesNotMatch(
+    source,
+    /\bbridge\.[A-Za-z_$][\w$]*\s*\(/,
+    `${path.relative(root, file)} must not call the removed flat bridge facade`,
+  );
+  if (file.startsWith(path.join(root, 'src', 'features'))) {
+    assert.doesNotMatch(
+      source,
+      /\b(?:window|globalThis)\s*\.\s*__TAURI__\b/,
+      `${path.relative(root, file)} must use the platform Tauri client`,
+    );
+  }
+  for (const match of source.matchAll(/\bbridge\.([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)/g)) {
+    const [, domain, method] = match;
+    assert.equal(typeof api[domain]?.[method], 'function', `${path.relative(root, file)} uses unknown bridge API ${domain}.${method}`);
+  }
+}
+
+const clientSource = read('client.js');
+const client = await import(`data:text/javascript;base64,${Buffer.from(clientSource).toString('base64')}`);
+const previousTauri = globalThis.__TAURI__;
+const nativeCalls = [];
+class PhysicalPosition {
+  constructor(x, y) { this.x = x; this.y = y; }
+}
+const currentWindow = { label: 'main' };
+globalThis.__TAURI__ = {
+  core: { invoke: async (command, payload) => { nativeCalls.push(['invoke', command, payload]); return 'ok'; } },
+  event: {
+    listen: async (name, handler) => { nativeCalls.push(['listen', name, handler]); return () => {}; },
+    emit: async (name, payload) => { nativeCalls.push(['emit', name, payload]); },
+  },
+  window: {
+    getCurrentWindow: () => currentWindow,
+    currentMonitor: async () => ({ name: 'primary' }),
+    availableMonitors: async () => [{ name: 'primary' }],
+    PhysicalPosition,
+  },
+};
+try {
+  assert.equal(client.isTauriAvailable(), true);
+  assert.equal(await client.invokeTauri('protocol_probe', { value: 1 }), 'ok');
+  await client.listenTauri('protocol:event', () => {});
+  await client.emitTauri('protocol:emit', { value: 2 });
+  assert.equal(client.getCurrentTauriWindow(), currentWindow);
+  assert.deepEqual(await client.currentTauriMonitor(), { name: 'primary' });
+  assert.deepEqual(await client.availableTauriMonitors(), [{ name: 'primary' }]);
+  const position = client.createPhysicalPosition(10.6, -2.4);
+  assert.equal(position.x, 11);
+  assert.equal(position.y, -2);
+  assert.deepEqual(nativeCalls.slice(0, 3).map(call => call.slice(0, 2)), [
+    ['invoke', 'protocol_probe'],
+    ['listen', 'protocol:event'],
+    ['emit', 'protocol:emit'],
+  ]);
+} finally {
+  if (previousTauri === undefined) delete globalThis.__TAURI__;
+  else globalThis.__TAURI__ = previousTauri;
+}
+console.log('bridge domain API and protocol contracts passed');

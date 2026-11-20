@@ -1,0 +1,22 @@
+{
+  "id": "obsidian",
+  "name": "Obsidian 知识库",
+  "description": "检索并管理本机 Obsidian 笔记库（vault）：搜索、读取、新建、编辑、改名（自动修双链）、删除。让大模型引用并维护你的个人知识。笔记不出本机。",
+  "version": "1.1.0",
+  "icon": "book-open",
+  "category": "知识库",
+  "mcp_tools": [
+    "mcp_obsidian_search",
+    "mcp_obsidian_read_note",
+    "mcp_obsidian_list",
+    "mcp_obsidian_create_note",
+    "mcp_obsidian_edit_note",
+    "mcp_obsidian_rename_note",
+    "mcp_obsidian_delete_note"
+  ],
+  "command": "python",
+  "args": ["server.py"],
+  "env": {},
+  "config_fields": [],
+  "pip_dependencies": []
+}

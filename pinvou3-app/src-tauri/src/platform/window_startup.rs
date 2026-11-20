@@ -1,0 +1,219 @@
+#[cfg(target_os = "linux")]
+use gtk::prelude::*;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use tauri::Manager;
+
+#[cfg(any(target_os = "linux", test))]
+const HIDDEN_MAIN_WINDOW_FALLBACK_SECS: u64 = 8;
+#[cfg(target_os = "linux")]
+static MAIN_WINDOW_STARTUP_READY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(any(target_os = "linux", test))]
+fn should_defer_main_window_activation(startup_ready: bool, is_visible: bool) -> bool {
+    !startup_ready && !is_visible
+}
+
+/// 8 秒兜底是否应真正 reveal 主窗口：仅当等待期满后窗口仍不可见。
+/// 调用方需先把 `is_visible()` 的 Err 折叠为"可见"，即"不明确隐藏就视为可见"。
+#[cfg(any(target_os = "linux", test))]
+fn should_fallback_reveal(visible_after_wait: bool) -> bool {
+    !visible_after_wait
+}
+
+#[cfg(target_os = "linux")]
+fn present_linux_main_window(
+    window: tauri::Window,
+    // Owned marks: both are captured by the 'static main-thread closure
+    // below, so borrowed parameters cannot outlive this frame (E0521).
+    success_mark: String,
+    error_mark: String,
+) -> Result<(), String> {
+    let main_window = window.clone();
+    window
+        .run_on_main_thread(move || match main_window.gtk_window() {
+            Ok(gtk_window) => {
+                // 同一 GTK 主循环任务内完成映射、取消 iconic 状态和前台呈现。
+                // 避免 release 启动较快时，异步 set_focus 早于窗口 map 而被 Mutter 丢弃。
+                //
+                // Mutter refuses to deiconify a window that is still iconic
+                // (unminimize returns Ok but the window never comes back;
+                // same observation and hide→show workaround as
+                // features/pet/pet_window.rs): hide (withdraw) first, then
+                // show — equivalent to a fresh window map, which the WM must
+                // honor. Only a genuinely iconic window takes this path; a
+                // visible window is not made to flicker needlessly. gtk 0.18
+                // does not bind GtkWindowExt::is_iconified, so test the
+                // equivalent GDK window state bits (WidgetExt::window →
+                // gdk::Window::state contains ICONIFIED).
+                if gtk_window.window().is_some_and(|gdk_window| {
+                    gdk_window
+                        .state()
+                        .contains(gtk::gdk::WindowState::ICONIFIED)
+                }) {
+                    gtk_window.hide();
+                }
+                gtk_window.show_all();
+                gtk_window.deiconify();
+                gtk_window.present();
+                crate::platform::startup::mark(&success_mark);
+            }
+            Err(error) => {
+                crate::platform::startup::mark_with_detail("rust", &error_mark, &error.to_string())
+            }
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Reveal only the Linux main window that the platform overlay creates hidden.
+/// The cfg gate keeps other platforms behaviorally unchanged.
+pub fn reveal_startup_window(window: tauri::Window) -> Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    {
+        if window.label() != "main" {
+            return Ok(false);
+        }
+        MAIN_WINDOW_STARTUP_READY.store(true, Ordering::Release);
+        if window.is_visible().map_err(|error| error.to_string())? {
+            return Ok(false);
+        }
+
+        present_linux_main_window(
+            window,
+            "tauri:startup_window_revealed".to_string(),
+            "tauri:startup_window_reveal_error".to_string(),
+        )?;
+        return Ok(true);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        Ok(false)
+    }
+}
+
+/// Bring an already-running main window forward without bypassing the Linux
+/// cold-start readiness gate used by the hidden startup overlay.
+///
+/// `source` labels the startup-timeline marks (`tauri:{source}_…`) so a
+/// reader can tell a second-instance launch from a global-shortcut press —
+/// both go through this shared present path and previously shared the
+/// single-instance mark names.
+///
+/// Returns `true` only when the Linux cold-start gate DEFERRED the activation
+/// (no present task was enqueued), so callers can skip follow-up work that
+/// assumes the window is coming up; `false` in every other case — the present
+/// was attempted (Linux: enqueued to the GTK main loop or run inline, possibly
+/// failing) or the platform presents unconditionally. `false` therefore means
+/// "not deferred", not "the window is up".
+pub(crate) fn activate_main_window(window: tauri::Window, source: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let startup_ready = MAIN_WINDOW_STARTUP_READY.load(Ordering::Acquire);
+        let is_visible = window.is_visible().unwrap_or(true);
+        if should_defer_main_window_activation(startup_ready, is_visible) {
+            // 冷启动未完成且窗口仍隐藏：defer 而非强行 present，避免把尚未稳定的
+            // 输入表面暴露给第二实例用户；前端首次提交或 8 秒兜底会负责显示窗口。
+            // 边界：若前端始终不 reveal，第二实例在兜底前启动将无窗口反馈（仅日志）。
+            crate::platform::startup::mark(&format!("tauri:{source}_activation_deferred"));
+            return true;
+        }
+        if let Err(error) = present_linux_main_window(
+            window,
+            format!("tauri:{source}_window_presented"),
+            format!("tauri:{source}_window_present_error"),
+        ) {
+            crate::platform::startup::mark_with_detail(
+                "rust",
+                &format!("tauri:{source}_window_dispatch_error"),
+                &error,
+            );
+        }
+        false
+    }
+
+    // macOS: a Cmd+H-hidden NSApplication reports its windows as invisible
+    // and ignores window-level show/set_focus (tao gates set_focus on
+    // isVisible), so the app must be UNHIDDEN first — AppHandle::show routes
+    // to NSApplication.unhide: and is a no-op on a visible app. Windows has
+    // no app-level hidden state; the calls below restore both hidden and
+    // minimized windows there.
+    #[cfg(target_os = "macos")]
+    let _ = window.app_handle().show();
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No startup-timeline marks here: the present is unconditional, so
+        // the source label (consumed by the Linux marks) has no use.
+        let _ = source;
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        false
+    }
+}
+
+/// Linux 通过 overlay 隐藏创建主窗口，正常由 React 首次提交负责显示。
+/// 若前端模块加载失败，超时后仍显示窗口，避免进程运行但用户完全无从诊断。
+pub(crate) fn arm_hidden_main_window_fallback(app: &tauri::AppHandle) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(window) = app.get_window("main") else {
+            return;
+        };
+        if window.is_visible().unwrap_or(true) {
+            MAIN_WINDOW_STARTUP_READY.store(true, Ordering::Release);
+            return;
+        }
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                HIDDEN_MAIN_WINDOW_FALLBACK_SECS,
+            ))
+            .await;
+            // 等待期内前端已正常 reveal（或 is_visible 出错），兜底不再介入。
+            if !should_fallback_reveal(window.is_visible().unwrap_or(true)) {
+                return;
+            }
+            match reveal_startup_window(window) {
+                Ok(true) => crate::platform::startup::mark("tauri:main_window_fallback_revealed"),
+                Ok(false) => {}
+                Err(error) => crate::platform::startup::mark_with_detail(
+                    "rust",
+                    "tauri:main_window_fallback_error",
+                    &error,
+                ),
+            }
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = app;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HIDDEN_MAIN_WINDOW_FALLBACK_SECS, should_defer_main_window_activation,
+        should_fallback_reveal,
+    };
+
+    #[test]
+    fn fallback_waits_for_a_cold_frontend_build_then_reveals_only_if_still_hidden() {
+        // 等待窗口须给冷前端构建留出时间（常量值本身是契约的一部分）。
+        assert_eq!(HIDDEN_MAIN_WINDOW_FALLBACK_SECS, 8);
+        // 仅当等待期满后仍隐藏才 reveal；已可见（前端已正常显示）或状态未知则不介入。
+        assert!(should_fallback_reveal(false));
+        assert!(!should_fallback_reveal(true));
+    }
+
+    #[test]
+    fn second_instance_waits_only_while_cold_start_is_hidden() {
+        assert!(should_defer_main_window_activation(false, false));
+        assert!(!should_defer_main_window_activation(false, true));
+        assert!(!should_defer_main_window_activation(true, false));
+        // 已就绪且窗口可见：第二实例激活直接 present，不 defer。
+        assert!(!should_defer_main_window_activation(true, true));
+    }
+}

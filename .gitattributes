@@ -1,0 +1,28 @@
+scripts/validate-commit-msg.py text eol=lf
+# Git hooks 必须保持 LF:Windows autocrlf=true checkout 会把 .githooks/ 下的
+# 钩子脚本转成 CRLF,导致 hook 执行失败或校验逻辑读到 \r。
+.githooks/* text eol=lf
+# Shell 脚本必须 LF:core.autocrlf=true 的 Windows checkout 会把 .sh 转成 CRLF,
+# 严格模式的 bash 读到 \r 直接失败(fork-guard.sh 等 PR 门控脚本跑不起来)。
+*.sh text eol=lf
+pinvou3-app/src-tauri/resources/platforms/linux/knowledge-host/pinvou-knowledge-host-helper text eol=lf
+# 编译期 include_str! 内嵌并按 "\n\n" 切分/golden 字节测试锁定:autocrlf=true 的
+# Windows checkout 转成 CRLF 后 split_once("\n\n") 直接 panic。
+pinvou3-app/src-tauri/resources/common/bundle/instructions-*.md text eol=lf
+# Third-party skill trees must stay byte-identical to their upstream
+# zip/tar archives, so merge tools must not rewrite line endings; CRLF
+# noise would distort diffs/review and resurface as line-by-line
+# conflicts on the next sync.
+pinvou3-app/src-tauri/resources/common/bundle/*-skills/** text eol=lf
+# Vendored browser assets ship byte-exact and are locked to the SHA-256
+# registry in pinvou3-app/src/vendor/README.md (enforced by
+# pinvou3-app/tests/vendor_asset_integrity.test.js); a core.autocrlf=true
+# checkout would rewrite line endings and break that contract.
+pinvou3-app/src/vendor/*.js text eol=lf
+# The vendor script rewrites this tracked placeholder after replacing its
+# directory; pin LF so its embedded GITKEEP bytes are identical on all hosts.
+pinvou3-app/src-tauri/resources/platforms/windows/chrome-devtools-mcp/.gitkeep text eol=lf
+# Workflow YAML 会被策略/路由测试逐行正则解析(scripts/tests/pr-check-routing.test.mjs、
+# test_ci_gate_policy.py 等):core.autocrlf=true 的 Windows checkout 转成 CRLF 后
+# 正则失配、守卫空转,与上方钩子/Shell 脚本同理钉 LF。
+.github/workflows/*.yml text eol=lf

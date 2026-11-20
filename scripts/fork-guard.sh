@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# CodeWhale v0.9.12 clean re-fork guard: 100 maintenance commits (EXPECTED_COMMITS), ten maintained themes (r3 closed at pinvou-v0.9.12-r3; inside a transition window the head may lead the tag).
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CODEWHALE="$REPO/CodeWhale"
+APP="$REPO/pinvou3-app/src-tauri"
+EXPECTED_UPSTREAM="dcd4c200f72f0c1ffd60d8e7f6850313db879fc5"
+# Public maintenance after CodeWhale#123/#124/#129/#131/#133/#134/#135,
+# CodeWhale#136/#142/#148/#150/#152 (incl. deps: rusqlite 0.41 / rmcp 3.9 / rio-vt 0.5.29),
+# and CodeWhale#156 (rustc/clippy 1.100 stable lint adaptation),
+# and CodeWhale#157 (session-reader read-only classification) merged.
+EXPECTED_HEAD="687358f7efde6abd3592737b8ec48adc74ba5a84"
+EXPECTED_COMMITS=100
+# Published maintenance base of this integration.
+MAINTENANCE_BASE="11cba403dc6bd6ca5c4dca55042785b03449ac8e"
+# The immutable r1 closure must remain an ancestor of the registered head.
+# A review candidate may lead public maintenance; this does not waive the
+# separate public-head gate or change the immutable r3 transition baseline.
+R1_CLOSURE="1fafee7e26b60a59457a43bce50c63aa2ad9dbaf"
+FAST_ONLY=0
+
+case "${1:-}" in
+  "") ;;
+  --fast) FAST_ONLY=1 ;;
+  *) echo "unknown argument: $1" >&2; exit 2 ;;
+esac
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+
+fail=0
+
+bold "── Layer 0: v0.9.12 registered maintenance topology ──"
+actual_head="$(git -C "$CODEWHALE" rev-parse HEAD 2>/dev/null || true)"
+if [[ "$actual_head" == "$EXPECTED_HEAD" ]]; then
+  green "  ✓ CodeWhale matches registered review head ${EXPECTED_HEAD}; public maintenance alignment is checked separately"
+else
+  red "  ✗ CodeWhale HEAD ${actual_head:-<unreadable>} differs from registered head $EXPECTED_HEAD"
+  fail=1
+fi
+
+if git -C "$CODEWHALE" merge-base --is-ancestor "$EXPECTED_UPSTREAM" HEAD 2>/dev/null; then
+  green "  ✓ Registered head descends from official v0.9.12"
+else
+  red "  ✗ Registered head does not descend from official v0.9.12 $EXPECTED_UPSTREAM"
+  fail=1
+fi
+
+if git -C "$CODEWHALE" merge-base --is-ancestor "$R1_CLOSURE" HEAD 2>/dev/null; then
+  green "  ✓ Registered head descends from the immutable r1 closure; public maintenance alignment is checked separately"
+else
+  red "  ✗ Immutable r1 closure $R1_CLOSURE is not an ancestor of the registered head"
+  fail=1
+fi
+
+if git -C "$CODEWHALE" merge-base --is-ancestor "$MAINTENANCE_BASE" HEAD 2>/dev/null; then
+  green "  ✓ Registered head contains public maintenance base $MAINTENANCE_BASE"
+else
+  red "  ✗ Registered head does not contain public maintenance base $MAINTENANCE_BASE"
+  fail=1
+fi
+
+commit_count="$(git -C "$CODEWHALE" rev-list --count "$EXPECTED_UPSTREAM..HEAD" 2>/dev/null || true)"
+if [[ "$commit_count" == "$EXPECTED_COMMITS" ]]; then
+  green "  ✓ $EXPECTED_COMMITS registered commits above v0.9.12"
+else
+  red "  ✗ ${commit_count:-<unreadable>} commits above v0.9.12; expected $EXPECTED_COMMITS"
+  fail=1
+fi
+
+bold "── 第 1 层：登记主题与父仓适配指纹 ──"
+# 格式：主题|说明|文件（相对父仓根）|grep -F 固定串
+fingerprints=(
+  "T2|Test metadata summary loss requests recovery|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_run_tests_metadata_summary_cut_requests_recovery"
+  "T2|Child report artifact retains exact bytes and ids|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_subagent_report_artifact_keeps_exact_bytes"
+  "T2|Deferred subagent report names explicit activation fallback|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn stamp_subagent_summary_truncates_when_over_budget"
+  "T2|Legacy spillover names explicit activation fallback|CodeWhale/crates/tui/src/tools/truncate.rs|fn truncation_footer_without_an_artifact_names_the_legacy_retrieval_route"
+  "T2|Preserved output activates only available and policy-allowed retrieval schema|CodeWhale/crates/tui/src/core/engine/tool_catalog/tests.rs|fn forkguard_preserved_output_activates_only_available_retrieval_schema"
+  "T2|Fetch full envelope survives context cut and one-hop recovery|CodeWhale/crates/tui/src/tools/fetch_url/tests.rs|fn forkguard_fetch_url_full_envelope_round_trips_before_context_cut"
+  "T2|Small fetch JSON stays artifact-free|CodeWhale/crates/tui/src/tools/fetch_url/tests.rs|fn forkguard_fetch_url_small_envelope_stays_parseable_and_artifact_free"
+  "T2|Immutable artifacts are private before publication|CodeWhale/crates/tui/src/artifacts.rs|fn forkguard_immutable_artifacts_are_private_and_replay_safe"
+  "T2|Aggregate envelope preserves original before fan-out|CodeWhale/crates/tui/src/core/engine/output_recovery_tests.rs|fn forkguard_turn_loop_envelope_preserves_output_before_fanout"
+  "T2|Serial complete output stays artifact-free|CodeWhale/crates/tui/src/core/engine/output_recovery_tests.rs|fn forkguard_turn_loop_serial_keeps_complete_output_artifact_free"
+  "T2|Parallel complete output stays artifact-free|CodeWhale/crates/tui/src/core/engine/output_recovery_tests.rs|fn forkguard_turn_loop_parallel_keeps_complete_output_artifact_free"
+  "T2|Envelope complete output stays artifact-free|CodeWhale/crates/tui/src/core/engine/output_recovery_tests.rs|fn forkguard_turn_loop_envelope_keeps_complete_output_artifact_free"
+  "T2|Parallel dispatch preserves original before fan-out|CodeWhale/crates/tui/src/core/engine/output_recovery_tests.rs|fn forkguard_turn_loop_parallel_preserves_output_before_fanout"
+  "T2|Gate stream DTO omissions are recoverable|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_task_stream_summaries_are_inline_or_recoverable"
+  "T2|Interrupted coordination field omissions are recoverable|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_short_coordination_fields_are_inline_or_recoverable"
+  "T2|Real taskless gate retains both output streams|CodeWhale/crates/tui/src/tools/tasks.rs|fn forkguard_gate_without_active_task_keeps_both_streams_recoverable"
+  "T2|Taskless gate recovery declares producer boundary|CodeWhale/crates/tui/src/tools/tasks.rs|fn forkguard_taskless_gate_recovery_names_returned_summaries"
+  # 2026-11-05 批次：#124 把结构化摘要的恢复 footer 收敛到共享 helper
+  # model_context_recovery_footer（truncate.rs），context.rs 的内联文案随之迁移——
+  # 指纹钉同一文案的真实新位置，主题声明不变。
+  "T2|Engine recovery names the complete returned result|CodeWhale/crates/tui/src/tools/truncate.rs|complete returned tool result at"
+  "T2|Real interrupted child retains checkpoint recovery|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_interrupted_snapshot_preserves_checkpoint_recovery"
+  "T2|Complete structured output has no false recovery|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_complete_structured_results_do_not_request_recovery"
+  "T2|Structured field omissions retain recovery|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_structured_field_cuts_still_request_recovery"
+  "T2|Adaptive evidence keeps original line totals|CodeWhale/crates/tui/src/tools/truncate.rs|fn adaptive_evidence_footer_names_artifact_path_and_recovery"
+  "T2|Preview metadata overflow fails closed|CodeWhale/crates/tui/src/tools/truncate.rs|fn refit_spilled_preview_rejects_overflowing_metadata"
+  "T2|Unsaved wire previews are not full-content refs|CodeWhale/crates/tui/src/client/chat/tests/stream_decoder.rs|fn request_builder_never_deduplicates_unsaved_output_previews"
+  "T2|Web JSONPath schema agrees with parser results|CodeWhale/crates/tui/src/tools/web/contract.rs|fn forkguard_web_fields_description_matches_parser"
+  "T2|Document the Web JSONPath subset|CodeWhale/crates/tui/src/tools/web_tool.rs|Recursive descent (..) and filters are not supported"
+  "T2|Preserve failed tool-result flags|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_tool_failure_flag_survives_recording_and_round_trip"
+  # 2026-10-26 批次：#118 回移上游 recoverable output-budget 切片、#119 重钉 wait 超时面与会话名生命周期，
+  # 指纹钉住各自的结果式行为回归（父仓随 gitlink 批次一并登记）。
+  "T2|完整输出在 fanout 前保留|CodeWhale/crates/tui/src/core/engine/output_recovery_tests.rs|fn forkguard_turn_loop_serial_preserves_output_before_fanout"
+  "T2|Web 正文在 header 重响应中存活|CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_web_body_and_json_fields_survive_header_padding"
+  # 2026-10-28 批次：#114 为流式工具入参引入 suffix-only 复用——仅在未完成字符串不可修复且所选 raw
+  # 段字节范围不变时复用上次解析结果，其余输入仍走 dispatch::parse_tool_input；无模型可见文案、
+  # 无公开签名变更。指纹钉模块意图与交错工具的端到端回归。
+  "T2|流式工具入参 suffix-only 复用模块     |CodeWhale/crates/tui/src/core/engine/partial_input.rs|Suffix-only proof for the existing per-delta tool-input parser"
+  "T2|流式入参复用保持完整参数与历史回归   |CodeWhale/crates/tui/tests/integration/partial_input_engine.rs|async fn partial_input_engine_interleaved_tools_keep_complete_arguments_and_history"
+  "T1|wait timeout 别名保持可解析|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn wait_timeout_alias_stays_parse_accepted"
+  "T1|settled 后会话名释放|CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn spawn_session_name_released_once_same_session_holder_settles"
+  "T2|Unix shell guidance preservation test|CodeWhale/crates/tui/src/tools/shell/guidance.rs|fn shell_guidance_preserves_unix_shell_contracts"
+  "T2|Windows PowerShell policy bypass flags|CodeWhale/crates/tui/src/shell_dispatcher.rs|fn powershell_build_command_includes_no_profile_and_command_flags"
+  "T2|Windows PowerShell encoded fallback builder|CodeWhale/crates/tui/src/shell_dispatcher.rs|fn forkguard_powershell_encoded_fallback_avoids_the_script_file"
+  "T2|Windows PowerShell encoded form off-limit payload|CodeWhale/crates/tui/src/shell_dispatcher.rs|fn forkguard_powershell_encoded_fallback_skips_a_payload_past_the_command_line_limit"
+  "T2|Windows PowerShell encoded form non-PowerShell shells|CodeWhale/crates/tui/src/shell_dispatcher.rs|fn forkguard_powershell_encoded_fallback_is_none_for_other_shells"
+  "T2|Windows execution-policy retry wiring|CodeWhale/crates/tui/src/tools/shell.rs|fn retry_powershell_without_script_file"
+  "T2|Windows execution-policy retry gate helper|CodeWhale/crates/tui/src/tools/shell.rs|fn powershell_refusal_needs_inline_retry"
+  "T2|Windows execution-policy refusal ownership|CodeWhale/crates/tui/src/tools/shell.rs|fn powershell_temp_script"
+  "T2|Windows execution-policy retry startup failure|CodeWhale/crates/tui/src/tools/shell.rs|fn keep_first_result_after_a_failed_retry"
+  "T2|Windows execution-policy rejection predicate|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_powershell_execution_policy_rejection_is_locale_independent"
+  "T2|Windows execution-policy retry gate|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_powershell_inline_retry_only_for_a_failed_file_refusal"
+  "T2|Windows execution-policy retry glue|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_powershell_inline_retry_runs_the_command_and_notes_the_fallback"
+  "T2|Windows execution-policy retry keeps first evidence|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_powershell_retry_keeps_the_first_result_when_it_cannot_start"
+  "T2|Windows shell UTF-8 prefix family rule|CodeWhale/crates/tui/src/sandbox/mod.rs|fn forkguard_windows_shell_text_matches_the_shell_family"
+  "T2|Shell environment overlays preserve defaults|CodeWhale/crates/tui/src/sandbox/mod.rs|fn command_spec_env_overlays_preserve_existing_values"
+  "T2|Windows Python stdio environment end-to-end|CodeWhale/crates/tui/src/sandbox/mod.rs|fn forkguard_windows_shell_env_overlays_keep_python_stdio_utf8"
+  "T2|Windows explicit environment override casing|CodeWhale/crates/tui/src/sandbox/mod.rs|fn windows_shell_env_explicit_override_is_case_insensitive"
+  "T2|Windows native Python lowercase bash output|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_windows_python_stdio_lowercase_bash"
+  "T2|Windows native Python background output|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_windows_python_stdio_background_shell"
+  "T2|Windows PowerShell encoded form end-to-end|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_powershell_encoded_spec_runs_a_non_ascii_payload"
+  "T2|Windows PowerShell temp-script form end-to-end|CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_powershell_temp_script_form_runs_a_non_ascii_payload"
+  "T1|宿主 facade 公开 Automation        |CodeWhale/crates/tui/src/lib.rs|pub mod automation_manager;"
+  "T1|宿主显式 route limits              |CodeWhale/crates/tui/src/route_runtime.rs|pub fn resolve_runtime_route_with_limits("
+  "T1|同模型请求保留冻结宿主额度           |CodeWhale/crates/tui/src/client.rs|if request.model.trim() == self.default_model {"
+  "T1|同模型 model-aware 请求额度回归     |CodeWhale/crates/tui/src/client.rs|fn model_aware_same_model_request_keeps_host_declared_route_limits"
+  "T1|同模型子客户端 rebind 额度回归      |CodeWhale/crates/tui/src/client.rs|fn rebinding_the_same_model_keeps_host_declared_route_limits"
+  "T1|只读 worker ledger                |CodeWhale/crates/tui/src/tools/subagent/mod.rs|pub fn read_persisted_agent_worker_records("
+  "T1|可靠 steer 返回关联 id             |CodeWhale/crates/tui/src/core/engine/handle.rs|pub async fn steer(&self, content: impl Into<String>) -> Result<String>"
+  "T1|steer 撤回有界回归                 |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_steer_lifecycle_withdrawal_is_bounded_and_prevents_commit"
+  "T1|steer 真实 channel/turn-loop 回归       |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_steer_channel_commits_live_and_drops_withdrawn_input_in_turn_loop"
+  "T1|换会话批量取消子智能体              |CodeWhale/crates/tui/src/core/ops.rs|CancelSubAgents"
+  "T1|批量取消按 session 隔离且幂等      |CodeWhale/crates/tui/src/tools/subagent/tests.rs|forkguard_cancel_all_running_is_session_scoped_and_idempotent"
+  "T1|宿主 prompt-only profile 边界       |CodeWhale/crates/tui/src/tools/subagent/tests.rs|forkguard_host_profile_overlay_is_config_only_and_prompt_only"
+
+  "T1|轮次绑定取消槽与身份契约            |CodeWhale/crates/tui/src/core/engine.rs|pub struct TurnCancelSlot"
+  "T1|宿主轮次绑定取消入口                |CodeWhale/crates/tui/src/core/engine/handle.rs|pub fn cancel_turn(&self, turn_id: &str, reason: CancelReason, mode: CancelMode) -> bool"
+  "T1|收口期 stop 处置入口不开火          |CodeWhale/crates/tui/src/core/engine/handle.rs|pub fn publish_stop_disposition(&self, reason: CancelReason, mode: CancelMode)"
+  "T1|陈旧取消不误杀自主续跑轮回归        |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_cancel_turn_binding_spares_unnamed_turns_and_hits_the_observed_turn"
+  "T1|自启续轮陈旧 stop 端到端回归        |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_idle_subagent_completion_self_start_ignores_a_stale_previous_turn_cancel"
+  "T1|处置入口不触发任何 token 回归      |CodeWhale/crates/tui/src/core/engine/tests.rs|engine_handle_stop_disposition_publishes_without_firing_any_token"
+  "T1|TurnStarted 回显宿主提交令牌回归    |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_turn_started_echoes_submission_id_self_starts_stay_none"
+
+  "T1|GLM-5.3 强制思考改写禁用 payload    |CodeWhale/crates/tui/src/client/chat.rs|fn apply_zai_forced_thinking_effort"
+  "T1|BigModel host 纳入第一方 Chat 路由  |CodeWhale/crates/config/src/provider.rs|is_exact_https_route(base_url, \"open.bigmodel.cn\", \"api/paas/v4\")"
+
+  "T2|宿主额外工具入口                  |CodeWhale/crates/tui/src/core/engine.rs|pub struct ExtraTools("
+  "T2|宿主 MCP secret resolver          |CodeWhale/crates/tui/src/mcp.rs|pub fn install_mcp_secret_resolver("
+  "T2|File 写入 64 KiB 硬上限           |CodeWhale/crates/tui/src/tools/file.rs|const WRITE_FILE_MAX_CONTENT_BYTES: usize = 64 * 1024;"
+  "T2|write primitive 64 KiB 边界回归   |CodeWhale/crates/tui/src/tools/file/tests.rs|forkguard_write_primitive_enforces_the_64kib_boundary"
+  "T2|write_file 64 KiB 边界回归        |CodeWhale/crates/tui/src/tools/file/tests.rs|forkguard_write_file_enforces_the_64kib_boundary"
+  "T2|逐轮安全策略                      |CodeWhale/crates/tui/src/core/ops.rs|pub struct TurnToolSecurityPolicy"
+  "T2|精确最终分发 fail-closed          |CodeWhale/crates/tui/src/core/engine/tool_execution.rs|forkguard_exact_dispatch_rejects_forged_backends"
+  "T2|只读最终分发 fail-closed          |CodeWhale/crates/tui/src/core/engine/tool_execution.rs|forkguard_read_only_turn_rejects_write_at_final_dispatch"
+  "T2|受限审计固定脱敏                  |CodeWhale/crates/tui/src/core/engine/tool_execution.rs|forkguard_restricted_tool_audit_redacts_private_payload"
+  "T2|排队控制面不绕过逐轮权限            |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_queued_control_op_keeps_restricted_turn_authority"
+  "T2|受限轮推迟 idle 子智能体唤醒         |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_restricted_turn_defers_idle_subagent_completion_until_new_message"
+  "T2|受限轮推迟 idle Shell 唤醒           |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_restricted_turn_defers_idle_shell_wake_until_new_message"
+  "T2|禁用 MCP 不进入 catalog 或执行       |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_denied_mcp_is_absent_from_catalog_and_blocked_at_execution"
+  "T2|禁用 MCP 与未知工具错误不可区分       |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|forkguard_denied_mcp_tool_error_matches_the_unknown_tool_error"
+  "T2|API 搜索后备链直接落到 Bing          |CodeWhale/crates/tui/src/tools/web/backend.rs|forkguard_api_provider_chain_tail_is_bing"
+  "T2|搜索全失败提供可操作配置提示          |CodeWhale/crates/tui/src/tools/web/backend.rs|all_unavailable_returns_actionable_error_without_private_details"
+  "T2|宿主 Shell owner+session 入口      |CodeWhale/crates/tui/src/tools/shell.rs|pub fn execute_with_options_env_for_owner_and_session("
+  "T2|评测控制默认关闭且显式启用          |CodeWhale/crates/tui/src/core/ops.rs|forkguard_benchmark_controls_are_explicit_and_default_off"
+  "T2|评测只修复无歧义只读调用            |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|forkguard_benchmark_repairs_only_unambiguous_read_actions"
+  "T2|评测 read schema/附件修复受约束     |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|forkguard_benchmark_repairs_read_schema_and_attachments"
+  "T2|评测预算截断并清空后续工具面         |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_benchmark_budget_truncates_batch_and_clears_followup_tool_surface"
+  "T2|评测 final-only 熔断有界            |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_benchmark_final_only_rejects_repeated_tool_only_responses"
+  "T2|评测轮次执行前修复 File aliases     |CodeWhale/crates/tui/src/core/engine/tests.rs|forkguard_benchmark_turn_repairs_file_aliases_before_execution"
+
+  "T2|cmd.exe 单字母斜杠旗标可跳过        |CodeWhale/crates/execpolicy/src/lib.rs|fn is_single_letter_slash_flag"
+  "T2|deny 规则中段通配符跨令牌          |CodeWhale/crates/execpolicy/src/lib.rs|if rule_tokens[j] == \"*\" {"
+  "T2|deny 命令词折叠 .exe 后缀           |CodeWhale/crates/execpolicy/src/lib.rs|basename.strip_suffix(\".exe\")"
+  "T2|引擎克隆共享活规则集                |CodeWhale/crates/execpolicy/src/lib.rs|rulesets: Arc<RwLock<Vec<Ruleset>>>"
+  "T2|File 绝对路径规则精确匹配          |CodeWhale/crates/execpolicy/src/lib.rs|fn absolute_path_rule_matches"
+  "T2|subagent 工具调用过 execpolicy      |CodeWhale/crates/tui/src/core/engine.rs|pub(crate) fn exec_shell_ask_rule_decision_for_policy"
+  "T2|subagent execpolicy 拒绝面回归      |CodeWhale/crates/tui/src/tools/subagent/tests.rs|async fn forkguard_subagent_execpolicy_deny_matches_main_line"
+
+  "T2|工具结果 metadata.images 图片注入   |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|fn tool_result_message_content("
+  "T2|工具结果图片到达模型行为回归        |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|fn forkguard_tool_result_images_reach_model_as_image_blocks"
+  "T2|无 images 键结果保持不变回归        |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|fn forkguard_tool_result_without_images_key_is_unchanged"
+  "T2|坏图片降级不中断轮次回归            |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|fn forkguard_tool_result_bad_images_degrade_to_text_only_result"
+  "T2|单结果图片数量上限回归              |CodeWhale/crates/tui/src/core/engine/turn_loop.rs|fn forkguard_tool_result_images_are_capped_per_result"
+  "T2|ToolResult images 元数据约定文档    |CodeWhale/crates/tools/src/lib.rs|a tool that produced image artifacts"
+
+  "T2|finance 工具受网络策略闸门          |CodeWhale/crates/tui/src/tools/finance.rs|fn check_network_policy("
+  "T2|verifier 不再教退役工具名          |CodeWhale/crates/tui/src/tools/verifier.rs|\"poll_with\": [\"task_shell_wait\"]"
+  "T2|notify 配置方法合同钉               |CodeWhale/crates/tui/src/tui/notifications.rs|fn settings_installs_configured_method_from_config"
+  "T2|shell 指引与执行同一 dispatcher    |CodeWhale/crates/tui/src/tools/shell/guidance.rs|pub(super) fn runtime_command_guidance()"
+  "T2|指引对齐 catalog 一致性回归        |CodeWhale/crates/tui/src/tools/shell/tests.rs|fn forkguard_shell_catalog_guidance_matches_execution"
+  "T2|computer-use zoom 子栅格换算       |CodeWhale/plugins/computer-use/src/raster.mjs|export function zoomChildRaster(prev, region)"
+
+  # Review 5871983071 (2026-11-12): the #148 todo schema deviation is
+  # registered fork-distinct (docs/fork-modifications.md §3) but had no
+  # guard enforcement, and its tests are not forkguard_-named, so layer 2
+  # never selected them. The fingerprints pin two schema literals (the
+  # required shrink and the default statement); the pinned runner below
+  # covers the tests themselves.
+  "T2|todo item status leaves required  |CodeWhale/crates/tui/src/tools/todo.rs|\"required\": [\"content\"]"
+  "T2|todo default-pending stated in schema |CodeWhale/crates/tui/src/tools/todo.rs|\"description\": \"Task status. Defaults to pending when omitted.\""
+
+  "T3|静态 prompt composer              |CodeWhale/crates/tui/src/prompts.rs|pub fn set_static_prompt_composer_override("
+  "T3|ambient project authority 密封     |CodeWhale/crates/tui/src/project_context.rs|forkguard_runtime_loader_ignores_ambient_project_authority"
+  "T3|显式 Skills 根排除 ambient 来源    |CodeWhale/crates/tui/src/skills/tests.rs|forkguard_explicit_skills_dir_excludes_ambient_workspace_sources"
+  # 2026-10-28 批次：#125 把技能索引 Usage、子代理 ## Skills 头串、mcp-discovery 技能、registry-first
+  # 系统指令与 worker handle_read 提示统一为同一有界探测话术——host 申报优先 → tool_search when
+  # available → 未被拒绝则按名直呼一次 → schema 收据不等于执行（retry_required 才许一次重试）→
+  # 不可用/被拒即停、不重复探测不猜名。下列 8 条 T3 文案指纹随 #125 的真实措辞重钉；
+  # 可执行回归仍由对应 forkguard_* 测试行承载。
+  "T3|技能索引 Usage 补 tool_search 激活兜底|CodeWhale/crates/tui/src/skills/mod.rs|activate it via \`tool_search\` if available. If discovery cannot provide it and access was not denied, try \`load_skill\` directly once"
+  "T3|技能索引 Usage 回归                 |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_skill_index_usage_names_tool_search_activation"
+  "T3|子代理技能段走 tool_search 发现        |CodeWhale/crates/tui/src/tools/subagent/mod.rs|If \`load_skill\` is not in your tool list, activate it via \`tool_search\` if available"
+  "T3|子代理技能目录回归                  |CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_subagent_skill_catalog_uses_tool_search_discovery"
+  "T3|发现技能幻影命令自条件             |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|run \`tool_search\` first to activate it when available"
+  "T3|宿主内置能力优先于 Registry 默认路径|CodeWhale/crates/tui/src/core/engine.rs|Follow host-declared built-in capability entry points and discovery exceptions;"
+  "T3|registry-first 指令与注册名互钉       |CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_registry_first_instruction_names_registered_tool_specs"
+  "T3|Registry start preserves bounded fallback|CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|try \`start_registry_mcp_server\` directly once"
+  "T3|Schema receipt licenses one retry|CodeWhale/crates/tui/src/core/engine.rs|\`retry_required: true\` licenses one retry"
+  "T3|Registry defines a plausible core match|CodeWhale/crates/tui/src/core/engine.rs|Treat a returned server as a match when it plausibly covers the core capability"
+  "T3|Registry inspects before local alternative|CodeWhale/crates/tui/src/core/engine.rs|inspect its tools before considering a local alternative"
+  "T3|Registry shell host declaration pin|CodeWhale/crates/tui/src/core/engine/tests.rs|Follow host-declared built-in capability entry points and discovery exceptions from trusted host system/instruction guidance first"
+  "T3|Discovery host declaration pin|CodeWhale/crates/tui/src/skills/tests.rs|Declarations must come from trusted host system/instruction guidance"
+  "T3|Exact-name-first skill description pin|CodeWhale/crates/tui/src/tools/skill.rs|\"Load its known exact name directly\","
+  "T3|Edited discovery with peer marker case|CodeWhale/crates/tui/src/skills/system/tests.rs|let expected_version = if customized && !peer_present {"
+  "T3|Deny subset preserves eager read|CodeWhale/crates/tui/src/core/engine/tests.rs|assert!(surface.allows_tool(\"read\"));"
+  "T3|mcp-discovery 命令自条件回归        |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_mcp_discovery_skill_conditions_registry_commands"
+  "T3|tool_search 缺失态诚实兜底          |CodeWhale/crates/tui/src/skills/mod.rs|If unavailable or denied, stop and report the limitation; do not repeat failed probes or guess other names"
+  "T3|目标续轮点名 tool_search 激活       |CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_goal_continuation_names_tool_search_activation"
+  "T3|技能索引省略尾行守护               |CodeWhale/crates/tui/src/skills/tests.rs|fn forkguard_omitted_skills_line_stays_short"
+  "T3|捆绑技能退役名清扫回归             |CodeWhale/crates/tui/src/skills/system/tests.rs|fn forkguard_bundled_skills_cite_no_hidden_or_retired_tool_names"
+  "T3|best-of-n 目标工具自条件回归        |CodeWhale/crates/tui/src/skills/system/tests.rs|fn forkguard_best_of_n_goal_tool_is_availability_gated"
+  # 2026-10-20 批次 #112 撤下了 pdf 技能里 "built-in read 工具可抽取 PDF 文本" 的失实声明，
+  # 可靠工具清单改为 bash 侧 pdftotext/pdfinfo/qpdf/mutool——指纹随 #112 的真实措辞重钉；
+  # 反幻影名意图仍由 forkguard_bundled_skills_cite_no_hidden_or_retired_tool_names 可执行回归承载。
+  "T3|pdf 技能改引 bash 侧活工具         |CodeWhale/crates/tui/assets/skills/pdf/SKILL.md|\`pdftotext\` for text extraction"
+  "T3|best-of-n 目标门控文案             |CodeWhale/crates/tui/assets/skills/best-of-n/SKILL.md|\`create_goal\` is in your tool list"
+  "T3|mcp-discovery 前言如实披露 pool 依赖 |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|the start tool once the host's MCP pool is initialized"
+  "T3|Start discovery shares step-1 receipt rules|CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|schema-receipt and refusal rules. When callable, use"
+  "T3|start 工具两段式激活门控           |CodeWhale/crates/tui/assets/skills/mcp-discovery/SKILL.md|\`tool_search\` when available, as in step 1"
+  "T3|best-of-n 补 tool_search 激活路径    |CodeWhale/crates/tui/assets/skills/best-of-n/SKILL.md|if it is not, run \`tool_search\` first"
+  "T3|父上下文提示只点名活工具          |CodeWhale/crates/tui/src/core/engine/context.rs|verify side effects with \`read\` or \`bash\`"
+  "T3|Permissions 窄 100 KiB 预算       |CodeWhale/crates/tui/src/prompts.rs|forkguard_instruction_fragment_preserves_explicit_host_budget"
+  "T3|内部 reminder 不污染 working set  |CodeWhale/crates/tui/src/working_set.rs|forkguard_working_set_ignores_leading_system_reminder_paths"
+  "T3|registry-first 指令补激活路径        |CodeWhale/crates/tui/src/core/engine.rs|run \`tool_search\` first to activate it when available; if discovery cannot provide it and access was not denied, try \`registry_sync\` directly once"
+  "T3|start 工具独立激活与一次直呼探测     |CodeWhale/crates/tui/src/core/engine.rs|activate it via \`tool_search\` as well when available. If discovery cannot provide it and access was not denied, one direct call to \`start_registry_mcp_server\` may surface its schema"
+  "T3|sync 结果提示补 start 激活          |CodeWhale/crates/tui/src/tools/mcp_registry.rs|run tool_search first to activate it"
+  "T3|sync 结果提示激活回归               |CodeWhale/crates/tui/src/tools/mcp_registry.rs|fn forkguard_registry_first_prompt_teaches_start_tool_activation"
+  "T3|worker 记录共享 handle_read 激活提示 |CodeWhale/crates/tui/src/tools/subagent/mod.rs|if \`handle_read\` is not in your tool list, activate it via \`tool_search\` when available; if discovery cannot provide it and access was not denied, try calling \`handle_read\` directly once"
+  "T3|worker 记录激活提示回归             |CodeWhale/crates/tui/src/tools/subagent/tests.rs|fn forkguard_worker_record_hints_teach_handle_read_activation"
+  # #125 新增的两条可执行回归：宿主过滤掉发现工具时父级 deferred 工具仍按名可达；
+  # 技能升级刷新随附 mcp-discovery 正文并保留用户自定义字节（混合 peer 刷新推进 marker、无 peer 不动）。
+  "T3|父级 deferred 工具无需发现即可达回归  |CodeWhale/crates/tui/src/core/engine/tests.rs|fn forkguard_parent_deferred_tools_remain_reachable_without_discovery"
+  "T3|技能升级刷新 mcp-discovery 并保留用户编辑回归|CodeWhale/crates/tui/src/skills/system/tests.rs|fn forkguard_skill_upgrade_refreshes_shipped_mcp_discovery_and_preserves_user_edits"
+  "T3|目标续轮直呼兜底                   |CodeWhale/crates/tui/src/prompts/text.rs|call \`update_goal\` directly anyway"
+  "T3|父上下文提示直呼兜底                |CodeWhale/crates/tui/src/core/engine/context.rs|Use \`handle_read\` on \`transcript_handle\` for bounded transcript slices"
+  "T3|fetch 溢出证据可取回标记            |CodeWhale/crates/tui/src/tools/fetch_url.rs|\"evidence_available\": true,"
+  "T3|web.run 溢出证据可取回标记          |CodeWhale/crates/tui/src/tools/web_run.rs|\"evidence_available\": true,"
+  "T3|/agent 派发简报补激活回归           |CodeWhale/crates/tui/src/commands/groups/core/agent.rs|fn forkguard_slash_agent_dispatch_teaches_handle_read_activation"
+  "T3|/goal 简报补 create_goal 激活        |CodeWhale/crates/tui/src/commands/groups/project/goal.rs|if \`create_goal\` is not in your tool list"
+  "T3|/goal 简报补直呼兜底                 |CodeWhale/crates/tui/src/commands/groups/project/goal.rs|call \`create_goal\` directly anyway"
+  "T3|/agent 简报补直呼兜底                |CodeWhale/crates/tui/src/commands/groups/core/agent.rs|Use \`handle_read\` on a sub-agent transcript handle if you need more detail"
+  "T3|幻影清单锚定 canonical 退役名        |CodeWhale/crates/tui/src/skills/system/tests.rs|fn forkguard_phantom_denylist_covers_canonical_lists"
+
+  "T4|Automation 稳定 conversation key |CodeWhale/crates/tui/src/automation_manager.rs|add_task_with_conversation_key(new_task, Some(automation.id.clone()))"
+  "T4|离线不补跑且同一任务不重叠          |CodeWhale/crates/tui/src/automation_manager.rs|forkguard_scheduler_skips_offline_backfill_and_overlapping_runs"
+  "T4|过期一次性任务精确入队一次            |CodeWhale/crates/tui/src/automation_manager.rs|forkguard_once_schedule_missed_while_offline_enqueues_exactly_one_run"
+  "T4|Pinvou 历史 v4 schema 窄兼容       |CodeWhale/crates/tui/src/task_manager.rs|const PINVOU_LEGACY_TASK_SCHEMA_VERSION: u32 = 4;"
+  "T4|conversation owner 与任务参数持久  |CodeWhale/crates/tui/src/automation_manager.rs|forkguard_automation_enqueue_preserves_settings_and_conversation_owner"
+  "T4|终态任务可显式清理                  |CodeWhale/crates/tui/src/task_manager.rs|pub async fn delete_terminal_task("
+  "T4|Task 删除拒绝 active 且幂等        |CodeWhale/crates/tui/src/task_manager.rs|forkguard_terminal_task_delete_refuses_active_and_is_idempotent"
+  "T4|Automation run 删除拒绝 active 且幂等|CodeWhale/crates/tui/src/automation_manager.rs|forkguard_terminal_automation_run_delete_refuses_active_and_is_idempotent"
+  "T4|worker 建线程边界事件              |CodeWhale/crates/tui/src/task_manager.rs|ThreadCreated {"
+
+  "T5|全保真归档导出入口                |CodeWhale/crates/tui/src/session_export.rs|pub fn write_session_archive("
+  "T5|liblzma 静态压缩依赖              |CodeWhale/crates/tui/Cargo.toml|liblzma = { version = \"0.4\", features = [\"static\"] }"
+  "T5|CLI sessions export 子命令        |CodeWhale/crates/tui/src/lib.rs|Some(SessionsCommand::Export {"
+  "T5|归档全上下文 roundtrip 回归        |CodeWhale/crates/tui/src/session_export.rs|forkguard_session_archive_export_roundtrips_full_context"
+  "T5|artifacts 包含/排除回归            |CodeWhale/crates/tui/src/session_export.rs|forkguard_session_archive_includes_artifacts_and_respects_skip"
+  "T5|短读 member fail-closed 回归      |CodeWhale/crates/tui/src/session_export.rs|forkguard_session_archive_rejects_artifact_shorter_than_recorded_size"
+
+  "T6|可缩容 launch gate 模块            |CodeWhale/crates/tui/src/tools/subagent/governor.rs|pub(crate) struct DynamicGate"
+  "T6|限流 AIMD 治理器                   |CodeWhale/crates/tui/src/tools/subagent/governor.rs|pub(crate) struct RateLimitGovernor"
+  "T6|fleet 治理器接线全部 spawn 路径    |CodeWhale/crates/tui/src/tools/subagent/mod.rs|runtime.governor = Some(Arc::clone(&self.governor));"
+  "T6|限流时间自愈行为回归               |CodeWhale/crates/tui/src/tools/subagent/governor.rs|fn forkguard_rate_limit_governor_pauses_and_time_recovers_after_window_drains"
+  "T6|取消授权重派与陈旧等待者回归       |CodeWhale/crates/tui/src/tools/subagent/governor.rs|fn forkguard_dynamic_gate_redispatches_grant_of_cancelled_waiter"
+
+  "T7|Compaction tool boundary regression|CodeWhale/crates/tui/src/runtime_handoff.rs|fn forkguard_compaction_topology_preserves_tool_round_boundary"
+  "T7|Compaction paired chat wire regression|CodeWhale/crates/tui/src/client/chat.rs|fn forkguard_compaction_tool_round_has_valid_chat_wire_roles"
+  "T7|Compaction topology round regression|CodeWhale/crates/tui/src/compaction/last_round.rs|fn forkguard_mid_round_topology_is_not_a_user_turn_on_recompaction"
+  "T7|Compaction later-turn survival regression|CodeWhale/crates/tui/src/compaction/last_round.rs|fn forkguard_recompaction_keeps_turns_after_the_previous_summary"
+  "T7|Compaction pasted-header provenance regression|CodeWhale/crates/tui/src/client/chat.rs|fn forkguard_full_summary_header_pasted_after_tool_result_is_not_relocated"
+  "T7|Restored completion boundary regression|CodeWhale/crates/tui/src/client/chat.rs|fn restored_completion_does_not_join_an_ordinary_user_turn"
+  "T7|Restored pre-fix session wire regression|CodeWhale/crates/tui/src/client/chat.rs|fn forkguard_restored_pre_fix_session_has_valid_chat_wire_roles"
+  "T7|Restore-tier quoted-header deletion regression|CodeWhale/crates/tui/src/compaction.rs|fn restore_keeps_a_user_turn_that_quotes_the_summary_header"
+  "T7|Pre-provenance carrier restore regression|CodeWhale/crates/tui/src/compaction.rs|fn restore_replaces_a_pre_provenance_carrier"
+  "T7|Checkpoint edit-target exclusion regression|CodeWhale/crates/tui/src/runtime_handoff.rs|fn compaction_checkpoint_is_never_the_edit_target"
+
+  "T8|roster 宿主 profiles 列表上限      |CodeWhale/crates/tui/src/tools/subagent/mod.rs|const ROSTER_HOST_PROFILE_LIMIT: usize = 48"
+  "T8|roster 载荷携带 host_profiles 键  |CodeWhale/crates/tui/src/tools/subagent/mod.rs|\"host_profiles_truncated\": host_profiles_truncated,"
+  "T8|roster profile_query 关键词发现通道 |CodeWhale/crates/tui/src/tools/subagent/mod.rs|fn roster_profile_query(input: &Value) -> Option<String>"
+
+  "APP|Execute explicit authorization boundary|pinvou3-app/src-tauri/src/features/runtime_bundle/platform/mod.rs|reply and wait for the user's decision."
+  "APP|Protected directory closed-state boundary|pinvou3-app/src-tauri/resources/common/bundle/instructions-shared.md|关闭或不支持时禁止写入这些目录"
+  "APP|Unavailable browser external-process boundary|pinvou3-app/src-tauri/resources/common/bundle/instructions-work.md|不启动外部 Chrome 或切换到截图流"
+  "APP|spawn 前安装 Engine session id   |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|cfg.session_id = Some(session_id.to_string());"
+  "APP|产品白名单复用原生 allowed_tools |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|allowed_tools: Some(crate::features::assistant::tool_policy::allowed_tool_names())"
+  "APP|宿主申报输出事实抵达钢丝回归        |pinvou3-app/src-tauri/src/features/assistant/route_wire_cap_tests.rs|fn host_declared_output_fact_reaches_the_wire_for_both_wire_policies"
+  "APP|审查线材预算与主对话同链钉        |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn main_wire_max_output_tokens_matches_engine_budget_for_k3"
+  "APP|审查思考永不关闭档位表钉        |pinvou3-app/src-tauri/src/features/review/mod.rs|fn review_thinking_controls_pick_lowest_tier_never_off"
+  "APP|审查线材型号规范化引擎同表钉    |pinvou3-app/src-tauri/src/features/review/mod.rs|fn canonical_wire_model_mirrors_engine_family_maps"
+  "APP|账目解码失败拒绝核账           |pinvou3-app/src-tauri/src/features/review/mod.rs|fn ledger_undecodable_issues_reject_reconcile"
+  "APP|会话工具开关走动态禁用整形        |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|pub fn shape_disallowed_tools("
+  "APP|subagent ledger root 透传       |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|cfg.subagent_state_root = Some(roots.ledger);"
+  "APP|逐轮精确安全策略下发               |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|turn_tool_security: Some(Arc::new(turn_tool_security))"
+  "APP|受限操作动态工具清空               |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|dynamic_tools: Vec::new()"
+  "APP|停止与回收级联取消子智能体          |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|Op::CancelSubAgents"
+  "APP|取消入口在引擎槽上按轮身份分派    |pinvou3-app/src-tauri/src/features/assistant/engine.rs|fn dispatch_turn_bound_cancel"
+  "APP|绑定命中精确开火目标轮            |pinvou3-app/src-tauri/src/features/assistant/engine.rs|self.cancel_turn_with_mode(turn_id, mode)"
+  "APP|无目标轮仅发布处置绝不开火        |pinvou3-app/src-tauri/src/features/assistant/engine.rs|engine.publish_stop_disposition_only(mode)"
+  "APP|cancel 闭包接入共享轮绑定分派     |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|dispatch_turn_bound_cancel(engine, identity.as_ref(), steer_mode)"
+  "APP|pending 取消按引擎轮身份重放      |pinvou3-app/src-tauri/src/features/assistant/forwarder.rs|approve_handle.cancel_turn("
+  "APP|超越自启轮不能消费 pending 重放    |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|overtaking_self_started_turn_started_cannot_consume_the_replay"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|async fn bounded_while_holding_turn_gate<F>"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|fn forkguard_cancel_holds_turn_lock_boundedly"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|async fn bounded_join_while_holding_turn_gate<T>"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|fn forkguard_bounded_join_reports_panicked_task_as_not_settled"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|fn forkguard_bounded_join_detaches_task_that_outlives_budget"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|fn forkguard_reclaim_shutdown_sends_bounded_and_retried"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|fn forkguard_reclaim_shutdown_retry_gives_up_within_patience"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/turn_shell_tasks.rs|fn forkguard_reclaim_cleanup_failed_preset_clears_on_success"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/turn_shell_tasks.rs|fn forkguard_background_cleanup_sweep_takes_cleanup_gate"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine.rs|async fn bounded_reserved_submit_send<Fut>"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine.rs|async fn bounded_join_detached_on_timeout<T>"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine.rs|fn forkguard_reserved_submit_send_fails_cleanly_on_wedged_engine"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine.rs|fn forkguard_reclaimed_persistence_join_detaches_task_that_outlives_budget"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|async fn bounded_teardown_shutdown<S, Fut>"
+  "APP|turn gate 持锁副作用 await 上界   |pinvou3-app/src-tauri/src/features/assistant/engine_pool.rs|fn forkguard_spawn_failure_teardown_shutdown_bounded_and_retried"
+  "APP|resolved route 由宿主统一解析     |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|pub fn resolve_runtime_route_for_model("
+  "APP|GLM 小写存量配置解析到规范模型    |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn forkguard_zai_direct_route_survives_model_casing_mismatch"
+  "APP|128K/256K compaction 合约        |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn forkguard_compaction_128k_scenarios"
+  "APP|事件按 owner session 隔离         |pinvou3-app/src-tauri/src/features/assistant/forwarder.rs|owner_session_id == session_id"
+  "APP|定时任务报告 ThreadCreated        |pinvou3-app/src-tauri/src/features/scheduled/executor.rs|TaskExecutionEvent::ThreadCreated"
+  "APP|定时任务复用 shared run API      |pinvou3-app/src-tauri/src/features/scheduled/tasks.rs|run_now_shared(&self.automations"
+  "APP|多智能体面板只读 live worker     |pinvou3-app/src-tauri/src/features/multiagent/transcripts.rs|read_persisted_agent_worker_records(workspace)"
+  "APP|Ordinary presenter preserves code denial|pinvou3-app/src-tauri/src/features/assistant/tool_policy.rs|fn artifact_delivery_is_loaded_without_widening_code_mode_tools"
+  "APP|Unattended questions are denied|pinvou3-app/src-tauri/src/features/assistant/engine.rs|fn unattended_turn_denies_scheduled_task_write_family"
+  "APP|Selected-root rule discovery contract|pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn project_rules_keep_additional_roots_for_on_demand_discovery"
+  "APP|Empty primary chain keeps discovery caveat|pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|content.contains(\"even when no rules were found\")"
+  "APP|Canonical Plan submission contract|pinvou3-app/src-tauri/src/features/assistant/session_policy.rs|assert!(reminder.contains(\"用 \`todo_write\` 提交方案步骤\"));"
+  "APP|静态 prompt composer 由应用安装   |pinvou3-app/src-tauri/src/features/runtime_bundle/platform/mod.rs|set_static_prompt_composer_override"
+  "APP|locale bookend slim wiring, reply-language only |pinvou3-app/src-tauri/src/features/runtime_bundle/platform/mod.rs|fn forkguard_locale_bookends_never_mandate_thinking_language"
+  "APP|运行时读取不修复在途工具调用       |pinvou3-app/src-tauri/src/features/sessions/tests.rs|fn forkguard_runtime_snapshot_load_does_not_repair_in_flight_tool_call"
+  "APP|进程启动恢复中断调用且幂等         |pinvou3-app/src-tauri/src/features/sessions/tests.rs|fn forkguard_boot_repairs_interrupted_tool_call_once"
+  "APP|仅进程启动入口触发历史恢复         |pinvou3-app/src-tauri/src/lib.rs|SessionStore::boot_for_process_startup()"
+  "APP|MCP secret 经 resolver 钩子下发  |pinvou3-app/src-tauri/src/features/marketplace/mod.rs|pub fn install_mcp_secret_resolver()"
+  "APP|进程 env 写收口到启动窗口         |pinvou3-app/src-tauri/src/lib.rs|pub(crate) fn startup_process_env()"
+  "APP|工具卡隐藏内部 runtime suffix    |pinvou3-app/src/shared/bridge-shared-helpers.js|function stripInternalToolRuntimeSuffix("
+  "APP|落盘编辑截断与底座同口径           |pinvou3-app/src-tauri/src/features/sessions/tests.rs|fn forkguard_admitted_display_fallback_edit_cuts_before_trailing_tool_result"
+  "APP|不支持的新用户内容不回退旧轮       |pinvou3-app/src-tauri/src/features/sessions/tests.rs|fn forkguard_admitted_display_fallback_does_not_skip_unsupported_user_turn"
+  "APP|Shell 任务按稳定来源对账         |pinvou3-app/src-tauri/src/features/assistant/shell_output.rs|fn forkguard_shell_monitor_assigns_identical_commands_by_stable_origin"
+  "APP|GUI export reuses base session_export |pinvou3-app/src-tauri/src/features/sessions/store.rs|deepseek_tui::session_export::write_session_archive("
+  "APP|GUI export store contract regression  |pinvou3-app/src-tauri/src/features/sessions/tests.rs|fn forkguard_session_archive_export_via_store_keeps_full_context"
+  # --fast runs only the fingerprint layer (CI's sole entry point), but
+  # renaming a pinned test is exactly the shape it cannot see: this
+  # source-level fingerprint pulls the existence of the "no tool-call cap
+  # pinned test" into the sub-second layer — a rename or deletion turns red
+  # immediately; whether it actually executes is still verified at compile
+  # level by the layer-3 run_pinned_cap_test.
+  "APP|engine config no-tool-call-cap pinned test |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn engine_config_has_no_tool_call_cap"
+  # Cross-feature / cross-language literal contracts: the two sides share no
+  # type-system link, so renaming either side alone fails silently — a code
+  # probe that misses the marker would treat a native code session as a plain
+  # chat and walk the wrong consent domain; a title-sentinel mismatch breaks
+  # sidebar localization and first-message auto-rename. One sub-second
+  # fingerprint pinned on each side.
+  "APP|code-session marker, probe-side literal    |pinvou3-app/src-tauri/src/features/sessions/store.rs|const CODE_SESSION_MARKER_FILE: &str = \"code-session.json\""
+  "APP|code-session marker, writer-side literal    |pinvou3-app/src-tauri/src/features/codex_acp/store.rs|join(\"code-session.json\")"
+  "APP|title sentinel, Rust-side literal          |pinvou3-app/src-tauri/src/features/sessions/store.rs|const NEW_CHAT_TITLE: &str = \"新对话\""
+  "APP|title sentinel, frontend dict literal      |pinvou3-app/src/shared/i18n.js|DEFAULT_CHAT_TITLES = new Set(['新对话', 'New chat', '新しいチャット'])"
+
+  "T9|Custom route honors the config wire channel |CodeWhale/crates/config/src/route/resolver.rs|pub wire_override: Option<RequestProtocol>"
+  "T9|Custom wire dialect parsed at a single source |CodeWhale/crates/config/src/provider.rs|pub fn wire_dialect_override"
+  "T9|Custom wire dialect read at a single source   |CodeWhale/crates/tui/src/route_runtime.rs|pub(crate) fn custom_wire_override_for"
+  "T9|Runtime candidate reads the dialect by identity |CodeWhale/crates/tui/src/route_runtime.rs|custom_wire_override_for(&route_config)"
+  "T9|Runtime candidate carries the true wire         |CodeWhale/crates/tui/src/route_runtime.rs|fn forkguard_named_table_wire_responses_reaches_the_runtime_candidate"
+  "T9|Unrecognized dialect degrades to Chat           |CodeWhale/crates/tui/src/route_runtime.rs|fn forkguard_named_table_unrecognized_wire_keeps_the_chat_default"
+  "T9|Per-turn client pins /responses                 |CodeWhale/crates/tui/src/client.rs|fn forkguard_custom_responses_route_turn_client_posts_to_the_responses_endpoint"
+  "T9|Replay tag scoped to provider identity          |CodeWhale/crates/tui/src/client.rs|fn reasoning_provider_tag"
+  "T9|Ingress fails closed on non-Chat custom wire    |CodeWhale/crates/app-server/src/chat_completions.rs|wire_dialect_override(\"custom\", provider_cfg.wire.as_deref())"
+  "T9|Preflight validates the table's own dialect     |CodeWhale/crates/tui/src/provider_readiness.rs|codewhale_config::provider::wire_dialect_override("
+  "T9|Custom Responses encrypted-reasoning capture    |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_responses_stream_captures_encrypted_reasoning_as_opaque_state"
+  "T9|Custom Responses exact-model replay             |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_responses_replays_only_exact_model_opaque_reasoning_state"
+  "T9|Chat wire never captures encrypted reasoning    |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_chat_stream_does_not_capture_encrypted_reasoning"
+  "T9|Empty encrypted content skips without breaking the stream |CodeWhale/crates/tui/src/client/responses/tests.rs|fn forkguard_custom_responses_capture_tolerates_missing_or_empty_encrypted_content"
+
+  "T10|Tachyon effort ladder never emits high   |CodeWhale/crates/tui/src/client.rs|fn forkguard_tachyon_effort_ladder_never_emits_high"
+  "T10|registered-only Tachyon table survives save |CodeWhale/crates/config/src/tests.rs|fn forkguard_tachyon_only_provider_table_survives_config_store_save"
+
+  "APP|unified 2000-step budget default           |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|const HOST_STEP_BUDGET: u32 = 2_000;"
+  "APP|2000-step budget behavior regression       |pinvou3-app/src-tauri/src/features/assistant/platform/bridge.rs|fn engine_config_defaults_to_unified_step_budget_and_respects_override"
+  "APP|chainable panic-hook registry module       |pinvou3-app/src-tauri/src/core/panic_hooks.rs|pub(crate) fn chain("
+  "APP|worker panic redaction behavior regression |pinvou3-app/src-tauri/src/features/computer_use/backend.rs|fn worker_thread_panics_are_redacted_and_other_panics_forwarded"
+  # Scheduled-session EngineCumulative accounting kernel (registered in
+  # docs/fork-modifications.md §11): the variant is producer-unwired
+  # (tests-only) until an app-side follow-up lands, and main's 60dba2f64
+  # dead-code sweep already deleted its single-variant predecessor once.
+  # The regression test keeps the official build's name (deliberately not
+  # forkguard_-renamed), so these fingerprints pull the kernel, the shared
+  # lifetime encoding, and the test's existence into the sub-second layer —
+  # a sweep or alignment sync that silently removes them turns red here.
+  "APP|scheduled EngineCumulative accounting variant         |pinvou3-app/src-tauri/src/features/sessions/scheduled.rs|EngineCumulative {"
+  "APP|shared scheduled lifetime-total encoding              |pinvou3-app/src-tauri/src/features/sessions/retention.rs|fn scheduled_lifetime_total(base_total_tokens: u64, engine_total_tokens: u64) -> u64"
+  "APP|scheduled token-accounting contract regression       |pinvou3-app/src-tauri/src/features/sessions/tests.rs|fn scheduled_engine_token_accounting_preserves_persisted_totals_across_restarts"
+)
+
+for fp in "${fingerprints[@]}"; do
+  IFS='|' read -r theme desc file pat <<<"$fp"
+  if grep -qF -- "$pat" "$REPO/$file" 2>/dev/null; then
+    green "  ✓ ${theme} ${desc}"
+  else
+    red "  ✗ ${theme} ${desc} — 指纹消失于 $file"
+    fail=1
+  fi
+done
+
+forkguard_count="$(grep -Rho --include='*.rs' 'forkguard_[A-Za-z0-9_]*' "$CODEWHALE/crates" 2>/dev/null | sort -u | wc -l | tr -d ' ')"
+if [[ "$forkguard_count" -ge 64 ]]; then
+  green "  ✓ CodeWhale 至少保留 64 条独立 forkguard 行为名（实际 ${forkguard_count}）"
+else
+  red "  ✗ CodeWhale forkguard 行为名仅 ${forkguard_count:-0}，登记下限为 64"
+  fail=1
+fi
+
+if [[ $FAST_ONLY -eq 1 ]]; then
+  echo
+  [[ $fail -eq 0 ]] && green "指纹层全过 (--fast)" || red "指纹层有缺失"
+  exit $fail
+fi
+
+echo
+bold "── 第 2 层：CodeWhale forkguard 回归 ──"
+( cd "$CODEWHALE" && cargo test -p codewhale-tui --lib --locked forkguard_ -- --test-threads=1 ) || fail=1
+( cd "$CODEWHALE" && cargo test -p codewhale-tui --lib --locked --features benchmark-eval-controls forkguard_benchmark_ -- --test-threads=1 ) || fail=1
+# The #148 todo schema tests are not forkguard_-named, so the filters
+# above never select them; `cargo test <filter>` also exits 0 on zero
+# matches. Pin both by name with run_pinned_cap_test's "1 passed"
+# discipline: a rename or deletion is a loud failure, not a silent no-op.
+run_pinned_todo_schema_tests() {
+  local test output
+  for test in \
+    todo_item_status_is_optional_with_a_pending_default \
+    work_update_treats_a_missing_status_as_pending; do
+    output=$( cd "$CODEWHALE" && cargo test -p codewhale-tui --lib --locked \
+      "$test" -- --test-threads=1 2>&1 ) || { printf '%s\n' "$output"; return 1; }
+    if ! grep -q '1 passed' <<<"$output"; then
+      printf '%s\n' "$output"
+      red "❌ pinned test $test did not run (renamed or deleted?)"
+      return 1
+    fi
+  done
+}
+run_pinned_todo_schema_tests || fail=1
+
+echo
+bold "── 第 3 层：pinvou3-app forkguard 回归 ──"
+( cd "$APP" && cargo test --lib --locked forkguard_ -- --test-threads=1 ) || fail=1
+( cd "$APP" && cargo check --all-targets --features benchmark-hooks --locked ) || fail=1
+( cd "$APP" && cargo test --lib --locked --features benchmark-hooks eval_send_message_op_isolated_from_gui_authority_and_installs_exact_policy -- --test-threads=1 ) || fail=1
+( cd "$APP" && cargo test --lib --locked --features benchmark-hooks features::assistant::product_runtime::headless_bridge::tests -- --test-threads=1 ) || fail=1
+( cd "$APP" && cargo test --lib --locked --features benchmark-hooks features::assistant::product_runtime::agentic_task::tests -- --test-threads=1 ) || fail=1
+# `cargo test <filter>` exits 0 when the filter matches nothing, so a renamed
+# or deleted pinned test would pass this gate silently — this very test has
+# already been renamed once. `--exact` plus the "1 passed" check makes the
+# absence of the test a failure instead of a no-op.
+run_pinned_cap_test() {
+  local output
+  output=$( cd "$APP" && cargo test --lib --locked --features benchmark-hooks \
+    features::assistant::platform::bridge::tests::engine_config_has_no_tool_call_cap \
+    -- --exact --test-threads=1 2>&1 ) || { printf '%s\n' "$output"; return 1; }
+  if ! grep -q '1 passed' <<<"$output"; then
+    printf '%s\n' "$output"
+    red "❌ pinned test engine_config_has_no_tool_call_cap did not run (renamed or deleted?)"
+    return 1
+  fi
+}
+run_pinned_cap_test || fail=1
+( cd "$APP" && cargo test --lib --locked --features benchmark-hooks headless_bridge_contract_tests:: -- --test-threads=1 ) || fail=1
+
+echo
+if [[ $fail -eq 0 ]]; then
+  green "✅ fork-guard 全过：CodeWhale v0.9.12 r3 的登记主题完好。"
+else
+  red "❌ fork-guard 失败：请对照 docs/fork-modifications.md 排查。"
+fi
+exit $fail

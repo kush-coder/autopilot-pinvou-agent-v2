@@ -1,0 +1,205 @@
+import { useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { Sparkles, X } from '../../components/icons.jsx';
+import { useDialogFocusRestore } from '../../hooks/useDialogFocusRestore.js';
+import { useDialogFocusTrap } from '../../hooks/useDialogFocusTrap.js';
+import { isWeb } from '../../shared/platform.js';
+import { setVoiceShortcutIntroOpen } from '../chat/voice-shortcut-state.mjs';
+
+// 两张模式卡同形异文案/同构异配色:配置驱动渲染,不再复制两份 JSX。
+// requiresEditSupport: web 通道无 edit 能力时整卡不渲染(见 editSupported)。
+const INTRO_MODE_CARDS = [
+  {
+    key: 'dictation',
+    requiresEditSupport: false,
+    cardClass: 'bg-[linear-gradient(120deg,#E0E0E0_0%,#F8FAFC_52%,#DCDCDC_100%)] shadow-[0_12px_36px_-18px_rgba(0,0,0,0.35)]',
+    labelKey: 'voiceIntroShortcutLabel',
+    keyClass: 'text-slate-950',
+    modeKey: 'voiceIntroDictationMode',
+    panelClass: 'w-full max-w-sm rounded-2xl bg-white/95 p-5 text-slate-700 shadow-[0_18px_36px_-22px_rgba(15,23,42,0.45)]',
+    stepsKey: 'voiceIntroDictationSteps',
+    badgeClass: 'bg-slate-900',
+  },
+  {
+    key: 'task',
+    requiresEditSupport: true,
+    cardClass: 'bg-[linear-gradient(120deg,#E0F2FE_0%,#FCE7F3_50%,#DBEAFE_100%)] shadow-[0_14px_40px_-18px_rgba(79,70,229,0.55)]',
+    labelKey: 'voiceIntroComboLabel',
+    keyClass: 'text-indigo-600',
+    modeKey: 'voiceIntroTaskMode',
+    panelClass: 'w-full max-w-md rounded-[24px] bg-white/95 p-6 text-slate-700 shadow-[0_18px_36px_-22px_rgba(79,70,229,0.5)]',
+    stepsKey: 'voiceIntroTaskSteps',
+    badgeClass: 'bg-indigo-600',
+    exampleLabelKey: 'voiceIntroTaskExampleLabel',
+    exampleKey: 'voiceIntroTaskExample',
+  },
+];
+
+function VoiceShortcutIntroModal({
+  isDark,
+  copy,
+  onClose,
+  onToggleShortcut,
+  shortcutEnabled = false,
+  closeLabel,
+  primaryLabel,
+}) {
+  const dialogRef = useRef(null);
+  const primaryButtonRef = useRef(null);
+  const backdropPressRef = useRef(false);
+  const onCloseRef = useRef(onClose);
+  // The web lane is web_asr_only: no smart post-processing, and Alt with text silently
+  // downgrades to append dictation, so the voice-edit card is no longer shown — avoid
+  // promising capabilities that do not exist on web.
+  const editSupported = !isWeb;
+  const canEnable = !shortcutEnabled && typeof onToggleShortcut === 'function';
+  const resolvedCloseLabel = closeLabel || copy.voiceIntroGotIt;
+  const resolvedPrimaryLabel = primaryLabel
+    || (canEnable ? (copy.voiceIntroEnable || copy.voiceIntroStart) : (copy.voiceIntroDone || copy.voiceIntroStart || copy.voiceIntroGotIt));
+
+  // latest-ref sync: the view rebuilds onClose on every render; reading it through the ref
+  // keeps the modal lifecycle effect below from re-running constantly (a re-run would steal
+  // focus back to the primary button).
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
+
+  // Shared modal-dismiss recipe: initial focus lands on the primary button
+  // and focus returns to the trigger on unmount; Tab cycling comes from the
+  // shared trap. This effect only flags the modal for the shortcut router
+  // (Esc yields to the modal) and owns the Esc-to-close capture listener.
+  useDialogFocusRestore(dialogRef, primaryButtonRef);
+  useDialogFocusTrap(dialogRef);
+  useEffect(() => {
+    setVoiceShortcutIntroOpen(true);
+    const handleKeyDown = (event) => {
+      if (!event || event.defaultPrevented) return;
+      if (event.key === 'Escape') {
+        if (event.repeat) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onCloseRef.current();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      setVoiceShortcutIntroOpen(false);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, []);
+
+  return createPortal(
+    // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop press-to-dismiss; the keyboard path is the capture-phase Escape listener and the in-dialog buttons
+    <div
+      className="fixed inset-0 z-[1200] flex items-center justify-center bg-black/35 px-4 py-6 backdrop-blur-md"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="voice-shortcut-intro-title"
+      onMouseDown={(event) => { backdropPressRef.current = event.target === event.currentTarget; }}
+      onMouseUp={(event) => { if (backdropPressRef.current && event.target !== event.currentTarget) backdropPressRef.current = false; }}
+      onClick={(event) => {
+        // Same two-end recipe as the move picker's backdrop: a text-selection
+        // drag that starts (or ends) here synthesizes a click on the common
+        // ancestor, and dismissing on it would close the intro mid-drag.
+        if (!backdropPressRef.current || event.target !== event.currentTarget) return;
+        backdropPressRef.current = false;
+        onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        className={`w-full max-w-[980px] overflow-hidden rounded-[32px] shadow-[0_24px_80px_-32px_rgba(0,0,0,0.45)] ${
+          isDark ? 'bg-[#111214] text-[#F1F3F4]' : 'bg-[#F7F9FC] text-[#0F172A]'
+        }`}
+      >
+        <div className="relative px-5 pb-5 pt-6 md:px-8 md:pb-7">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={copy.voiceIntroClose}
+            title={copy.voiceIntroClose}
+            className={`absolute right-4 top-4 flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${
+              isDark ? 'text-[#BDC1C6] hover:bg-white/10' : 'text-[#64748B] hover:bg-black/5'
+            }`}
+          >
+            <X size={18} />
+          </button>
+          <div className="mb-6 pr-10 text-center">
+            <h2 id="voice-shortcut-intro-title" className="text-[24px] font-bold tracking-tight md:text-[30px]">
+              {copy.voiceIntroTitle}
+            </h2>
+          </div>
+          <div className={`grid grid-cols-1 gap-4 md:gap-5 ${editSupported ? 'md:grid-cols-2' : 'md:max-w-[520px] md:mx-auto'}`}>
+            {INTRO_MODE_CARDS.filter((card) => !card.requiresEditSupport || editSupported).map((card) => (
+              <div key={card.key} className={`flex min-h-[360px] flex-col overflow-hidden rounded-[28px] ${card.cardClass}`}>
+                <div className="m-3 flex shrink-0 items-start justify-between rounded-[24px] bg-white/85 p-5 shadow-sm backdrop-blur-xl">
+                  <div>
+                    <div className="mb-1 text-[13px] font-semibold text-slate-500">{copy[card.labelKey]}</div>
+                    <div className={`text-[38px] font-extrabold leading-none tracking-tight ${card.keyClass}`}>Alt</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">{copy.voiceIntroModeLabel}</div>
+                    <div className="text-[17px] font-bold text-slate-800">{copy[card.modeKey]}</div>
+                  </div>
+                </div>
+                <div className="flex flex-1 items-center justify-center px-6 pb-8 pt-3">
+                  <div className={card.panelClass}>
+                    <div className="space-y-3">
+                      {copy[card.stepsKey].map((step, index) => (
+                        <div key={step} className="flex items-start gap-3">
+                          <span className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[12px] font-bold text-white ${card.badgeClass}`}>
+                            {index + 1}
+                          </span>
+                          <span className="text-[15px] font-semibold leading-6 text-slate-700">{step}</span>
+                        </div>
+                      ))}
+                    </div>
+                    {card.exampleKey && (
+                      <div className="mt-5 rounded-2xl bg-indigo-50/80 px-4 py-3 text-[14px] font-medium leading-6 text-slate-600">
+                        <div className="mb-1 flex items-center gap-1.5 text-[12px] font-bold text-indigo-600">
+                          <Sparkles size={14} />
+                          {copy[card.exampleLabelKey]}
+                        </div>
+                        {copy[card.exampleKey]}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            {canEnable && (
+              <button
+                type="button"
+                onClick={onClose}
+                className={`rounded-full px-4 py-2 text-[13px] font-medium ${
+                  isDark ? 'text-[#E8EAED] hover:bg-white/10' : 'text-[#3C4043] hover:bg-black/5'
+                }`}
+              >
+                {resolvedCloseLabel}
+              </button>
+            )}
+            <button
+              ref={primaryButtonRef}
+              type="button"
+              onClick={() => {
+                if (canEnable) {
+                  onToggleShortcut(true);
+                } else {
+                  onClose();
+                }
+              }}
+              className="rounded-full bg-[#0B57D0] px-5 py-2 text-[13px] font-semibold text-white shadow-sm hover:bg-[#1967D2]"
+            >
+              {resolvedPrimaryLabel}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+export { VoiceShortcutIntroModal };

@@ -1,0 +1,9 @@
+{
+  "name": "pinvou3-acp-bridge-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.95.0",
+    "@agentclientprotocol/codex-acp": "2.2.2"
+  }
+}

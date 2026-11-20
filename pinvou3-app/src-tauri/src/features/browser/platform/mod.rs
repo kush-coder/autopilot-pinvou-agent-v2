@@ -1,0 +1,921 @@
+//! Platform boundary for native browser display.
+//!
+//! Windows, macOS, and Linux share workspace, tab, layout, navigation, and security policy
+//! in `host`. Platform modules provide only system-WebView construction parameters and an
+//! accurate declaration of Agent automation capability.
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod host;
+
+/// Global name the BrowserCore runtime registers on the page (see
+/// `resources/common/bundle/mcp-servers/browser-core-runtime.js`): shared by
+/// the core prelude and the macOS readiness probe so the two cannot drift.
+pub(crate) const BROWSER_CORE_GLOBAL: &str = "__PINVOU_BROWSER_CORE_V1__";
+
+pub(crate) mod state;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod system;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+#[cfg(target_os = "linux")]
+mod linux_automation;
+
+#[cfg(target_os = "linux")]
+mod linux_surface;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeSurfaceCapabilities {
+    pub(crate) native_display: bool,
+    pub(crate) agent_automation: bool,
+    pub(crate) chrome_devtools_protocol: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeWorkspaceRestore {
+    pub(crate) urls: Vec<String>,
+    pub(crate) active_index: usize,
+}
+
+/// BrowserCore evaluations are read-only unless the caller explicitly marks
+/// them as capable of mutating page state. A mutating script that has already
+/// crossed the system-WebView dispatch boundary must never surface as an
+/// ordinary retryable transport timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserCoreEvaluationMode {
+    ReadOnly,
+    MayMutate,
+}
+
+/// Keep the mutating-evaluation authorization invariant at the common platform
+/// boundary. Read-only BrowserCore observations deliberately carry no control
+/// capability; page-mutating JavaScript must carry the exact begun tab lease
+/// all the way to the native UI-thread callback.
+fn evaluation_authorization(
+    mode: BrowserCoreEvaluationMode,
+    authorization: Option<&state::NativeTabLease>,
+) -> Result<Option<&state::NativeTabLease>, String> {
+    match mode {
+        BrowserCoreEvaluationMode::ReadOnly => Ok(None),
+        BrowserCoreEvaluationMode::MayMutate => authorization
+            .map(Some)
+            .ok_or_else(|| "browser/mutating-script-lease-required".to_string()),
+    }
+}
+
+/// Shared core of the platform `dispatch_script_mutation_if_authorized`
+/// adapters. Resolve the tab's live control through `control_lookup`, then
+/// keep the control lock held through `dispatch` so a user takeover either
+/// revokes the operation first or is ordered after this native dispatch; there
+/// is no check/enqueue gap. Script execution can synthesize page state but
+/// cannot produce an OS-trusted input event, so it still needs the exact live
+/// Agent lease. `error_prefix` preserves each platform's stable
+/// `browser/<platform>-*` error codes.
+pub(in crate::features::browser::platform) fn dispatch_script_mutation_with_authorized_control<
+    T,
+    F,
+    L,
+>(
+    control_lookup: L,
+    authorization: &state::NativeTabLease,
+    error_prefix: &str,
+    dispatch: F,
+) -> Result<T, String>
+where
+    L: FnOnce() -> Result<std::sync::Arc<state::WorkspaceControl>, String>,
+    F: FnOnce() -> Result<T, String>,
+{
+    control_lookup()?
+        .dispatch_if_agent_authorized(authorization, dispatch)?
+        .ok_or_else(|| format!("browser/{error_prefix}-control-lease-lost"))
+}
+
+pub(crate) const ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION: &str =
+    "browser/action-commit-unknown-after-script-interruption";
+// Commit-boundary error codes shared by core.rs and the platform adapters.
+// The JS contract tests and browser-wrapper.mjs match these strings literally;
+// never reword them locally.
+pub(crate) const ACTION_COMMIT_UNKNOWN_WEBDRIVER: &str = "browser/action-commit-unknown-webdriver";
+pub(crate) const ACTION_COMMITTED_FOCUS_RESTORE_FAILED: &str =
+    "browser/action-committed-focus-restore-failed";
+pub(crate) const ACTION_COMMIT_UNKNOWN_FOCUS_RESTORE_FAILED: &str =
+    "browser/action-commit-unknown-focus-restore-failed";
+pub(crate) const ACTION_COMMIT_UNKNOWN_INPUT_INTERRUPTION: &str =
+    "browser/action-commit-unknown-after-input-interruption";
+pub(crate) const ACTION_PARTIALLY_COMMITTED: &str = "browser/action-partially-committed";
+pub(crate) const ACTION_COMMIT_UNKNOWN_NAVIGATION_DISPATCH: &str =
+    "browser/action-commit-unknown-after-navigation-dispatch";
+pub(crate) const ACTION_COMMIT_UNKNOWN_TAB_CLOSE: &str =
+    "browser/action-commit-unknown-after-tab-close";
+
+/// Host-owned internal about:blank fragment markers, shared by host.rs and
+/// linux_automation.rs. Rust writes the plain `#` form; WebKit serializes the
+/// fragment delimiter in opaque `about:` URLs as `%23`, so both spellings are
+/// recognized. These prefixes are reserved and never user-visible content.
+pub(crate) const HOST_BLANK_MARKER_SESSION_PREFIX: &str = "about:blank#pinvou-session-";
+pub(crate) const HOST_BLANK_MARKER_TAB_PREFIX: &str = "about:blank#pinvou-tab-";
+pub(crate) const HOST_BLANK_MARKER_WEBDRIVER_BIND_PREFIX: &str =
+    "about:blank#pinvou-webdriver-bind-";
+pub(crate) const HOST_BLANK_MARKER_SESSION_PREFIX_ENCODED: &str = "about:blank%23pinvou-session-";
+pub(crate) const HOST_BLANK_MARKER_TAB_PREFIX_ENCODED: &str = "about:blank%23pinvou-tab-";
+pub(crate) const HOST_BLANK_MARKER_WEBDRIVER_BIND_PREFIX_ENCODED: &str =
+    "about:blank%23pinvou-webdriver-bind-";
+/// Every reserved marker spelling; used to detect reserved (never user-visible)
+/// blank URLs regardless of which WebView serialization produced them.
+pub(crate) const HOST_BLANK_MARKER_RESERVED_PREFIXES: [&str; 6] = [
+    HOST_BLANK_MARKER_SESSION_PREFIX,
+    HOST_BLANK_MARKER_TAB_PREFIX,
+    HOST_BLANK_MARKER_SESSION_PREFIX_ENCODED,
+    HOST_BLANK_MARKER_TAB_PREFIX_ENCODED,
+    HOST_BLANK_MARKER_WEBDRIVER_BIND_PREFIX,
+    HOST_BLANK_MARKER_WEBDRIVER_BIND_PREFIX_ENCODED,
+];
+/// The session/tab bootstrap markers in both spellings; host-owned token
+/// extraction strips exactly these.
+pub(crate) const HOST_BLANK_MARKER_TOKEN_PREFIXES: [&str; 4] = [
+    HOST_BLANK_MARKER_SESSION_PREFIX,
+    HOST_BLANK_MARKER_TAB_PREFIX,
+    HOST_BLANK_MARKER_SESSION_PREFIX_ENCODED,
+    HOST_BLANK_MARKER_TAB_PREFIX_ENCODED,
+];
+
+const ASYNC_DISPATCH_PENDING: u8 = 0;
+const ASYNC_DISPATCH_RUNNING: u8 = 1;
+const ASYNC_DISPATCH_CANCELLED: u8 = 2;
+const ASYNC_DISPATCH_FINISHED: u8 = 3;
+
+/// Shared commit boundary for callbacks queued onto GTK/AppKit. A timeout can
+/// cancel work only while it is still pending. Once the native callback has
+/// started, callers choose whether an interrupted result is ordinary
+/// (read-only observation) or commit-unknown (page/native mutation).
+#[derive(Clone)]
+struct AsyncDispatchState {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+}
+
+impl AsyncDispatchState {
+    fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(ASYNC_DISPATCH_PENDING)),
+        }
+    }
+
+    fn begin(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ASYNC_DISPATCH_PENDING,
+                ASYNC_DISPATCH_RUNNING,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn finish(&self) {
+        // Rust 1.99 deprecated fetch_update (renamed to try_update); the MSRV
+        // (1.90) predates the new name, so keep the old call.
+        #[allow(deprecated)]
+        let _ = self.state.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |state| match state {
+                ASYNC_DISPATCH_PENDING | ASYNC_DISPATCH_RUNNING => Some(ASYNC_DISPATCH_FINISHED),
+                ASYNC_DISPATCH_CANCELLED | ASYNC_DISPATCH_FINISHED => None,
+                _ => None,
+            },
+        );
+    }
+
+    fn cancel_pending(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ASYNC_DISPATCH_PENDING,
+                ASYNC_DISPATCH_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn interruption_error(&self, cause: &str, commit_unknown_prefix: Option<&str>) -> String {
+        if matches!(
+            self.state.load(std::sync::atomic::Ordering::Acquire),
+            ASYNC_DISPATCH_RUNNING | ASYNC_DISPATCH_FINISHED
+        ) {
+            if let Some(prefix) = commit_unknown_prefix {
+                return format!("{prefix}: {cause}");
+            }
+        }
+        cause.to_string()
+    }
+
+    async fn wait<T>(
+        &self,
+        mut rx: tokio::sync::oneshot::Receiver<Result<T, String>>,
+        timeout: std::time::Duration,
+        timeout_error: &str,
+        callback_closed_error: &str,
+        commit_unknown_prefix: Option<&str>,
+    ) -> Result<T, String> {
+        match tokio::time::timeout(timeout, &mut rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) if self.cancel_pending() => Err(callback_closed_error.to_string()),
+            Ok(Err(_)) => {
+                Err(self.interruption_error(callback_closed_error, commit_unknown_prefix))
+            }
+            Err(_) => {
+                // Prefer a result that raced the timer before deciding whether
+                // the queued callback is still cancelable.
+                match rx.try_recv() {
+                    Ok(result) => return result,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        if self.cancel_pending() {
+                            return Err(callback_closed_error.to_string());
+                        }
+                        return Err(
+                            self.interruption_error(callback_closed_error, commit_unknown_prefix)
+                        );
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+
+                if self.cancel_pending() {
+                    return Err(timeout_error.to_string());
+                }
+
+                // The callback may have completed between the first receive
+                // probe and the cancellation CAS. Preserve its exact result.
+                match rx.try_recv() {
+                    Ok(result) => result,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        Err(self.interruption_error(callback_closed_error, commit_unknown_prefix))
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        Err(self.interruption_error(timeout_error, commit_unknown_prefix))
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn browser_core_available() -> bool {
+    if !crate::platform::capabilities::browser_product_enabled() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return linux_automation::backend_available();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos::backend_available();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    false
+}
+
+pub(crate) fn browser_core_backend_name() -> &'static str {
+    if !crate::platform::capabilities::browser_product_enabled() {
+        "browser-core-unavailable"
+    } else if cfg!(target_os = "macos") {
+        "browser-core-wkwebview"
+    } else if cfg!(target_os = "linux") {
+        "browser-core-webkitgtk"
+    } else {
+        "browser-core-unavailable"
+    }
+}
+
+/// Register a WebView label with the platform automation adapter. When Linux must rebuild the
+/// private WebDriver-handle map, the host temporarily navigates that exact WebView to a fresh
+/// internal marker and then reloads its prior URL. No binding identity enters a remote page.
+fn register_browser_core_webview_binding(
+    label: &str,
+    tab_token: &str,
+    control: &std::sync::Arc<state::WorkspaceControl>,
+    navigation: &std::sync::Arc<parking_lot::Mutex<state::UserNavigationState>>,
+    host_bootstrap_pending: bool,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_automation::register_webview_binding_with_navigation(
+            label,
+            tab_token,
+            control,
+            navigation,
+            host_bootstrap_pending,
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (navigation, host_bootstrap_pending);
+        return macos::register_webview_binding(label, tab_token, control);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (
+            label,
+            tab_token,
+            control,
+            navigation,
+            host_bootstrap_pending,
+        );
+        Ok(())
+    }
+}
+
+pub(crate) fn unregister_browser_core_webview_binding(label: &str) {
+    #[cfg(target_os = "linux")]
+    linux_automation::unregister_webview_binding(label);
+    #[cfg(target_os = "macos")]
+    macos::unregister_webview_binding(label);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = label;
+}
+
+/// Return true only for the exact host-generated navigation currently used to
+/// bind a Linux WebKitWebDriver handle. Other platforms never expose an
+/// intermediate binding URL to their page host.
+fn classify_browser_core_binding_navigation(label: &str, url: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_automation::classify_binding_navigation(label, url);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (label, url);
+        false
+    }
+}
+
+/// Release Linux's first-bind barrier after the exact host bootstrap Finished
+/// callback has committed and the navigation admission gate is idle.
+fn settle_browser_core_host_bootstrap(label: &str, payload_url: &str, live_url: Option<&str>) {
+    #[cfg(target_os = "linux")]
+    {
+        linux_automation::settle_host_bootstrap_page_load(label, payload_url, live_url);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (label, payload_url, live_url);
+    }
+}
+
+/// Page-load callbacks are the authoritative main-document commit signal. The
+/// Linux WebDriver adapter briefly commits a private marker while recovering a
+/// handle; keep that exact implementation URL out of UI and persistence.
+fn is_browser_core_binding_url(url: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return linux_automation::is_binding_marker_url(url);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = url;
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_native_surface(webview: &tauri::Webview) -> Result<(), String> {
+    linux_surface::attach(webview)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn attach_native_surface(_webview: &tauri::Webview) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn show_native_surface(
+    webview: &tauri::Webview,
+    bounds: Option<super::NativeSurfaceBounds>,
+) -> Result<(), String> {
+    linux_surface::show(webview, bounds)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn show_native_surface(
+    webview: &tauri::Webview,
+    bounds: Option<super::NativeSurfaceBounds>,
+) -> Result<(), String> {
+    if let Some(bounds) = bounds {
+        webview
+            .set_bounds(tauri::Rect {
+                position: tauri::PhysicalPosition::new(bounds.x, bounds.y).into(),
+                size: tauri::PhysicalSize::new(bounds.width as u32, bounds.height as u32).into(),
+            })
+            .map_err(|error| format!("Failed to reposition browser tab: {error}"))?;
+    }
+    webview
+        .show()
+        .map_err(|error| format!("Failed to show browser tab: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn hide_native_surface(webview: &tauri::Webview) -> Result<(), String> {
+    linux_surface::hide(webview)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hide_native_surface(webview: &tauri::Webview) -> Result<(), String> {
+    webview
+        .hide()
+        .map_err(|error| format!("Failed to hide browser tab: {error}"))
+}
+
+/// Prepare process-wide browser automation state before Tauri creates any
+/// WebKit context. Other platforms intentionally have no process hook.
+pub(crate) fn prepare_process_environment() {
+    if !crate::platform::capabilities::browser_product_enabled() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = linux_automation::prepare_process_environment() {
+        eprintln!("[browser] Linux WebKit automation environment unavailable: {error}");
+    }
+}
+
+/// Register the dedicated Linux browser WebKit context before the first task
+/// browser child WebView is created. The main application WebView remains in
+/// Tauri's default, non-automated context.
+pub(crate) fn install_automation_context(_app: &mut tauri::App) {
+    if !crate::platform::capabilities::browser_product_enabled() {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if let Err(error) = linux_automation::install_automation_context(_app) {
+        eprintln!("[browser] Linux WebKit automation context unavailable: {error}");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use tauri::Manager;
+        if let Some(main_webview) = _app.get_webview("main") {
+            if let Err(error) = linux_surface::prepare(&main_webview) {
+                eprintln!(
+                    "[browser] Failed to preinitialize Linux native browser overlay: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn evaluate_browser_core_json(
+    webview: &tauri::Webview,
+    script: String,
+    mode: BrowserCoreEvaluationMode,
+    authorization: Option<&state::NativeTabLease>,
+) -> Result<serde_json::Value, String> {
+    linux::evaluate_json(webview, script, mode, authorization).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn evaluate_browser_core_json(
+    webview: &tauri::Webview,
+    script: String,
+    mode: BrowserCoreEvaluationMode,
+    authorization: Option<&state::NativeTabLease>,
+) -> Result<serde_json::Value, String> {
+    macos::evaluate_json(webview, script, mode, authorization).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn evaluate_browser_core_json(
+    _webview: &tauri::Webview,
+    _script: String,
+    _mode: BrowserCoreEvaluationMode,
+    _authorization: Option<&state::NativeTabLease>,
+) -> Result<serde_json::Value, String> {
+    Err("browser/core-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn wait_browser_core_ready() -> Result<(), String> {
+    linux_automation::wait_until_ready().await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn wait_browser_core_ready() -> Result<(), String> {
+    macos::wait_until_ready().await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn wait_browser_core_ready() -> Result<(), String> {
+    Err("browser/core-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn bind_browser_core_webview(webview: &tauri::Webview) -> Result<(), String> {
+    linux_automation::bind_webview(webview).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn bind_browser_core_webview(webview: &tauri::Webview) -> Result<(), String> {
+    macos::bind_webview(webview).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn bind_browser_core_webview(_webview: &tauri::Webview) -> Result<(), String> {
+    Err("browser/core-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn click_browser_core_element(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    uid: &str,
+    click_count: u8,
+) -> Result<(), String> {
+    linux_automation::click_element(webview, authorization, uid, click_count).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn click_browser_core_element(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    uid: &str,
+    click_count: u8,
+) -> Result<(), String> {
+    macos::click_element(webview, authorization, uid, click_count).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn click_browser_core_element(
+    _webview: &tauri::Webview,
+    _authorization: &state::NativeTabLease,
+    _uid: &str,
+    _click_count: u8,
+) -> Result<(), String> {
+    Err("browser/trusted-input-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn fill_browser_core_element(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    uid: &str,
+    value: &str,
+) -> Result<(), String> {
+    linux_automation::fill_element(webview, authorization, uid, value).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn fill_browser_core_element(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    uid: &str,
+    value: &str,
+) -> Result<(), String> {
+    macos::fill_element(webview, authorization, uid, value).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn fill_browser_core_element(
+    _webview: &tauri::Webview,
+    _authorization: &state::NativeTabLease,
+    _uid: &str,
+    _value: &str,
+) -> Result<(), String> {
+    Err("browser/trusted-input-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn type_browser_core_text(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    text: &str,
+    submit_key: Option<&str>,
+) -> Result<(), String> {
+    linux_automation::type_text(webview, authorization, text, submit_key).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn type_browser_core_text(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    text: &str,
+    submit_key: Option<&str>,
+) -> Result<(), String> {
+    macos::type_text(webview, authorization, text, submit_key).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn type_browser_core_text(
+    _webview: &tauri::Webview,
+    _authorization: &state::NativeTabLease,
+    _text: &str,
+    _submit_key: Option<&str>,
+) -> Result<(), String> {
+    Err("browser/trusted-input-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn press_browser_core_key(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    key: &str,
+) -> Result<(), String> {
+    linux_automation::press_key(webview, authorization, key).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn press_browser_core_key(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    key: &str,
+) -> Result<(), String> {
+    macos::press_key(webview, authorization, key).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn press_browser_core_key(
+    _webview: &tauri::Webview,
+    _authorization: &state::NativeTabLease,
+    _key: &str,
+) -> Result<(), String> {
+    Err("browser/trusted-input-backend-unavailable".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn handle_browser_core_dialog(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    action: &str,
+    prompt_text: Option<&str>,
+) -> Result<String, String> {
+    linux_automation::handle_dialog(webview, authorization, action, prompt_text).await
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) async fn handle_browser_core_dialog(
+    webview: &tauri::Webview,
+    authorization: &state::NativeTabLease,
+    action: &str,
+    prompt_text: Option<&str>,
+) -> Result<String, String> {
+    macos::handle_dialog(webview, authorization, action, prompt_text).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) async fn handle_browser_core_dialog(
+    _webview: &tauri::Webview,
+    _authorization: &state::NativeTabLease,
+    _action: &str,
+    _prompt_text: Option<&str>,
+) -> Result<String, String> {
+    Err("browser/dialog-backend-unavailable".to_string())
+}
+
+/// Stop the shared BrowserCore automation runtime at an explicit lifecycle
+/// boundary. Linux serializes this reset with every WebDriver operation, so a
+/// select/action already in flight cannot restart the driver after stop has
+/// committed.
+pub(crate) async fn shutdown_browser_core_for_stop() {
+    #[cfg(target_os = "linux")]
+    linux_automation::shutdown_for_stop().await;
+}
+
+/// Permanently close process-level BrowserCore admission before an application
+/// restart. Linux checks this latch only after acquiring its operation gate, so
+/// even work queued before restart cannot spawn a driver after the final reset.
+pub(crate) fn begin_browser_core_process_shutdown() {
+    #[cfg(target_os = "linux")]
+    linux_automation::begin_process_shutdown();
+}
+
+/// Synchronous process-exit collector. Exit cannot await the WebDriver
+/// operation gate, so Linux first closes process admission and then takes the
+/// same child slot lock used by spawn publication. That transaction guarantees
+/// no WebKitWebDriver child can be published after the collector has run.
+pub(crate) fn shutdown_browser_core_for_exit() {
+    #[cfg(target_os = "linux")]
+    linux_automation::shutdown_for_exit();
+}
+
+impl NativeSurfaceCapabilities {
+    pub(crate) const fn new(
+        native_display: bool,
+        agent_automation: bool,
+        chrome_devtools_protocol: bool,
+    ) -> Self {
+        Self {
+            native_display,
+            agent_automation,
+            chrome_devtools_protocol,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) type NativeBrowserSurface = host::DesktopBrowserSurface<windows::WindowsWebviewConfig>;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) type NativeBrowserSurface = host::DesktopBrowserSurface<system::SystemWebviewConfig>;
+
+#[cfg(test)]
+mod async_dispatch_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const TIMEOUT: &str = "browser/test-dispatch-timeout";
+    const CLOSED: &str = "browser/test-dispatch-callback-closed";
+
+    #[test]
+    fn mutating_evaluation_requires_an_explicit_native_tab_lease() {
+        assert_eq!(
+            evaluation_authorization(BrowserCoreEvaluationMode::ReadOnly, None),
+            Ok(None)
+        );
+        assert_eq!(
+            evaluation_authorization(BrowserCoreEvaluationMode::MayMutate, None),
+            Err("browser/mutating-script-lease-required".to_string())
+        );
+
+        let lease = state::NativeTabLease::from_assertion(
+            "session-a",
+            "0123456789abcdef",
+            "target-a",
+            7,
+            "0123456789abcdeffedcba9876543210",
+        )
+        .unwrap();
+        assert_eq!(
+            evaluation_authorization(BrowserCoreEvaluationMode::MayMutate, Some(&lease)),
+            Ok(Some(&lease))
+        );
+        assert_eq!(
+            evaluation_authorization(BrowserCoreEvaluationMode::ReadOnly, Some(&lease)),
+            Ok(None),
+            "read-only observations must not retain a page-mutation capability"
+        );
+    }
+
+    #[test]
+    fn script_mutation_helper_maps_lookup_and_lease_failures_with_platform_prefix() {
+        let lease = state::NativeTabLease::from_assertion(
+            "session-a",
+            "0123456789abcdef",
+            "target-a",
+            7,
+            "0123456789abcdeffedcba9876543210",
+        )
+        .unwrap();
+        let never_authorized = std::sync::Arc::new(state::WorkspaceControl::new(
+            7,
+            state::NativeControlOwner::User,
+        ));
+        let dispatched = std::cell::Cell::new(false);
+        let dispatch = || -> Result<(), String> {
+            dispatched.set(true);
+            Ok(())
+        };
+
+        // A live control without a valid Agent lease must surface as the
+        // platform-prefixed lease-lost error and never run the dispatch.
+        let result = dispatch_script_mutation_with_authorized_control(
+            || Ok(std::sync::Arc::clone(&never_authorized)),
+            &lease,
+            "webkit",
+            dispatch,
+        );
+        assert_eq!(result, Err("browser/webkit-control-lease-lost".to_string()));
+        assert!(!dispatched.get(), "unauthorized control must not dispatch");
+
+        // Lookup failures propagate verbatim so stale-binding codes stay
+        // platform-specific.
+        let result = dispatch_script_mutation_with_authorized_control(
+            || Err("browser/webkit-binding-stale".to_string()),
+            &lease,
+            "wkwebview",
+            dispatch,
+        );
+        assert_eq!(result, Err("browser/webkit-binding-stale".to_string()));
+        assert!(!dispatched.get());
+    }
+
+    #[tokio::test]
+    async fn queued_mutation_timeout_cancels_before_native_dispatch() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let state = AsyncDispatchState::new();
+
+        assert_eq!(
+            state
+                .wait(
+                    rx,
+                    Duration::ZERO,
+                    TIMEOUT,
+                    CLOSED,
+                    Some(ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION),
+                )
+                .await,
+            Err(TIMEOUT.to_string())
+        );
+        assert!(!state.begin(), "a cancelled native callback must be inert");
+    }
+
+    #[tokio::test]
+    async fn dispatched_mutation_timeout_is_commit_unknown_but_read_only_is_ordinary() {
+        let (_mutating_tx, mutating_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let mutating = AsyncDispatchState::new();
+        assert!(mutating.begin());
+        assert_eq!(
+            mutating
+                .wait(
+                    mutating_rx,
+                    Duration::ZERO,
+                    TIMEOUT,
+                    CLOSED,
+                    Some(ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION),
+                )
+                .await,
+            Err(format!(
+                "{ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION}: {TIMEOUT}"
+            ))
+        );
+
+        let (_read_tx, read_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let read_only = AsyncDispatchState::new();
+        assert!(read_only.begin());
+        assert_eq!(
+            read_only
+                .wait(read_rx, Duration::ZERO, TIMEOUT, CLOSED, None)
+                .await,
+            Err(TIMEOUT.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_close_obeys_the_same_dispatch_boundary() {
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let pending = AsyncDispatchState::new();
+        drop(pending_tx);
+        assert_eq!(
+            pending
+                .wait(
+                    pending_rx,
+                    Duration::from_secs(1),
+                    TIMEOUT,
+                    CLOSED,
+                    Some(ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION),
+                )
+                .await,
+            Err(CLOSED.to_string())
+        );
+        assert!(
+            !pending.begin(),
+            "a closed pending callback must stay cancelled"
+        );
+
+        let (running_tx, running_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        let running = AsyncDispatchState::new();
+        assert!(running.begin());
+        drop(running_tx);
+        assert_eq!(
+            running
+                .wait(
+                    running_rx,
+                    Duration::from_secs(1),
+                    TIMEOUT,
+                    CLOSED,
+                    Some(ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION),
+                )
+                .await,
+            Err(format!(
+                "{ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION}: {CLOSED}"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_result_wins_a_timer_race_exactly() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let state = AsyncDispatchState::new();
+        assert!(state.begin());
+        tx.send(Err::<(), _>("exact-platform-error".to_string()))
+            .unwrap();
+        state.finish();
+
+        assert_eq!(
+            state
+                .wait(
+                    rx,
+                    Duration::ZERO,
+                    TIMEOUT,
+                    CLOSED,
+                    Some(ACTION_COMMIT_UNKNOWN_SCRIPT_INTERRUPTION),
+                )
+                .await,
+            Err("exact-platform-error".to_string())
+        );
+    }
+}

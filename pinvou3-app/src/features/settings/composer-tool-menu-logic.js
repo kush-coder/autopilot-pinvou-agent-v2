@@ -1,0 +1,136 @@
+import { isBuiltinPlugin, DEFAULT_BUILTIN_SKILLS } from '../tools/builtin-plugin-logic.js';
+
+function asArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return [];
+  return Object.entries(value).map(([id, state]) => ({ id, ...state }));
+}
+
+function buildComposerToolMenuState({
+  marketplaceTools = [],
+  marketplaceSkills = [],
+  disabledIds = [], // 开关（on/off）
+  hiddenIds = [], // 可见性（显隐，预过滤）
+  serviceStates = [],
+  activeSkill = null,
+  builtinSkills = DEFAULT_BUILTIN_SKILLS,
+  scope = 'plain',
+} = {}) {
+  // 开关与可见性正交：hidden 决定是否出现在列表，disabled 决定 on/off。
+  const disabled = new Set(disabledIds || []);
+  const hidden = new Set(hiddenIds || []);
+  const installedTools = (marketplaceTools || []).filter(tool => tool && tool.installed);
+  const companionSkillIds = new Set(installedTools.flatMap(tool => tool.companion_skills || []));
+
+  const connectedServices = asArray(serviceStates)
+    .filter(service => service && service.connected && !hidden.has(service.id))
+    .map(service => ({
+      id: service.id,
+      kind: 'service',
+      title: service.title || service.name || service.id,
+      enabled: service.enabled !== false && !disabled.has(service.id),
+      switchable: true,
+    }));
+
+  const toolRows = installedTools
+    // docs/builtin-toolset-contract.md §3.2 configuration visibility: builtin
+    // plugins (e.g. session-reader) are hidden from the composer tool list via
+    // the shared isBuiltinPlugin judgement; execution visibility (ToolCard
+    // rendering in the chat timeline) is unaffected. Missing fields (old
+    // backend / regular plugins) pass through; the caller refreshToolsMenu
+    // forwards the raw list_marketplace_tools result.
+    .filter(tool => tool && !hidden.has(tool.id) && !isBuiltinPlugin(tool))
+    .map(tool => ({
+      id: tool.id,
+      kind: 'tool',
+      title: tool.name || tool.title || tool.id,
+      enabled: !disabled.has(tool.id),
+      switchable: true,
+    }));
+
+  const installedSkills = (marketplaceSkills || [])
+    .filter(skill => skill && skill.installed && !companionSkillIds.has(skill.id));
+  const skillRows = installedSkills
+    .filter(skill => !hidden.has(skill.id))
+    .map(skill => ({
+      id: skill.id,
+      skillId: skill.id,
+      kind: 'skill',
+      title: skill.title || skill.name || skill.id,
+      enabled: !disabled.has(skill.id),
+      active: activeSkill === skill.id,
+      switchable: true,
+      unavailable: false,
+    }));
+
+  const builtinRows = (builtinSkills || [])
+    .filter(skill => !(skill.unavailableIn || []).includes(scope))
+    .map(skill => ({
+      id: `builtin-skill:${skill.id}`,
+      skillId: skill.id,
+      kind: 'builtin-skill',
+      title: skill.title || skill.name || skill.id,
+      // 该模式提供（不可用者已在上方过滤）：权限只读开关恒为开，不可手动切换。
+      enabled: true,
+      active: activeSkill === skill.id,
+      switchable: false,
+      readonly: true,
+      unavailable: false,
+    }));
+
+  const allSkillRows = [...skillRows, ...builtinRows];
+  const enabledCount =
+    connectedServices.filter(row => row.enabled).length +
+    toolRows.filter(row => row.enabled).length +
+    allSkillRows.filter(row => row.enabled).length;
+
+  // 「所有技能已关闭」应覆盖三类携带技能的行：独立技能 + 带 companion_skills 的
+  // MCP 工具（如 pptx、combo-demo）+ CLI 服务（如 feishu）。配套技能跟随所属包开关。
+  const skillCarryingToolIds = installedTools
+    .filter(tool => (tool.companion_skills || []).length > 0)
+    .map(tool => tool.id);
+  const allSkillsDisabled =
+    skillRows.length > 0 &&
+    skillRows.every(row => !row.enabled) &&
+    skillCarryingToolIds.every(id => hidden.has(id) || disabled.has(id)) &&
+    connectedServices.every(row => !row.enabled);
+
+  return {
+    connectedServices,
+    toolRows,
+    skillRows: allSkillRows,
+    enabledCount,
+    allSkillsDisabled,
+  };
+}
+
+// Governance write generation gate: each control (package toggle / project
+// skills) tracks its own write-request generation — begin() issues one, the
+// completion checks it in. With rapid toggles an earlier write can fail later
+// (out-of-order completion); a completion whose generation no longer matches
+// must not roll back the optimistic state or report a failure — the control's
+// outcome is decided solely by its latest write.
+function createToggleWriteGate() {
+  const generations = new Map();
+  return {
+    begin(key) {
+      const generation = (generations.get(key) || 0) + 1;
+      generations.set(key, generation);
+      return generation;
+    },
+    isCurrent(key, generation) {
+      return generations.get(key) === generation;
+    },
+  };
+}
+
+// Key for the project-skills toggle inside the gate: namespaced to stay disjoint
+// from the package-id space so an identically named package cannot collide with it.
+const TOGGLE_WRITE_KEY_PROJECT_SKILLS = '__project_skills__';
+
+/**
+ * Builtin skills whose availability is session-mode-controlled (backend
+ * MODE_TABLE delta): the builtin page's audit badge must agree with the
+ * store card for these instead of claiming "always on".
+ */
+export { buildComposerToolMenuState, createToggleWriteGate, TOGGLE_WRITE_KEY_PROJECT_SKILLS };

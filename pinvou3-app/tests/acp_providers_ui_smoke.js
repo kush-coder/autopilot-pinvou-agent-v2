@@ -1,0 +1,842 @@
+#!/usr/bin/env node
+/**
+ * ACP Provider（第三方中转）管理 UI smoke：加载真实 Vite dist，mock TauriBridge，
+ * 点击真实 React UI。覆盖设置页 模型 →「ACP 管理」子页：标签页、新增/保存、
+ * 一键切换、删除确认、导出警告、env 冲突警告、卸载确认弹窗。
+ */
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { startUiTestServer } = require('./ui_test_server');
+
+function loadPuppeteer() {
+  try { return require('puppeteer-core'); } catch { /* fall through */ }
+  const npx = path.join(os.homedir(), '.npm', '_npx');
+  if (fs.existsSync(npx)) {
+    for (const directory of fs.readdirSync(npx)) {
+      const candidate = path.join(npx, directory, 'node_modules', 'puppeteer-core');
+      if (fs.existsSync(candidate)) {
+        try { return require(candidate); } catch { /* try next */ }
+      }
+    }
+  }
+  console.error('SKIP: 找不到 puppeteer-core');
+  process.exit(2);
+}
+
+const puppeteer = loadPuppeteer();
+const CHROME = process.env.CHROME || [
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  '/snap/bin/chromium',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+].find(candidate => fs.existsSync(candidate));
+if (!CHROME) {
+  console.error('SKIP: 未找到 chromium/chrome，可用 env CHROME=/path/to/chrome 指定');
+  process.exit(2);
+}
+const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), 'pinvou-acp-providers-'));
+
+function injectSource() {
+  return `(function () {
+    var handlers = Object.create(null);
+    var calls = [];
+    var settings = { theme: 'liquid-light', language: 'zh-Hans', memory_enabled: false, notifications: { enabled: true, task_completed: true }, pet: { enabled: false }, search: { provider: 'bing', enabled_providers: ['bing'], api_key: null, credentials: {} }, advanced: {} };
+    // ACP Provider mock 状态：codex 预置两个 Provider（一个带 key、一个不带）
+    var providersByAgent = {
+      codex: {
+        currentProviderId: null,
+        effectiveEntries: [
+          { key: 'model_provider', value: 'pv-000000000001' },
+          { key: 'model', value: 'gpt-5.2' },
+          { key: 'model_providers.pv-000000000001.base_url', value: 'https://api.example.com/v1' },
+        ],
+        providers: [
+          { id: 'pv-000000000001', name: '我的中转', baseUrl: 'https://api.example.com/v1', model: 'gpt-5.2', wireApi: 'openai', hasCredential: true, created_at: '' },
+          { id: 'pv-000000000002', name: '无 Key 中转', baseUrl: 'https://api.other.com/v1', model: null, wireApi: 'anthropic', hasCredential: false, created_at: '' },
+        ],
+      },
+      claude: { currentProviderId: null, providers: [] },
+      kimi: { currentProviderId: null, providers: [] },
+    };
+    var envConflicts = [];
+    var envEffectiveEntries = [];
+    var nextProviderSeq = 0;
+    // 端点模型自动发现(规格 §2.7)候选:ACP 线 runtime 交互用,形状与
+    // EndpointModelsListing(serde snake_case)一致;两条候选带不同 context
+    // 长度,用于钉「onPick 填 model + contextWindow 仅空填入、绝不覆盖」。
+    var acpProbeListing = {
+      status: 'listed',
+      http_status: 200,
+      transport: null,
+      server_kind: null,
+      truncated: false,
+      models: [
+        { id: 'gpt-5.2-turbo', context_window_tokens: 262144, context_from: 'endpoint', max_output_tokens: null, output_from: null, loaded: null, title: null },
+        { id: 'gpt-5.2', context_window_tokens: 131072, context_from: 'catalog', max_output_tokens: null, output_from: null, loaded: null, title: null },
+      ],
+    };
+    // probe 失败注入(round-4 m1-1 运行时钉):非 null 时 probe_endpoint_models
+    // reject,驱动探测失败 → 共享 error 条 → URL 编辑清扫的完整链路。
+    var probeEndpointError = null;
+    // 跨挂载安装自愈测试：install promise 挂起到 resolvePendingInstall，
+    // 模拟真实安装进行中设置面板被关闭/切走的窗口期
+    var pendingInstalls = {};
+    var statusByAgent = {
+      codex: { agent_id: 'codex', agent_name: 'Codex', installed: true, authenticated: true, version: '0.144.6', update_available: false, update_required: false, install_action: 'none', bridge_ready: true, setup_hint: null },
+      claude: { agent_id: 'claude', agent_name: 'Claude Code', installed: true, authenticated: true, version: '2.0.0', update_available: false, update_required: false, install_action: 'none', bridge_ready: true, setup_hint: null },
+      kimi: { agent_id: 'kimi', agent_name: 'Kimi', installed: true, authenticated: true, version: '0.9.0', update_available: false, update_required: false, install_action: 'none', bridge_ready: true, setup_hint: null },
+    };
+    function invoke(cmd, args) {
+      calls.push({ cmd: cmd, args: args || {} });
+      switch (cmd) {
+        case 'get_settings': return Promise.resolve(settings);
+        case 'update_settings':
+          settings = Object.assign({}, settings, args.patch || {});
+          return Promise.resolve(settings);
+        case 'get_platform_capabilities': return Promise.resolve({
+          os: 'windows',
+          codexAcpSupported: true,
+          showSuperPermissionSettings: false,
+          usesBundledDependencyInstaller: true,
+          taskCompletionNotificationsDefault: true,
+        });
+        case 'get_effective_model_config': return Promise.resolve({ model: null, baseUrl: null, preset: null, api_key_set: false });
+        case 'list_acp_providers': {
+          var agentState = providersByAgent[args.agent] || { currentProviderId: null, providers: [] };
+          return Promise.resolve(Object.assign({
+            envConflicts: envConflicts,
+            envEffectiveEntries: envEffectiveEntries,
+            officialActive: !agentState.currentProviderId,
+            externalActive: false,
+            configUnreadable: false,
+            effectiveEntries: [],
+          }, agentState));
+        }
+        // Same as the real backend: return a fresh object per call (Rust
+        // re-serializes each time). Returning the same reference in place
+        // lets React setState dedupe by identity and status updates never
+        // reach effects.
+        case 'get_acp_agent_status': {
+          var statusSnapshot = statusByAgent[args.agentId];
+          return Promise.resolve(statusSnapshot ? Object.assign({}, statusSnapshot) : null);
+        }
+        case 'save_acp_provider': {
+          var state = providersByAgent[args.agent] || (providersByAgent[args.agent] = { currentProviderId: null, providers: [] });
+          // 新建按计数器分配唯一 id：固定 id 会让多次新增产生重复卡片/React key
+          var record = { id: args.providerId || ('pv-0000000000' + String(9 + nextProviderSeq++)), name: args.name, baseUrl: args.baseUrl, model: args.model, wireApi: args.wireApi, hasCredential: args.apiKeyAction !== 'delete' && (!!args.apiKey || state.providers.some(function (p) { return p.id === args.providerId && p.hasCredential; })), created_at: '' };
+          if (args.providerId) {
+            var index = state.providers.findIndex(function (p) { return p.id === args.providerId; });
+            if (index >= 0) state.providers[index] = record;
+          } else {
+            state.providers.push(record);
+          }
+          return Promise.resolve(record);
+        }
+        case 'switch_acp_provider':
+          providersByAgent[args.agent].currentProviderId = args.providerId;
+          return Promise.resolve(statusByAgent[args.agent]);
+        case 'switch_acp_provider_official':
+          providersByAgent[args.agent].currentProviderId = null;
+          return Promise.resolve(statusByAgent[args.agent]);
+        case 'delete_acp_provider': {
+          var state = providersByAgent[args.agent];
+          var index = state.providers.findIndex(function (p) { return p.id === args.providerId; });
+          if (index >= 0) state.providers.splice(index, 1);
+          if (state.currentProviderId === args.providerId) state.currentProviderId = null;
+          return Promise.resolve(statusByAgent[args.agent]);
+        }
+        case 'export_acp_providers':
+          return Promise.resolve(JSON.stringify(providersByAgent[args.agent].providers.map(function (p) { return Object.assign({}, p, { api_key: 'test-api-key-exported' }); }), null, 2));
+        case 'import_acp_providers':
+          return Promise.resolve({ imported: 1, idConflicts: 0, skipped: 0 });
+        // 一次性模型探针：smoke 不验证探针内容，返回 null（前端静默回退占位快照）
+        case 'probe_acp_agent_models': return Promise.resolve(null);
+        // 端点模型自动发现(规格 §2.7):显式点击「获取模型列表」才会到达;
+        // probeEndpointError 非 null 时 reject(命令层在真实后端把传输失败
+        // 映射进结果对象,这里用 reject 走前端 catch 分支,语义等价)。
+        case 'probe_endpoint_models':
+          if (probeEndpointError) return Promise.reject(new Error(probeEndpointError));
+          return Promise.resolve(JSON.parse(JSON.stringify(acpProbeListing)));
+        // Stay pending instead of resolving immediately: a real install only
+        // returns once finished, so pending covers the "component unmounted
+        // mid-install" window (see the cross-mount heal steps at the end of
+        // this file)
+        case 'install_acp_agent': return new Promise(function (resolve) { pendingInstalls[args.agent] = resolve; });
+        case 'cancel_acp_agent_install': statusByAgent[args.agent].installing = false; return Promise.resolve(statusByAgent[args.agent]);
+        case 'uninstall_acp_agent': statusByAgent[args.agent].installed = false; return Promise.resolve(statusByAgent[args.agent]);
+        case 'login_acp_agent': return Promise.resolve(statusByAgent[args.agentId]);
+        case 'get_acp_provider_key': return Promise.resolve('test-api-key-saved');
+        case 'logout_acp_agent': statusByAgent[args.agent].authenticated = false; return Promise.resolve(statusByAgent[args.agent]);
+        case 'open_acp_agent_login_url': return Promise.resolve(null);
+        case 'submit_acp_agent_login_code': return Promise.resolve(statusByAgent[args.agentId]);
+        case 'list_models': return Promise.resolve({ models: [], active_model_id: null });
+        case 'check_for_update': return Promise.resolve({ available: false, current_version: '0.6.1', latest_version: '0.6.1' });
+        case 'get_backend_status': return Promise.resolve({ online: true, ok: true, status: 'online' });
+        case 'get_selected_pet': return Promise.resolve('lingling');
+        case 'list_sessions': return Promise.resolve([]);
+        case 'list_personas': return Promise.resolve([]);
+        case 'get_super_permission_status': return Promise.resolve({ can_use: false });
+        case 'get_mode_state': return Promise.resolve({ mode: 'yolo', plan_phase: 'none' });
+        case 'get_active_persona': return Promise.resolve(null);
+        case 'list_scheduled_tasks': return Promise.resolve([]);
+        case 'list_workspace_files': return Promise.resolve([]);
+        case 'check_dependencies': return Promise.resolve([]);
+        case 'find_resumable_run': return Promise.resolve(null);
+        case 'get_app_version': return Promise.resolve('0.7.3');
+        case 'list_acp_agents': return Promise.resolve([
+          { agent_id: 'codex', agent_name: 'Codex', installed: true, authenticated: true },
+          { agent_id: 'claude', agent_name: 'Claude Code', installed: true, authenticated: true },
+          { agent_id: 'kimi', agent_name: 'Kimi', installed: true, authenticated: true },
+        ]);
+        default: return Promise.resolve(null);
+      }
+    }
+    window.__ACP_PROVIDERS_TEST__ = {
+      calls: calls,
+      setEnvConflicts: function (next, entries) { envConflicts = next; envEffectiveEntries = entries || []; },
+      setProbeEndpointError: function (message) { probeEndpointError = message || null; },
+      // 安装中测试钩子：安装进行中的真实形态是 CLI 尚不可用（installed=false），
+      // 安装入口保持渲染且按钮呈禁用 + 进行中文案
+      setInstalling: function (agent, installing) {
+        var status = statusByAgent[agent];
+        status.installing = installing;
+        if (installing) status.installed = false;
+      },
+      // Cross-mount install heal test hooks: setInstallScenario rewrites
+      // status fields directly (installed/installing/install_finished etc.),
+      // emitInstallProgress dispatches acp:install-progress events, and
+      // resolvePendingInstall settles the pending install promise (simulating
+      // the install command returning).
+      setInstallScenario: function (agent, patch) {
+        Object.assign(statusByAgent[agent], patch);
+      },
+      emitInstallProgress: function (agent, kind, value) {
+        return Promise.all((handlers['acp:install-progress'] || []).slice().map(function (handler) {
+          return handler({ payload: { agent: agent, kind: kind, value: value } });
+        }));
+      },
+      resolvePendingInstall: function (agent) {
+        var resolve = pendingInstalls[agent];
+        if (resolve) {
+          delete pendingInstalls[agent];
+          // Fresh object per call, same as get_acp_agent_status: the real
+          // backend re-serializes each time.
+          var snapshot = statusByAgent[agent];
+          resolve(snapshot ? Object.assign({}, snapshot) : null);
+        }
+      },
+    };
+    window.__TAURI__ = {
+      core: { invoke: invoke },
+      event: {
+        listen: function (name, handler) {
+          (handlers[name] || (handlers[name] = [])).push(handler);
+          return Promise.resolve(function () {});
+        },
+        emit: function (name, payload) {
+          return Promise.all((handlers[name] || []).slice().map(function (handler) {
+            return handler({ payload: payload || {} });
+          }));
+        },
+      },
+      window: {
+        getCurrentWindow: function () {
+          return { minimize: function () {}, maximize: function () {}, close: function () {}, toggleMaximize: function () {}, isMaximized: function () { return Promise.resolve(false); }, onResized: function () { return Promise.resolve(function () {}); }, startDragging: function () {} };
+        },
+      },
+      dialog: { open: function () { return Promise.resolve(null); } },
+    };
+  })();`;
+}
+
+const sleep = ms => new Promise(resolve => { setTimeout(resolve, ms); });
+const callCount = (page, cmd) => page.evaluate(command =>
+  window.__ACP_PROVIDERS_TEST__.calls.filter(call => call.cmd === command).length, cmd);
+
+async function clickSettingsSection(page, label) {
+  const ok = await page.evaluate(text => {
+    const buttons = [...document.querySelectorAll('aside button')].filter(button => (button.textContent || '').trim() === text);
+    const button = buttons[buttons.length - 1];
+    if (!button) return false;
+    button.click();
+    return true;
+  }, label);
+  if (!ok) throw new Error('找不到设置分区: ' + label);
+  await sleep(300);
+}
+
+(async () => {
+  const { url } = await startUiTestServer();
+  const browser = await puppeteer.launch({
+    executablePath: CHROME,
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-gpu', '--no-first-run', '--no-default-browser-check'],
+    userDataDir: PROFILE,
+  });
+  const page = await browser.newPage();
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('console', message => { if (message.type() === 'error') errors.push('console:' + message.text()); });
+  await page.evaluateOnNewDocument(injectSource());
+  await page.setViewport({ width: 1440, height: 1000 });
+  await page.goto(url, { waitUntil: 'networkidle0' });
+  await page.waitForFunction(() => window.TauriBridge && document.querySelector('[data-testid="app-root"]'), { timeout: 20000 });
+  await sleep(1000);
+
+  const results = [];
+  const rec = (name, pass, detail = '') => {
+    results.push({ name, pass });
+    console.log(`${pass ? '✅' : '❌'} ${name}${detail ? '  ' + detail : ''}`);
+  };
+
+  // 打开设置 → 模型分节 → 顶端切换到「ACP 管理」子页
+  await page.evaluate(() => {
+    const button = [...document.querySelectorAll('button[title="设置"]')].pop();
+    if (button) button.click();
+  });
+  await sleep(600);
+  await clickSettingsSection(page, '模型');
+  await page.evaluate(() => document.querySelector('[data-testid="settings-model-tab-acp"]')?.click());
+  await sleep(300);
+  rec('① ACP 管理子页渲染', await page.evaluate(() => !!document.querySelector('[data-testid="acp-providers-section"]')));
+  rec('② 三 Agent 标签页', await page.evaluate(() =>
+    ['acp-agent-tab-codex', 'acp-agent-tab-claude', 'acp-agent-tab-kimi'].every(id => !!document.querySelector(`[data-testid="${id}"]`))
+  ));
+
+  // 预置 Provider 卡片：切换按钮仅对有 key 的展示
+  rec('③ 卡片与 key 徽标', await page.evaluate(() => {
+    const cards = document.querySelectorAll('[data-testid^="acp-provider-card-"]');
+    if (cards.length !== 2) return false;
+    const firstText = cards[0].textContent || '';
+    return firstText.includes('已保存密钥');
+  }));
+  rec('④ 无 key Provider 切换被禁用', await page.evaluate(() => {
+    const buttons = [...document.querySelectorAll('[data-testid^="acp-provider-switch-pv-"]')];
+    return buttons.length === 2
+      && buttons.filter(button => button.disabled).length === 1
+      && buttons.filter(button => !button.disabled).length === 1;
+  }));
+
+  // 新增 Provider → 表单 → 保存
+  await page.click('[data-testid="acp-provider-add"]');
+  await sleep(250);
+  rec('⑤ 新增弹窗', await page.evaluate(() => !!document.querySelector('[data-testid="acp-provider-form-dialog"]')));
+  await page.type('[data-testid="acp-provider-name"]', '新中转');
+  await page.type('[data-testid="acp-provider-base-url"]', 'https://relay.example.com/v1');
+  await page.type('[data-testid="acp-provider-api-key"]', 'test-api-key-123');
+  await page.click('[data-testid="acp-provider-form-save"]');
+  await sleep(500);
+  rec('⑥ 保存调用与卡片出现', (await callCount(page, 'save_acp_provider')) === 1 && await page.evaluate(() => {
+    return [...document.querySelectorAll('[data-testid^="acp-provider-card-"]')].some(card => (card.textContent || '').includes('新中转'));
+  }));
+
+  // 新建空 key：自绘二级确认弹窗（Tauri WebView2 下系统 window.confirm 不弹）——
+  // 点保存后必须出现确认弹窗且**不**发保存请求；取消后确认弹窗消失仍不保存；
+  // 确认后以 apiKeyAction='keep' 保存成功（空 key 允许保存，之后补）。
+  await page.click('[data-testid="acp-provider-add"]');
+  await sleep(250);
+  await page.type('[data-testid="acp-provider-name"]', '空 Key 中转');
+  await page.type('[data-testid="acp-provider-base-url"]', 'https://relay-empty.example.com/v1');
+  const savesBeforeEmpty = await callCount(page, 'save_acp_provider');
+  await page.click('[data-testid="acp-provider-form-save"]');
+  await sleep(300);
+  rec('⑥.6 空 key 保存弹确认弹窗', await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="acp-provider-form-confirm"]');
+    return !!el && (el.textContent || '').includes('未填写 API Key');
+  }) && (await callCount(page, 'save_acp_provider')) === savesBeforeEmpty);
+  await page.evaluate(() => {
+    const modal = document.querySelector('[data-testid="acp-provider-form-confirm"]');
+    const cancel = [...modal.querySelectorAll('button')].find(button => (button.textContent || '').trim() === '取消');
+    cancel.click();
+  });
+  await sleep(200);
+  rec('⑥.7 取消确认弹窗后未保存', await page.evaluate(() =>
+    !document.querySelector('[data-testid="acp-provider-form-confirm"]')
+  ) && (await callCount(page, 'save_acp_provider')) === savesBeforeEmpty);
+  await page.click('[data-testid="acp-provider-form-save"]');
+  await sleep(300);
+  await page.click('[data-testid="acp-provider-form-confirm-ok"]');
+  await sleep(500);
+  rec('⑥.8 确认后以 keep 保存空 key', await page.evaluate(() => {
+    const saves = window.__ACP_PROVIDERS_TEST__.calls.filter(call => call.cmd === 'save_acp_provider');
+    const last = saves[saves.length - 1];
+    return !!last && last.args.apiKeyAction === 'keep' && !last.args.apiKey;
+  }));
+
+  // 编辑已存密钥的 Provider 并清空 key = 删除密钥：必须弹 deleteKey 确认弹窗，
+  // 确认后以 apiKeyAction='delete' 上送
+  await page.click('[data-testid="acp-provider-edit-pv-000000000001"]');
+  await sleep(400);
+  await page.evaluate(() => {
+    const input = document.querySelector('[data-testid="acp-provider-api-key"]');
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, '');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.click('[data-testid="acp-provider-form-save"]');
+  await sleep(300);
+  rec('⑥.9 清空已存 key 弹删除确认弹窗', await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="acp-provider-form-confirm"]');
+    return !!el && (el.textContent || '').includes('删除已保存的密钥');
+  }));
+  await page.click('[data-testid="acp-provider-form-confirm-ok"]');
+  await sleep(500);
+  rec('⑥.10 确认后以 delete 上送', await page.evaluate(() => {
+    const saves = window.__ACP_PROVIDERS_TEST__.calls.filter(call => call.cmd === 'save_acp_provider');
+    const last = saves[saves.length - 1];
+    return !!last && last.args.apiKeyAction === 'delete';
+  }));
+
+  // 编辑**无已存密钥**的 Provider + 空 key：与新建同语义，也必须弹
+  // 「未填写 API Key」确认（此前静默 keep 直接保存，不弹确认）
+  await page.click('[data-testid="acp-provider-edit-pv-000000000002"]');
+  await sleep(400);
+  const savesBeforeNoKeyEdit = await callCount(page, 'save_acp_provider');
+  await page.click('[data-testid="acp-provider-form-save"]');
+  await sleep(300);
+  rec('⑥.11 编辑无密钥 Provider 空 key 弹确认弹窗', await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="acp-provider-form-confirm"]');
+    return !!el && (el.textContent || '').includes('未填写 API Key');
+  }) && (await callCount(page, 'save_acp_provider')) === savesBeforeNoKeyEdit);
+  await page.click('[data-testid="acp-provider-form-confirm-ok"]');
+  await sleep(500);
+  rec('⑥.12 确认后以 keep 保存', await page.evaluate(() => {
+    const saves = window.__ACP_PROVIDERS_TEST__.calls.filter(call => call.cmd === 'save_acp_provider');
+    const last = saves[saves.length - 1];
+    return !!last && last.args.providerId === 'pv-000000000002' && last.args.apiKeyAction === 'keep';
+  }));
+
+  // Claude 细化模型槽位：切到 claude 标签页 → 新增 → 五个槽位必填；输入主模型
+  // 后槽位自动跟随填充；保存时 modelSlots 随参数上送
+  await page.click('[data-testid="acp-agent-tab-claude"]');
+  await sleep(400);
+  await page.click('[data-testid="acp-provider-add"]');
+  await sleep(300);
+  rec('⑥.1 claude 槽位表单渲染', await page.evaluate(() =>
+    ['opus', 'sonnet', 'haiku', 'fable', 'subagent'].every(
+      slot => !!document.querySelector(`[data-testid="acp-provider-slot-${slot}"]`)
+    )
+  ));
+  await page.type('[data-testid="acp-provider-model"]', 'deepseek-v4-flash');
+  rec('⑥.2 主模型联动填充槽位', await page.evaluate(() =>
+    ['opus', 'sonnet', 'haiku', 'fable', 'subagent'].every(
+      slot => document.querySelector(`[data-testid="acp-provider-slot-${slot}"]`).value === 'deepseek-v4-flash'
+    )
+  ));
+  // 必填校验：关闭重开表单，不填模型（槽位为空）时保存必须被前端拦截
+  await page.click('[data-testid="acp-provider-form-cancel"]');
+  await sleep(300);
+  await page.click('[data-testid="acp-provider-add"]');
+  await sleep(300);
+  await page.type('[data-testid="acp-provider-name"]', 'claude 中转');
+  await page.type('[data-testid="acp-provider-base-url"]', 'https://relay-claude.example.com');
+  await page.type('[data-testid="acp-provider-api-key"]', 'test-api-key-456');
+  const savesBefore = await callCount(page, 'save_acp_provider');
+  await page.click('[data-testid="acp-provider-form-save"]');
+  await sleep(300);
+  rec('⑥.3 槽位缺失时阻止保存', await page.evaluate(() =>
+    !!document.querySelector('[data-testid="acp-provider-form-error"]')
+  ) && (await callCount(page, 'save_acp_provider')) === savesBefore);
+  // 1M variants are vendor-scoped: the Kimi Code preset shows
+  // k3.1-pro[1m]/k3[1m] and nothing from other vendors
+  await page.click('[data-testid="acp-provider-preset"]');
+  await sleep(200);
+  await page.click('[data-testid="acp-provider-preset-option-kimi-code"]');
+  await sleep(200);
+  await page.click('[data-testid="acp-provider-model"]');
+  await sleep(200);
+  rec('⑥.4 1M variants filter by vendor (Kimi Code k3.1-pro[1m]/k3[1m])', await page.evaluate(() => {
+    const values = [...document.querySelectorAll('[data-testid^="acp-provider-model-option-"]')]
+      .map(option => (option.textContent || '').trim());
+    return values.includes('k3.1-pro[1m]')
+      && values.includes('k3[1m]')
+      && !values.some(value => /\[1M\]/.test(value))
+      && !values.includes('deepseek-v4-flash[1m]');
+  }));
+  // 候选不做字符过滤：输入后下拉仍全量展示（仅匹配项排序提前），避免
+  // 「只有匹配的几个模型可选」的误解
+  const optionCountBefore = await page.evaluate(() =>
+    document.querySelectorAll('[data-testid^="acp-provider-model-option-"]').length
+  );
+  await page.type('[data-testid="acp-provider-model"]', 'k3');
+  await sleep(200);
+  rec('⑥.5 输入后候选仍全量展示', await page.evaluate(() =>
+    document.querySelectorAll('[data-testid^="acp-provider-model-option-"]').length
+  ) === optionCountBefore && optionCountBefore > 1);
+  // 规格 §2.7:claude 不提供「获取模型列表」(模型槽位编辑器走官方,范围外)。
+  // 此刻表单 base URL 已填——若 agent 是 codex/kimi 该按钮本应出现,缺席即证明闸门。
+  rec('⑥.13 claude 不渲染获取模型列表按钮', await page.evaluate(() =>
+    !document.querySelector('[data-testid="acp-provider-fetch-models"]')
+  ));
+  await page.click('[data-testid="acp-provider-form-cancel"]');
+  await sleep(300);
+  await page.click('[data-testid="acp-agent-tab-codex"]');
+  await sleep(400);
+
+  // 规格 §2.7 ACP 线模型发现:codex 表单 base URL 非空才出现按钮;点击显式探测
+  // probe_endpoint_models(携表单 baseUrl + key + wire)→ 候选面板 onPick 填
+  // model 字段,contextWindow 仅空字段填入、绝不覆盖。
+  const savesBeforeAcpFetch = await callCount(page, 'save_acp_provider');
+  await page.click('[data-testid="acp-provider-add"]');
+  await sleep(300);
+  rec('⑥.14 codex 未填 base URL 时无获取按钮', await page.evaluate(() =>
+    !document.querySelector('[data-testid="acp-provider-fetch-models"]')
+  ));
+  await page.type('[data-testid="acp-provider-base-url"]', 'https://relay.example.com/v1');
+  await sleep(200);
+  rec('⑥.15 codex 填 base URL 后获取按钮出现且可用', await page.evaluate(() => {
+    const button = document.querySelector('[data-testid="acp-provider-fetch-models"]');
+    return !!button && !button.disabled;
+  }));
+  await page.click('[data-testid="acp-provider-fetch-models"]');
+  await sleep(500);
+  const acpProbeCall = await page.evaluate(() => {
+    const call = [...window.__ACP_PROVIDERS_TEST__.calls].reverse().find(item => item.cmd === 'probe_endpoint_models');
+    return {
+      args: call && call.args,
+      pickerOpen: !!document.querySelector('[data-testid="endpoint-model-picker-dialog"]'),
+    };
+  });
+  rec('⑥.16 点击探测携 baseUrl/apiKey/wire 并打开候选面板', !!acpProbeCall.args
+    && acpProbeCall.args.baseUrl === 'https://relay.example.com/v1'
+    && acpProbeCall.args.apiKey === null
+    && acpProbeCall.args.wire === 'openai'
+    && acpProbeCall.pickerOpen);
+  // 候选行「添加」= onPick:模型 id 进输入框,contextWindow 空字段填入,面板关闭
+  await page.evaluate(() => {
+    const dialog = document.querySelector('[data-testid="endpoint-model-picker-dialog"]');
+    const row = [...dialog.querySelectorAll('[data-testid="endpoint-model-row"]')]
+      .find(node => (node.textContent || '').includes('gpt-5.2-turbo'));
+    row.querySelector('[data-testid="endpoint-model-row-add"]').click();
+  });
+  await sleep(300);
+  rec('⑥.17 onPick 填 model 且 contextWindow 仅空填入并关闭面板', await page.evaluate(() =>
+    document.querySelector('[data-testid="acp-provider-model"]').value === 'gpt-5.2-turbo'
+    && document.querySelector('[data-testid="acp-provider-context-window"]').value === '262144'
+    && !document.querySelector('[data-testid="endpoint-model-picker-dialog"]')
+  ));
+  // 绝不覆盖非空值:再次获取并选不同模型(不同长度),已填 contextWindow 必须原样保留
+  await page.click('[data-testid="acp-provider-fetch-models"]');
+  await sleep(500);
+  await page.evaluate(() => {
+    const dialog = document.querySelector('[data-testid="endpoint-model-picker-dialog"]');
+    const row = [...dialog.querySelectorAll('[data-testid="endpoint-model-row"]')]
+      .find(node => (node.textContent || '').includes('gpt-5.2') && !(node.textContent || '').includes('turbo'));
+    row.querySelector('[data-testid="endpoint-model-row-add"]').click();
+  });
+  await sleep(300);
+  rec('⑥.18 二次挑选不同模型不覆盖已填 contextWindow', await page.evaluate(() =>
+    document.querySelector('[data-testid="acp-provider-model"]').value === 'gpt-5.2'
+    && document.querySelector('[data-testid="acp-provider-context-window"]').value === '262144'
+  ));
+  // 收尾(复审 ACP minor):Escape 逐层关闭——先重开候选面板,第一下 Escape 只关
+  // 面板(表单保留),第二下才关表单;随后断言全程未产生保存调用。
+  await page.click('[data-testid="acp-provider-fetch-models"]');
+  await sleep(500);
+  await page.keyboard.press('Escape');
+  await sleep(200);
+  rec('⑥.18a Escape closes the endpoint picker first and keeps the form open', await page.evaluate(() =>
+    !document.querySelector('[data-testid="endpoint-model-picker-dialog"]')
+    && !!document.querySelector('[data-testid="acp-provider-form-dialog"]')
+  ));
+  await page.keyboard.press('Escape');
+  await sleep(200);
+  rec('⑥.18b second Escape closes the form once the picker is closed', await page.evaluate(() =>
+    !document.querySelector('[data-testid="endpoint-model-picker-dialog"]')
+    && !document.querySelector('[data-testid="acp-provider-form-dialog"]')
+  ));
+  // round-4 m1-1:探测失败写在本表单共享的 error 条上;URL 编辑的失效清扫
+  // 必须连同清 error——旧 URL 的红色失败条不许挂在新 URL 下(运行时覆盖,
+  // 源码钉在 tests/settings_ui_smoke.js 的 clearEndpointProbeState 守卫)。
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setProbeEndpointError('probe exploded'));
+  await page.click('[data-testid="acp-provider-add"]');
+  await sleep(300);
+  await page.type('[data-testid="acp-provider-base-url"]', 'https://relay-error.example.com/v1');
+  await page.click('[data-testid="acp-provider-fetch-models"]');
+  await sleep(500);
+  rec('⑥.18c probe failure surfaces the shared form error banner', await page.evaluate(() =>
+    !!document.querySelector('[data-testid="acp-provider-form-error"]')
+  ));
+  await page.evaluate(() => {
+    const input = document.querySelector('[data-testid="acp-provider-base-url"]');
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, 'https://relay-edited.example.com/v1');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await sleep(200);
+  rec('⑥.18d editing the base URL clears the stale probe-error banner (invalidation sweep covers the shared error state)',
+    await page.evaluate(() => !document.querySelector('[data-testid="acp-provider-form-error"]')
+      && !document.querySelector('[data-testid="endpoint-model-picker-dialog"]')));
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setProbeEndpointError(null));
+  await page.keyboard.press('Escape');
+  await sleep(200);
+  rec('⑥.19 候选流程未产生保存调用', (await callCount(page, 'save_acp_provider')) === savesBeforeAcpFetch);
+
+  // 一键切换
+  await page.evaluate(() => {
+    const button = [...document.querySelectorAll('[data-testid^="acp-provider-switch-"]')].find(candidate => !candidate.disabled);
+    if (button) button.click();
+  });
+  await sleep(500);
+  rec('⑦ 切换调用', (await callCount(page, 'switch_acp_provider')) === 1);
+  rec('⑧ 当前徽标', await page.evaluate(() => (document.body.textContent || '').includes('当前')));
+
+  // 切回官方：Provider 生效时按钮可见，点击调 switch_acp_provider_official
+  rec('⑧.1 切回官方按钮可见', await page.evaluate(() => !!document.querySelector('[data-testid="acp-provider-switch-official"]')));
+  await page.click('[data-testid="acp-provider-switch-official"]');
+  await sleep(500);
+  rec('⑧.2 切回官方调用', (await callCount(page, 'switch_acp_provider_official')) === 1);
+
+  // 官方登出：codex 有登出按钮并调用 logout_acp_agent；kimi 也有（provider remove）
+  rec('⑧.3 登出按钮可见', await page.evaluate(() => !!document.querySelector('[data-testid="acp-cli-logout"]')));
+  await page.click('[data-testid="acp-cli-logout"]');
+  await sleep(500);
+  rec('⑧.4 登出调用', (await callCount(page, 'logout_acp_agent')) === 1);
+  await page.click('[data-testid="acp-agent-tab-kimi"]');
+  await sleep(400);
+  rec('⑧.5 kimi 有登出按钮', await page.evaluate(() => !!document.querySelector('[data-testid="acp-cli-logout"]')));
+  await page.click('[data-testid="acp-agent-tab-codex"]');
+  await sleep(400);
+
+  // env 冲突警告
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setEnvConflicts(
+    ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'],
+    [
+      { key: 'ANTHROPIC_BASE_URL', value: 'https://env-override.example.com', secret: false },
+      { key: 'ANTHROPIC_AUTH_TOKEN', value: '', secret: true },
+    ]
+  ));
+  await page.click('[data-testid="acp-provider-refresh"]');
+  await sleep(500);
+  rec('⑨ env 冲突警告条', await page.evaluate(() => !!document.querySelector('[data-testid="acp-providers-env-warning"]')));
+  rec('⑨.1 生效中配置只读区渲染', await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="acp-providers-effective"]');
+    if (!el) return false;
+    const values = [...el.querySelectorAll('.font-mono')].map(span => (span.textContent || '').trim());
+    // CodeQL js/incomplete-url-substring-sanitization treats includes(url) as a prefix/substring
+    // containment check; the some(===) exact-equality form does not trigger it (same fix as b27788bbb for ui_smoke).
+    return values.includes('gpt-5.2')
+      // eslint-disable-next-line unicorn/prefer-includes -- exact-equality assertion; avoids a CodeQL false positive
+      && values.some(value => value === 'https://api.example.com/v1');
+  }));
+  rec('⑨.2 env 覆盖时徽标降格', await page.evaluate(() => {
+    const section = document.querySelector('[data-testid="acp-providers-section"]');
+    return !!(section && (section.textContent || '').includes('被环境变量覆盖'));
+  }));
+  rec('⑨.3 env 生效值：非密明文 + 凭据掩码', await page.evaluate(() => {
+    const el = document.querySelector('[data-testid="acp-providers-env-warning"]');
+    if (!el) return false;
+    // URL 明文可见；凭据只显示「已设置」掩码，值不得出现
+    const values = [...el.querySelectorAll('.font-mono')].map(span => (span.textContent || '').trim());
+    // The some(===) exact-equality form does not trip CodeQL's URL substring check (see the ⑨.1 comment above).
+    // eslint-disable-next-line unicorn/prefer-includes -- exact-equality assertion; avoids a CodeQL false positive
+    return values.some(value => value === 'https://env-override.example.com')
+      && (el.textContent || '').includes('已设置（值已隐藏）');
+  }));
+
+  // 导出警告
+  await page.click('[data-testid="acp-provider-export"]');
+  await sleep(300);
+  rec('⑩ 导出明文 key 警告', await page.evaluate(() => {
+    const text = document.body.textContent || '';
+    return !!document.querySelector('[data-testid="acp-provider-export-json"]') && text.includes('明文');
+  }));
+  await page.click('[data-testid="acp-provider-export-select"]');
+  await sleep(200);
+  // 关闭导出弹窗（点背景），避免遮挡后续交互
+  await page.mouse.click(20, 20);
+  await sleep(250);
+
+  // 删除确认
+  await page.evaluate(() => {
+    const button = document.querySelector('[data-testid^="acp-provider-delete-"]');
+    if (button) button.click();
+  });
+  await sleep(250);
+  rec('⑪ 删除确认弹窗', await page.evaluate(() => (document.body.textContent || '').includes('删除 Provider？')));
+  await page.click('[data-testid="acp-provider-delete-confirm"]');
+  await sleep(500);
+  rec('⑫ 删除调用', (await callCount(page, 'delete_acp_provider')) === 1);
+
+  // 卸载确认（默认不勾选清理）
+  await page.click('[data-testid="acp-cli-uninstall"]');
+  await sleep(250);
+  rec('⑬ 卸载确认弹窗', await page.evaluate(() => (document.body.textContent || '').includes('卸载')));
+  const cleanupChecked = await page.evaluate(() => document.querySelector('[data-testid="acp-uninstall-cleanup"]')?.checked);
+  rec('⑭ 清理默认不勾选', cleanupChecked === false);
+  await page.click('[data-testid="acp-uninstall-cancel"]').catch(() => {});
+  // 兜底关闭：点击取消按钮（文本）
+  await page.evaluate(() => {
+    const buttons = [...document.querySelectorAll('button')].filter(button => (button.textContent || '').trim() === '取消');
+    const button = buttons[buttons.length - 1];
+    if (button) button.click();
+  });
+  await sleep(200);
+
+  // 安装中状态恢复与取消：installing=true 时安装按钮禁用并显示「正在安装」，
+  // 取消按钮可见；点击后调用 cancel_acp_agent_install 并恢复可安装形态
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstalling('codex', true));
+  // DOM click 而非坐标点击：Provider 较多时内容更高，CLI 区滚入视口后
+  // 刷新按钮可能被吸顶通知条（3.2s 自动消失）遮住，坐标点击会打在通知条上
+  await page.evaluate(() => document.querySelector('[data-testid="acp-provider-refresh"]').click());
+  await sleep(500);
+  rec('⑯ 安装中按钮禁用且显示进行中文案', await page.evaluate(() => {
+    const button = document.querySelector('[data-testid="acp-cli-install-update"]');
+    return !!button && button.disabled && (button.textContent || '').includes('正在安装');
+  }));
+  rec('⑰ 取消安装按钮可见', await page.evaluate(() => !!document.querySelector('[data-testid="acp-cli-install-cancel"]')));
+  await page.click('[data-testid="acp-cli-install-cancel"]');
+  await sleep(500);
+  rec('⑱ 取消安装调用', (await callCount(page, 'cancel_acp_agent_install')) === 1);
+  rec('⑲ 取消后安装入口恢复可用', await page.evaluate(() => {
+    const button = document.querySelector('[data-testid="acp-cli-install-update"]');
+    return !!button && !button.disabled && !document.querySelector('[data-testid="acp-cli-install-cancel"]');
+  }));
+
+  // Cross-mount install heal: switching settings sections mid-install
+  // unmounts ProvidersSection (the terminal state is delivered only to the
+  // unmounted initiator) → the "downloading" card restored after remount
+  // must converge from status.install_finished, not stay in-progress forever.
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installed: false,
+    installing: false,
+    install_finished: null,
+  }));
+  await page.evaluate(() => document.querySelector('[data-testid="acp-provider-refresh"]').click());
+  await sleep(400);
+  await page.evaluate(() => document.querySelector('[data-testid="acp-cli-install-update"]').click());
+  await sleep(300);
+  // The backend registers the install and pushes the first command event
+  // (the frontend switches to "downloading")
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installing: true,
+    install_command: 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash',
+  }));
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.emitInstallProgress(
+    'codex', 'command', 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash',
+  ));
+  await sleep(300);
+  rec('⑳ 安装中卡片出现', await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="acp-cli-install-progress"]');
+    return !!card && (card.textContent || '').includes('下载安装中');
+  }));
+  // Switch away and back: ProvidersSection unmounts and remounts, the
+  // in-progress phase is restored from the module cache
+  await clickSettingsSection(page, '通用');
+  await clickSettingsSection(page, '模型');
+  await page.click('[data-testid="settings-model-tab-acp"]');
+  await sleep(500);
+  rec('㉑ 重挂载后卡片恢复进行中', await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="acp-cli-install-progress"]');
+    return !!card && (card.textContent || '').includes('下载安装中');
+  }));
+  // Backend wraps up: installing=false + install_finished=ok. The initiator
+  // is unmounted; the remounted instance must converge the card to "done"
+  // from it instead of staying on "downloading" forever. Deliberately click
+  // no refresh: the install poller (2s) is still running, and that passive
+  // path is exactly what a real user watching the panel exercises — the heal
+  // effect converges as status comes back (the mock flips
+  // installing/install_finished atomically; the "installing drops early"
+  // window is excluded by the backend's active-window registry, see
+  // acp_providers_contract 8.2).
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installing: false,
+    installed: true,
+    install_finished: { ok: true, cancelled: false },
+  }));
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.resolvePendingInstall('codex'));
+  await sleep(3000);
+  rec('㉒ 不点击刷新也按 install_finished 收敛为完成', await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="acp-cli-install-progress"]');
+    return !!card && (card.textContent || '').includes('完成');
+  }));
+  // Failed-outcome heal: a failed (non-cancelled) outcome must echo the
+  // error chain recorded in the outcome into the red error area (the only
+  // terminal convergence that carries copy). Order mirrors a real install:
+  // first read installing=true into the component (poller armed, heal held
+  // by the installing gate), then switch to "downloading" via the command
+  // event, then land the failed outcome and let the poller converge. The
+  // scenario starts from a cleared outcome: the real backend clears
+  // install_finished at install entry, so "installing=true with a leftover
+  // outcome" is a state production never produces.
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installing: true,
+    install_finished: null,
+    install_command: 'npm install -g @kimi/kimi-code',
+  }));
+  await page.evaluate(() => document.querySelector('[data-testid="acp-provider-refresh"]').click());
+  await sleep(400);
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.emitInstallProgress(
+    'codex', 'command', 'npm install -g @kimi/kimi-code',
+  ));
+  await sleep(300);
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installing: false,
+    install_finished: { ok: false, cancelled: false, error: 'npm install failed: EBUSY' },
+  }));
+  await sleep(3000);
+  rec('㉓ 按 install_finished 收敛为失败并回显原因', await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="acp-cli-install-progress"]');
+    const banner = document.querySelector('[data-testid="acp-providers-error"]');
+    return !!card && (card.textContent || '').includes('失败')
+      && !!banner && (banner.textContent || '').includes('EBUSY');
+  }));
+
+  // Cross-entrance run observation: an install started at ANOTHER entrance
+  // (e.g. the ACP 管理 view) while this panel stays mounted. The panel holds
+  // a pre-run snapshot (installing=false carrying the previous run's outcome
+  // from step ㉓); the new run's command event must NOT let the heal consume
+  // that stale outcome — freshness is invalidated, the card stays in-progress
+  // (with the old code it flipped straight to the previous run's terminal),
+  // and the poller — armed by the installing phase itself, since the held
+  // status.installing is stale — converges only on the new run's own
+  // terminal.
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.emitInstallProgress(
+    'codex', 'command', 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash',
+  ));
+  await sleep(300);
+  rec('㉔ 观察到新安装不吞旧结果（保持进行中）', await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="acp-cli-install-progress"]');
+    return !!card && (card.textContent || '').includes('下载安装中');
+  }));
+  // Mirror the real backend ordering for the rest of the run: entry (clears
+  // the outcome; active window → installing=true), then the terminal. From
+  // here every poll lands with installing=true until the outcome exists.
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installing: true,
+    install_finished: null,
+  }));
+  await sleep(2500);
+  await page.evaluate(() => window.__ACP_PROVIDERS_TEST__.setInstallScenario('codex', {
+    installing: false,
+    installed: true,
+    install_finished: { ok: true, cancelled: false },
+  }));
+  await sleep(3000);
+  rec('㉕ 观察到的新安装按其自身结果收敛', await page.evaluate(() => {
+    const card = document.querySelector('[data-testid="acp-cli-install-progress"]');
+    return !!card && (card.textContent || '').includes('完成');
+  }));
+
+  const pageErrors = errors.filter(message => !message.includes('favicon'));
+  rec('⑮ 无页面错误', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));
+
+  await browser.close();
+  const failed = results.filter(result => !result.pass);
+  if (failed.length) {
+    console.error(`ACP providers UI smoke FAILED: ${failed.length}/${results.length}`);
+    process.exit(1);
+  }
+  console.log('ACP providers UI smoke passed');
+  process.exit(0);
+// eslint-disable-next-line unicorn/prefer-top-level-await -- the smoke script already has an async main() structure
+})().catch(async error => {
+  console.error('ACP providers UI smoke crashed:', error);
+  process.exit(1);
+});

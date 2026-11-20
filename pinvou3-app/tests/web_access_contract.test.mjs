@@ -1,0 +1,1560 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Source-regex assertions use bounded character gaps (e.g. [\s\S]{0,200});
+// a Windows checkout with core.autocrlf=true inflates those gaps with \r
+// characters, so normalize line endings before matching.
+const readSource = (filePath, encoding) =>
+  fs.readFileSync(filePath, encoding).replace(/\r\n/g, '\n');
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const bridgeRoot = path.join(root, 'src', 'platform', 'tauri');
+const chunkedUpload = readSource(
+  path.join(root, 'src', 'shared', 'chunked-file-upload.js'),
+  'utf8',
+);
+const fileIngest = readSource(
+  path.join(root, 'src-tauri', 'src', 'features', 'files', 'file_ingest.rs'),
+  'utf8',
+);
+const webBridge = readSource(path.join(root, 'src', 'platform', 'web', 'bridge.js'), 'utf8');
+const webDomainAdapter = readSource(
+  path.join(root, 'src', 'platform', 'web', 'bridge', 'domain-adapter.js'),
+  'utf8',
+);
+const attachmentDropController = readSource(
+  path.join(root, 'src', 'features', 'attachments', 'attachment-drop-controller.js'),
+  'utf8',
+);
+const attachmentDropHook = readSource(
+  path.join(root, 'src', 'features', 'attachments', 'useAttachmentDrop.js'),
+  'utf8',
+);
+const desktopRemoteControlBridge = readSource(
+  path.join(bridgeRoot, 'bridge', 'remote-control.js'),
+  'utf8',
+);
+const desktopSessionsBridge = readSource(
+  path.join(bridgeRoot, 'bridge', 'sessions.js'),
+  'utf8',
+);
+const desktopAuxChatBridge = readSource(
+  path.join(bridgeRoot, 'bridge', 'aux-chat.js'),
+  'utf8',
+);
+const sharedBridgeHelpers = readSource(
+  path.join(root, 'src', 'shared', 'bridge-shared-helpers.js'),
+  'utf8',
+);
+const desktopBridgeSources = [
+  readSource(path.join(bridgeRoot, 'bridge.js'), 'utf8'),
+  ...fs.readdirSync(path.join(bridgeRoot, 'bridge'))
+    .filter(name => name.endsWith('.js'))
+    .sort() // eslint-disable-line unicorn/require-array-sort-compare -- lexicographic order of the string array is the asserted expectation
+    .map(name => readSource(path.join(bridgeRoot, 'bridge', name), 'utf8')),
+];
+const bridge = [
+  webBridge,
+  webDomainAdapter,
+  ...desktopBridgeSources,
+].join('\n');
+const bootstrap = readSource(path.join(root, 'src', 'platform', 'web', 'bootstrap.js'), 'utf8');
+const hostFilePicker = readSource(
+  path.join(root, 'src', 'platform', 'web', 'host-file-picker.js'),
+  'utf8',
+);
+const commandsRoot = path.join(root, 'src-tauri', 'src', 'app', 'commands');
+const commands = fs.readdirSync(commandsRoot)
+  .filter(name => name.endsWith('.rs'))
+  .sort() // eslint-disable-line unicorn/require-array-sort-compare -- lexicographic order of the string array is the asserted expectation
+  .map(name => readSource(path.join(commandsRoot, name), 'utf8'))
+  .join('\n');
+const remoteControlCommands = readSource(path.join(commandsRoot, 'remote_control.rs'), 'utf8');
+const remoteControlManagerRoot = path.join(
+  root,
+  'src-tauri',
+  'src',
+  'features',
+  'remote_control',
+  'manager',
+);
+const remoteControlManager = fs.readdirSync(remoteControlManagerRoot)
+  .filter(name => name.endsWith('.rs'))
+  .sort() // eslint-disable-line unicorn/require-array-sort-compare -- lexicographic order of the string array is the asserted expectation
+  .map(name => readSource(path.join(remoteControlManagerRoot, name), 'utf8'))
+  .join('\n');
+const remoteControlPlatformRoot = path.join(
+  root,
+  'src-tauri',
+  'src',
+  'features',
+  'remote_control',
+  'platform',
+);
+const remoteControlPlatform = fs.readdirSync(remoteControlPlatformRoot)
+  .filter(name => name.endsWith('.rs'))
+  .sort() // eslint-disable-line unicorn/require-array-sort-compare -- lexicographic order of the string array is the asserted expectation
+  .map(name => readSource(path.join(remoteControlPlatformRoot, name), 'utf8'))
+  .join('\n');
+const settingsView = readSource(path.join(root, 'src', 'features', 'settings', 'SettingsView.jsx'), 'utf8');
+const artifactsPanel = readSource(path.join(root, 'src', 'features', 'artifacts', 'ArtifactsPanel.jsx'), 'utf8');
+const toolStoreView = readSource(path.join(root, 'src', 'features', 'tools', 'ToolStoreView.jsx'), 'utf8');
+const toolRenderers = readSource(path.join(root, 'src', 'features', 'tools', 'tool-renderers.jsx'), 'utf8');
+const knowledgeView = readSource(path.join(root, 'src', 'features', 'knowledge', 'KnowledgeView.jsx'), 'utf8');
+const toolCommon = readSource(path.join(root, 'src', 'features', 'tools', 'tool-common.jsx'), 'utf8');
+const connectionStatus = readSource(path.join(root, 'src', 'features', 'web', 'WebConnectionStatus.jsx'), 'utf8');
+const chatView = readSource(path.join(root, 'src', 'features', 'chat', 'ChatView.jsx'), 'utf8');
+const codexView = readSource(path.join(root, 'src', 'features', 'codex', 'CodexAcpView.jsx'), 'utf8');
+const acpRuntimeNotices = readSource(
+  path.join(root, 'src', 'features', 'codex', 'AcpRuntimeNotices.jsx'),
+  'utf8',
+);
+const codexWorkspacePanel = readSource(
+  path.join(root, 'src', 'features', 'codex', 'CodexWorkspacePanel.jsx'),
+  'utf8',
+);
+const codeViewerContent = readSource(
+  path.join(root, 'src', 'features', 'codex', 'CodeViewerContent.jsx'),
+  'utf8',
+);
+const acpPlatformClient = readSource(path.join(root, 'src', 'features', 'codex', 'acpClient.js'), 'utf8');
+const acpErrors = readSource(path.join(root, 'src', 'features', 'codex', 'acpErrors.js'), 'utf8');
+const i18n = ['zh', 'en', 'ja'].map((l) => readSource(path.join(root, 'src', 'shared', 'i18n', `${l}.js`), 'utf8')).join('\n'); // 拆分后三语在 i18n/ 目录
+const appMain = readSource(path.join(root, 'src', 'app', 'main.jsx'), 'utf8');
+const policy = JSON.parse(readSource(path.join(root, 'src', 'platform', 'web', 'access-policy.json'), 'utf8'));
+const allowed = new Set(policy.allowed_commands);
+const allowedEvents = new Set(policy.allowed_events);
+
+function rustCommandBlock(source, command) {
+  const signature = source.indexOf(`fn ${command}(`);
+  assert.notEqual(signature, -1, `missing Rust command ${command}`);
+  const start = source.lastIndexOf('#[tauri::command]', signature);
+  const next = source.indexOf('#[tauri::command]', signature + command.length);
+  return source.slice(start, next === -1 ? source.length : next);
+}
+
+// Round-11 复审 M4:web_access_* 管理命令的桌面专用反钉收敛为单一清单。
+// 命名空间约定:web_access_* 一律管理面(端点生命周期、配对状态、RPC 代
+// 理、bridge 就绪),除 web_access_list_host_files 外全部不进 Web 策略。
+const desktopOnlyWebAccessCommands = [
+  'web_access_enable',
+  'web_access_disable',
+  'web_access_status',
+  'web_access_rotate',
+  'web_access_revoke_host_workspace',
+  // Round-10 复审 minor:主 WebView 事件通道同样管理专用——进 Web 策略的
+  // 话手机可经 RPC→bridge invoke 触发 publish_frontend_event(只过
+  // policy.events 允许名单,可伪造允许事件);缺席即全部防线。
+  'web_access_publish_event',
+  // Round-11 复审 M4:RPC 代理与 bridge 就绪命令——各自 doc comment 声明
+  // desktop-only,但此前不在任何反钉/门钉清单,把它们加进 access-policy
+  // 或删掉其 require_main_webview 门都静默全绿(rpc_begin/rpc_respond 的
+  // 策略侧防线即全部防线:relay 路径的执行窗口本就是 main)。
+  'web_access_bridge_ready',
+  'web_access_rpc_begin',
+  'web_access_rpc_respond',
+];
+
+for (const command of [
+  'chat',
+  'ingest_file',
+  'transcribe_voice_audio',
+  'save_model',
+  'delete_model',
+  'set_active_model',
+  'test_model_connection',
+  'set_disabled_connectors',
+  'install_marketplace_skill',
+  'install_marketplace_tool',
+  'uninstall_marketplace_skill',
+  'uninstall_marketplace_tool',
+  'codex_acp_prompt',
+  'get_codex_acp_timeline',
+  'get_codex_acp_session_info',
+  'get_codex_acp_pending_permissions',
+  'get_codex_acp_pending_elicitations',
+  'list_acp_agents',
+  'get_acp_agent_status',
+  'set_codex_acp_model',
+  'set_codex_acp_mode',
+  'set_codex_acp_config_option',
+  'create_codex_acp_session',
+  'cancel_codex_acp',
+  'list_codex_acp_sessions',
+  'list_codex_workspace',
+  'search_codex_workspace',
+  'preview_codex_workspace_file',
+  'get_codex_workspace_changes',
+  'get_codex_workspace_diff',
+  'install_acp_agent',
+  'login_acp_agent',
+  'switch_acp_agent_account',
+  'open_acp_agent_login_url',
+  'submit_acp_agent_login_code',
+  'web_access_enable',
+  // Round-9 复审:web_access_* 的管理命令同样桌面专用——手机侧的可达性
+  // 只经由主 WebView 代理 RPC(此时 require_main_webview 门按设计放行),
+  // 真正的门是策略白名单的缺席;只反钉 enable 会让「把其余命令加进
+  // access-policy.json」静默通过全部测试。(web_access_list_host_files
+  // 有意留在 Web 策略内——手机文件选择器的 RPC 由主 WebView 派发,不在
+  // 本反钉清单;require_main_webview 门在命令层单独拦 aux webview。)
+  // Round-11 复审 M4:web_access_* 管理命令收敛为单一清单,下方结构性
+  // 互斥钉按它判「其余命令」——清单与 Web 策略的并集必须覆盖
+  // remote_control.rs 里定义的每一个 web_access_* 命令,新增命令不加进
+  // 任一侧即红(结构性漏网:rpc 代理三兄弟、bridge_ready 由此兜住)。
+  ...desktopOnlyWebAccessCommands,
+  // 上传包展示名/说明编辑写 bundles.json 并可能回写 SKILL.md：写操作桌面专用。
+  'update_bundle_display_meta',
+  // 回收站恢复/彻底删除与两种包导出都是桌面端写操作（原生保存对话框 + 文件系统
+  // 变更）：Web 端回收站只读，仅放行 list_recycled_plugins，写命令留在桌面端。
+  'restore_recycled_plugin',
+  'purge_recycled_plugin',
+  'export_recycled_plugin',
+  'export_installed_plugin',
+  // Workspace branch view/checkout run local git mutations (add -A / commit /
+  // stash / checkout): desktop-only, the web client rejects them explicitly.
+  'list_codex_workspace_branches',
+  'checkout_codex_workspace_branch',
+  // Clipboard reads are desktop-privacy surface: the paste fallback runs on
+  // the desktop host only; web pastes go through the device-upload path.
+  'paste_clipboard_image',
+  // Dependency detection shells out to system package managers and is
+  // deliberately not allowlisted on the web; the web hides the whole
+  // dependency section behind the dependencyInstall capability bit.
+  'check_dependencies',
+  // The embedding-model install pair is desktop-only: a ~585MB native download
+  // and its cancel belong to the desktop host. The JS cancelKbModel facade
+  // exists on web as a policy-denied no-op (checkDependencies shape); keeping
+  // the commands off the policy AND in this anti-pin list means an accidental
+  // future allowlisting turns red instead of silently passing.
+  'kb_model_download',
+  'kb_model_cancel',
+]) {
+  assert.equal(allowed.has(command), false, `${command} must remain desktop-only`);
+}
+
+// Round-1 review M3 (endpoint model discovery): the probe command is
+// deliberately WEB-ALLOWED, so pin the positive half of that contract the
+// same way the desktop-only half above is anti-pinned — otherwise a policy
+// edit could silently un-allowlist it and strand the ACP/settings picker on
+// web. Rationale: probe_endpoint_models is keyring-blind — the caller
+// supplies whatever key the form holds, the command never reads the local
+// keyring or saved credentials, so probing from a paired browser leaks no
+// stored secret. That is exactly why it may ride the web RPC lane while
+// test_model_connection (resolves SAVED keys by model id → keyring access)
+// and save_model (credential writes) stay desktop-only above.
+// Round-2 review M7: the grant is wider than the keyring argument alone —
+// the OpenAI-compatible ladder short-circuits loopback/private base URLs
+// (base_url_uses_local_or_private in core/endpoint_discovery.rs), so a
+// paired page also gains a port-open/closed oracle via the transport class,
+// service identification via server_kind, and the loaded model names of
+// loopback/LAN services (ids only — the `title` field is populated only by
+// the remote anthropic/gemini native lanes; the local lanes return bare
+// ids) — silent (no desktop-side confirmation) and with no per-command rate
+// limit (only the shared MAX_RPC_IN_FLIGHT=32 window).
+// Round-3 review M5 (disclosure accuracy amendment): the reach is GLOBAL,
+// not "bounded internal-network" — the command validates only URL SHAPE,
+// not the host, and the remote ladders run unconditionally for every
+// non-local URL. A paired page can classify any PUBLIC host too (dns/
+// connect/timeout/tls per invocation, http_status for >=400/3xx), with the
+// desktop as vantage and the user's IP as source; IPv6 ULAs/link-local and
+// 169.254.169.254-style cloud-metadata addresses never hit the local
+// short-circuit at all. Accepted anyway because: keyring-blind with a
+// caller-supplied key only (saved credentials are never readable — but a
+// user-typed key transits the relay transport inside the paired page's RPC
+// frame: TLS terminates at the relay, so the relay operator and its logs
+// can observe it; the default localhost relay is unaffected; the RPC ledger
+// fingerprints args with the secret replaced by its length, so the
+// persisted hash is not an offline verifier for the key);
+// the sanitized response carries status codes, transport class, server kind,
+// and model entries, never the URL or key or body text; one caller-supplied
+// endpoint per invocation — exact on the remote ladders, which stay
+// no-redirect and are pinned, while the LOCAL lane's probes ride the shared
+// probe client, which follows redirects (reqwest default, up to 10 hops);
+// only Bearer is attached there and reqwest strips it on any host-or-port
+// change (scheme is NOT compared — a same-host scheme downgrade keeps it,
+// but that host already received the key), so no credential reaches a second
+// host, but the probe's requests may land on
+// hosts the caller-supplied URL redirects to (still a single starting
+// point; the shape is not a scanner, the page must issue its own requests);
+// and today only page JS reaches the command: the probe's UI entries stay
+// off the web lane because the web bridge never populates
+// platformCapabilities.codexAcpSupported (the ACP tab's gate) and the
+// saved-model editor additionally gates on modelManagement:false
+// (platform/web/bootstrap.js).
+// discoverLocalVllm (the multi-candidate local discovery) stays
+// desktop-only — see tests/bridge_domain_contract.mjs.
+assert.equal(
+  allowed.has('probe_endpoint_models'),
+  true,
+  'probe_endpoint_models must stay web-allowlisted (keyring-blind: caller supplies the key; no saved-credential read, unlike test_model_connection; disclosed GLOBAL reach: the command accepts any caller-supplied URL and the remote ladders classify any public host — a port/service/model oracle with the desktop as vantage, bounded only by MAX_RPC_IN_FLIGHT=32 — accepted because the sanitized response never echoes the URL or key, one caller-supplied endpoint per invocation with the remote ladders no-redirect and pinned while the local lane may follow redirects (Bearer stripped on any host-or-port change; scheme is not compared), typed keys transit the relay frame where the relay operator can observe them (saved credentials never readable; localhost default unaffected), the ledger fingerprint redacts secret-named args at any depth to their length, and only page JS reaches the command today — the probe UI stays off the web lane because the web bridge never populates platformCapabilities.codexAcpSupported, with the saved-model editor additionally gated on modelManagement:false)',
+);
+
+// Round-11 复审 M4:结构性互斥钉——remote_control.rs 里定义的每一个
+// web_access_* 命令必须要么在 Web 策略里(受 positive wrapper 钉约束),
+// 要么在上面的桌面专用反钉清单里。手工反钉清单的结构性漏网
+// (web_access_bridge_ready / web_access_rpc_begin / web_access_rpc_respond
+// 曾三个全漏)由本钉永久兜住:任何新 web_access_* 命令不加进任一侧即红。
+{
+  const defined = new Set();
+  for (const match of remoteControlCommands.matchAll(/pub(?:\([\w:]+\))? (?:async )?fn (web_access_\w+)\(/g)) {
+    defined.add(match[1]);
+  }
+  assert.ok(defined.size >= 50,
+    `expected the full web_access_* command surface, found ${defined.size}`);
+  for (const command of defined) {
+    assert.ok(
+      allowed.has(command) || desktopOnlyWebAccessCommands.includes(command),
+      `${command} must be either in the web policy or explicitly anti-pinned as desktop-only`,
+    );
+  }
+  for (const command of desktopOnlyWebAccessCommands) {
+    assert.ok(defined.has(command),
+      `${command} is anti-pinned but no longer defined in remote_control.rs`);
+  }
+}
+
+// Round-11 复审 M4:事件半边的反钉——web_access:* 事件全部管理专用
+// (status 携带配对 URL/QR,rpc_request 携带代理命令与参数,
+// event_subscribe 是订阅控制)。结构化扫描 Rust 管理器与 JS 桥里的
+// web_access:* 字面量:任何一个都不允许出现在 Web 策略事件名单里,
+// 新增同名事件即被扫进(此前事件半边没有任何反向钉)。
+for (const source of [remoteControlManager, desktopRemoteControlBridge]) {
+  for (const match of source.matchAll(/"web_access:([a-z_]+)"/g)) {
+    const eventName = `web_access:${match[1]}`;
+    assert.equal(allowedEvents.has(eventName), false,
+      `${eventName} is a management channel and must never enter the web event policy`);
+  }
+}
+
+// Round-11 复审 minor:JS↔Rust 错误码表的跨语言契约。bridge.js 的
+// `WEB_TURN_ERROR_KEYS` 键是 Rust 侧折叠出的稳定 wire code;Rust 端的
+// stable_web_error_codes_are_locked 等钉锁住生产侧,这里是消费侧的
+// 反向钉:每个 JS 键必须仍出现在某个 Rust 命令源码里——重命名一个
+// Rust 码而漏改 JS 时,该键映射不到任何文案、静默落进红acted 兜底,
+// 本钉即红。
+{
+  const tableStart = webBridge.indexOf('const WEB_TURN_ERROR_KEYS = {');
+  assert.notEqual(tableStart, -1, 'WEB_TURN_ERROR_KEYS must exist in web/bridge.js');
+  const tableEnd = webBridge.indexOf('};', tableStart);
+  const table = webBridge.slice(tableStart, tableEnd);
+  const jsKeys = [...table.matchAll(/^\s{4}([a-z_0-9]+): "/gm)].map(match => match[1]);
+  assert.ok(jsKeys.length >= 14,
+    `expected the full turn-error code table, found ${jsKeys.length} keys`);
+  // 生产代码分布在 app/commands/*(折叠点)与 features/remote_control/manager/*
+  // (rpc 准入拒绝),两侧都扫。
+  const rustProducers = commands + remoteControlManager;
+  for (const code of jsKeys) {
+    assert.ok(rustProducers.includes(code),
+      `WEB_TURN_ERROR_KEYS entry "${code}" has no Rust producer; rename one side or the other`);
+  }
+}
+
+// 知识库批量导入的进度查看与继续/取消/重试/失败文件分页是一组协同命令：Web 端知识库
+// 已开放（kb_collection_add_sources 等），任一导入控制命令遗漏会让对应按钮静默失败。
+for (const command of [
+  'kb_index_status',
+  'kb_index_cancel',
+  'kb_index_resume',
+  'kb_index_retry_file',
+  'kb_index_failed_files',
+]) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (KB import controls)`);
+}
+
+// Builtin feature switches (docs/builtin-toolset-contract.md §3.3): the WebUI
+// proxies to the same desktop host, so the feature-off state must be readable
+// from the browser too — otherwise a browser client keeps a switched-off
+// feature (session mention) fully live while read_session is gone on the
+// host. list_builtin_features is lane-agnostic and read-only; the write side
+// stays desktop-only.
+for (const command of ['list_builtin_features']) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (builtin feature registry read)`);
+}
+for (const command of ['set_builtin_feature_enabled']) {
+  assert.equal(allowed.has(command), false, `${command} must remain desktop-only (builtin feature toggles)`);
+}
+// Hot refresh: switch toggles broadcast remote_control:tools_changed; the relay
+// must forward it (allowlist) and the web bridge must re-dispatch the shared
+// pinvou:tools-changed DOM event so ChatView's registry subscription updates
+// on browser clients too (desktop gets the same event via chat-events.js).
+assert.equal(
+  allowedEvents.has('remote_control:tools_changed'), true,
+  'remote_control:tools_changed must be allowed on Web (builtin feature switch hot refresh)',
+);
+assert.match(
+  webBridge,
+  /listen\("remote_control:tools_changed", function \(\) \{\s*try \{ window\.PinvouToolStoreEvents\.notifyComposerToolsChanged\(\); \}/,
+  'web bridge must re-dispatch pinvou:tools-changed through the shared module from remote_control:tools_changed (bounded to the adjacent dispatch line — round-23 asto minor 3: the old unbounded gap stayed green on a deleted dispatch; round-9: FFE4-1 conversion completed, the web lane now matches the desktop chat-events.js twin)',
+);
+
+// Memory organize is a global action (no session scope, same surface as
+// get_memory_overview): the settings "AI 整理记忆" (AI organize memory) button and
+// the "上次整理" (last organized) history read must work on WebUI too; missing
+// either one makes the button fail silently with command_not_allowed.
+for (const command of ['organize_memory', 'get_memory_organize_history']) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (memory organize)`);
+}
+
+// Scene-label sidecars sync per session switch on Web exactly like the
+// persona-events / pinvou-reviews siblings; dropping either entry logs a
+// sidecar failure per session switch and silently stops label sync.
+for (const command of ['get_session_pinvou_scene_events', 'save_session_pinvou_scene_events']) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (scene-label sidecars)`);
+}
+
+// Authorized-connector toggle/skill state queries are part of the WebUI surface
+// (SettingsView's composer tool menu calls *_skills_state; authorization-state
+// injection happens inside the command layer via get_marketplace_tool_auth_status,
+// so the frontend no longer calls *_status directly). Missing any one leaves the
+// connector permanently showing "disconnected" on Web: the card depends on the
+// installed badge because externalAuth is unavailable.
+// Connector toggling and skill install/remove (*_ensure_cli, *_apply_skills, ...)
+// remain desktop-only.
+for (const command of [
+  'feishu_skills_state',
+  'wecom_skills_state',
+  'dingtalk_skills_state',
+  'tmeet_skills_state',
+]) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (authorized connector status queries)`);
+}
+// Connector mutation surfaces stay desktop-only: connect/disconnect
+// (*_connect_begin/*_logout, ima_connect/ima_logout), native CLI install
+// (*_ensure_cli triggers download + materialization), skill install/remove
+// (*_apply_skills materializes skill packs into ~/.pinvou3), OAuth abort
+// (*_cancel), authorization-gate recomputation (refresh_connector_auth_gates).
+// The per-connector toggles (set_*_enabled) and the skill-level disable lists
+// (set_disabled_skills/get_disabled_skills) were removed with the dead-command
+// cleanup: connector toggles go through set_disabled_connectors.
+// This list must stay in sync with the connector registration surface in lib.rs.
+// The retired *_status commands left the frontend (ToolStoreView now uses
+// *_skills_state / bundle_readiness); they were never web-allowed (not in the
+// allowlist on main either) and are reverse-pinned here so they cannot
+// quietly return.
+for (const command of [
+  'feishu_status',
+  'wecom_status',
+  'dingtalk_status',
+  'tmeet_status',
+  'ima_status',
+]) {
+  assert.equal(allowed.has(command), false, `retired ${command} must not return to the Web allowlist`);
+}
+const deniedConnectorMutations = [];
+for (const connector of ["feishu", "wecom", "dingtalk", "tmeet"]) {
+  deniedConnectorMutations.push(
+    `${connector}_connect_begin`,
+    `${connector}_logout`,
+    `${connector}_ensure_cli`,
+    `${connector}_cancel`,
+    `${connector}_apply_skills`,
+  );
+}
+deniedConnectorMutations.push(
+  "ima_connect", "ima_logout", "set_disabled_connectors", "refresh_connector_auth_gates",
+  // Project-level skills toggle (settings admin surface; both read and write are
+  // desktop-only. It used to be covered by neither list, so adding it to the
+  // policy would not have triggered any test — contradicting the "list must stay
+  // in sync with the registration surface" promise).
+  "set_project_skills_enabled", "get_project_skills_enabled",
+);
+for (const command of deniedConnectorMutations) {
+  assert.equal(allowed.has(command), false, `${command} must remain desktop-only (connector mutations)`);
+}
+
+for (const command of [
+  'web_access_chat',
+  'web_access_list_sessions',
+  'web_access_list_archived_sessions',
+  'web_access_create_session',
+  // Round-11 复审 M4:create_session 与 create_session_and_chat 同批——
+  // 它返回带 transcript revision 的会话元数据,静默移出策略会打断 Web
+  // 建会话与乐观并发令牌,且此前没有任何钉看到。
+  'web_access_create_session_and_chat',
+  'web_access_ingest_file',
+  'web_access_upload_attachment_chunk',
+  'web_access_abort_attachment_upload',
+  'web_access_discard_attachment',
+  'web_access_cancel_session_download',
+  'web_access_load_session_chunk',
+  'web_access_transcribe_voice_audio',
+  'web_access_codex_acp_prompt',
+  'web_access_cancel_codex_acp',
+  'web_access_get_codex_acp_timeline',
+  'web_access_get_codex_acp_session_info',
+  'web_access_get_codex_acp_pending_permissions',
+  'web_access_get_codex_acp_pending_elicitations',
+  'web_access_list_acp_agents',
+  'web_access_list_codex_acp_sessions',
+  'web_access_get_acp_agent_status',
+  'web_access_set_codex_acp_model',
+  'web_access_set_codex_acp_mode',
+  'web_access_set_codex_acp_config_option',
+  'web_access_create_codex_acp_session',
+  'web_access_list_codex_workspace',
+  'web_access_search_codex_workspace',
+  'web_access_preview_codex_workspace_file',
+  'web_access_get_codex_workspace_changes',
+  'web_access_get_codex_workspace_diff',
+]) {
+  assert.equal(allowed.has(command), true, `${command} must be the bounded Web wrapper`);
+}
+assert.equal(allowed.has('list_sessions'), false,
+  'Web must not call the native session list that exposes host workspace metadata');
+assert.equal(allowed.has('list_archived_sessions'), false,
+  'Web must not call the native archived list that exposes host workspace metadata');
+
+// Aux chat domain: platform/web/bridge.js's auxChatEnsure/
+// auxChatReset invoke these commands directly; sending goes through the
+// existing web_access_chat (an aux session can be store.load'ed by id and is
+// not affected by the list_sessions filter). Missing any entry would make
+// the Web aux chat fail silently.
+for (const command of [
+  'get_or_create_aux_session',
+  'reset_aux_session',
+]) {
+  assert.equal(allowed.has(command), true, `${command} must be allowed on Web (aux chat)`);
+}
+assert.equal(allowed.has('get_aux_session'), false,
+  'the dead get_aux_session command must stay removed from the Web surface');
+
+// get_or_create_aux_session and reset_aux_session cross the Web/Relay
+// boundary, so they must return the minimal AuxSessionBinding projection (id
+// only) — never the full SessionMetadata, whose inherited host workspace
+// path would leak to the browser (the redaction invariant behind
+// redact_session_metadata_for_web).
+assert.match(commands, /pub struct AuxSessionBinding \{\s*pub id: String,?\s*\}/,
+  'the aux session command must return an id-only projection');
+assert.match(commands, /fn get_or_create_aux_session\([\s\S]{0,300}?-> Result<AuxSessionBinding, String>/,
+  'get_or_create_aux_session must not return raw SessionMetadata across the Web boundary');
+assert.match(commands, /get_or_create_aux_session\(&session_id\)[\s\S]{0,200}?AuxSessionBinding \{ id: metadata\.id \}/,
+  'the aux session projection must be built from the store metadata without exposing it');
+assert.match(commands, /fn reset_aux_session\([\s\S]{0,400}?-> Result<AuxSessionBinding, String>/,
+  'reset_aux_session must not return raw SessionMetadata across the Web boundary');
+assert.match(commands, /fn reset_aux_session[\s\S]{0,600}?WebSessionOperation::ResetAuxSession/,
+  'reset_aux_session errors must fold into the stable web_session code');
+
+assert.equal(allowedEvents.has('acp:event'), true,
+  'the shared ACP timeline must reach WebUI through the normal event transport');
+assert.match(bootstrap, /acpCodeMode:\s*\{[\s\S]*?commands:\s*\[[\s\S]*?web_access_codex_acp_prompt[\s\S]*?events:\s*\["acp:event"\]/,
+  'ACP code mode must require the complete Web-safe command and event contract');
+assert.match(acpPlatformClient, /web_access_codex_acp_prompt/);
+assert.match(acpPlatformClient, /attachmentHandles/);
+assert.match(acpPlatformClient, /web_access_create_codex_acp_session/);
+assert.match(acpPlatformClient, /workspaceHandle/);
+assert.match(acpPlatformClient, /web_access_get_codex_workspace_changes/);
+assert.match(acpPlatformClient, /web_access_get_codex_workspace_diff/);
+assert.match(acpPlatformClient, /web_access_cancel_codex_acp/);
+assert.doesNotMatch(codexWorkspacePanel, /invoke\('get_codex_workspace_(?:changes|diff)'/,
+  'the shared workspace UI must not bypass the Web-safe command adapter');
+assert.doesNotMatch(codexView, /invoke\('cancel_codex_acp'/,
+  'the shared ACP UI must not bypass the Web-safe cancellation adapter');
+assert.doesNotMatch(
+  acpPlatformClient.match(/export function createAcpSession[\s\S]*?\n\}/)?.[0] || '',
+  /web_access_create_codex_acp_session[\s\S]*?workspacePath/,
+  'Web code-session creation must submit only the opaque workspace handle',
+);
+// Web 列表必须走投影命令（主机绝对路径降级为目录名），不得直接调用桌面原命令。
+assert.match(acpPlatformClient, /web_access_list_codex_acp_sessions/,
+  'the Web session list must go through the path-redacting wrapper');
+assert.doesNotMatch(codexView, /list_codex_acp_sessions/,
+  'the shared code UI must list sessions through the platform ACP adapter');
+assert.doesNotMatch(codexView, /invoke\('codex_acp_prompt'/,
+  'the shared code UI must submit through the platform ACP adapter');
+assert.match(acpRuntimeNotices, /manageAgentOnDesktop/,
+  'WebUI must explain that install and login actions happen on the target desktop');
+assert.match(codexWorkspacePanel, /can\('externalSystemOpen'\)/,
+  'desktop-only open and reveal actions must stay hidden in WebUI');
+assert.match(codexWorkspacePanel, /onOpen=\{systemOpenAvailable/);
+assert.match(codexWorkspacePanel, /onReveal=\{systemOpenAvailable/);
+assert.match(codexWorkspacePanel, /onOpenInNewWindow=\{systemOpenAvailable/);
+assert.match(codeViewerContent, /\{!hideDesktopActions && onReveal && \(/);
+assert.match(codeViewerContent, /\{!hideDesktopActions && onOpen && \(/,
+  'the shared code preview must omit desktop system actions when callbacks are unavailable');
+
+// 浏览器本机上传:双入口按能力协商门控,分块有界,取消/失败路径完备。
+assert.match(
+  bootstrap,
+  /deviceFileUpload:\s*\[[\s\S]*?"web_access_upload_attachment_chunk"[\s\S]*?"web_access_abort_attachment_upload"[\s\S]*?"web_access_discard_attachment"[\s\S]*?\]/,
+  'the device upload capability must require chunk, abort, and discard commands',
+);
+assert.match(chatView, /can\('deviceFileUpload'\)/,
+  'the attach button must gate the dual-entry menu on the negotiated capability');
+assert.match(chatView, /bridge\.attachments\.uploadDeviceFiles\(files\)/);
+assert.match(chatView, /bridge\.attachments\.pickAndAttach\(\)/,
+  'the desktop-instance picker entry must keep using the existing remote browser');
+assert.match(chunkedUpload, /CHUNK_BYTES = 256 \* 1024/,
+  'upload chunks must stay aligned with the desktop MAX_TRANSFER_CHUNK_BYTES limit');
+assert.match(chunkedUpload, /MAX_FILE_BYTES = 50 \* 1024 \* 1024/,
+  'the browser preflight must mirror file_ingest::MAX_FILE_BYTES');
+assert.match(fileIngest, /MAX_FILE_BYTES: u64 = 50 \* 1024 \* 1024/,
+  'the Rust ingest cap must keep the same literal the browser preflight mirrors — without this pin a Rust-only cap change leaves every test green while the browser falsely rejects files the desktop accepts');
+assert.match(webBridge, /PinvouChunkedFileUpload/,
+  'Web chat uploads must use the shared chunk uploader');
+assert.doesNotMatch(webBridge, /function bytesToBase64/,
+  'Web chat must not carry a second base64 chunk implementation');
+assert.match(webBridge, /web_access_abort_attachment_upload/,
+  'cancelled or failed uploads must release the desktop buffer');
+assert.match(webBridge, /web_access_discard_attachment/,
+  'removed or late-cancelled attachments must release their opaque desktop handle');
+assert.match(remoteControlCommands, /stage_uploaded_attachments\(attachments, session_id, &?store\)/,
+  'uploaded attachments must be staged into the Session workspace before the engine sees their paths');
+// Agent 安装命令行/输出可能含内部镜像源或主机路径，Web status 投影必须清除；
+// 安装终局的 error 字段同为错误链，一并仅桌面端展示。
+assert.match(remoteControlCommands,
+  /project_acp_status_for_web[\s\S]*?status\.install_command = None[\s\S]*?status\.install_latest_line = None[\s\S]*?status\.install_finished = None/,
+  'the Web agent-status projection must strip install command/output lines and the install outcome');
+assert.match(remoteControlCommands, /redact_workspace_path_for_web|list_codex_acp_sessions_for_web/,
+  'the Web session list must redact host workspace paths to a directory name');
+assert.match(remoteControlCommands,
+  /fn web_acp_agent_id[\s\S]*?or\(Some\("codex"\)\)[\s\S]*?support ACP agents only[\s\S]*?pub async fn web_access_create_codex_acp_session[\s\S]*?web_acp_agent_id\(agent_id\)\?/,
+  'Web session creation must default to ACP and reject the desktop-only native agent before consuming a workspace grant');
+assert.match(commands,
+  /pub async fn list_codex_acp_sessions_for_web[\s\S]*?acp_pool\.is_acp_metadata\(metadata\)[\s\S]*?redact_codex_session_list_item_for_web/,
+  'the Web code-session list must contain ACP sessions only');
+assert.match(remoteControlCommands,
+  /struct WebSavedSession[\s\S]*?metadata: deepseek_tui::session_manager::SessionMetadata[\s\S]*?messages:[\s\S]*?artifacts:[\s\S]*?transcript_revision:/,
+  'chunked Web session downloads must use an explicit browser field allowlist');
+assert.doesNotMatch(remoteControlCommands,
+  /struct WebSavedSession[\s\S]{0,300}#\[serde\(flatten\)\]/,
+  'the Web session projection must not flatten the full desktop SavedSession');
+assert.match(remoteControlCommands,
+  /impl<'a> WebSavedSession<'a>[\s\S]*?redact_session_metadata_for_web\(session\.metadata\.clone\(\)\)[\s\S]*?web_artifact_storage_path[\s\S]*?ledger_root\(&session_id\)[\s\S]*?session_artifacts_dir\(&session_id\)[\s\S]*?WebSavedSession::project\(&saved, &artifact_roots, &revision\)/,
+  'the Web session projection must redact metadata and scope legacy artifact paths before serialization');
+assert.match(webBridge,
+  /invoke\("web_access_list_sessions"\)[\s\S]*?"web_access_list_archived_sessions"/,
+  'Web history refreshes must use path-redacted session list commands');
+assert.match(remoteControlCommands,
+  /fn web_operation_result[\s\S]*?format!\("\{prefix\}_\{operation\}_failed"\)[\s\S]*?fn web_workspace_result[\s\S]*?web_operation_result\([\s\S]*?"web_workspace"[\s\S]*?web_access_list_codex_workspace[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Listing, result\)[\s\S]*?web_access_search_codex_workspace[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Search, result\)[\s\S]*?web_access_preview_codex_workspace_file[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Preview, result\)[\s\S]*?web_access_get_codex_workspace_changes[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Changes, result\)[\s\S]*?web_access_get_codex_workspace_diff[\s\S]*?web_workspace_result\(WebWorkspaceOperation::Diff, result\)/,
+  'Web workspace RPC failures must not return host paths embedded in native errors');
+assert.match(remoteControlCommands,
+  /web_access_get_codex_acp_timeline[\s\S]*?web_acp_result\(WebAcpOperation::Timeline/,
+  'Web ACP timeline failures must cross Relay as a controlled error code');
+// Every web_access_* ACP command maps failures through a WebAcpOperation enum
+// variant; the Rust test stable_web_error_codes_are_locked pins the wire codes.
+for (const [command, variant] of Object.entries({
+  web_access_create_codex_acp_session: 'SessionCreate',
+  web_access_cancel_codex_acp: 'Cancel',
+  web_access_codex_acp_prompt: 'Prompt',
+  web_access_get_codex_acp_timeline: 'Timeline',
+  web_access_get_codex_acp_session_info: 'SessionInfo',
+  web_access_set_codex_acp_model: 'SetModel',
+  web_access_set_codex_acp_mode: 'SetMode',
+  web_access_set_codex_acp_config_option: 'SetConfigOption',
+  web_access_get_codex_acp_pending_permissions: 'PendingPermissions',
+  web_access_respond_codex_acp_permission: 'RespondPermission',
+  web_access_get_codex_acp_pending_elicitations: 'PendingElicitations',
+  web_access_respond_codex_acp_elicitation: 'RespondElicitation',
+  web_access_list_codex_acp_sessions: 'ListSessions',
+  web_access_list_acp_agents: 'ListAgents',
+  web_access_get_acp_agent_status: 'AgentStatus',
+})) {
+  assert.match(
+    rustCommandBlock(remoteControlCommands, command),
+    new RegExp(`web_acp_result\\(WebAcpOperation::${variant}`),
+    `${command} must map every failure to its stable Web ACP error code`,
+  );
+}
+assert.match(remoteControlCommands,
+  /project_acp_session_info_for_web[\s\S]*?project_acp_value_for_web\(serde_json::to_value\(info\)\?\)/,
+  'successful Web SessionInfo responses must reuse the recursive ACP Web sanitizer');
+assert.match(remoteControlPlatform,
+  /struct WorkspaceIdentity[\s\S]*?device:\s*u64[\s\S]*?inode:\s*u64[\s\S]*?volume_serial:\s*u32[\s\S]*?file_index:\s*u64/,
+  'the platform adapter must snapshot native directory identity on Unix and Windows');
+assert.match(remoteControlManager,
+  /fn verify_bound_path\([\s\S]*?bound_path != self\.path[\s\S]*?validate_browsable_path[\s\S]*?current != self\.path[\s\S]*?current_identity != self\.identity[\s\S]*?fn revalidate\(self\)[\s\S]*?self\.verify_bound_path/,
+  'workspace grant redemption must reapply path policy and reject directory replacement');
+assert.match(remoteControlCommands,
+  /reservation\.path\(\)\.to_path_buf\(\)[\s\S]*?verify_bound_path\(path\)[\s\S]*?create_codex_acp_session_with_workspace_binding/,
+  'Web Session creation must preserve the native path and carry its identity verifier into the final binding');
+assert.match(commands,
+  /create_codex_acp_session_with_workspace_binding[\s\S]*?verify_workspace_binding\(project_workspace\.as_deref\(\), workspace_verifier\)[\s\S]*?set_acp_workspace[\s\S]*?verify_workspace_binding\(project_workspace\.as_deref\(\), workspace_verifier\)[\s\S]*?capture_baseline[\s\S]*?verify_workspace_binding\(project_workspace\.as_deref\(\), workspace_verifier\)/,
+  'workspace identity must be checked before persistence, after binding, and after baseline capture');
+assert.equal(allowed.has('respond_codex_acp_permission'), false,
+  'Web must not call the native ACP permission response command');
+assert.equal(allowed.has('respond_codex_acp_elicitation'), false,
+  'Web must not call the native ACP elicitation response command');
+assert.equal(allowed.has('web_access_respond_codex_acp_permission'), true);
+assert.equal(allowed.has('web_access_respond_codex_acp_elicitation'), true);
+assert.match(acpPlatformClient,
+  /respond_codex_acp_permission',[\s\S]*?'web_access_respond_codex_acp_permission'/,
+  'permission responses must preserve the native command and use a stable Web wrapper');
+assert.match(acpPlatformClient,
+  /respond_codex_acp_elicitation',[\s\S]*?'web_access_respond_codex_acp_elicitation'/,
+  'elicitation responses must preserve the native command and use a stable Web wrapper');
+assert.doesNotMatch(codexView,
+  /isWeb \? 'web_access_respond_/,
+  'the view must route permission/elicitation responses through the acp client');
+assert.match(acpErrors, /CONTROLLED_WEB_ERROR[\s\S]*?copy\.operationFailed/,
+  'controlled Web error codes must become localized UI copy instead of raw browser text');
+
+// Upload integrity failures must surface a stable wire code that the web
+// client maps to trilingual copy; the Chinese raw text must no longer pass
+// through the Relay to en/ja users (review P2).
+// web_access_upload_attachment_chunk serves both plain sessions and the ACP
+// code mode, so both display paths must recognize these two codes.
+assert.match(remoteControlManager, /WEB_ATTACHMENT_DIGEST_INVALID: &str = "web_attachment_digest_invalid"/,
+  'the malformed-digest failure must be a stable wire code');
+assert.match(remoteControlManager, /WEB_ATTACHMENT_INTEGRITY_MISMATCH: &str = "web_attachment_integrity_mismatch"/,
+  'the digest-mismatch failure must be a stable wire code');
+assert.doesNotMatch(remoteControlManager, /远程控制附件完整性校验/,
+  'single-language integrity errors must not cross the Relay');
+assert.match(acpErrors, /'web_attachment_digest_invalid'[\s\S]*?'web_attachment_integrity_mismatch'/,
+  'the session-level fallback must fold both codes into localized copy');
+assert.match(webBridge, /rawUploadError === "web_attachment_digest_invalid"[\s\S]*?bt\("deviceUploadDigestInvalid"\)/,
+  'the Web chat upload path must localize the malformed-digest code');
+assert.match(webBridge, /rawUploadError === "web_attachment_integrity_mismatch"[\s\S]*?bt\("deviceUploadIntegrityMismatch"\)/,
+  'the Web chat upload path must localize the mismatch code');
+assert.equal((webBridge.match(/deviceUploadDigestInvalid:/g) || []).length, 3,
+  'the malformed-digest copy must exist in all three BT_TABLE language blocks');
+assert.equal((webBridge.match(/deviceUploadIntegrityMismatch:/g) || []).length, 3,
+  'the mismatch copy must exist in all three BT_TABLE language blocks');
+assert.match(codexView, /uploadErrorText === 'web_attachment_digest_invalid'[\s\S]*?uiAttachments\.deviceUploadDigestInvalid/,
+  'the ACP attachment path must localize the malformed-digest code');
+assert.match(codexView, /uploadErrorText === 'web_attachment_integrity_mismatch'[\s\S]*?uiAttachments\.deviceUploadIntegrityMismatch/,
+  'the ACP attachment path must localize the mismatch code');
+assert.equal((i18n.match(/deviceUploadDigestInvalid:/g) || []).length, 3,
+  'the ACP malformed-digest copy must exist in all three i18n dictionaries');
+assert.equal((i18n.match(/deviceUploadIntegrityMismatch:/g) || []).length, 3,
+  'the ACP mismatch copy must exist in all three i18n dictionaries');
+
+// The two size-bound rejections of the upload lane (64 MiB in-flight
+// aggregate; 32 MiB serialized parsed-result cache) are ordinary outcomes
+// since the per-file cap rose to 50 MiB (issue #842), so they follow the
+// same stable-wire-code rule as the digest failures: defined as codes,
+// localized on every client path, raw single-language text never crossing
+// the Relay.
+assert.match(remoteControlManager, /WEB_ATTACHMENT_UPLOAD_CACHE_FULL: &str = "web_attachment_upload_cache_full"/,
+  'the upload-buffer overflow must be a stable wire code');
+assert.match(remoteControlManager, /WEB_ATTACHMENT_PARSED_CACHE_TOO_LARGE: &str =\s*"web_attachment_parsed_cache_too_large"/,
+  'the parsed-result cache overflow must be a stable wire code');
+assert.match(remoteControlManager, /WEB_ATTACHMENT_UPLOAD_CACHE_FULL\.to_string\(\)/,
+  'the aggregate-buffer gate must return the stable wire code');
+assert.match(remoteControlManager, /fn web_attachment_cache_overflow[\s\S]*?WEB_ATTACHMENT_PARSED_CACHE_TOO_LARGE/,
+  'the serialized-cache gate must return the stable wire code');
+assert.doesNotMatch(remoteControlManager, /远程控制附件上传缓存超过总容量上限/,
+  'single-language upload-buffer errors must not cross the Relay');
+assert.doesNotMatch(remoteControlManager, /解析后的附件超过远程控制桌面缓存上限/,
+  'single-language cache-overflow errors must not cross the Relay');
+// The localized copy names the bound ("32 MB"); pin the Rust literal it
+// mirrors and the number inside every language so a one-sided change —
+// the constant moved without the copy, or one language drifted — turns
+// CI red instead of shipping a lying message (same rule as the 50 MiB
+// file_ingest::MAX_FILE_BYTES mirror above).
+assert.match(remoteControlManager, /MAX_WEB_ATTACHMENT_BYTES: usize = 32 \* 1024 \* 1024/,
+  'the parsed-cache bound literal must stay in sync with the localized copy');
+assert.equal((i18n.match(/deviceParsedTooLarge:[^,\n]*32 MB/g) || []).length, 3,
+  'the parsed-cache copy must name the same 32 MB bound in all three languages');
+assert.match(acpErrors, /'web_attachment_upload_cache_full'[\s\S]*?'web_attachment_parsed_cache_too_large'/,
+  'the session-level fallback must fold both cache codes into localized copy');
+assert.match(webBridge, /rawUploadError === "web_attachment_upload_cache_full"[\s\S]*?bt\("deviceUploadCacheFull"\)/,
+  'the Web chat upload path must localize the upload-buffer code');
+assert.match(webBridge, /raw === "web_attachment_parsed_cache_too_large"[\s\S]*?bt\("deviceParsedTooLarge"\)/,
+  'the shared limit mapper must localize the parsed-cache code');
+assert.equal((webBridge.match(/deviceUploadCacheFull:/g) || []).length, 3,
+  'the upload-buffer copy must exist in all three BT_TABLE language blocks');
+assert.equal((webBridge.match(/deviceParsedTooLarge:/g) || []).length, 3,
+  'the parsed-cache copy must exist in all three BT_TABLE language blocks');
+assert.match(webBridge, /const limitError = attachmentLimitDisplayError\(e, att\.basename\)/,
+  'the desktop-picked ingest path must map limit codes instead of storing raw text');
+assert.match(codexView, /const attachmentLimitError = formatAttachmentLimitError\(err, t\.uiAttachments\)/,
+  'the ACP attachment path must localize limit codes through the shared formatter');
+assert.equal((i18n.match(/deviceUploadCacheFull:/g) || []).length, 3,
+  'the ACP upload-buffer copy must exist in all three i18n dictionaries');
+assert.equal((i18n.match(/deviceParsedTooLarge:/g) || []).length, 3,
+  'the ACP parsed-cache copy must exist in all three i18n dictionaries');
+
+// The third size-bound rejection of the same lane — the 64 MiB parsed-result
+// cache TOTAL, reachable when entries pinned by in-flight submissions block
+// eviction and ordinary ~30 MiB parsed results (routine since the per-file
+// cap rose to 50 MiB, issue #842) fill the cache — follows the same
+// stable-wire-code rule as its two siblings above.
+assert.match(remoteControlManager, /WEB_ATTACHMENT_CACHE_FULL: &str = "web_attachment_cache_full"/,
+  'the attachment-cache overflow must be a stable wire code');
+assert.match(remoteControlManager, /Err\(transfer::WEB_ATTACHMENT_CACHE_FULL\.into\(\)\)/,
+  'the cache-total gate must return the stable wire code');
+assert.doesNotMatch(remoteControlManager, /远程控制附件缓存已满/,
+  'single-language cache-full errors must not cross the Relay');
+assert.match(webBridge, /raw === "web_attachment_cache_full"[\s\S]*?bt\("deviceCacheFull"\)/,
+  'the shared limit mapper must localize the cache-full code');
+assert.equal((webBridge.match(/deviceCacheFull:/g) || []).length, 3,
+  'the cache-full copy must exist in all three BT_TABLE language blocks');
+assert.equal((i18n.match(/deviceCacheFull:/g) || []).length, 3,
+  'the ACP cache-full copy must exist in all three i18n dictionaries');
+assert.match(acpErrors, /'web_attachment_cache_full'/,
+  'the session-level fallback must fold the cache-full code into localized copy');
+
+// The shared formatter's code table must keep mirroring the Rust wire
+// literals one-for-one: a value drift in attachment-limit-errors.js breaks
+// chip mapping while every behavioral test stays green (the tests import the
+// module and compare it against itself).
+const limitErrors = readSource(path.join(root, 'src', 'features', 'attachments', 'attachment-limit-errors.js'), 'utf8');
+for (const [rustSource, codes] of [
+  [fileIngest, ['attachment_file_too_large', 'attachment_archive_too_many_entries', 'attachment_archive_expanded_too_large', 'attachment_archive_unsafe_entry']],
+  [remoteControlManager, ['web_attachment_upload_cache_full', 'web_attachment_parsed_cache_too_large', 'web_attachment_cache_full']],
+]) {
+  for (const code of codes) {
+    assert.match(limitErrors, new RegExp(`'${code}'`),
+      `the shared limit formatter must map ${code}`);
+    assert.match(rustSource, new RegExp(`"${code}"`),
+      `the Rust emitter must keep the ${code} literal the shared formatter mirrors`);
+  }
+}
+
+// The BT_TABLE copy names hard bounds ("50 MB" / "32 MB"); key-presence pins
+// alone let a one-sided figure edit ship a lying notice in the web chat while
+// the shared-i18n figure pins stay green (same rule as the 32 MB i18n pin
+// above, extended to the bridge's own language blocks).
+assert.equal((webBridge.match(/deviceUploadTooLarge:[^,\n]*50 MB/g) || []).length, 3,
+  'the web chat oversize notice must name the 50 MB bound in all three BT_TABLE language blocks');
+assert.equal((webBridge.match(/deviceParsedTooLarge:[^,\n]*32 MB/g) || []).length, 3,
+  'the web chat parsed-cache notice must name the 32 MB bound in all three BT_TABLE language blocks');
+
+// The zh upload-limit copy bodies are kept identical between the bridge
+// BT_TABLE and the shared i18n dict so both surfaces translate the same
+// truth; BT rows carry a sanctioned "⚠️ " notice prefix the dict rows lack
+// (a473cbcb9's "byte-identical" wording overstates this — pin the bodies
+// modulo that prefix), so a one-sided punctuation/wording edit (halfwidth
+// vs fullwidth comma) turns CI red instead of shipping split copy. BT
+// blocks are ordered en/ja/zh, so the last match is the zh row.
+const i18nZh = readSource(path.join(root, 'src', 'shared', 'i18n', 'zh.js'), 'utf8');
+const stripWarningPrefix = (value) => (value && value.startsWith('⚠️ ') ? value.slice('⚠️ '.length) : value);
+const zhBtValue = (key) => {
+  const matches = [...webBridge.matchAll(new RegExp(`${key}:\\s*"([^"]+)"`, 'g'))];
+  return matches.length ? matches.at(-1)[1] : null;
+};
+const zhDictValue = (key) => {
+  const match = i18nZh.match(new RegExp(`${key}:'([^']+)'`));
+  return match ? match[1] : null;
+};
+for (const key of ['deviceUploadCacheFull', 'deviceParsedTooLarge', 'deviceCacheFull']) {
+  assert.equal(stripWarningPrefix(zhBtValue(key)), zhDictValue(key),
+    `zh ${key} body must stay identical between the bridge BT_TABLE (minus its ⚠️ prefix) and the shared i18n dict`);
+}
+
+assert.match(chunkedUpload, /device attachment exceeds \$\{MAX_FILE_BYTES\} bytes/,
+  'the dev-facing oversize message must derive from the mirrored constant, not a stale literal');
+
+// After the watchdog skips a stalled predecessor, the web live stream shows
+// an envelope-seq hole; the listener must detect the jump and debounce-refetch
+// the authoritative timeline to self-heal (instead of waiting for a
+// reconnect/session reopen), merging the snapshot and rebasing the tracker.
+assert.match(codexView, /acpEventSeqTrackerRef\.current\.note\(incoming\.sessionId, incoming\.seq\) === 'gap'[\s\S]*?acpGapResyncRef\.current\.schedule\(incoming\.sessionId\)/,
+  'the live acp:event listener must detect envelope-seq gaps and schedule a resync');
+assert.match(codexView, /createAcpGapResyncScheduler\(sessionId => \{[\s\S]*?resyncAcpSessionAfterGap\(sessionId\);[\s\S]*?\}, \{/,
+  'the gap resync must go through the bounded-retry scheduler wrapping resyncAcpSessionAfterGap');
+assert.match(codexView, /mergeAcpTimelineSnapshot\(timeline, current, sessionId\)[\s\S]*?rebaseAcpEventSeqTracker\(sessionId, timeline\)/,
+  'the gap resync must merge the authoritative snapshot and rebase the tracker');
+assert.match(codexView, /acpGapResyncRef\.current\.cancel\(\)/,
+  'the pending gap resync must be cancelled on unmount');
+
+assert.match(bootstrap, /sendRaw\(\{ \.\.\.value, v: protocolVersion, lease_id: this\.leaseId \}\)/);
+assert.match(bootstrap, /desktopCapabilitiesReady/);
+assert.match(bootstrap, /SEMANTIC_COMMAND_REQUIREMENTS/);
+assert.match(bootstrap, /supportsCapability\(capability\)/);
+assert.match(bootstrap, /supportsCommand\(command\) \{\s*return this\.desktopCapabilitiesReady/,
+  'individual RPC commands must remain unavailable while the desktop is offline');
+assert.match(bootstrap, /if \(!this\.negotiatedCapabilitiesKnown\) return false/,
+  'semantic capabilities must fail closed until the first authoritative snapshot');
+assert.match(bootstrap, /this\.negotiatedCommands = new Set\(this\.allowedCommands\)/,
+  'a negotiated compatibility snapshot must survive transient reconnects');
+assert.match(bridge, /if \(IS_WEB && typeof PLATFORM\.can === "function"\) return PLATFORM\.can\(name\) === true/);
+assert.match(hostFilePicker, /function rememberRoots\(listing\)/,
+  'the Web host picker must retain the desktop-provided root inventory');
+assert.match(hostFilePicker, /function showRoots\(\)/,
+  'the Web host picker must expose an explicit root view');
+assert.match(hostFilePicker, /rootsButton\.addEventListener\("click", showRoots\)/,
+  'the root view must remain directly reachable from nested folders');
+assert.match(hostFilePicker, /if \(parentPath\) load\(parentPath\);[\s\S]{0,100}else if \(!showingRoots\) showRoots\(\);/,
+  'up from a filesystem root must return to the root inventory');
+assert.doesNotMatch(hostFilePicker, /Array\.isArray\(listing\.roots\) && !parentPath/,
+  'filesystem roots must not be mixed into a drive directory listing');
+assert.match(hostFilePicker, /openWorkspace:/,
+  'the host picker must expose a dedicated code-workspace selection flow');
+assert.match(hostFilePicker, /issueWorkspaceHandle:\s*true/,
+  'the one-shot host capability must be minted on confirm');
+assert.match(hostFilePicker, /issueWorkspaceHandle:\s*false/,
+  'directory browsing must not mint one-shot workspace handles');
+assert.match(hostFilePicker, /(?:var|const|let) confirmedPath = currentPath;[\s\S]{0,1000}finish\(\{ path: confirmedPath, workspaceHandle: handle \}\);/,
+  'workspace selection must finish with the click-time path and the handle minted for it');
+assert.doesNotMatch(hostFilePicker, /currentWorkspaceHandle/,
+  'browsing never carries a workspace handle, so no stale-handle fallback path may remain');
+assert.match(hostFilePicker, /localizedPickerError/,
+  'both the listing and confirm-mint failures must map stable authorization codes to localized copy');
+assert.match(hostFilePicker,
+  /(?:var|const|let) confirmedGeneration = loadGeneration;[\s\S]{0,900}if \(disposed \|\| confirmedGeneration !== loadGeneration\) return;/,
+  'a late confirm-mint failure must not touch the UI after the picker closed or a newer listing rendered');
+assert.match(hostFilePicker,
+  /\.then\(function \(listing\) \{[\s\S]{0,600}if \(disposed \|\| confirmedGeneration !== loadGeneration\) return;[\s\S]{0,200}finish\(\{ path: confirmedPath, workspaceHandle: handle \}\);/,
+  'a late confirm-mint success must not close the picker on a directory the user already navigated away from');
+assert.match(hostFilePicker, /mintInFlight = true;/,
+  'the confirm handler must mark the mint as in flight before its RPC');
+assert.match(hostFilePicker,
+  /confirm\.disabled = mintInFlight \|\| \(directoryMode \? !currentPath : count === 0\);/,
+  'navigation must not re-enable the confirm button while a mint is still in flight');
+assert.match(hostFilePicker, /(?:var|const|let) generation = \+\+loadGeneration;\s*\n\s*mintInFlight = false;/,
+  'navigation must supersede any in-flight mint instead of racing a second one');
+assert.match(remoteControlManager,
+  /HOST_WORKSPACE_NOT_AUTHORIZED:\s*&str\s*=\s*"host_workspace_not_authorized"[\s\S]*?Err\(HOST_WORKSPACE_NOT_AUTHORIZED\.to_string\(\)\)/,
+  'the desktop and browser must share the stable host-workspace authorization error code');
+for (const label of [
+  '请先在桌面端允许远程访问本机目录',
+  'Allow remote access to local folders on the desktop first',
+  '先にデスクトップでローカルフォルダーへの遠隔アクセスを許可してください',
+]) {
+  assert.equal(i18n.includes(label), true, `missing localized host workspace error: ${label}`);
+}
+assert.match(appMain, /PinvouHostFilePickerStrings\s*=\s*misc\.hostFilePicker/,
+  'the active locale must reach the Web host picker error branch');
+assert.match(remoteControlCommands,
+  /reserve_web_workspace_grant[\s\S]*?create_codex_acp_session[\s\S]*?restore_web_workspace_grant/,
+  'failed Web ACP Session creation must restore its same-endpoint one-shot workspace reservation');
+assert.match(hostFilePicker, /initialPathPending[\s\S]*?path === initialPath[\s\S]*?load\(null\)/,
+  'a stale recent workspace must fall back to the normal host-file root instead of trapping the picker');
+// HTML5 拖放由当前可见输入框认领，再复用对应平台的上传通道。
+assert.match(chatView, /enabled=\{bridge\.available && \(!isWeb \|\| can\('deviceFileUpload'\)\)\}/,
+  'browser drop must gate on the negotiated device upload capability');
+assert.match(chatView, /onFiles=\{files => bridge\.attachments\.uploadDeviceFiles\(files\)\}/,
+  'normal chat drop must reuse the device upload pipeline');
+assert.match(codexView, /onFiles=\{files => uploadDeviceFiles\(files, attachmentKey\)\}/,
+  'ACP Code must own drops while its composer is visible');
+assert.match(attachmentDropHook, /PinvouAttachmentDropController/);
+assert.doesNotMatch(webBridge, /PinvouAttachmentDropController\.install/,
+  'the Web bridge must not route Code drops into the hidden normal-chat draft');
+assert.match(attachmentDropController, /dataTransfer\.dropEffect = "copy"/);
+assert.match(attachmentDropController, /setActive\(true\)/);
+assert.match(attachmentDropController, /setActive\(false\)/);
+assert.match(bootstrap, /sendReady\(false\)/);
+assert.match(bootstrap, /state_ready: stateReady/);
+assert.match(bootstrap, /markStateReady\(\)/);
+assert.match(bootstrap, /if \(!this\.frontendReady \|\| !this\.stateReady\)/);
+const main = readSource(path.join(root, 'src', 'app', 'main.jsx'), 'utf8');
+// The desktop-only saveSearchSettingsAndRestart wrapper (and its
+// "unsupported by the Web host" stub) was removed from the web bridge as dead
+// surface; the surviving invariant is that the web host never invokes the
+// native-only restart command at all.
+assert.doesNotMatch(webBridge, /invoke\("restart_app"/,
+  'Web settings bridge must not invoke the native-only restart command');
+assert.doesNotMatch(webBridge, /async function saveSearchSettingsAndRestart/,
+  'the desktop-only restart wrapper must stay off the web bridge');
+assert.match(main, /const saved = isWeb[\s\S]{0,180}saveSearchSettings\(search\)[\s\S]{0,180}saveSearchSettingsAndRestart\(search\)/,
+  'the shared UI must save without requesting a desktop restart in WebUI');
+assert.match(webBridge, /state\.settings = await invoke\("web_access_update_settings"/,
+  'WebUI must keep the canonical settings returned by the desktop backend');
+assert.match(webBridge, /web_access_update_settings", \{ patch: \{ (?:search: search|search) \} \}/,
+  'WebUI search saves must send a narrow patch instead of a full settings snapshot');
+assert.match(remoteControlCommands, /web_access_update_settings\([\s\S]{0,120}patch: super::settings::WebSettingsPatch,[\s\S]{0,80}\) -> Result<UserPrefs, String>/,
+  'the bounded Web settings command must return canonical preferences');
+assert.match(bootstrap, /pinvou:web-capabilities/);
+// The collapsed/expanded footer buttons were consolidated into one shared
+// renderer: one definition plus exactly one call per sidebar layout. A layout
+// that stops calling the renderer, or a second inline copy of the buttons,
+// changes the count.
+assert.ok((main.match(/renderFooterButtons\(/g) || []).length === 2,
+  'footer buttons must stay consolidated: one shared renderer called from both sidebar layouts');
+assert.match(main, /\{!isSidebarOpen && renderFooterButtons\(true\)\}/,
+  'the collapsed sidebar layout must render the shared footer buttons');
+assert.match(main, /\{\s*renderFooterButtons\(false\)\s*\}/,
+  'the expanded sidebar layout must render the shared footer buttons');
+assert.match(main, /const renderFooterButtons = \(collapsed\) => \{[\s\S]{0,900}\{can\('webAccessAdmin'\) && <button[\s\S]{0,220}handleOpenWebAccess/,
+  'desktop Web-access controls must stay hidden inside WebUI in both sidebar layouts');
+assert.match(main, /const renderFooterButtons = \(collapsed\) => \{[\s\S]{0,1200}\{can\('pet'\) && <button[\s\S]{0,220}handleSetPetEnabled/,
+  'desktop pet controls must stay hidden inside WebUI in both sidebar layouts');
+assert.doesNotMatch(webBridge, /registerWebAccessDesktopProxy|web_access:rpc_request/,
+  'the browser-only bridge must not own the desktop RPC proxy');
+assert.match(desktopRemoteControlBridge, /async function startDesktopProxy\(\)/);
+assert.match(desktopRemoteControlBridge, /listen\("web_access:rpc_request"/);
+assert.match(desktopRemoteControlBridge, /invoke\("web_access_bridge_ready"/);
+assert.match(desktopRemoteControlBridge, /eventForwardersReady/);
+assert.match(bridge, /listen\("chat:user_message"/);
+assert.match(bridge, /listen\("chat:transcript_committed"/);
+assert.equal(allowedEvents.has('session:deleted'), true,
+  'committed session deletion must reach every WebUI client');
+assert.match(webBridge, /listen\("session:deleted"/);
+assert.match(desktopSessionsBridge, /listen\("session:deleted"/,
+  'the desktop session store must apply deletions initiated by WebUI');
+assert.match(commands, /app\.emit\("session:deleted"/);
+assert.match(commands, /forward_app_event\(&app, "session:deleted"/);
+assert.equal(allowedEvents.has('session:list_changed'), true,
+  'session list mutations must reach both WebUI and desktop clients');
+assert.match(webBridge, /listen\("session:list_changed"/);
+assert.match(desktopSessionsBridge, /listen\("session:list_changed"/);
+assert.match(commands, /app\.emit\(event, payload\.clone\(\)\)/);
+assert.match(commands, /forward_app_event\(app, event, payload\)/);
+assert.match(webBridge, /composerDraft: ""/,
+  'WebUI must keep a per-session in-memory composer draft');
+assert.match(webDomainAdapter, /chat: domain\(\["sendMessage", "sendMessageToSession", "getComposerDraft", "setComposerDraft"/,
+  'WebUI domain facade must expose the same composer draft API as desktop');
+assert.match(webDomainAdapter, /auxChat: domain\(\[\], \{\s*ensure: "auxChatEnsure",\s*send: "auxChatSend",\s*snapshot: "auxChatSnapshot",\s*reset: "auxChatReset"/,
+  'WebUI domain facade must expose the same auxChat domain as desktop');
+// M7: the auxChat domain bodies live in the shared lane (cluster "auxChat");
+// both lanes consume it and keep only their send dispatch. Renaming an
+// operation in the shared cluster must turn these pins red.
+assert.match(sharedBridgeHelpers, /"auxChat": function \(deps\)/,
+  'the shared bridge base must register the auxChat cluster (M7)');
+assert.match(sharedBridgeHelpers, /async function auxChatEnsure\(taskId\)/);
+assert.match(webBridge, /PinvouBridgeShared\.create\("auxChat", \{/,
+  'the Web lane must consume the shared auxChat cluster (M7)');
+assert.match(desktopAuxChatBridge, /PinvouBridgeShared\.create\("auxChat", \{/,
+  'the desktop lane must consume the shared auxChat cluster (M7)');
+assert.match(sharedBridgeHelpers, /invoke\("get_or_create_aux_session", \{ sessionId: task \}\)/,
+  'aux chat must create-or-fetch the aux session by task id');
+assert.match(webBridge, /invoke\("web_access_chat", \{ message, attachmentHandles: \[\], sessionId: sid, restrictTools: true \}\)/,
+  'WebUI aux chat sends must ride the bounded web chat command with tools restricted');
+assert.match(sharedBridgeHelpers, /async function auxChatReset\(taskId\)/);
+assert.match(sharedBridgeHelpers, /invoke\("reset_aux_session", \{ sessionId: task \}\)/,
+  'aux chat restart must ride the atomic reset command (M6)');
+// M5: the aux id is a pure function of the task id (aux-<taskId>, round-30
+// B8), so both lanes derive it at the purge site — the redundant, never-pruned
+// auxIdByTask maps are gone.
+assert.doesNotMatch(webBridge, /auxIdByTask/,
+  'the WebUI aux id must be derived, not stored in an unbounded per-task map (M5)');
+assert.doesNotMatch(desktopAuxChatBridge, /auxIdByTask/,
+  'the desktop aux id must be derived, not stored in an unbounded per-task map (M5)');
+assert.match(bridge, /registry\.auxChat = function \(context\)/,
+  'the desktop bridge must register the auxChat feature module');
+assert.match(desktopAuxChatBridge, /invoke\("chat", \{ message, attachments: \[\], sessionId: sid, restrictTools: true \}\)/,
+  'desktop aux chat sends must restrict tools and skip attachments');
+// The lane-merge residual wave moved the working-set save/restore bodies into
+// the shared base; the Web lane executes them through its cluster instance.
+assert.match(sharedBridgeHelpers, /buf\.composerDraft = state\.composerDraft/,
+  'WebUI session switching must save the active composer draft');
+assert.match(sharedBridgeHelpers, /state\.composerDraft = buf\.composerDraft/,
+  'WebUI session switching must restore the destination composer draft');
+assert.match(webBridge, /(?:var|const|let) draftComposer = realId \? "" : \(state\.composerDraft \|\| ""\)/,
+  'WebUI background session events must snapshot an unmaterialized draft');
+assert.match(webBridge, /if \(!realId\) restoreBuffer\.composerDraft = draftComposer/,
+  'WebUI background session events must restore an unmaterialized draft');
+for (const eventName of ['session:model_changed', 'session:persona_changed']) {
+  assert.equal(allowedEvents.has(eventName), true, `${eventName} must reach both clients`);
+  assert.match(webBridge, new RegExp(`listen\\("${eventName.replace(':', '\\:')}"`));
+  assert.match(desktopSessionsBridge, new RegExp(`listen\\("${eventName.replace(':', '\\:')}"`));
+  assert.match(commands, new RegExp(`"${eventName.replace(':', '\\:')}"`));
+}
+
+function literalListeners(source) {
+  return new Set([...source.matchAll(/\blisten\(\s*["']([^"']+)["']/g)].map(match => match[1]));
+}
+const webListenerNames = literalListeners(webBridge);
+const desktopListenerNames = literalListeners(desktopBridgeSources.join('\n'));
+for (const eventName of webListenerNames) {
+  assert.equal(desktopListenerNames.has(eventName), true,
+    `desktop bridge must handle Web bridge event ${eventName}`);
+}
+assert.match(bridge, /Transcript persistence is authoritative in Rust/);
+assert.doesNotMatch(bridge, /saveSessionMessagesForClient/);
+assert.match(bridge, /session_turn_in_progress/);
+assert.match(bridge, /turnAlreadyInProgress/);
+assert.match(bridge, /addSystemItem\(concurrentTurn[\s\S]{0,120}bt\("turnAlreadyInProgress"\)/,
+  'turn admission conflicts must show product copy instead of an internal reservation error');
+// The fold must live in the WEB bridge itself: pins scoped to the concatenated
+// `bridge` are satisfied by the desktop twin even with the web mapping deleted
+// (round-4 mutation M7 stayed green).
+assert.match(webBridge, /web_session_turn_in_progress:\s*"turnAlreadyInProgress"/,
+  'the web bridge itself must map the turn-in-progress code to product copy');
+assert.match(webBridge, /addSystemItem\(concurrentTurn[\s\S]{0,120}bt\("turnAlreadyInProgress"\)/,
+  'the web-side turn admission conflict must show product copy');
+// Round-10 复审 minor:accept_plan/edit_last_turn 不折叠,错误链携带调用方
+// 可选的 session id——裸 `session_turn_in_progress` 子串匹配会把同名会话的
+// 硬失败折成可重试 busy(对账卡死)。两个 catch 必须锚定各自的 reservation
+// 段(生产者 map_err 独家引入,session id 字符集无法伪造空格/冒号)。
+assert.match(webBridge,
+  /includes\("reserve accept_plan turn: session_turn_in_progress"\)/,
+  'the accept_plan catch must anchor on its reservation segment');
+assert.match(webBridge,
+  /includes\("reserve edit_last_turn: session_turn_in_progress"\)/,
+  'the edit_last_turn catch must anchor on its reservation segment');
+assert.doesNotMatch(webBridge,
+  /includes\("session_turn_in_progress"\)/,
+  'no web-bridge busy match may stay on the bare, session-id-forgeable marker');
+// Round-9 复审:下载车道的折叠此前零测试钉——回退码表查找或删除任一表
+// 项都全绿。钉住:下载 catch 走 displayTurnError(未识别文本进与 turn 车
+// 道相同的脱敏兜底,不再拼接原始码/admission 原文);admission 层可达的
+// 两个码在码表内;新表项三语齐备。
+assert.match(
+  webBridge,
+  /addSystemItem\(bt\("downloadFailed"\) \+ displayTurnError\(e\)\)/,
+  'the download lane must fold through displayTurnError instead of appending the raw code',
+);
+assert.doesNotMatch(
+  webBridge,
+  /copyKey \? bt\(copyKey\) : code/,
+  'the download lane must not keep the raw-code fallback',
+);
+assert.match(webBridge, /web_session_unavailable:\s*"webSessionUnavailable"/,
+  'the transient scope rejection must map to trilingual download copy');
+assert.match(webBridge, /invalid_web_session_id:\s*"webSessionUnavailable"/,
+  'the invalid-session rejection must map to trilingual download copy');
+for (const source of [webBridge]) {
+  const count = [...source.matchAll(/webSessionUnavailable:/g)].length;
+  assert.equal(count, 3,
+    'the webSessionUnavailable copy must exist in all three inline languages');
+}
+// Round-12 复审 P2:WEB_TURN_ERROR_KEYS 的映射键此前只有上面
+// webSessionUnavailable 一根单键计数钉,其余键(en/ja 新增句)任一语言块
+// 缺表项时 bt() 静默回退 zh——en/ja 用户看到中文兜底且无任何测试变红。
+// 从桥源码解析码表键清单,逐键钉 BT_TABLE 三个语言块内必有 `key:` 定义。
+{
+  const turnErrorTableStart = webBridge.indexOf('const WEB_TURN_ERROR_KEYS = {');
+  assert.notEqual(turnErrorTableStart, -1,
+    'the WEB_TURN_ERROR_KEYS mapping must exist in the web bridge');
+  const turnErrorTableEnd = webBridge.indexOf('};', turnErrorTableStart);
+  assert.notEqual(turnErrorTableEnd, -1,
+    'the WEB_TURN_ERROR_KEYS mapping must have a closing brace');
+  const turnErrorCopyKeys = [
+    ...new Set(
+      [
+        ...webBridge
+          .slice(turnErrorTableStart, turnErrorTableEnd)
+          .matchAll(/:\s*"([A-Za-z]+)"/g),
+      ].map((match) => match[1]),
+    ),
+  ];
+  assert.ok(turnErrorCopyKeys.length >= 11,
+    `expected the full WEB_TURN_ERROR_KEYS copy surface, found ${turnErrorCopyKeys.length}`);
+  const btTableStart = webBridge.indexOf('const BT_TABLE = {');
+  assert.notEqual(btTableStart, -1,
+    'the BT_TABLE copy table must exist in the web bridge');
+  const btTableEnd = webBridge.indexOf('\n  };', btTableStart);
+  assert.notEqual(btTableEnd, -1,
+    'the BT_TABLE copy table must have a closing brace');
+  const btTable = webBridge.slice(btTableStart, btTableEnd);
+  const btEnStart = btTable.indexOf('    en: {');
+  const btJaStart = btTable.indexOf('    ja: {');
+  const btZhStart = btTable.indexOf('    zh: {');
+  assert.notEqual(btEnStart, -1, 'the BT_TABLE en block marker must exist');
+  assert.notEqual(btJaStart, -1, 'the BT_TABLE ja block marker must exist');
+  assert.notEqual(btZhStart, -1, 'the BT_TABLE zh block marker must exist');
+  const btLanguageBlocks = [
+    ['en', btTable.slice(btEnStart, btJaStart)],
+    ['ja', btTable.slice(btJaStart, btZhStart)],
+    ['zh', btTable.slice(btZhStart)],
+  ];
+  for (const [language, block] of btLanguageBlocks) {
+    for (const key of turnErrorCopyKeys) {
+      assert.match(
+        block,
+        new RegExp(`\\b${key}:`),
+        `WEB_TURN_ERROR_KEYS maps to copy key "${key}", but the BT_TABLE ${language} block has no ${key}: definition (bt() silently falls back to zh for a missing key)`,
+      );
+    }
+  }
+}
+// The JS half of the edit_last_turn revision guard: dropping or renaming the
+// arg would silently degrade the stale-view protection to fail-open, and the
+// Rust-side Option param alone cannot catch it (round-4 minor).
+assert.match(webBridge, /expectedTranscriptRevision: expectedRevision \|\| null/,
+  'the web bridge must send its transcript revision with edit_last_turn');
+const memoryCommands = readSource(
+  path.join(root, 'src-tauri', 'src', 'app', 'commands', 'memory.rs'),
+  'utf8',
+);
+assert.match(memoryCommands, /expected_transcript_revision: Option<String>/,
+  'edit_last_turn must keep the optional transcript-revision guard parameter');
+assert.match(bridge, /(?:var|const|let) sid = state\.activeSessionId;/);
+assert.match(bridge, /if \(state\.activeSessionId !== sid\) return;/);
+assert.match(bridge, /remoteAdmissionKeys/);
+assert.match(bridge, /(?:var|const|let) activePlanCards = Object\.create\(null\)/);
+assert.match(bridge, /(?:var|const|let) hydratedKey = planCardHydrationKey\(hydratedPlan\)/);
+assert.match(bridge, /hydratedPlan\.cardState = "active"/);
+// Wave 5 moved the hydration live-card filter into the shared base
+// (liveChatItemKeptForHydration); pin the shared body + the lane delegation.
+assert.match(bridge, /liveChatItemKeptForHydration/);
+assert.match(readSource(path.join(root, 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8'), /if \(item\.type === "plan_card"\) return false/);
+assert.match(bridge, /action === "accept_plan"/);
+assert.match(bridge, /acceptedMode = payload\.mode_state \|\| payload\.modeState/);
+assert.match(bridge, /planNotActive = errorText\.(?:indexOf\("plan_not_active"\)|includes\("plan_not_active"\))/);
+assert.match(bridge, /planId = String\(p\.plan_id \|\| p\.planId \|\| ""\)\.trim\(\)/);
+assert.match(bridge, /readyMode = p\.mode_state \|\| p\.modeState/);
+assert.match(bridge, /listen\("chat:plan_resolved"/);
+assert.equal(allowedEvents.has('chat:plan_resolved'), true, 'plan resolution must reach the WebUI event bridge');
+assert.match(bridge, /planId: planTicket/);
+assert.match(bridge, /invoke\("discard_plan", \{ sessionId: sid, planId: planTicket \}\)/);
+const discardPlanBody = bridge.slice(bridge.indexOf('async function discardPlan'), bridge.indexOf('async function exitPlanToYolo'));
+assert.ok(discardPlanBody.indexOf('notify();') < discardPlanBody.indexOf('await invoke("discard_plan"'),
+  'discard Plan must notify the frozen card before waiting on the remote invoke');
+assert.match(bridge, /function isActionablePlanCard\(sid, itemId, planId\)/);
+assert.match(bridge, /else if \(!card\.planResolutionConfirmed\)/);
+assert.match(toolRenderers, /!item\.resolved && !!item\.planId/);
+assert.match(toolRenderers, /acceptPlan\(item\.id, item\.planMarkdown, undefined, item\.planId\)/);
+assert.match(toolRenderers, /discardPlan\(item\.id, item\.planId\)/);
+assert.match(bridge, /restoreUiTurnState\(preparation\.snapshot\)/);
+assert.match(bridge, /attachmentHandles:/);
+assert.match(bridge, /web_access_load_session_chunk/);
+assert.match(bridge, /web_access_cancel_session_download/);
+assert.match(bootstrap, /areInvokeCapabilitiesReady\(\) \{ return client\.desktopCapabilitiesReady === true; \}/,
+  'the shared bridge must reuse bootstrap capability-handshake state');
+const capabilitiesWaitAt = webBridge.indexOf('await waitForWebInvokeCapabilities();');
+const downloadChoiceAt = webBridge.indexOf(
+  'supportsSessionDownloadCancellation = canInvoke("web_access_cancel_session_download")',
+);
+assert.ok(capabilitiesWaitAt >= 0, 'the capability wait must exist in the web bridge');
+assert.ok(downloadChoiceAt >= 0, 'the download protocol choice must exist in the web bridge');
+assert.ok(
+  capabilitiesWaitAt < downloadChoiceAt,
+  'session downloads must not choose new or legacy protocol before the desktop snapshot',
+);
+assert.match(bridge, /pinvou:web-capabilities/);
+assert.match(bridge, /desktop_capabilities_timeout/);
+assert.match(bridge, /desktop_capabilities_unavailable/);
+assert.match(bridge, /scheduleAbandonedSessionDownloadCleanup\(\)/,
+  'connection recovery must retry persisted lease cleanup without another session switch');
+assert.match(bridge, /retryCapabilityBlockedSessionSwitch\(\)/,
+  'a late capability snapshot must retry the switch that timed out');
+assert.match(bridge, /supportsSessionDownloadCancellation = canInvoke\("web_access_cancel_session_download"\)/,
+  'new lease behavior must be gated by the installed desktop command capability');
+assert.match(bridge, /if \(supportsSessionDownloadCancellation\) \{[\s\S]{0,120}await cleanupAbandonedSessionDownloads/,
+  'legacy desktops must skip persisted lease cleanup they cannot implement');
+assert.match(bridge, /downloadId = supportsSessionDownloadCancellation \? newSessionDownloadId\(\) : ""/,
+  'legacy desktops must begin without a client-selected download id');
+assert.match(bridge, /if \(supportsSessionDownloadCancellation && !offset\) \{[\s\S]{0,100}chunkArgs\.requestedDownloadId = downloadId/,
+  'requestedDownloadId must only be sent to desktops that support cancellable leases');
+assert.match(bridge, /if \(!downloadId\) downloadId = chunkDownloadId/,
+  'the legacy path must adopt the server-generated first-chunk download id');
+assert.match(bridge, /if \(supportsSessionDownloadCancellation && downloadId\) \{/,
+  'legacy failures must not enter cancellable lease cleanup');
+assert.match(bridge, /cancellationIds[\s\S]{0,500}cancelSessionDownloadLease\(cancellationId, sid\)/,
+  'cancellable failures must release every known lease id');
+assert.doesNotMatch(
+  webBridge,
+  /web_access_load_session_chunk[\s\S]{0,220}\blimit\s*:/,
+  'WebUI must let each desktop version choose its supported session chunk size',
+);
+assert.match(bridge, /MAX_WEB_ARTIFACT_DOWNLOAD_BYTES = 256 \* 1024 \* 1024/);
+assert.match(bridge, /if \(IS_WEB && !hasCapability\("artifactDownload"\)\)/);
+assert.match(bridge, /(?:var|const|let) info = await artifactInfo\(path, resolvedSessionId\)/);
+assert.match(bridge, /if \(expectedSize > MAX_WEB_ARTIFACT_DOWNLOAD_BYTES\)/);
+// F-XT7-7: the per-part overflow re-check lives in the shared
+// streamBase64PartsToBlob core (maxBytes-parameterized); both download
+// pipelines must route through it.
+assert.match(bridge, /streamBase64PartsToBlob\(function \(offset\)/);
+assert.match(bridge, /if \(bytes\.length > maxBytes - offset\)/);
+// Round-2 review minor: the maxBytes ARGUMENT at each call site is
+// load-bearing — the core re-checks are only as strong as the binding passed
+// in (e.g. Infinity would silently disarm them), so both download pipelines
+// must pass the module cap explicitly, exactly once each.
+assert.equal(
+  (bridge.match(/\}, expectedSize, MAX_WEB_ARTIFACT_DOWNLOAD_BYTES, \{/g) || []).length,
+  1,
+  'the artifact download pipeline must pass MAX_WEB_ARTIFACT_DOWNLOAD_BYTES as maxBytes',
+);
+assert.equal(
+  (bridge.match(/\}, null, MAX_WEB_ARTIFACT_DOWNLOAD_BYTES, \{/g) || []).length,
+  1,
+  'the attachment download pipeline must pass MAX_WEB_ARTIFACT_DOWNLOAD_BYTES as maxBytes',
+);
+assert.match(bridge, /streamBase64PartsToBlob\(function \(offset\) \{\n {6}return invoke\("web_access_read_conversation_attachment_chunk"/);
+assert.match(artifactsPanel, /const canDownloadArtifacts = can\('artifactDownload'\);/);
+assert.ok((artifactsPanel.match(/\(!isWeb \|\| canDownloadArtifacts\)/g) || []).length >= 2,
+  'WebUI artifact download buttons must hide when the installed desktop lacks download support');
+assert.match(commands, /claim_pending_plan\(&session_id, &plan_id\)/);
+assert.match(commands, /restore plan claim failed/);
+assert.match(bridge, /function armWebInitRetry\(\)/);
+assert.match(bridge, /window\.addEventListener\("pinvou:web-connection", webInitRetryHandler\)/);
+assert.match(bridge, /if \(client && !client\.stateReady\) \{[\s\S]{0,120}initPromise = null/);
+
+// UI mutation affordances must follow the browser capability allowlist while
+// leaving desktop defaults and per-session model switching intact.
+assert.match(settingsView, /const canManageModels = can\('modelManagement'\);/);
+const composerShared = readSource(path.join(root, 'src', 'features', 'settings', 'composer-shared.jsx'), 'utf8');
+assert.match(composerShared, /const canSwitchModels = can\('sessionModelSwitch'\);/);
+assert.match(composerShared, /const canMutateToolStore = can\('toolStoreMutations'\);/);
+assert.match(composerShared, /const toolSwitchDisabled = !canMutateToolStore;/);
+// 只增不减 + 未提交可撤销：会话中阻隔「关闭」，但本会话内刚打开（pending）、
+// 尚未随新一轮对话进入上下文的允许改回；新一轮被后端受理后才锁死。
+assert.match(composerShared, /if \(toolSwitchDisabled \|\| \(hasActiveSession && enabled && !pending\.ids\.has\(id\)\)\) return;/);
+assert.match(composerShared, /if \(toolSwitchDisabled \|\| \(hasActiveSession && projectSkillsEnabled && !pending\.projectSkills\)\) return;/);
+assert.match(composerShared, /if \(enabled\) pending\.ids\.delete\(id\); else pending\.ids\.add\(id\);/);
+assert.match(composerShared, /window\.addEventListener\('pinvou:chat-round-committed', onCommitted\)/);
+assert.match(composerShared, /pending\.ids\.clear\(\);\s*\n\s*pending\.projectSkills = false;/);
+// 转正（清空 pending）必须在模块级监听里做，不能只在组件 effect 里：受理事件
+// 可能在菜单组件已卸载时到达（排队消息在用户切页后 flush、后台定向发送），
+// 组件级监听会漏清，重挂载后 pending 悬空、已进上下文的工具仍显示可关。
+// 模块级监听注册点还必须先于组件定义，保证清空发生在组件 bump 重渲染之前。
+const moduleListenerIdx = composerShared.indexOf(
+  "window.addEventListener('pinvou:chat-round-committed', (event)",
+);
+assert.ok(
+  moduleListenerIdx >= 0 && moduleListenerIdx < composerShared.indexOf('const ComposerToolMenu'),
+  'round-committed pending-clear listener must be registered at module level (before ComposerToolMenu), not only inside the component',
+);
+// 提交信号由发送链路在后端受理新一轮后派发：常规发送（desktop/web doSendFor）、
+// Web 首轮提交、接受计划（desktop/web acceptPlan）、编辑重跑（desktop/web
+// editLastTurn）、原生代码车道发送与接受方案，缺任一处 pending 都不会转正。
+// FFE4-1：原始 dispatch 只存在于 shared/tool-store-events.js；platform 桥接层
+// 的 7 处发送/接受/重跑路径必须经 window.PinvouToolStoreEvents 调用。
+const toolStoreEventsShared = readSource(path.join(root, 'src', 'shared', 'tool-store-events.js'), 'utf8');
+assert.match(toolStoreEventsShared, /pinvou:chat-round-committed/);
+assert.match(toolStoreEventsShared, /pinvou:tools-changed/);
+assert.match(
+  bridge,
+  /window\.PinvouToolStoreEvents\.notifyChatRoundCommitted\(\)/,
+  'platform bridges must dispatch the round-committed event through the shared helper',
+);
+assert.ok(
+  (bridge.match(/PinvouToolStoreEvents\.notifyChatRoundCommitted\(\)/g) || []).length >= 7,
+  'desktop doSendFor/acceptPlan/editLastTurn and web doSendFor/first-turn/acceptPlan/editLastTurn must each dispatch the round-committed event',
+);
+assert.ok(
+  (bridge.match(/PinvouToolStoreEvents\.notifyComposerToolsChanged\(\)/g) || []).length >= 1,
+  'the desktop bridge must dispatch the tools-changed refresh through the shared helper',
+);
+assert.ok(
+  (codexView.match(/notifyChatRoundCommitted\('code'\);/g) || []).length >= 2,
+  'native code lane send and accept-plan must each commit pending enables',
+);
+const toolEvents = readSource(path.join(root, 'src', 'features', 'tools', 'tool-events.js'), 'utf8');
+assert.match(toolEvents, /export \{ notifyComposerToolsChanged, notifyChatRoundCommitted \};/);
+assert.match(composerShared, /bridge\.models\.switchModel\(activeSessionId, id\)/);
+assert.match(settingsView, /\{canManageModels && editingModel && \(/);
+assert.match(toolStoreView, /if \(!can\('toolStoreMutations'\)\) \{/);
+assert.match(toolStoreView, /const canMutateToolStore = can\('toolStoreMutations'\);/);
+assert.ok((toolStoreView.match(/if \(!canMutateToolStore(\s*\|\|\s*busyRef\.current)?\) return;/g) || []).length >= 4,
+  'all tool install, uninstall, and import handlers must fail closed in WebUI');
+// 回收站 Web 只读降级：list_recycled_plugins 为只读命令（access-policy 放行），
+// 恢复/导出/彻底删除的动作按钮整块挂 canMutateToolStore 门控，处理函数自身
+// fail-closed（含 purge——其确认弹窗入口虽由门控按钮触发，处理函数仍须自守）。
+assert.match(toolStoreView,
+  /\{canMutateToolStore && \(\s*<div className="flex items-center gap-2 shrink-0">[\s\S]{0,900}recycled-restore-[\s\S]{0,900}recycled-export-[\s\S]{0,900}recycled-purge-/,
+  'recycle bin restore/export/purge buttons must be gated behind canMutateToolStore');
+assert.match(toolStoreView,
+  /const handleRestoreRecycled = async \(item\) => \{\s*if \(!canMutateToolStore/,
+  'restore handler must fail closed in WebUI');
+assert.match(toolStoreView,
+  /const handleExportRecycled = async \(item\) => \{\s*if \(!canMutateToolStore/,
+  'recycled export handler must fail closed in WebUI');
+assert.match(toolStoreView,
+  /const doPurgeRecycled = async \(\) => \{\s*if \(!canMutateToolStore/,
+  'purge handler must fail closed in WebUI');
+assert.match(knowledgeView, /const canDownloadArtifacts = !isWeb \|\| can\('artifactDownload'\);/);
+assert.match(knowledgeView, /const canPickHostFiles = !isWeb \|\| can\('hostFilePicker'\);/);
+assert.match(knowledgeView, /const outputSessionId = o\.sessionId \|\| null;/);
+assert.match(knowledgeView, /const cacheKey = `\$\{outputSessionId \|\| ''\}\|\$\{o\.path\}\|\$\{o\.mtime \|\| 0\}`;/);
+assert.ok((knowledgeView.match(/o\.path, outputSessionId/g) || []).length >= 5,
+  'output previews must authorize every Web artifact read with the owning session');
+assert.match(knowledgeView, /<FilePreviewModal path=\{outputPreview\.path\} sessionId=\{outputPreview\.sessionId\}/);
+assert.match(
+  knowledgeView,
+  /if \(isWeb\) \{ setPv\(\{ kind: 'fallback' \}\); return \(\) => \{ alive = false; \}; \}/,
+  'Web builds must render the fallback card instead of reading local-knowledge host paths',
+);
+// Note: the Web gate above keeps the grid's OutputLivePreview from scheduling artifact
+// reads at all; the session-authorized reads asserted above stay desktop-only for the
+// grid and remain server-scoped (web_access_* commands) for the user-initiated
+// FilePreviewModal, whose reads the backend still authorizes against the session.
+assert.match(settingsView, /const canPickHostFiles = can\('hostFilePicker'\);/);
+assert.match(toolCommon, /const canOpenArtifact = !isWeb \|\| can\('artifactDownload'\);/);
+assert.match(connectionStatus, /incompatible_desktop/);
+assert.match(connectionStatus, /BLOCKING[\s\S]*incompatible_desktop/);
+assert.match(connectionStatus, /copy\[connection\.status\] \? fallback : \(connection\.message \|\| fallback\)/,
+  'known connection states must use localized copy while unknown states retain diagnostics');
+assert.doesNotMatch(connectionStatus, /connection\.status === 'error'.*connection\.message/s,
+  'known error states must not expose unlocalized backend diagnostics');
+assert.match(settingsView, /remoteCopy = t\.uiRemote/);
+assert.match(settingsView, /\{remoteCopy\.title\}/);
+assert.match(settingsView, /\{remoteCopy\.link\}/);
+assert.match(settingsView, /\{remoteCopy\.refresh\}/);
+// Enable and allow-folders must stay on separate handlers (regression: one shared
+// handler made a single Enable click silently latch allow_host_workspace consent):
+// the Enable handler starts with an empty options object, and the explicit
+// allow-folders handler is the only place that passes allowHostWorkspace: true.
+assert.match(settingsView, /async function handleEnableWebAccess\(\) \{[\s\S]{0,220}startRemoteControl\(\{\}\)/,
+  'Enable Access must start remote control without host workspace consent');
+assert.match(settingsView, /async function handleAllowHostWorkspace\(\) \{[\s\S]{0,220}startRemoteControl\(\{ allowHostWorkspace: true \}\)/,
+  'host workspace access must follow an explicit allow-folders action in the desktop modal');
+assert.match(settingsView, /onClick=\{handleAllowHostWorkspace\}[\s\S]{0,400}\{remoteCopy\.allowWorkspace\}/,
+  'the allow-folders button must keep its dedicated consent handler');
+assert.match(settingsView, /onClick=\{handleEnableWebAccess\}[\s\S]{0,400}\{remoteCopy\.enable\}/,
+  'the Enable button must use the consent-free start handler');
+assert.doesNotMatch(settingsView, /useEffect\(\(\) => \{[\s\S]{0,240}startRemoteControl/,
+  'opening the remote-control modal must not silently authorize host workspace access');
+assert.match(desktopRemoteControlBridge, /allowHostWorkspace: !!\(options && options\.allowHostWorkspace\)/,
+  'the desktop bridge must carry explicit host-workspace consent');
+// Folder consent must stay visible and individually revocable while the link
+// is active: consent latched by the pre-split single-button UI can be seen
+// and taken back without stopping or rotating the whole link.
+assert.match(settingsView, /async function handleRevokeHostWorkspace\(\) \{[\s\S]{0,220}revokeRemoteHostWorkspace\(\)/,
+  'the modal must expose a dedicated revoke-folder-consent handler');
+assert.match(settingsView, /webAccessActive && hostWorkspaceAuthorized && \([\s\S]{0,420}\{remoteCopy\.workspaceAllowed\}[\s\S]{0,300}onClick=\{handleRevokeHostWorkspace\}/,
+  'folder authorization must render an affirmative indicator wired to the revoke handler');
+assert.match(settingsView, /\{remoteCopy\.revokeWorkspace\}/,
+  'the revoke control must carry explicit trilingual copy');
+assert.doesNotMatch(settingsView, /handleRevokeHostWorkspace[\s\S]{0,200}allowHostWorkspace: true/,
+  'revoking folder consent must never re-grant it');
+// Round-12 复审 P3:uiRemote 的 close / workspaceAllowed / revokeWorkspace
+// 三键此前没有三语在位钉。close: 在各语言文件里与 uiToolStore、子智能体
+// 抽屉、uiCodexWorkspace 等分区重名(每文件 7 处),裸 contains 会误配——
+// 按 uiRemote 分区的开闭括号切片后逐键钉在位,删任一语言的任一键即红。
+const i18nByLanguage = {
+  en: readSource(path.join(root, 'src', 'shared', 'i18n', 'en.js'), 'utf8'),
+  ja: readSource(path.join(root, 'src', 'shared', 'i18n', 'ja.js'), 'utf8'),
+  zh: readSource(path.join(root, 'src', 'shared', 'i18n', 'zh.js'), 'utf8'),
+};
+for (const [language, source] of Object.entries(i18nByLanguage)) {
+  const uiRemoteStart = source.indexOf('uiRemote: {');
+  assert.notEqual(uiRemoteStart, -1,
+    `the ${language} i18n dictionary must define a uiRemote section`);
+  const uiRemoteEnd = source.indexOf('\n        },', uiRemoteStart);
+  assert.notEqual(uiRemoteEnd, -1,
+    `the uiRemote section of the ${language} i18n dictionary must have a closing brace`);
+  const uiRemoteBlock = source.slice(uiRemoteStart, uiRemoteEnd);
+  for (const key of ['close', 'workspaceAllowed', 'revokeWorkspace']) {
+    assert.match(
+      uiRemoteBlock,
+      new RegExp(`\\b${key}:`),
+      `the uiRemote section of the ${language} i18n dictionary must define ${key}: (missing copy breaks the settings remote-control modal)`,
+    );
+  }
+}
+// Registration rejections must surface trilingual recovery copy through the
+// stable last_error_code; the raw English last_error is fallback only
+// (regression: the actionable hints shipped as English-only raw strings).
+assert.match(settingsView, /webAccess\.last_error_code\s*\?\s*remoteCopy\.registerHints\?\.\[webAccess\.last_error_code\]/,
+  'the settings modal must map the registration error code to localized recovery copy');
+assert.match(settingsView, /registerHint \|\| webAccess\.last_error/,
+  'unmapped errors must fall back to the raw last_error text');
+assert.equal((i18n.match(/rotate_credentials:/g) || []).length, 3,
+  'the rotate-credentials recovery copy must exist in all three languages');
+assert.equal((i18n.match(/rotate_recover_config:/g) || []).length, 3,
+  'the rotate-recover recovery copy must exist in all three languages');
+assert.equal((i18n.match(/update_desktop:/g) || []).length, 3,
+  'the update-desktop recovery copy must exist in all three languages');
+assert.match(desktopRemoteControlBridge, /invoke\("web_access_revoke_host_workspace"\)/,
+  'the desktop bridge must call the desktop-only revoke command');
+// Round-6 复审 M6:round-5 的「乐观合并清码」账必须逐分支成立——错误
+// 写入与码清理成对。remote-control.js 全部十个清码点在此逐点设 pin:
+// refresh 失败、乐观开始、start 成功/失败、stop 成功/失败、rotate
+// 成功/失败、revoke 合并/失败。其中两组字节完全相同的孪生形状——
+// refresh/revoke 失败共用的 { last_error: String(error), ... } 单行,
+// 以及 stop/rotate 失败共用的 status: "error"... 单行——无法按文本
+// 指向单侧,改用全局 count 断言守住两侧,删任一侧即红;其余各点按该
+// merge 对象的唯一形状逐点匹配。revoke 合并另须按 url 有无推导
+// active,不得把非活跃状态标成在线,改回强制 active: true 即红。
+assert.match(desktopRemoteControlBridge, /\{ starting: true, last_error: null, last_error_code: null \}/,
+  'the optimistic start merge must clear the stale recovery code');
+assert.match(desktopRemoteControlBridge,
+  /active: true, starting: false, last_error: null, last_error_code: null,/,
+  'the start success merge must clear the stale recovery code');
+assert.match(desktopRemoteControlBridge,
+  /active: wasActive, web_client_connected: wasActive && !!state\.webAccess\.web_client_connected, starting: false,\n {10}status: "error", last_error: String\(error\), last_error_code: null,/,
+  'the start failure merge must clear the stale recovery code');
+assert.equal(
+  (desktopRemoteControlBridge.match(/status: "error", last_error: String\(error\), last_error_code: null, starting: false \}/g) || []).length, 2,
+  'the stop and rotate failure merges are byte-identical twins; both must keep clearing the stale recovery code');
+assert.match(desktopRemoteControlBridge,
+  /status: "stopped", starting: false,\n {8}last_error: null, last_error_code: null,/,
+  'the stop success merge must clear the stale recovery code');
+assert.match(desktopRemoteControlBridge,
+  /active: true, web_client_connected: false, last_error: null, last_error_code: null, starting: false,/,
+  'the rotate success merge must clear the stale recovery code');
+assert.match(desktopRemoteControlBridge,
+  /active: !!\(info && info\.url\), starting: false,\n {10}host_workspace_authorized: false, last_error: null, last_error_code: null,/,
+  'the revoke merge must derive active from the url and clear the stale recovery code');
+assert.equal(
+  (desktopRemoteControlBridge.match(/\{ last_error: String\(error\), last_error_code: null \}/g) || []).length, 2,
+  'the status-refresh failure merge and the revoke failure merge must both clear the stale code');
+assert.match(remoteControlCommands, /web_access_revoke_host_workspace\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'only the main desktop WebView may revoke folder consent');
+assert.match(remoteControlCommands, /web_access_enable\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'only the main desktop WebView may enable a persistent remote endpoint');
+assert.match(
+  remoteControlCommands,
+  /web_access_status\([\s\S]{0,260}require_main_webview\(&webview\)\?/,
+  'web_access_status carries the token-bearing pairing URL and must stay main-WebView only',
+);
+assert.match(
+  remoteControlCommands,
+  /web_access_rotate\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'rotation rewrites link credentials and must stay main-WebView only',
+);
+// Round-8 复审:disable / relay_settings / list_host_files 的主 WebView gate
+// 此前没有 source-shape pin,删除任一 gate 行仍然全绿;补齐与上方四条同款。
+assert.match(remoteControlCommands, /web_access_disable\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'only the main desktop WebView may stop a persistent remote endpoint');
+assert.match(
+  remoteControlCommands,
+  /web_access_list_host_files\([\s\S]{0,400}require_main_webview\(&webview\)\?/,
+  'host filesystem browsing must stay main-WebView only',
+);
+// Round-11 复审 M4:publish_event 拿到了 Round-10 的策略反钉,但其主
+// WebView gate 行是管理命令里唯一没有 Round-8 同款 source-shape 钉的
+// ——门是桌面 aux WebView 侧的唯一防线(策略反钉护的是另一侧调用者)。
+assert.match(
+  remoteControlCommands,
+  /web_access_publish_event\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'the management event-publish channel must stay main-WebView only',
+);
+// Round-12 复审 P3:RPC 代理三兄弟(bridge_ready / rpc_begin / rpc_respond)
+// 的主 WebView gate 行此前没有 Round-8 同款 source-shape 钉——策略反钉护的
+// 是手机侧调用者,辅助桌面 WebView 的唯一防线就是这行 gate;删行仍全绿。
+// 补齐同款:rpc_respond 参数表长(签名到 gate 实距 ~311),间距上限放宽到
+// 400(与 list_host_files 同款),仍远小于删除后到下一命令 gate 的距离
+// (~837),删行即红。
+assert.match(
+  remoteControlCommands,
+  /web_access_bridge_ready\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'the bridge readiness handshake must stay main-WebView only',
+);
+assert.match(
+  remoteControlCommands,
+  /web_access_rpc_begin\([\s\S]{0,240}require_main_webview\(&webview\)\?/,
+  'the RPC dispatch ACK must stay main-WebView only',
+);
+assert.match(
+  remoteControlCommands,
+  /web_access_rpc_respond\([\s\S]{0,400}require_main_webview\(&webview\)\?/,
+  'the RPC completion handoff must stay main-WebView only',
+);
+assert.match(remoteControlManager, /require_host_workspace_authorization\(endpoint\.config\.allow_host_workspace\)\?/,
+  'workspace capabilities must fail closed until desktop authorization is persisted');
+assert.doesNotMatch(settingsView, />刷新链接</);
+assert.doesNotMatch(settingsView, /Relay 服务器/);
+assert.doesNotMatch(settingsView, /getWebRelaySettings/);
+assert.match(main, /title=\{t\.uiRemote\.title\}/);
+assert.match(main, /const isWebAccessConnected = !!\(bs && bs\.webAccess && bs\.webAccess\.web_client_connected\);/,
+  'desktop indicator must reflect an actual browser connection, not a persistent access link');
+// The collapsed/expanded footer consolidation shares one indicator render:
+// the indicator must live inside the shared renderer (distance-bounded match),
+// so neither layout can silently lose it.
+assert.match(main, /const renderFooterButtons = \(collapsed\) => \{[\s\S]{0,900}isWebAccessConnected && <span/,
+  'expanded and collapsed navigation must use the actual connection indicator');
+assert.doesNotMatch(main, /bs\.webAccess\.active && <span/,
+  'an enabled access link must not be presented as a connected phone');
+assert.match(desktopRemoteControlBridge, /listen\("web_access:status"/,
+  'desktop bridge must consume live browser connection status events');
+assert.match(desktopRemoteControlBridge, /web_client_connected: false, host_workspace_authorized: false, status: "stopped"/,
+  'stopping remote access must clear any stale connected state');
+const desktopBridge = readSource(path.join(bridgeRoot, 'bridge.js'), 'utf8');
+assert.match(desktopBridge, /web_client_connected: false/,
+  'desktop bridge state must start with an explicit disconnected browser state');
+for (const source of [settingsView, connectionStatus]) {
+  assert.doesNotMatch(source, /WebUI/,
+    'user-facing remote control copy must not expose the WebUI implementation name');
+}
+assert.match(chatView, /data-testid="chat-bottom-spacer"[\s\S]{0,180}className="w-full shrink-0"/,
+  'all chat surfaces must use a real flex item because WebKit may omit trailing overflow padding');
+assert.match(chatView, /\.\.\.\(hasMessages \? \{\} : \{ paddingBottom:/,
+  'message lists must use the real spacer while the non-scrolling empty state retains centering clearance');
+assert.match(chatView, /composerH \? composerH \+ 64 : 176/,
+  'the bottom spacer must clear both the floating composer and its fade mask');
+assert.match(chatView, /composerH \? composerH \+ 48 : 172/,
+  'the fade mask must remain shorter than the bottom spacer');
+
+
+// review #464 round-5 item 3: the web session list must delegate the
+// whole-list projection (metadata + workspace_binding) to the extracted
+// project_session_list_for_web — reverting that one line must not stay green.
+{
+  const start = remoteControlCommands.indexOf('pub async fn web_access_list_sessions');
+  assert.notStrictEqual(start, -1);
+  const body = remoteControlCommands.slice(start, start + 900);
+  assert.ok(
+    body.includes('project_session_list_for_web(&mut sessions)'),
+    'web_access_list_sessions must delegate the web projection to project_session_list_for_web',
+  );
+}
+
+console.log('web access contract tests passed');

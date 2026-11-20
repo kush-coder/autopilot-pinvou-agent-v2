@@ -1,0 +1,542 @@
+//! EnginePoolRuntime: 产品等价的聊天 runtime seam。
+//!
+//! GUI 和评测 Runner 共同调用此入口，确保评测走真实产品链路。
+//! 当前实现薄包装 EnginePool——逻辑逐步从 EnginePool/AppEngine/Bridge
+//! 迁入此处，但首期只建立 seam 不搬逻辑。
+//!
+//! 设计原则（低耦合）：
+//! - seam 类型（SessionSpec/TurnInput/TurnHandle）不引用 EnginePool/Op/EngineConfig
+//! - 窄接口：prepare/submit/is_turn_active/wait_for_completion/cancel/close
+//! - 实现是唯一知道 EnginePool 的地方；换实现不影响消费方
+//! - 不引入循环依赖：product_runtime -> engine_pool（单向）
+
+use anyhow::Result;
+use deepseek_tui::AppMode;
+use deepseek_tui::models::{ContentBlock, Message};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::features::assistant::engine_pool::EnginePool;
+use crate::features::assistant::eval::{EvalModelSelection, EvalSuiteModelSnapshot};
+use crate::features::assistant::timing;
+use std::time::Duration;
+
+#[cfg(feature = "benchmark-hooks")]
+pub mod agentic_task;
+pub(crate) mod eval_tool_policy;
+#[cfg(feature = "benchmark-hooks")]
+pub mod headless_bridge;
+// Keep the benchmark bridge contract in the lib test harness. Building it as
+// a standalone integration-test crate links the complete Tauri graph a second
+// time and exceeds the 16 GB hosted-runner boundary even with serialized lld.
+#[cfg(all(test, feature = "benchmark-hooks"))]
+mod headless_bridge_contract_tests;
+
+/// 会话创建规格
+pub struct SessionSpec {
+    pub session_id: String,
+    pub model_selection: Option<EvalModelSelection>,
+    /// Workspace recorded in the new session's `metadata.workspace`. `None`
+    /// keeps the pool's default (bridge) workspace — right for scratch
+    /// sessions. Only the display/binding metadata is affected here; the
+    /// durable `--workspace` binding is a separate sidecar the caller writes
+    /// (see `bind_session_workspace`). Recording the task directory in both
+    /// places keeps the GUI list/detail honest for bound headless sessions.
+    pub workspace: Option<std::path::PathBuf>,
+}
+
+/// 单轮提交输入（产品级，不暴露 Op/EngineConfig）
+pub struct TurnInput {
+    pub session_id: String,
+    pub content: String,
+    pub mode: AppMode,
+    pub restrict_tools: bool,
+    pub eval_tool_policy: Option<eval_tool_policy::EvalToolPolicy>,
+}
+
+/// 单轮句柄（后续扩展为事件订阅入口）
+pub struct TurnHandle {
+    pub session_id: String,
+    pub turn_id: String,
+}
+
+/// 单轮完成结果
+pub struct TurnResult {
+    pub turn_id: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub usage: Option<timing::TurnUsage>,
+    pub milestones: Vec<timing::TimelineEvent>,
+    pub assistant_text: String,
+    pub tool_events: Vec<RuntimeToolEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeToolEvent {
+    pub id: String,
+    pub name: String,
+    pub failed: bool,
+    pub failure_code: Option<String>,
+    pub elapsed_ms: Option<u64>,
+}
+
+fn classify_tool_failure(content: &str) -> &'static str {
+    let normalized = content.to_ascii_lowercase();
+    if normalized.contains("per-turn tool-call budget")
+        || normalized.contains("tool-call budget") && normalized.contains("exhausted")
+    {
+        "tool_call_budget_exhausted"
+    } else if normalized.contains("host read-only turn policy") {
+        "host_read_only_blocked"
+    } else if normalized.contains("host turn policy") {
+        "host_tool_blocked"
+    } else if normalized.contains("blocked by network policy") {
+        "network_policy_blocked"
+    } else if normalized.contains("restricted address")
+        || normalized.contains("private/loopback/link-local")
+    {
+        "restricted_address"
+    } else if normalized.contains("requires approval") {
+        "approval_required"
+    } else if normalized.contains("missing `action`")
+        || normalized.contains("missing action")
+        || normalized.contains("requires an `action` parameter")
+        || normalized.contains("requires `action` to be")
+    {
+        "missing_action"
+    } else if normalized.contains("invalid input")
+        || normalized.contains("invalid argument")
+        || normalized.contains("validation")
+        || normalized.contains("must be")
+    {
+        "invalid_arguments"
+    } else if normalized.contains("api key") || normalized.contains("configuration") {
+        "search_provider_config"
+    } else if normalized.contains("no readable page content")
+        || normalized.contains("requires javascript")
+    {
+        "dynamic_page_unreadable"
+    } else if normalized.contains("no content could be extracted")
+        || normalized.contains("content extraction failed")
+        || normalized.contains("extracted content was empty")
+    {
+        "content_extraction_failed"
+    } else if normalized.contains("cloudflare challenge")
+        || normalized.contains("access denied")
+        || normalized.contains("http status 401")
+        || normalized.contains("http status 403")
+        || normalized.contains("http status 429")
+    {
+        "remote_access_denied"
+    } else if normalized.contains("http status") || normalized.contains("http response status") {
+        "http_status_failed"
+    } else if normalized.contains("no such file")
+        || normalized.contains("does not exist")
+        || normalized.contains("resource not found")
+    {
+        "resource_not_found"
+    } else if normalized.contains("timeout") || normalized.contains("timed out") {
+        "network_timeout"
+    } else if normalized.contains("connection")
+        || normalized.contains("network")
+        || normalized.contains("request failed")
+    {
+        "network_failed"
+    } else if normalized.contains("permission")
+        || normalized.contains("denied")
+        || normalized.contains("policy")
+    {
+        "policy_denied"
+    } else {
+        "tool_execution_failed"
+    }
+}
+
+fn extract_turn_analysis(messages: &[Message]) -> (String, Vec<RuntimeToolEvent>) {
+    let assistant_text = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+
+    let failures = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                content,
+                ..
+            } => {
+                let failed = is_error.unwrap_or(false);
+                Some((
+                    tool_use_id.as_str(),
+                    (
+                        failed,
+                        failed.then(|| classify_tool_failure(content).to_owned()),
+                    ),
+                ))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let tool_events = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, .. } => Some(RuntimeToolEvent {
+                id: id.clone(),
+                name: name.clone(),
+                failed: failures
+                    .get(id.as_str())
+                    .map(|(failed, _)| *failed)
+                    .unwrap_or(false),
+                failure_code: failures.get(id.as_str()).and_then(|(_, code)| code.clone()),
+                elapsed_ms: None,
+            }),
+            _ => None,
+        })
+        .collect();
+
+    (assistant_text, tool_events)
+}
+
+/// EnginePool 薄包装实现。
+///
+/// 首期只是委托调用，不添加逻辑。后续产品语义（路由策略、
+/// 事件归一化、工具策略等）逐步从 EnginePool/AppEngine/Bridge
+/// 迁入此处，调用方不受影响。
+#[derive(Clone)]
+pub struct EnginePoolRuntime {
+    pool: Arc<EnginePool>,
+}
+
+pub(crate) struct EvalSuiteModelGuard {
+    runtime: EnginePoolRuntime,
+    snapshot: EvalSuiteModelSnapshot,
+}
+
+impl EvalSuiteModelGuard {
+    pub(crate) fn identity(&self) -> &crate::features::assistant::eval::ModelIdentity {
+        self.snapshot.identity()
+    }
+
+    pub(crate) fn derive_case_selection(&self) -> Result<EvalModelSelection> {
+        self.runtime
+            .derive_eval_suite_case_selection(&self.snapshot)
+    }
+}
+
+impl Drop for EvalSuiteModelGuard {
+    fn drop(&mut self) {
+        self.runtime.discard_eval_suite_model(&self.snapshot);
+    }
+}
+
+impl EnginePoolRuntime {
+    pub fn new(pool: Arc<EnginePool>) -> Self {
+        Self { pool }
+    }
+
+    pub(crate) fn pin_active_eval_suite_model(&self) -> Result<EvalSuiteModelSnapshot> {
+        self.pool.pin_active_eval_suite_model()
+    }
+
+    pub(crate) fn capture_eval_suite_model(&self) -> Result<EvalSuiteModelGuard> {
+        Ok(EvalSuiteModelGuard {
+            runtime: self.clone(),
+            snapshot: self.pin_active_eval_suite_model()?,
+        })
+    }
+
+    pub(crate) fn derive_eval_suite_case_selection(
+        &self,
+        suite: &EvalSuiteModelSnapshot,
+    ) -> Result<EvalModelSelection> {
+        self.pool.derive_eval_suite_case_selection(suite)
+    }
+
+    pub(crate) fn discard_eval_suite_model(&self, suite: &EvalSuiteModelSnapshot) {
+        self.pool.discard_eval_suite_model(suite);
+    }
+
+    pub(crate) fn pin_eval_model_selection(&self, model_id: &str) -> Result<EvalModelSelection> {
+        self.pool.pin_eval_model_selection(model_id)
+    }
+
+    pub(crate) async fn close_eval_session_result(&self, session_id: &str) -> Result<()> {
+        self.pool.delete_eval_session(session_id).await
+    }
+
+    /// Headless stub-cleanup delete: the durable delete is guarded — under
+    /// the turn gate a record that carries messages is a started transcript
+    /// and is kept (only the engine reclaimed), never destroyed as a stub.
+    #[cfg(any(feature = "benchmark-hooks", test))]
+    pub(crate) async fn delete_headless_stub_session(&self, session_id: &str) -> Result<()> {
+        self.pool
+            .delete_chat_session_if_still_empty(session_id)
+            .await
+    }
+
+    pub(crate) fn eval_session_execution_root(
+        &self,
+        session_id: &str,
+    ) -> Result<std::path::PathBuf> {
+        self.pool.eval_session_execution_root(session_id)
+    }
+
+    pub(crate) fn schedule_eval_cleanup(&self, session_id: &str) {
+        self.pool.schedule_eval_cleanup(session_id);
+    }
+}
+
+impl EnginePoolRuntime {
+    /// Turn-scoping pipeline shared by the completion path and the agentic
+    /// partial-salvage path: keep the timeline milestones recorded for
+    /// `turn_id` (bookends excluded) and retain only the extracted tool events
+    /// whose ids appear in those milestones. The caller owns the timeline
+    /// read-error semantics (completion fails hard; salvage keeps all events).
+    fn scope_turn_analysis_to_turn(
+        timeline: &[timing::TimelineEvent],
+        turn_id: &str,
+        mut tool_events: Vec<RuntimeToolEvent>,
+    ) -> (Vec<timing::TimelineEvent>, Vec<RuntimeToolEvent>) {
+        let milestones: Vec<timing::TimelineEvent> = timeline
+            .iter()
+            .filter(|event| {
+                event.turn_id == turn_id
+                    && !matches!(event.event.as_str(), "user_start" | "assistant_done")
+            })
+            .cloned()
+            .collect();
+        let turn_tool_ids = milestones
+            .iter()
+            .filter_map(|event| event.tool_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        tool_events.retain(|tool| turn_tool_ids.contains(&tool.id));
+        (milestones, tool_events)
+    }
+
+    /// 确保会话已创建并就绪
+    pub(crate) async fn prepare(&self, spec: &SessionSpec) -> Result<()> {
+        self.pool
+            .prepare_eval_session(
+                &spec.session_id,
+                spec.model_selection.as_ref(),
+                spec.workspace.as_deref(),
+            )
+            .await
+    }
+
+    /// 提交用户消息，返回轮次句柄
+    pub(crate) async fn submit(&self, input: &TurnInput) -> Result<TurnHandle> {
+        let turn_id = timing::start_turn(&input.session_id);
+        if let Some(policy_id) = input.eval_tool_policy {
+            let policy = eval_tool_policy::resolve_eval_policy(match policy_id {
+                eval_tool_policy::EvalToolPolicy::ProductV1 => "pinvou-read-only-web/v1",
+                eval_tool_policy::EvalToolPolicy::GaiaPublicWebV1 => "pinvou-gaia-public-web/v1",
+                eval_tool_policy::EvalToolPolicy::GaiaOfflineV1 => "pinvou-gaia-offline/v1",
+                eval_tool_policy::EvalToolPolicy::GaiaFinalAnswerOnlyV1 => {
+                    "pinvou-gaia-final-answer-only/v1"
+                }
+            })?;
+            self.pool
+                .send_eval_user_message(&input.session_id, input.content.clone(), policy)
+                .await?;
+        } else {
+            self.pool
+                .send_user_message(
+                    &input.session_id,
+                    input.content.clone(),
+                    input.mode,
+                    input.restrict_tools,
+                )
+                .await?;
+        }
+        Ok(TurnHandle {
+            session_id: input.session_id.clone(),
+            turn_id,
+        })
+    }
+
+    /// 当前是否有活跃轮次
+    pub(crate) fn is_turn_active(&self, session_id: &str) -> bool {
+        self.pool.is_turn_active(session_id)
+    }
+
+    /// 等待轮次完成并返回结果（轮询实现，后续可升级为事件流）
+    pub(crate) async fn wait_for_completion(&self, handle: &TurnHandle) -> Result<TurnResult> {
+        let session_id = &handle.session_id;
+        while self.pool.is_turn_active(session_id) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let timeline =
+            timing::read_timeline(session_id).map_err(|e| anyhow::anyhow!("read timeline: {e}"))?;
+        let entry = timeline
+            .iter()
+            .rev()
+            .find(|e| e.turn_id == handle.turn_id && e.event == "assistant_done");
+        let transcript = self.pool.load_eval_transcript(session_id)?;
+        let (assistant_text, tool_events) = extract_turn_analysis(&transcript);
+        let (milestones, mut tool_events) =
+            Self::scope_turn_analysis_to_turn(&timeline, &handle.turn_id, tool_events);
+        let tool_elapsed = milestones
+            .iter()
+            .filter(|event| event.event == "tool_call_completed")
+            .filter_map(|event| Some((event.tool_id.as_ref()?.clone(), event.elapsed_ms?)))
+            .collect::<HashMap<_, _>>();
+        for tool in &mut tool_events {
+            tool.elapsed_ms = tool_elapsed.get(&tool.id).copied();
+        }
+        Ok(TurnResult {
+            turn_id: handle.turn_id.clone(),
+            status: entry
+                .and_then(|e| e.status.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            error: entry.and_then(|e| e.error.clone()),
+            usage: entry.and_then(|e| e.usage),
+            milestones,
+            assistant_text,
+            tool_events,
+        })
+    }
+
+    /// 取消当前轮次
+    pub(crate) async fn cancel(&self, session_id: &str) {
+        // Evaluation/headless cancel means stop: un-injected steers are not
+        // kept (StopDropInbox).
+        self.pool.cancel(session_id, false).await;
+    }
+}
+
+/// Best-effort note on stderr: Rust ignores SIGPIPE, so a closed stderr
+/// (the headless CLI's `2>&1 | head`) turns a plain `eprintln!` into a
+/// panic (exit 101) that also loses the run report these diagnostics
+/// accompany. A failed note is dropped and the run carries on.
+pub(crate) fn note_stderr(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_tool_failure, extract_turn_analysis};
+    use deepseek_tui::models::{ContentBlock, Message};
+    use serde_json::json;
+
+    #[test]
+    fn transcript_analysis_extracts_only_last_assistant_text_and_tool_metadata() {
+        let messages = vec![
+            Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::Text {
+                    text: "older answer".into(),
+                    cache_control: None,
+                }],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-1".into(),
+                    name: "weather".into(),
+                    input: json!({"query": "secret tool input"}),
+                    caller: None,
+                    thought_signature: None,
+                }],
+            },
+            Message {
+                role: "user".into(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "tool-1".into(),
+                    content: "secret tool output".into(),
+                    is_error: Some(true),
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".into(),
+                content: vec![
+                    ContentBlock::Text {
+                        text: "final ".into(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Text {
+                        text: "answer".into(),
+                        cache_control: None,
+                    },
+                ],
+            },
+        ];
+
+        let (assistant_text, tool_events) = extract_turn_analysis(&messages);
+
+        assert_eq!(assistant_text, "final answer");
+        assert_eq!(tool_events.len(), 1);
+        assert_eq!(tool_events[0].name, "weather");
+        assert!(tool_events[0].failed);
+        assert_eq!(
+            tool_events[0].failure_code.as_deref(),
+            Some("tool_execution_failed")
+        );
+        let debug = format!("{tool_events:?}");
+        assert!(!debug.contains("secret tool input"));
+        assert!(!debug.contains("secret tool output"));
+    }
+
+    #[test]
+    fn tool_failure_classification_separates_safe_policy_causes() {
+        assert_eq!(
+            classify_tool_failure("Tool action blocked by host read-only turn policy"),
+            "host_read_only_blocked"
+        );
+        assert_eq!(
+            classify_tool_failure("network call to 'redacted' blocked by network policy"),
+            "network_policy_blocked"
+        );
+        assert_eq!(
+            classify_tool_failure("resolved IP redacted is a restricted address"),
+            "restricted_address"
+        );
+        assert_eq!(
+            classify_tool_failure("Tool 'Web' rejected: per-turn tool-call budget of 12 exhausted"),
+            "tool_call_budget_exhausted"
+        );
+        assert_eq!(
+            classify_tool_failure(
+                "Invalid input: Unknown Web action \"open\". Input schema summary: Required: action"
+            ),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            classify_tool_failure(
+                "Web requires an `action` parameter; nothing was run. Pass one of: search, fetch, wait."
+            ),
+            "missing_action"
+        );
+        assert_eq!(
+            classify_tool_failure(
+                "No readable page content was found at redacted; the page may require JavaScript."
+            ),
+            "dynamic_page_unreadable"
+        );
+        assert_eq!(
+            classify_tool_failure("request timed out while fetching redacted"),
+            "network_timeout"
+        );
+        assert_eq!(
+            classify_tool_failure("resource does not exist in the staged workspace"),
+            "resource_not_found"
+        );
+    }
+}

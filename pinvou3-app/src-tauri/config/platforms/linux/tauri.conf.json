@@ -1,0 +1,36 @@
+{
+  "$schema": "../../../../node_modules/@tauri-apps/cli/config.schema.json",
+  "bundle": {
+    "targets": ["deb"],
+    "resources": {
+      "resources/platforms/linux/asr/pinvou3-asr-shim.py": "runtime/asr/pinvou3-asr-shim.py",
+      "resources/platforms/linux/asr/LICENSE-SenseVoice.cpp": "runtime/asr/LICENSE-SenseVoice.cpp",
+      "resources/platforms/linux/codex-bridge/": "runtime/codex-bridge",
+      "resources/platforms/linux/knowledge-host/": "runtime/knowledge-host"
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": "packaging/linux/deb/pinvou3.desktop",
+        "postInstallScript": "packaging/linux/deb/scripts/postinst.sh",
+        "preRemoveScript": "packaging/linux/deb/scripts/prerm.sh",
+        "depends": [
+          "libwebkit2gtk-4.1-0 (>= 2.40)",
+          "webkit2gtk-driver",
+          "libpipewire-0.3-0",
+          "libgbm1",
+          "libegl1"
+        ],
+        "recommends": [
+          "poppler-utils",
+          "tesseract-ocr",
+          "tesseract-ocr-chi-sim",
+          "pandoc",
+          "p7zip-full",
+          "python3",
+          "libreoffice",
+          "libemail-outlook-message-perl"
+        ]
+      }
+    }
+  }
+}

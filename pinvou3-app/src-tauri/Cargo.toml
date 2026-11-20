@@ -1,0 +1,655 @@
+[package]
+name = "pinvou3-tauri"
+version = "1.0.2"
+description = "品悟智能助手桌面应用后端"
+authors = ["pinvou"]
+license = "MIT"
+# edition 2024: aligned with the CodeWhale foundation (workspace edition
+# "2024"); requires rustc >= 1.85.
+edition = "2024"
+# MSRV: rust-version is the lower bound "the minimum rustc that can compile
+# this crate"; the actual toolchain is pinned to an exact version by
+# rust-toolchain.toml (reproducible). The two are complementary.
+# 1.90 is the floor required by the Tauri 2.12 line (tauri 2.12 / tauri-build
+# 2.7 and the 2.12-era plugins declare rust-version 1.90; wry 0.57 itself
+# declares 1.85, so tauri sets the floor);
+# above the 1.85 floor of edition 2024.
+rust-version = "1.90"
+# The main binary is the Tauri app (src/main.rs); src/bin/dump_system_prompt.rs
+# is a dev tool. This key makes `cargo run` (without --bin) default to the
+# main app instead of erroring out due to multiple bins. Must live directly in
+# [package]: below the [package.metadata.*] header these keys are swallowed
+# into the metadata table and silently ignored (dev run failed on this).
+default-run = "pinvou3-tauri"
+autobins = false
+# cargo-shear (unused-dependency / unlinked-file check) exemption:
+# rustc-stack-wrapper.rs is not a compilation target of this crate; it is
+# source code that scripts/rustc-stack-wrapper-select.sh compiles on demand
+# into rustc-stack-wrapper.exe on Windows (direct CreateProcess launch to
+# bypass the cmd 8191-char limit) — see the RUSTC_WRAPPER notes in
+# .cargo/config.toml. Do NOT delete it per shear's advice.
+[package.metadata.cargo-shear]
+ignored-paths = ["scripts/rustc-stack-wrapper.rs"]
+
+[[bin]]
+name = "pinvou3-tauri"
+path = "src/main.rs"
+
+[[bin]]
+name = "dump_system_prompt"
+path = "src/bin/dump_system_prompt.rs"
+required-features = ["dev-tools"]
+
+[lib]
+name = "pinvou3_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["local-embed"]
+local-embed = ["pinvou-knowledge/local-embed"]
+dev-tools = []
+benchmark-hooks = ["dep:agent-backend-api", "deepseek-tui/benchmark-eval-controls"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+cc = "1"
+
+[dev-dependencies]
+# test-util is unified onto the normal tokio build for test targets only:
+# engine_pool's rebind gate-timeout regression drives tokio::time with a
+# paused clock (#[tokio::test(start_paused = true)]) instead of sleeping the
+# real 2s REBIND_EVICT_GATE_TIMEOUT.
+tokio = { version = "1.49", features = ["test-util"] }
+# computer_use retention test ages a crash-orphaned atomic-write temp past
+# the sweep threshold; pinned to the version already in the lock graph (tar).
+filetime = "0.2.29"
+
+[dependencies]
+pinvou-knowledge = { path = "../../pinvou-knowledge", default-features = false, features = ["client", "discovery"] }
+# workflow 整目录内嵌(含二进制),include_str 撑不住
+include_dir = "0.7"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+semver = "1"
+toml = "1"
+log = "0.4"
+tauri = { version = "2.12", features = ["unstable"] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2.4.2"
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2.3.2"
+
+# 异步 / 错误
+anyhow = "1.0"
+async-trait = "0.1" # impl 底座 ToolSpec(kb_search Agentic 工具)
+agent-backend-api = { path = "../../pinvou-cli/crates/agent-backend-api", optional = true }
+tokio = { version = "1.49", features = ["full"] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
+uuid = { version = "1.11", features = ["v4", "v5"] }
+
+# 外部 Agent ACP 客户端：只负责协议连接与 typed schema。Agent 本体由
+# Codex/Claude/Kimi 各自的 ACP 实现提供，pinvou3 不复制其会话/工具循环。
+# unstable_elicitation 在 2.1.0 已转正（feature 被移除），2.2 直接带稳定
+# elicitation；不再加 feature 开关。3.x（2026-10 已到 3.5.0）改了 feature 命名与
+# 协议 schema，留给独立 PR 评估，本仓暂不升级。
+# 钉死 =2.2.0：协议 schema crate，wire 兼容由锁文件可复现；浮动的 "2.2"
+# 会允许 cargo update 静默漂到未评审的 2.x minor（本块旧注释对 2.0.0 的
+# 论证同样适用于 2.2.x）。
+agent-client-protocol = { version = "=2.2.0" }
+
+# 底层 Agent —— CodeWhale 提供 LLM 调用 + 工具循环 + 流式事件。
+# 上游 v0.8.45 起 rebrand：库 crate 改名 codewhale-tui。用 Cargo 的 `package`
+# 重命名保留本地别名 deepseek-tui，全部 `use deepseek_tui::*` 无需改动
+# （上游自己也保留 deepseek-tui bin shim 做 back-compat，做法一致）。
+deepseek-tui = { path = "../../CodeWhale/crates/tui", package = "codewhale-tui" }
+
+# 凭证存储复用底座 codewhale-secrets(DefaultKeyringStore + FileKeyringStore 文件回退),
+# 不再在 app 层自建 keyring 封装;headless/无 D-Bus 服务器也能存凭证。
+codewhale-secrets = { path = "../../CodeWhale/crates/secrets" }
+
+# Reuse the foundation codewhale-core MAX_WORKSPACE_ROOTS constant (review
+# #484 round-21 M8): the project roots capacity ceiling stays sourced from
+# the same place as the foundation's intake/delivery, so a foundation-side
+# value change can no longer drift here silently.
+codewhale-core = { path = "../../CodeWhale/crates/core" }
+
+# 复用底座 codewhale-config 的 RouteLimits 类型(填 active_route_limits.context_tokens,
+# 把 vLLM 探测的窗口喂给底座压缩阈值推导)。facade(deepseek-tui)不 re-export 该类型,
+# 直接引 crate;它已在依赖图内,Cargo.lock 几乎不动。
+codewhale-config = { path = "../../CodeWhale/crates/config" }
+
+# CLI 连接器硬拦截(scope 门禁的 execpolicy 通道):按会话构造 deny 规则集
+# (Ruleset/ToolAskRule/PermissionAction),底座 spawn 前硬拒被禁 CLI 二进制。
+codewhale-execpolicy = { path = "../../CodeWhale/crates/execpolicy" }
+
+# Monitor 用：vLLM HTTP probe（/v1/models + Prometheus /metrics）
+# 0.13 与 CodeWhale 子模块对齐；feature `rustls`(0.13 改名,自带 aws-lc-rs)。
+# aws-lc-rs 构建需 cmake,CI 已加安装步骤。
+# 注意:hf-hub(经 reqwest 0.12 传递)会把 rustls 0.23 的 `ring` feature 拉进图,
+# 使 rustls 同时启用 aws-lc-rs + ring。tokio-tungstenite 的无参 ClientConfig::builder()
+# 在两 provider 共存时会 panic,故需在启动时显式 install_default(见 lib.rs)。
+# (CodeWhale#122 已把底座 oauth2 改为 default-features=false,不再经它引入 reqwest 0.12;
+# ring 的另一 requirer 仍在,本备注因此保持有效。)
+# system-proxy: reqwest 0.13 的 default feature,读 macOS SystemConfiguration /
+# Windows 系统代理设置(非环境变量)。此前 default-features=false 把它关掉,
+# 导致用「系统代理」模式(非 TUN)的用户模型请求直连而被代理工具的路由规则
+# 绕过。显式启用后,reqwest 在 Client::build() 时自动注入系统代理 matcher。
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "blocking", "stream", "query", "system-proxy"] }
+wait-timeout = "0.2"
+
+# ACP resource ledger: aggregate RSS + process-tree ownership on Linux/macOS/Windows.
+# Pin 0.36.x for the project's MSRV line; newer sysinfo majors require a newer
+# rustc. Disable disk/network/user/component probes because the ledger only
+# samples processes.
+sysinfo = { version = "=0.36.1", default-features = false, features = ["system"] }
+
+# rustls 直依赖:仅为在启动时调 aws_lc_rs::default_provider().install_default()
+# 选定进程级 CryptoProvider(见上方 panic 根因)。只声明 aws-lc-rs;ring 由传递依赖启用。
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+
+# Updater 用：sha256 校验；产物卡封面读 .pptx 里的 thumbnail。
+# 0.11 与 CodeWhale 子模块对齐。digest 的 Output 不实现 LowerHex,统一用 hex_lower 编码
+# (see src/platform/encoding.rs). computer_use's screenshot audit is content-addressed (SHA-256) and shares this crate.
+sha2 = "0.11"
+# computer_use's T3 screening folds attacker-controlled accessible names before
+# matching. NFKC is what collapses the compatibility families a hostile label
+# hides a term in (fullwidth ASCII, the Math Alphanumeric block, circled and
+# parenthesized letters, halfwidth katakana, CJK compatibility ideographs);
+# hand-rolling those tables would be a partial re-implementation of a Unicode
+# standard annex. Already in the graph transitively, so this direct edge adds
+# no package to either lockfile.
+unicode-normalization = "0.1"
+# 9.x：退役 8.6.0（命中 RUSTSEC-2026-0367/0368/0369 解包族通告）；calamine 0.37 要求
+# zip ^9,全图收敛为单一 zip 9.x。
+# 仅 deflate（读 .pptx / 写技能 zip 包），关默认 feature 去掉 bzip2/lzma/zstd 等。
+zip = { version = "9", default-features = false, features = ["deflate"] }
+flate2 = "1"
+tar = "0.4"
+# 会话归档导入（import_session_archive）的 xz 解码；与底座 session_export
+# 的编码端同用 liblzma static（版本对齐，复用同一锁定版本）。
+liblzma = { version = "0.4", features = ["static"] }
+
+# Session store 用：阻塞式 RwLock（sync 不需要 .await 拿读写锁）
+parking_lot = "0.12"
+# Process-ownership lock (remote_control web access single-process authority).
+# fd-lock is already in the graph (transitive via codewhale-config) and wraps the
+# same primitives as fs2 — flock(unix)/LockFileEx(windows). The phase-4 audit
+# replaces the direct fs2 dependency with it, dropping one app-only crate.
+fd-lock = "4"
+
+# 时间戳：SessionMetadata.updated_at 用 chrono::Utc::now()，对齐上游 schema
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# File watcher：监听 ~/.pinvou3/sessions/*/workspace/ 新文件产出，
+# 自动入 session.artifacts (覆盖 write_file 之外的工具如 exec_shell pandoc 产出的 docx)
+# 8.x：把 mio 收敛到 1.x、连带消除 windows-sys 0.48.0，并修 Windows
+# FILE_NOTIFY_INFORMATION 未对齐 UB。
+# 项目仅用稳定高层 API（recommended_watcher / Watcher::watch / EventKind / RecursiveMode），
+# 6→8 公开签名零变化，watcher.rs / file_watcher.rs 源码无需改动。
+notify = "8"
+
+# 本地知识底座 L0：全系统元数据索引 + 秒搜 + 去重
+# rusqlite bundled —— 自带 SQLite + FTS5（名/路径秒搜），不依赖系统 libsqlite，
+# 对 .deb 离线分发友好（与 file_ingest 二进制依赖降 recommends 的思路一致）。
+rusqlite = { version = "0.41.0", features = ["bundled"] }
+# 全盘遍历：容错(权限不足跳过)、防 symlink 环。L0 扫描器用。
+walkdir = "2"
+
+# 本地 embedding（L1 语义检索）：fastembed-rs 进程内 ONNX 推理（CPU EP），**不依赖 vLLM**。
+# 模型(bge-m3 ONNX)用户本地下载，UserDefinedEmbeddingModel 从目录加载，不走 HF 自动下载。
+# 电子表格解析（file_ingest 用）：读 xlsx/xls/ods 的全部工作表。
+# 0.37 要求 zip ^9（见上）与 quick-xml ^0.42（ReDoS 修复线,见 RUSTSEC-2026-0194/0195）。
+# 0.38：修 RUSTSEC-2026-0436（CFB/OLE2 解析器对恶意输入 panic/无界分配,见该通告;
+# zip ^9 与 quick-xml ^0.42 约束不变）。注意：本 bump 的极小 lock 更新会让 resolver
+# 把图中 range requirement 边（errno/tempfile/cssparser-macros 等对 windows-sys/
+# getrandom/syn 的 ">=x,<y" 需求）重 pick 到较旧版本——21 个条目共 22 条边随本
+# bump 移动,系 cargo 1.99 的规范输出（byte-reproducible）,非人工改动,勿手工回改。
+# 残留的 quick-xml 0.41 仅来自 wayland-scanner/xcb 的 Linux 构建链（`cargo tree -i quick-xml`）。
+calamine = "0.38"
+# XLSX structure preservation: inspect OOXML cell styles, formulas, and merged
+# ranges that calamine's value-only Range intentionally does not expose.
+quick-xml = "0.42"
+# 文本附件编码兜底：把国内常见 GBK / GB18030 文件真正转成 UTF-8，
+# 避免 `from_utf8_lossy` 把中文正文替换成一串 U+FFFD。
+encoding_rs = "0.8"
+
+# CLI 连接器(飞书/企微)扫码授权:把授权 URL 渲染成二维码(SVG data URL,前端 <img> 直显)。
+# 纯 Rust,不依赖各 CLI 自带的 qrcode 子命令(wecom-cli 就没有)。关默认的 image 渲染器
+# (省掉 image crate 依赖),只用 svg 渲染器。
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# 0.30:Message::Text 的 String→Utf8Bytes、Ping/Pong 的 Vec→Bytes,relay_client.rs 已适配。
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rand = "0.10"
+# Keep 0.22: age, codewhale-tui, reqwest 0.12, ureq 2.12, termwiz,
+# pinvou-knowledge and this crate itself still require 0.22 (hf-hub and
+# ort-sys have no direct base64 dependency — theirs arrives transitively
+# via reqwest and ureq; verify against Cargo.lock before listing a
+# holdout here). rmcp 3 declares
+# base64 0.23 as an optional dependency enabled only by its
+# default/request-state/client-side-sse/auth-enterprise-managed/
+# server-side-http features; this graph enables just auth + client
+# (default-features = false), so rmcp adds no base64 requirement
+# here. A solo 0.23 bump would leave those holdouts on a separate
+# 0.22 copy. Revisit once upstreams align.
+base64 = "0.22"
+tempfile = "3"
+age = { version = "0.12", default-features = false }
+
+# Computer Use capability foundation (features/computer_use): screen capture via
+# xcap (0.9.8, reusing its re-exported image 0.25 for PNG encoding/scaling, no direct
+# image dependency anymore), input injection via enigo 0.6 (Result-only,
+# Windows/macOS/X11). Both APIs are fully synchronous with unsafe FFI inside; always
+# construct/use/drop them on computer_use's dedicated worker thread.
+xcap = "0.9.8"
+enigo = "0.6"
+
+# keyring 不再直接依赖 —— 凭证走底座 codewhale-secrets(它内部按平台引 keyring)。
+# macOS 桌伴窗口策略补丁(pet_window.rs):
+# - NSWindowCollectionBehavior 跨 Space/全屏保持可见(TAO 只设 level,没设 collectionBehavior)
+# - NSStatusWindowLevel 提升桌宠浮在全屏 App 之上
+# detach.rs 的撕离拖拽已改用 CoreGraphics FFI(不再依赖 objc2 NSEvent global monitor)。
+# objc2 0.6.x 是 tao 0.35.2 的传递依赖,这里显式声明只是为了把 major/minor
+# 提升到**直接依赖**(否则它只是传递依赖,Cargo 不会按 app 的意愿解析)。
+# 注意:这些是 caret 版本(objc2 = "0.6" 允许 0.6.x 内任意 minor/patch 升级),
+# **不是** ABI 严格锁——严格锁应写成 `=0.6.4`。caret 版本只保证对齐到同一 major:
+# objc2 0.6.x / objc2-app-kit 0.3.x / objc2-foundation 0.3.x,与 tao 0.35.2
+# 期望的 objc2 family major 一致即可。具体 patch 由 Cargo.lock 在 lockfile 阶段
+# 固定(当前 0.6.4 / 0.3.2)。如未来需要绝对复现同一 ABI,改为精确锁 `=0.6.4`。
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri = { version = "2.12", features = ["macos-private-api"] }
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+# BrowserCore invokes WKWebView's public async JavaScript API directly.  Keep
+# the binding surface deliberately narrow: the page world, main-frame async
+# completion, and the WKWebView class itself.  AppKit input is dispatched
+# through the existing objc2-app-kit dependency below; no Safari/remote
+# debugging process is involved.
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "WKContentWorld",
+    "WKFrameInfo",
+    "WKWebView",
+] }
+# block2: Speech framework 的 recognitionTask result handler 是 Obj-C block,
+# voice_asr_speech.rs 用 block2::RcBlock 包装 Rust 闭包。版本对齐 objc2 0.6 family。
+block2 = "0.6"
+# macOS 系统 Speech framework 绑定,替代内嵌 SenseVoice ASR 引擎——免模型下载、
+# 免 ffmpeg、零额外体积。项目构建与应用最低系统版本统一为 macOS 11。
+objc2-speech = { version = "0.3", default-features = false, features = [
+    "std",
+    "SFSpeechRecognizer",
+    "SFSpeechRecognitionTask",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTaskHint",
+    "SFTranscription",
+    "SFTranscriptionSegment",
+    "block2",
+    "objc2-avf-audio",
+    "objc2-core-media",
+] }
+# Computer Use accessibility tree (features/computer_use): macOS ApplicationServices
+# (AXUIElement / HIServices). Version aligned with the objc2 0.6 family.
+objc2-application-services = "0.3"
+# Computer Use capture-permission preflight (features/computer_use): CGPreflight/CGRequestScreenCaptureAccess.
+# Already in the lockfile (0.3.2, an objc2-family transitive dependency); here it is only
+# promoted to a direct dependency, adding no new crate.
+objc2-core-graphics = "0.3"
+# Computer Use screen capture (features/computer_use): ScreenCaptureKit static screenshots
+# (SCScreenshotManager::captureImageInRect, macOS 15.2+). CGWindowListCreateImage
+# (xcap's macOS path) is obsoleted in the macOS 15 SDK and triggers the periodic
+# screen-recording re-confirmation on Sequoia+; below macOS 15.2 xcap's CGWindowList path
+# is still the fallback (see platform/screen_capture_kit.rs). Version aligned with the objc2 0.6 family.
+# Computer Use screen capture (features/computer_use): types such as CGRect/CGSize/CFRetained
+# come from objc2-core-foundation (the coordinate arguments of SCK calls and the CFData smart pointer). Already in the
+# lockfile (objc2-family transitive dependencies); here they are only promoted to direct dependencies, adding no new crates.
+objc2-core-foundation = "0.3"
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "SCScreenshotManager",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+] }
+
+[target.'cfg(windows)'.dependencies]
+tauri = { version = "2.12", features = ["tray-icon"] }
+# Keep this aligned with Tauri's resolved tray-icon/muda versions: Tauri
+# forwards their native events. Direct access supplies the public GUID API
+# needed to query registration without losing Shell's S_FALSE success.
+tray-icon = { version = "=0.25.1", default-features = false }
+# Win32_Graphics_Gdi: the in-repo monitor capture (computer_use) BitBlts the
+# desktop DC directly — xcap 0.9.8's capture_monitor leaks one GDI bitmap per
+# call (DeleteObject runs while the bitmap is still selected into the memory
+# DC) and its selection is never restored.
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Performance", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+webview2-com = "0.39"
+# Native Outlook .msg parsing (ingest_email.rs; same gating the retired
+# os::msg_native_supported() predicate provided). Windows-only compile:
+# macOS/Linux take the msgconvert → .eml branch; previously dead-compiled everywhere.
+msg_parser = "0.3.0"
+# voice/platform/windows.rs 仅用 COM 基础类型(Interface/HSTRING/Result),它们源自
+# windows-core——不必拉入完整 windows crate。windows-core 已由 webview2-com 传递引入,
+# 此处显式声明只为把 app 直接依赖收敛到更轻的 windows-core(windows::core::* 即其 re-export)。
+# 0.62 与 codewhale-tui 的 windows 0.62.2、uiautomation 0.25 及 webview2-com 0.39
+# 收敛 app 直接依赖为单一版本；enigo 0.6.1（0.6 线暂无更新）在 Windows target 仍拉
+# windows 0.61.3/windows-core 0.61.2，该副本保留到 enigo 发版；不跳 0.100——那会新增
+# 第三份拷贝。
+windows-core = "0.62"
+# Computer Use accessibility tree (features/computer_use): Windows UI Automation.
+uiautomation = "0.25"
+# The same `windows` release uiautomation builds against, so it is already in
+# the lock through it and this adds no package. Declared directly because
+# `ui_tree`'s cache request needs `TreeScope_Element | TreeScope_Children`,
+# which uiautomation's plain `TreeScope` enum cannot express: the flag is set
+# on the underlying `IUIAutomationCacheRequest`, and that interface has to be
+# the type from this exact `windows` version.
+# The Win32_* features beyond Accessibility serve the computer-use virtual
+# display (features/computer_use/platform/windows_virtual): hidden-desktop
+# creation (StationsAndDesktops; the API is Security-gated upstream, so
+# Win32_Security is declared here explicitly instead of riding another
+# crate's feature unification), the hidden-desktop composite capture
+# (Graphics_Gdi), the kill-on-close job object wrapping launched apps
+# (JobObjects + Threading + Security), the message-level input posts
+# (UI_Input_KeyboardAndMouse + UI_WindowsAndMessaging), and the cloaked-
+# window filter for the composite (Graphics_Dwm).
+windows = { version = "0.62", features = [
+    "Win32_UI_Accessibility",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Security",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_JobObjects",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+] }
+
+# Process liveness probe using kill(pid, 0) semantics; see process_alive in
+# platform/os/posix.rs. Browser watch uses it to guard stale port-file
+# deletion. The macOS computer_use backend also reads `libc::pid_t` for the
+# self-targeted AX guard's pid comparisons.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Linux webview(webkit2gtk)默认拒绝 getUserMedia → 语音输入点麦克风被拒。
+# 连 permission-request 信号放行 UserMedia(麦克风)请求。版本对齐 wry 0.57 用的 2.0.x。
+[target.'cfg(target_os = "linux")'.dependencies]
+# Wayland same-session screen capture (features/computer_use/platform/wayland_capture, a
+# Linux-only module): the ScreenCast stream of the portal RemoteDesktop session takes frames
+# by connecting straight to PipeWire via the OpenPipeWireRemote fd. The version matches
+# xcap's transitive dependency. Lives in the Linux target section — macOS/Windows do not
+# compile this module. Linux builds need the PipeWire system headers: libspa-sys's build
+# script probes them via system-deps, so libpipewire-0.3-dev (plus libdrm-dev/libgbm-dev/
+# libegl-dev) must be installed or the build fails outright; the pr-check Linux jobs install
+# these in their apt steps.
+pipewire = "0.10"
+
+# Tauri 的 show/set_focus 是两条独立主循环消息；隐藏启动窗口在 release 下可能
+# 尚未完成 map 就执行 present。直接在 GTK 主线程原子 show/deiconify/present。
+gtk = "0.18"
+webkit2gtk = "2.0"
+# 输入框粘贴图片兜底(platform/os/linux/linux_clipboard.rs):WebKitGTK 的 paste
+# 事件不携带图像数据,经 GTK 剪贴板读图(gtk::gdk::SELECTION_CLIPBOARD)并编码
+# PNG;gdk 经 gtk 的 re-export 访问,不引入直接依赖(避免双 Cargo.lock 同步)。
+# 多窗口撕离(detach.rs begin_detach_drag):X11 XQueryPointer 读全局鼠标坐标+左键状态,
+# 驱动鬼影跨屏跟随 + 松手落位。Wayland(无 XWayland)下不可用 → 降级(后续 task)。
+# 直连 x11 而非经 device_query 封装:x11 已被 gdkx11(wry/tauri 栈)拉入图,直连零新增 crate,
+# 且消除 device_query 独占拖入的 windows 0.48 链(windows-targets + 7 个 win 二进制 crate)与
+# macOS-only 传递依赖(readkey/readmouse/macos-accessibility-client)——这些本就永不编译
+# (device_query 的 windows/macOS dep 是 cfg-gated 死重),仅污染 lockfile。仅用 xlib feature。
+x11 = { version = "2.21", features = ["xlib"] }
+# BrowserCore reads JSON results from WebKitGTK's evaluate_javascript callback.
+# This is already a transitive WebKit dependency; declaring it directly keeps
+# the platform driver on the public typed API instead of reaching into FFI.
+javascriptcore = { package = "javascriptcore-rs", version = "1.1" }
+# Computer Use accessibility tree (features/computer_use): Linux AT-SPI (D-Bus).
+atspi = "0.30"
+# Computer Use Wayland input injection (features/computer_use): xdg-desktop-portal
+# RemoteDesktop (D-Bus). The feature set matches atspi, sharing the same zbus compilation.
+# Held on 5.x even though zbus 6.0.0 (2026-10, MSRV 1.89) exists: atspi 0.30 pins
+# zbus ^5.5 and secret-service keeps the 4.4 copy in the lock, so a direct 6 would
+# be a third zbus major; the 5.x companion crates (zbus_names/zvariant) now carry
+# unmaintained advisories, suppressed by unmaintained="workspace" in deny.toml.
+# Move together with atspi.
+zbus = { version = "5.5", default-features = false, features = ["async-io"] }
+# Tauri's unstable Wry plugin API lets the browser feature pre-register its
+# dedicated WebKit context with automation enabled. Keep this exact version
+# aligned with Tauri's resolved runtime so the unstable runtime API cannot drift.
+tauri-runtime-wry = "=2.12.5"
+# Computer Use virtual display (features/computer_use/platform/linux_virtual):
+# pure-Rust X11 connection for Xvfb readiness polling and full-screen GetImage
+# capture. default-features = false keeps the pure-Rust RustConnection path —
+# libxcb is NOT needed and the dl-libxcb/allow-unsafe-code features must stay
+# off (a hidden Xvfb with no libxcb dependency is the point of this backend).
+# Already in the lock (global-hotkey pulls it), so this adds no new crate.
+# NOTE: x11rb 0.13 has no connect_to_display_with_auth helper; the explicit
+# cookie path is parse_display → DefaultStream::connect →
+# RustConnection::connect_to_stream_with_auth_info (see the linux_virtual
+# module docs for the verified recipe).
+x11rb = { version = "0.13", default-features = false }
+
+# =============================================================================
+# Lint gates — hard-gate design: deny only lints with a measured zero
+# backlog; lints/groups with backlog are explicitly allowed with the backlog
+# size noted, to be enabled one by one by follow-up cleanup PRs.
+# CI (rust-lint job in pr-check.yml) runs two steps (no continue-on-error):
+# `cargo clippy --lib --bins --no-deps --features dev-tools -- -D warnings`
+# and `+ --tests`; a deny hit fails CI, allowed backlog lints stay silent.
+# Measured baseline (rustc 1.97.1, 2026-08-24, after the edition 2024
+# migration): every individually denied lint below has zero backlog; the
+# `all` group still carries hundreds (collapsible_if ~154,
+# too_many_arguments ~22, unnecessary_sort_by 7, …) so the group stays
+# allowed and only high-value lints are denied individually.
+# The remaining 19 private_interfaces hits all originate from the CodeWhale
+# submodule — not covered by this table under --no-deps (upstream backlog).
+# =============================================================================
+[lints.rust]
+# —— Zero backlog, deny hard gate (measured 0 violations) ——
+# Operations inside unsafe blocks still require explicit unsafe blocks,
+# preventing accidental misuse:
+unsafe_op_in_unsafe_fn = "deny"
+# Redundant nested braces in imports, e.g. `use std::{collections::{HashMap}};`
+unused_import_braces = "deny"
+# Explicit lifetime annotations that could be elided:
+unused_lifetimes = "deny"
+# Unused imports / variables / mut:
+unused_imports = "deny"
+unused_variables = "deny"
+unused_mut = "deny"
+# edition 2024 is adopted; this group keeps the code upgradable under
+# future rustc evolution (measured zero backlog):
+rust_2024_compatibility = "deny"
+# Known future-incompatible patterns (deprecated syntax etc.; zero backlog):
+future_incompatible = "deny"
+# Transitional while pub reachability is being tightened (rust_2018_idioms
+# backlog cleared in this PR; warn→deny after one stable observation cycle):
+rust_2018_idioms = "warn"
+# Hidden lifetime parameters (elided_lifetimes_in_paths is part of the
+# group; backlog cleared in the same pass). The rust_2018_idioms warn above
+# covers it; raising to deny is left to a follow-up cleanup PR.
+
+# —— Backlog: explicitly allowed; sizes noted, to be re-enabled after cleanup ——
+# unreachable_pub: 1795 hits (crate-wide pub tightening; large effort, own PR).
+unreachable_pub = "allow"
+# let_underscore_drop: 306 hits (`let _ =` swallowing Drop side effects; each
+# site needs semantic confirmation).
+let_underscore_drop = "allow"
+# dead_code: 96 hits (historical keepers / cfg residue; needs triage).
+dead_code = "allow"
+# private_interfaces: 14 hits (pub interfaces exposing private types; to be
+# tightened together with unreachable_pub).
+private_interfaces = "allow"
+# missing_docs: 699 hits — this crate is a private bin (never published to
+# crates.io, no external consumers); doc completeness is of limited value,
+# allowed long-term.
+missing_docs = "allow"
+
+[lints.clippy]
+# —— The all/pedantic groups carry historical backlog; allowed as groups
+# (priority=-1 keeps the individual denies below effective) ——
+# The all group still measures in the hundreds (collapsible_if ~154 /
+# too_many_arguments ~22 etc.) and grows as clippy evolves; allowing the
+# whole group is the conservative posture. The individually denied lints
+# below are unaffected. The pedantic group has ~2360 hits (doc_markdown 871,
+# mostly from mixed Chinese/English comments) — allowed long-term; the
+# high-value subset is denied individually below.
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+# The perf group used to be allowed together with `all`; the measured backlog
+# in 2026-09 was only 3 warnings (result_large_err / large_enum_variant /
+# manual_ascii_case_insensitive) and has been cleared, so the group is
+# promoted to a hard deny gate to keep redundant_clone-class perf regressions
+# out (priority=1 overrides the -1 on `all`).
+perf = { level = "deny", priority = 1 }
+
+# —— Curated zero-backlog regression guards: deny hard gate (0 violations,
+# new hits fail CI) ——
+# dbg!/todo!/unimplemented! panic at runtime or leave debug residue behind.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Redundant unwrap (correctness class, very low false-positive rate).
+unnecessary_unwrap = "deny"
+# Forbid `dep = "*"` wildcard versions (prevent future un-pinned deps).
+wildcard_dependencies = "deny"
+# Pointer `as` casts (provenance pitfalls in FFI; all converted to
+# ptr.cast(), deny prevents regressions):
+ptr_as_ptr = "deny"
+# Rc<Mutex<_>> deadlock footgun / needless heap alloc of Rc<String>/Rc<Vec>
+# (measured 0):
+rc_mutex = "deny"
+empty_drop = "deny"
+# Single-arm match destructuring suggested as if let (style class, uniform):
+single_match = "deny"
+# cargo group: feature naming hygiene (measured 0; guards against future
+# counter-intuitive feature names):
+negative_feature_names = "deny"
+redundant_feature_names = "deny"
+
+# —— Cleared in this PR, kept at warn for one observation cycle before deny ——
+# Every unsafe block requires a SAFETY comment (the edition 2024 migration
+# added many unsafe blocks). The macOS/Linux compile surface was annotated
+# first; the legacy Windows-only unsafe blocks (PDH/registry/NtDll FFI etc.)
+# are annotated since the issue #491 cleanup, so all three desktop targets
+# pass the gate.
+undocumented_unsafe_blocks = "warn"
+# unwrap/expect in a long-lived desktop process kills the session on panic
+# (baseline: unwrap 6 / expect 38; test code exempt). Production code is
+# cleared in this PR; kept at warn to prevent regressions.
+unwrap_used = "warn"
+expect_used = "warn"
+# unwrap/expect inside Result constructors (API smell; baseline 3):
+unwrap_in_result = "warn"
+# process::exit skips cleanup hooks (one baseline site in the Tauri lib):
+exit = "warn"
+# `.get(i).unwrap()` pattern (baseline 0, deny directly):
+get_unwrap = "deny"
+
+# Not enabled: print_stdout/print_stderr — startup diagnostics rely heavily
+#     on eprintln! (before the logging backend is up); revisit once the
+#     logging pipeline is unified.
+# Not enabled: cargo_common_metadata — this crate is a private bin (never
+#     published to crates.io); repository/readme/keywords/categories are moot.
+# Not enabled: doc_markdown (871 hits) — comments are mostly Chinese;
+#     backtick-wrapping has low value and high noise there. Prose checks
+#     belong in a dedicated tool (e.g. cargo-spellcheck), not clippy.
+
+# =============================================================================
+# 构建优化 Profile —— release 开启「安全范围内最大优化」
+# =============================================================================
+# panic="unwind"(非 abort):底座 CodeWhale 用 catch_unwind 做工具调用 panic 隔离,
+# 改 abort 会破坏「单次工具 panic 不拖垮整个会话」的设计。
+# Per-platform state of identical-code folding (ICF) / dead-code elimination
+# (none of them needs a linker flag in this file):
+# - Linux: the release jobs inject lld + -Wl,--icf=safe (RUSTFLAGS, see
+#   release-packages.yml); dead-code section elimination is handled by
+#   rustc's default --gc-sections.
+# - Windows MSVC: rustc already passes /OPT:REF,ICF automatically when
+#   opt-level>0, so there is nothing to repeat.
+# - macOS: Apple ld/ld-prime has no ICF capability; rustc already passes
+#   -dead_strip by default.
+[profile.release]
+opt-level = 3
+# Thin LTO 替代 fat:fat 在 ubuntu 16GB runner 上编译 codewhale-tui + tauri 全图
+# 会 link 越线被 SIGTERM(merge_group run 实证)。thin 内存峰值与耗时远低于 fat,
+# 运行时优化损失可忽略(官方:大型项目 thin 常优于 fat)。
+# Note: with lto="thin", cargo compiles dependency crates with -C
+# linker-plugin-lto (producing LLVM bitcode); the final crate's -C lto=thin
+# rustc consumes that bitcode and completes cross-crate ThinLTO in its own
+# process, handing the linker only post-LTO plain objects (dependency code
+# included). No platform's linker ever touches bitcode, therefore — not
+# windows link.exe/lld-link, macOS Apple ld, or linux rust-lld/BFD; the
+# windows nsis and macOS dmg releases work through this same path. The lld
+# family is chosen for object-linking time and memory (rustc >= 1.90 bundles
+# rust-lld by default on x86_64-linux-gnu); release-packages' Linux release
+# jobs additionally inject -fuse-ld=lld as an older-toolchain fallback.
+# Mechanism clarification (verified with cargo 1.98 verbose output + rustc
+# docs): the final bin unit gets -C lto=thin — ThinLTO is executed by rustc
+# itself; dependency crates get -C linker-plugin-lto and their .o files are
+# pure LLVM bitcode (not even recognized as Mach-O by Apple's objdump), which
+# rustc reads back for LTO. That flag does not require linker plugin support
+# (rustc docs: "rustc can also read its own object files produced with
+# -Clinker-plugin-lto"). So thin LTO genuinely takes effect on all three
+# platforms (Apple ld / MSVC link.exe / lld), independent of linker identity.
+# The real reason the Linux release jobs inject -fuse-ld=lld: BFD ld links
+# large binaries with poor memory efficiency (proven OOM) and has no --icf,
+# so it cannot do identical-code folding (see the ICF comment).
+lto = "thin"
+codegen-units = 1
+# Zero-debug-info set for shipped artifacts: debug=false (rustc emits no
+# DWARF/line tables) + strip="symbols" (link-time --strip-all on ELF; a no-op
+# on MSVC, where the debug info lives in the PDB that is never packaged).
+# 1.98.0 already contains the Mach-O __LINKEDIT 8-byte alignment fix
+# (rust#157750, LLVM backport #158410), so macOS is back to the same strip
+# policy as Linux/Windows and no longer needs the macOS 27+ strip=none
+# injection (the workflow step was removed).
+# When symbolized crashes are needed: macOS can emit a dSYM via
+# split-debuginfo="packed", Linux a .dwp, Windows the PDB under target/ — all
+# are separate debug artifacts and never enter any shipped package.
+strip = "symbols"
+debug = false
+panic = "unwind"
+incremental = false
+
+# 专为 Release 测试/CI 用的轻量 profile:不 LTO、不禁 incremental,编译快但仍走 release 优化。
+# The pr-check macos-rust-check push legs (compile smoke + universal bundle
+# smoke, folded from mac-build.yml in 2026-10) use this profile, and their
+# artifacts can reuse each other (same profile, same target dir), avoiding a
+# duplicate full-graph compile under two profiles in CI.
+# 真正发版的 thin-LTO 产物由 scripts/release-macos.sh(走真 --release)产出。
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+# Smoke builds never enter shipped artifacts: keep line tables explicitly so
+# a panic backtrace from a failed CI smoke run resolves to line numbers
+# (release is now debug=false, so nothing is inherited implicitly). strip
+# must be relaxed back to none explicitly: the inherited strip="symbols"
+# would strip the line tables together with the symbol table at link time
+# (symbols is a superset of debuginfo in rustc semantics), so the line tables
+# would never actually reach the smoke binaries.
+debug = "line-tables-only"
+strip = "none"
+
+# Dev profile:line-tables-only 编译提速、overflow-checks 在调试期暴露整数回绕。
+[profile.dev]
+debug = "line-tables-only"
+opt-level = 0
+overflow-checks = true
+# 依赖在 dev 下也做轻量优化(否则全 debug 编译,运行太慢影响本地调试体验)。
+[profile.dev.package."*"]
+opt-level = 2
+
+# 与根工作区相同的 CJK 感知 unicode-width 补丁(#4479):本应用通过 path 依赖
+# 编译 CodeWhale 的 codewhale-tui,原版 width() 对等宽歧义字符按 1 列测量,
+# CJK 终端下造成单元格错位。补丁取自子模块内的同一份拷贝,保证嵌入式 TUI
+# 与依赖它的各工作区行为一致。
+[patch.crates-io]
+unicode-width = { path = "../../CodeWhale/patches/unicode-width-0.2.2" }

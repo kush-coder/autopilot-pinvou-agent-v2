@@ -1,0 +1,3132 @@
+//! pinvou3 内置 bundle：随 app 编译进去的 instructions.md / mcp.json / skills 模板，
+//! 首次启动时解包到 `~/.pinvou3/bundle/`。
+//!
+//! 与 user/ 严格分离：bundle/ 每次升级被覆写，user/ 永远不动。
+//! 解包用 `bundle/VERSION` 比对 [`BUNDLE_VERSION`]，相同则跳过。
+
+use std::path::PathBuf;
+
+use include_dir::{Dir, include_dir};
+
+use crate::platform::paths;
+
+mod extraction;
+pub use extraction::Pinvou3Bundle;
+
+/// 飞书官方域技能（lark-*，MIT，sync 自 github.com/larksuite/cli `skills/`）：
+/// 编译期内嵌整个 skills 目录树（各域 SKILL.md + references/*.md + NOTICE.md）。
+/// 启动解包到 `bundle_skills_dir`，供引擎 `SkillRegistry` 发现、`load_skill` 渐进披露。
+static LARK_SKILLS_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/resources/common/bundle/lark-skills");
+
+/// 企微官方域技能(wecomcli-*,MIT,来自 github.com/WecomTeam/wecom-cli `skills/`):
+/// 编译期内嵌整个 wecom-skills 目录树。**单独放 `wecom-skills/`**(不进 `skills/`)——
+/// `skills/` 整目录被 `LARK_SKILLS_DIR` 内嵌、随飞书门控解包,企微若混进去会被飞书
+/// 连带控制,故隔离成独立 include_dir + 独立门控。
+static WECOM_SKILLS_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/resources/common/bundle/wecom-skills");
+
+/// 钉钉官方 mono skill(dws,Apache-2.0,来自 dingtalk-workspace-cli `dws-skills.zip`)。
+/// 独立放 `dingtalk-skills/`，按钉钉连接 / 停用状态单独门控。
+static DINGTALK_SKILLS_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/resources/common/bundle/dingtalk-skills");
+
+/// 腾讯会议官方 CLI skill(tmeet-skill,MIT,同步自 github.com/TencentCloud/
+/// tencentmeeting-cli 对应 tag 的 `skills/tmeet-skill/`,见 NOTICE-tmeet.md)。
+/// 独立放 `tmeet-skills/`，按腾讯会议连接 / 停用状态单独门控。
+static TMEET_SKILLS_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/resources/common/bundle/tmeet-skills");
+
+// 连接器技能目录表（飞书 lark 9 + 企微 15 新名 + 0.1.9 legacy 名 + 钉钉/腾讯会议
+// mono skill）已下沉到 `crate::platform::connector_skills` 作为单一真相源：
+// marketplace 注册表（wecom 卡 skills 列表）、扁平布局迁移、`cli_bundle_of_skill`
+// 反查与 `legacy_cli_records` 首启登记与本模块的门控写/删共用（五轮评审必修 3：
+// marketplace 侧曾按 0.1.9 旧表写死 7 技能，与本表分叉）。
+// 此处 re-export 保持本模块及 extraction 的既有引用不变。
+pub(crate) use crate::platform::connector_skills::{
+    DINGTALK_SKILL_DIRS, DINGTALK_SKILLS_NOTICE, FEISHU_SKILLS_NOTICE, LARK_SKILL_DIRS,
+    TMEET_SKILL_DIRS, TMEET_SKILLS_NOTICE, WECOM_LEGACY_SKILL_DIRS, WECOM_SKILL_DIRS,
+    WECOM_SKILLS_NOTICE,
+};
+
+/// Bundle 版本号：手动 base + 自动 instructions.md 内容 hash（build.rs 注入）。
+/// 改 INSTRUCTIONS_MD 时不需要 bump base —— hash 自动变，ensure_extracted 自动覆写。
+/// 改其他 bundle 资源（mcp.json 默认 / skills 模板等）才需要手动 bump base。
+///
+/// 0.4: 加 Pinvou Review 内置 skills(pinvou-review-plan / pinvou-review-final)
+/// 0.5: 下线旧版演示工作流，phase 协议随之停渲
+/// 0.6: 加 present_artifact 内置 MCP server(成品卡):mcp.json 注册 + server 脚本解包
+/// 0.7: 下线 Pinvou Review v2(EXIT GATE 评审被推翻,等新方案):两个 review skill
+///      不再解包,既有装机的残留目录启动时清理
+/// 注:「视觉设计」内置 skill 在 VERSION gate 之前由 write_builtin_skills 每启动防御性写出,
+///     不依赖版本号 bump(同 write_mcp_servers）。
+/// 0.10: 接入飞书官方域技能(lark-shared + calendar/doc/drive/sheets/im/task/wiki/base):
+///       include_dir 内嵌 + 启动解包到 bundle_skills_dir,供 SkillRegistry 发现
+/// 0.11: Windows 敏感路径硬拦截新增 PowerShell hook,并补充 Credential Manager 相关拦截规则
+/// 0.13: 接入企微官方域技能(wecomcli-*,MIT):独立 wecom-skills/ 内嵌 + 独立门控
+/// 0.14: 接入钉钉官方 dws skill + Linux ARM64 内置 dws CLI
+/// 0.15: 增加 exec_shell 登录终端环境过滤 hook(shell_env.sh)
+/// 0.16: 接入腾讯会议官方 tmeet CLI skill
+/// 0.17: 接入腾讯 ima OpenAPI Skill（原生受控工具）
+/// 0.18: 连接器 CLI 统一为首次使用在线安装；原生 CLI 按平台 lock 校验后落用户目录
+/// 0.19: 增加多智能体深度护栏 hook，防止模型用单次 `max_depth` 覆盖会话上限
+/// 0.20: 多智能体深度上限调整为两层，正数覆盖仍拦截
+/// 0.21: 完整移除三省六部及专家团队
+/// 0.22: 连接器技能全量同步（lark 1.0.87 / dws 1.0.58 / tmeet 1.0.15 / wecom 适配）。
+///       四棵技能树不参与内容哈希，须 bump 语义版本让已连接用户启动即同步刷新
+///       （否则要等首帧后 refresh_connector_auth_gates 补刷）
+/// 0.23: wecom-cli 升 1.1.0：技能树按上游服务模型重排为 14 个（msg→message、
+///       schedule→calendar，新增 disk/doc-manage/email/media/shared/sheet/smartpage），
+///       旧目录（wecomcli-msg/wecomcli-schedule）启动门控时清理。
+/// 0.25: wecom sheet/smartsheet/smartpage routing-rule unification and
+///       fixes, plus calendar/meeting/email/message/media doc-audit
+///       fixes (15 findings; all registered in NOTICE-wecom.md). Takes
+///       the slot reserved for #366 by the 0.28 entry; the
+///       extracted-VERSION gate is inequality-only, so landing order
+///       and skipped numbers stay safe. Skill trees are excluded from
+///       the content hash, so the semantic bump is required for
+///       connected users to refresh at startup.
+/// 0.26: tmeet-skill doc-audit fixes (seventh review round), registered
+///       as entries 7-12 in NOTICE-tmeet.md: contact downstream command
+///       list, underscore command names, crossed cause/solution columns
+///       in the error table, hard-constraint item reference,
+///       playback-address wording, and a digits-only meeting-code
+///       reminder. Takes the slot reserved for #362 by the 0.28 entry;
+///       the extracted-VERSION gate is inequality-only, so landing
+///       order and skipped numbers stay safe. Skill trees are excluded
+///       from the content hash, so the semantic bump is required for
+///       connected users to refresh at startup.
+/// 0.27: dws doc-audit fixes, 11 findings. The dws skill tree is excluded from the
+///       instructions content hash like the other connector trees, so
+///       connected installs skip re-extraction unless the semantic base
+///       changes. Lands after 0.28 (lark-skills #365), the 0.26
+///       re-take (tmeet #362), and the 0.25 re-take (wecom #366) are
+///       already on main; the extracted-VERSION gate is inequality-only,
+///       so 0.25 -> 0.27 still changes the build VERSION and triggers
+///       startup re-extraction.
+/// 0.28: lark-skills doc audit fixes, 31 findings across eight packs
+///       (registered in lark-skills/NOTICE.md, including review fixes
+///       aligned with CLI v1.0.87 ground truth). Version takes the next
+///       free slot after 0.24 (weibo #333), 0.25 (wecom #366),
+///       0.26 (tmeet #362), and 0.27 (dws #359); 0.27 was already
+///       claimed by #359, and a duplicate number would leave the
+///       upgraded build VERSION unchanged between the two PRs and skip
+///       startup re-extraction. Skill trees are excluded from the
+///       content hash, so the semantic version must be bumped for
+///       connected users to refresh at startup (otherwise the refresh
+///       waits for the post-first-frame refresh_connector_auth_gates
+///       backfill).
+/// 0.30: wecomcli doc-audit second-round fixes, 21 findings across ten
+///       packs (PR #438, registered in NOTICE-wecom.md). Next free slot
+///       after 0.27 (dws #359, on main) and 0.29 (lark-skills #439, in
+///       review); the extracted-VERSION gate is inequality-only, so
+///       landing order and skipped numbers stay safe. Skill trees are
+///       excluded from the content hash, so the semantic bump is
+///       required for connected users to refresh at startup (otherwise
+///       the refresh waits for the post-first-frame
+///       refresh_connector_auth_gates backfill).
+/// 0.31: lark-skills model-facing doc-audit partition fixes, 21
+///       findings across eight packs (PR #439, registered in
+///       lark-skills/NOTICE.md, verified against CLI behavior and
+///       upstream main): identity-switch consent gates, condition_list
+///       null semantics, workflow outer-field contract, dropdown color
+///       semantics, wiki token-routing split, task search routing, and
+///       deduplications. Next free slot after 0.29 (lark-skills #439,
+///       reserved in review) and 0.30 (wecom #438, on main); the
+///       extracted-VERSION gate is inequality-only, so landing order
+///       and skipped numbers stay safe. Skill trees are excluded from
+///       the content hash, so the semantic bump is required for
+///       connected users to refresh at startup (otherwise the refresh
+///       waits for the post-first-frame refresh_connector_auth_gates
+///       backfill).
+/// 0.32: connector skill trees synced to latest upstream (wecom-cli
+///       1.2.1 skills, lark-cli 1.0.95, dws 1.0.61, tmeet 1.0.18; sync
+///       records live in the lark/wecom/tmeet NOTICE ledgers, the dws
+///       NOTICE keeps only a modifications summary). wecom-cli min
+///       acceptable version raised to 1.2.1; tmeet npm pin raised to
+///       1.0.18. Skill trees are excluded from the content hash, so
+///       the semantic bump is required for connected users to refresh
+///       at startup (otherwise the refresh waits for the post-first-frame
+///       refresh_connector_auth_gates backfill).
+/// 0.33: model-facing text audit fixes across the bundle (no upstream sync).
+/// Skill trees: dws danger-table row, five reference files, and the
+/// calendar_schedule_meeting.py script all stopped citing the nonexistent
+/// `calendar participant *` (`attendee` + `--attendees` is the real
+/// surface), stale P0/P1 attendance marker dropped, non-blocking auth
+/// guidance added across SKILL.md first-use pointer, global-reference.md,
+/// event.md, and the attendance_report_checkin.py error outputs;
+/// wecomcli-email send/reply body files unified
+/// to tmp/mail/ so intermediate mail bodies stop landing in the
+/// artifact-panel root (NOTICE-wecom.md); tmeet example `--meeting-id`
+/// placeholders moved from the 9-digit meeting-code form to the 19-digit
+/// meeting-id form, 54 sites, and the agent_init invocation path is now
+/// Skill-root-qualified (NOTICE-tmeet.md); 20 lark sites across 19 files
+/// rewritten from blocking `auth login --scope` to the lark-shared
+/// `--no-wait --json` split-flow form or carrier-pointer-only phrasing
+/// (lark-skills/NOTICE.md; connector contract rule 5
+/// tightened to match). Hooks:
+/// multiagent_depth_guard now emits its deny reason as stdout
+/// JSON (the engine reads reasons only from stdout; stderr never reaches the
+/// model) with a truthful narrow-only rationale (foundation #5253 min-clamp)
+/// and covers the workflow snake_case alias plus the quoted camelCase key;
+/// deny_sensitive_paths names both
+/// blocked tools, matches connector aliases case-insensitively, and its
+/// header now documents the real fail-closed contract (deny_sensitive_paths.sh
+/// is content-hashed and self-invalidates; the depth-guard twins,
+/// deny_sensitive_paths.ps1, and shell_env.sh are not hashed and ride this
+/// bump). Built-in visual-design skill: real images inlined as data URLs
+/// only (no external URLs, no relative-path image files — the artifact-card
+/// srcDoc preview has no asset resolver), matching the poster scene;
+/// present_artifact protocol stated once. mcp-servers browser protocol text
+/// aligned with the enforced URL gate and uid lifetime (browser-wrapper-protocol.mjs,
+/// browser-core-protocol.mjs; MCP server scripts are rewritten on every boot
+/// and do not depend on this bump). Next free slot after 0.32.
+/// Skill trees are excluded from the content hash, so the semantic bump is
+/// required for connected users to refresh at startup (otherwise the refresh
+/// waits for the post-first-frame refresh_connector_auth_gates backfill).
+/// 0.34: third-party connector skill trees re-synced to the upgraded CLI
+/// pins (no behavior change outside the trees; BUNDLE_VERSION must move so
+/// connected installs re-extract). dws skills 1.0.61 → 1.0.64: new
+/// contract/html/dingtalk-tag domains plus the oa template suite, the
+/// one-stop `aitable +import-file` shortcut retires the import-script
+/// path, server-side `record stats`/`psql` analytics routing, shortcut
+/// counts re-measured against the pinned 1.0.64 binary (upstream's todo
+/// doc still says 21; the shipped table follows the measured binary: 20); lark skills 1.0.95 → 1.0.98: sheets
+/// SKILL.md rewritten upstream (condensed speed table, 9 editing rules,
+/// +filter-view/+history/+range-copy commands, sheets_df.py renamed
+/// lark_sheets_df.py), lark-task prerequisite links path-fixed upstream
+/// under the local linkified form; wecom skills 1.2.1 → 1.3.4: new
+/// wecomcli-pptx skill (documents the binary's `slide` surface, 15th
+/// skill), upstream anti-injection "安全提示" sections adopted, shared
+/// version-gate text raised to 1.3.4. tmeet skills re-verified against
+/// upstream v1.0.18 (still latest; only registered local modifications
+/// differ). All replayed local normalizations are registered in the
+/// NOTICE files (lark/wecom/tmeet keep full sync ledgers; the dws
+/// NOTICE carries a modifications summary plus a git-history pointer
+/// to its pre-trim ledger — see the 2026-10 hygiene trim). Next free
+/// slot after 0.33.
+/// 0.35: model-facing text fixes inside the dws and lark skill trees from
+/// the PR #808 stale-comment sweep (no upstream sync, no code change): dws
+/// oa actionerRules count corrected 10 → 11 across oa.md /
+/// oa-process-nodes.md / approver.md / handler.md with the missing
+/// `target_connect_approval` rule documented, condition.md's example node
+/// type fixed `audit` → `handler`, form-components.md control classes
+/// corrected 五大类 → 六大类, sheet-search-replace.md documents the real
+/// `--find`/`--replacement` emptiness contract, and the five
+/// attendance_report_*.py header/state comments aligned with the code;
+/// lark-sheets-workbook.md shortcut count corrected 14 → 16. The lark
+/// entry is registered in lark-skills/NOTICE.md for the next upstream
+/// sync replay; the dws-side replay record stays reachable through the
+/// dws NOTICE's git-history pointer. Next free slot after 0.35.
+/// Skill trees are excluded from the content hash, so the semantic bump is
+/// required for connected users to refresh at startup (otherwise the refresh
+/// waits for the post-first-frame refresh_connector_auth_gates backfill).
+/// 0.36: model-facing guidance gaps from the 2026-10-07 audit's undelivered
+/// fork-side items (no upstream sync, no Rust logic change): lark
+/// calendar `+meeting` row no longer routes video-conference link
+/// retrieval through `+get` (the reference documents meeting_id/meeting_note
+/// only) and states the `+create` default-VC fact; lark-shared gains the
+/// CLI-not-installed/host-managed install pointer, the on-demand-auth
+/// reminder, and a central rate-limit default (per-reference specifics
+/// still win); wecomcli-meeting's open_vid≡userid equivalence claim
+/// replaced with the wo-prefix contact-search-only rule; wecomcli-contact /
+/// wecomcli-doc / wecomcli-doc-manage gain compact business-failure
+/// sections in the meeting pack's retry-cap style, with bounded automatic
+/// retries restricted to read-only ops — a timed-out write is an unknown
+/// outcome with no call-correlatable receipt: readbacks and name searches
+/// cannot attribute the result to this call, so the automation stops and
+/// reports "outcome unknown" for user confirmation instead of judging or
+/// re-writing (append/overwrite references carry the workflow); the scoped aux persona
+/// (bridge.rs AUX_SESSION_INSTRUCTIONS) explains the trailing
+/// `# userselect:` quote envelope while the zero-tool fallback persona
+/// stays verbatim. Hooks:
+/// multiagent_depth_guard's opaque-source gate matches any string-valued
+/// `"source_path"` key (grep cannot count nesting depth, so nested
+/// occurrences still deny — conservative, fail-closed) — the bare `path`
+/// manual fallback (an optional_str fallback, not serde) hit nested `path`
+/// fields inside plan payloads and false-denied legitimate calls (the deny
+/// message named only source_path);
+/// instructions-work / instructions-work-bound now explain the
+/// `<context_update>` delta messages (only the code lane did, via
+/// CORE_EXECUTION_PROFILE_PROMPT). All entries registered in
+/// lark-skills/NOTICE.md and NOTICE-wecom.md for the next upstream sync
+/// replay. Next free slot after 0.35 (0.35 claimed by PR #808's
+/// comment-cleanup tree-text delivery). The instructions files are inside
+/// the content hash, so the changed hash alone already forces the startup
+/// refresh; the slot bump additionally delivers the un-hashed surfaces —
+/// skill trees (also backfilled post-first-frame by
+/// refresh_connector_auth_gates for currently visible connectors) and the
+/// depth-guard hook twins, whose only writer is this bundle_changed-gated
+/// block — and keeps one coherent slot per delivered batch.
+pub const BUNDLE_VERSION: &str = concat!("0.36-", env!("BUNDLE_INSTRUCTIONS_HASH"));
+
+/// Native ordinary/code instructions share this compile-time skeleton.
+/// skeleton = identity / baseline / user memory (placeholder) / tool-and-fact discipline /
+/// how-to / red lines / output; three placeholder lines:
+/// `{{PINVOU3_MEMORY_SECTION}}` at the 「用户记忆」 slot, filled per the memory toggle
+/// (see [`memory_section`]),
+/// `{{PINVOU3_MODE_ENV_SECTION}}`（§工作环境 位）与
+/// `{{PINVOU3_MODE_ARTIFACT_RULE}}`（§验证与交付 的成品条位）。
+/// Work environment/browser sections and the final artifact rule occupy separate
+/// slots, preserving the current mode composition without duplicating the skeleton.
+pub const INSTRUCTIONS_SHARED_MD: &str =
+    include_str!("../../../../resources/common/bundle/instructions-shared.md");
+
+/// Body of the 「用户记忆」 (user memory) section; fills the `{{PINVOU3_MEMORY_SECTION}}`
+/// placeholder line when enabled, trailing inter-section blank line included.
+/// Long-term memory is an optional capability: off by default, and force-disabled for
+/// non-Simplified-Chinese users by prefs' `enforce_memory_locale_policy`. If the section
+/// went into the skeleton unconditionally, a memory-disabled user saying 「记住」
+/// ("remember this") would get the guided confirmation 「已记下」 ("noted") while the
+/// background writes no memory — violating the factual persistence contract.
+/// So the skeleton keeps only the
+/// placeholder line, and the session render layer fills the body or an explicit
+/// off-notice based on `memory_enabled`; it stays out of the `instructions_md` OnceLock and shares
+/// `{{PINVOU3_SUDO_INSTRUCTION}}`'s lifecycle (setting changes take effect on new sessions).
+const MEMORY_SECTION_MD: &str = "## 用户记忆\n\
+- 用户明确要求记住内容时，简短确认收到请求，同轮继续任务。应用后台在回合结束后处理长期保存，必要时请求确认；未取得保存结果前，不断言已持久保存。\n\
+- 对未明确要求记忆的偏好自然回应，不承诺入库。只使用实际提供的记忆，不编造“我记得”；与当前明确要求冲突时，以当前要求为准；事实核对和指令优先级见「底线」。\n\n";
+
+/// Off-state fill for the same placeholder: memory is off by default (and
+/// force-disabled for non-Simplified-Chinese users), so the default session has
+/// no 「用户记忆」 section at all. Without this line the model's default behavior
+/// on 「记住」 is still a confirmation ("sure, noted") while nothing persists —
+/// the same persistence contract [`MEMORY_SECTION_MD`] guards against. Chinese
+/// is used to match the all-Chinese instruction file this line embeds into (the
+/// on-state [`MEMORY_SECTION_MD`] is Chinese as well).
+const MEMORY_OFF_NOTICE_MD: &str = "本会话长期记忆已关闭。用户要求记住时，不声称已长期保存；说明需先切换到简体中文界面，再在设置中开启。本轮照常完成任务。\n\n";
+
+/// Fill for the `{{PINVOU3_MEMORY_SECTION}}` placeholder line (newline included): the
+/// [`MEMORY_SECTION_MD`] when memory is on, a truthful off-notice ([`MEMORY_OFF_NOTICE_MD`])
+/// when off so the model never claims a memory write that will not happen.
+pub(crate) fn memory_section(enabled: bool) -> &'static str {
+    if enabled {
+        MEMORY_SECTION_MD
+    } else {
+        MEMORY_OFF_NOTICE_MD
+    }
+}
+
+/// Work-mode layer: the `## 工作环境` section for artifact-panel and tmp/ semantics, the
+/// `## Browser capabilities` section as the model's static discovery entry point for the
+/// embedded headed browser, and the present_artifact rule for `## 验证与交付`. Blank lines
+/// separate the three sections for [`work_layer_sections`].
+pub const INSTRUCTIONS_WORK_MD: &str =
+    include_str!("../../../../resources/common/bundle/instructions-work.md");
+
+/// Returns the three Work-layer sections: the complete `## 工作环境` section and complete
+/// `## Browser capabilities` section without trailing newlines, plus the artifact rule with
+/// its trailing newline.
+// The input is a compile-time embedded resource whose section structure is
+// fixed by the build artifact, and tests lock the rendered output byte for
+// byte; if the resource is accidentally modified, the panic surfaces at first
+// startup, and no runtime input exists that could make this branch reachable.
+#[allow(clippy::expect_used)]
+fn work_layer_sections() -> (&'static str, &'static str, &'static str) {
+    let (env_section, rest) = INSTRUCTIONS_WORK_MD
+        .split_once("\n\n")
+        .expect("instructions-work.md must contain the '## 工作环境' section, a blank line, and the '## Browser capabilities' section");
+    let (browser_section, artifact_rule) = rest.split_once("\n\n").expect(
+        "instructions-work.md must contain '## 工作环境', '## Browser capabilities', and the artifact rule separated by blank lines",
+    );
+    (env_section, browser_section, artifact_rule)
+}
+
+/// Environment section for plain sessions bound to a real working directory: a
+/// single `## 工作环境` section (with the `{{PINVOU3_WORKSPACE_HINT}}` workspace
+/// placeholder). Difference from the work layer's default environment section:
+/// the working target is the user-selected real directory (changes are visible
+/// live), with no artifact panel and no `tmp/` semantics.
+pub const INSTRUCTIONS_WORK_BOUND_MD: &str =
+    include_str!("../../../../resources/common/bundle/instructions-work-bound.md");
+
+/// work 模式完整 instructions（共享骨架 + work 层占位替换）。
+/// 与拆分前 instructions.md 逐字节相等。
+pub fn instructions_md() -> &'static str {
+    static RENDERED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RENDERED.get_or_init(|| {
+        let (env_section, browser_section, artifact_rule) = work_layer_sections();
+        INSTRUCTIONS_SHARED_MD
+            // Replace the environment placeholder with both `## 工作环境` and
+            // `## Browser capabilities`. Neither section has a trailing newline, so add
+            // the inter-section blank line and one final newline before following content.
+            .replace(
+                "{{PINVOU3_MODE_ENV_SECTION}}",
+                &format!("{env_section}\n\n{browser_section}\n"),
+            )
+            // 成品条位：占位行整体（含换行）替换为成品条原文 + 补回节间空行。
+            .replace(
+                "{{PINVOU3_MODE_ARTIFACT_RULE}}\n",
+                &format!("{artifact_rule}\n"),
+            )
+    })
+}
+
+/// Full instructions for plain sessions bound to a real working directory
+/// (shared skeleton + bound environment section + the work layer's Browser
+/// capabilities section and deliverables section): only the environment section
+/// swaps in the bound variant; browser and deliverable-card capabilities match
+/// plain sessions. `instructions_md()` keeps its byte-for-byte semantics.
+#[allow(clippy::expect_used)]
+pub fn instructions_work_bound_md(workspace_hint: &str) -> String {
+    let (_env_section, browser_section, artifact_rule) = work_layer_sections();
+    let env_section = INSTRUCTIONS_WORK_BOUND_MD
+        .trim_end()
+        .replace("{{PINVOU3_WORKSPACE_HINT}}", workspace_hint);
+    INSTRUCTIONS_SHARED_MD
+        .replace(
+            "{{PINVOU3_MODE_ENV_SECTION}}",
+            &format!("{env_section}\n\n{browser_section}\n"),
+        )
+        .replace(
+            "{{PINVOU3_MODE_ARTIFACT_RULE}}\n",
+            &format!("{artifact_rule}\n"),
+        )
+}
+
+/// 代码模式层（品悟原生代码会话）：§工作环境（代码模式身份 + `{{PINVOU3_WORKSPACE_HINT}}`
+/// 工作区占位）+ ## 代码场景纪律 增量段，两段以空行分隔。
+/// 底座 `CORE_EXECUTION_PROFILE_PROMPT` 不复制进文件，由 [`instructions_code_md`]
+/// 在渲染层原样拼接——上游更新自动跟随。
+pub const INSTRUCTIONS_CODE_MD: &str =
+    include_str!("../../../../resources/common/bundle/instructions-code.md");
+
+/// 代码模式完整 instructions（共享骨架 + 代码层）：
+/// 骨架的 §工作环境 位填代码版环境段（workspace_hint 已按绑定情况渲染），
+/// 成品条位整行删除（代码会话无产出物/成品卡语义）；尾部依次拼接底座
+/// core_execution 执行循环与 ## 代码场景纪律。
+// Same as work_layer_sections: the input is a compile-time embedded resource
+// whose section structure is fixed by the build artifact; if the resource is
+// accidentally modified, the panic surfaces at first startup, and no runtime
+// path can reach this branch.
+#[allow(clippy::expect_used)]
+pub fn instructions_code_md(workspace_hint: &str) -> String {
+    let (env_section, discipline) = INSTRUCTIONS_CODE_MD
+        .split_once("\n\n")
+        .expect("instructions-code.md 必须是 §工作环境 段 + 空行 + ## 代码场景纪律 段");
+    let env_section = env_section.replace("{{PINVOU3_WORKSPACE_HINT}}", workspace_hint);
+    let mut out = INSTRUCTIONS_SHARED_MD
+        .replace("{{PINVOU3_MODE_ENV_SECTION}}", &format!("{env_section}\n"))
+        .replace("{{PINVOU3_MODE_ARTIFACT_RULE}}\n", "");
+    out.push_str("\n\n");
+    out.push_str(deepseek_tui::prompts::CORE_EXECUTION_PROFILE_PROMPT.trim());
+    out.push_str("\n\n");
+    out.push_str(discipline.trim_end());
+    out.push('\n');
+    out
+}
+
+/// 内置「视觉设计」技能（设计系统直出 HTML）。编译期内嵌，解包到
+/// `~/.pinvou3/bundle/skills/visual-design/SKILL.md`，进 SkillRegistry 的 `## Skills`
+/// 目录。目录名与 frontmatter 均使用 v0.9 要求的安全命令名 `visual-design`；中文触发词
+/// 继续由 description / 正文承载。
+const VISUAL_DESIGN_SKILL_MD: &str =
+    include_str!("../../../../resources/common/bundle/builtin-skills/visual-design/SKILL.md");
+
+/// Test-only view of the embedded builtin-skill resource tree: binds
+/// `Pinvou3Bundle::BUILTIN_RELEASED_SKILL_DIRS` to the actual resources
+/// (same pattern as `wecom_skill_dirs_match_embedded_resources`).
+#[cfg(test)]
+static BUILTIN_SKILLS_DIR: Dir<'_> =
+    include_dir!("$CARGO_MANIFEST_DIR/resources/common/bundle/builtin-skills");
+
+/// pinvou3 版 base prompt，编译期内嵌。通过底座 `prompts::set_base_prompt_override`
+/// 注入，替换底座的上游 `BASE_PROMPT`。这样 pinvou3 的 prompt 定制活在 app,
+/// CodeWhale submodule 的 base.md 回退上游原文（fork drift 归零）。
+/// 注：base.md 已折叠为自述空壳，实际静态文案由本文件的 composer（见下）输出，
+/// 工具纪律与语言要求分别由 instructions.md 与 `LOCALE_PREAMBLE_*` 承载。
+pub const BASE_PROMPT_MD: &str = include_str!("../../../../resources/common/bundle/base.md");
+
+/// pinvou3 版简体中文 locale 前导段（替换底座 `LOCALE_PREAMBLE_ZH_HANS`）。
+/// Slimming rationale: the upstream text guards against thinking drifting to
+/// English (#1118) by mandating "think (reasoning_content) in Chinese" —
+/// dropped per product decision: mandating a thinking language hurts
+/// reasoning quality, and the thinking stream's language brings no
+/// user-perceivable benefit (production cloud routes default to
+/// `reasoning_effort=high`, thinking on — not "off" as an earlier comment
+/// claimed). Reply language follows the user's messages; this constant only
+/// adds the fallback for when the language is ambiguous. Same for the closer.
+pub const LOCALE_PREAMBLE_ZH_HANS: &str = "## 语言要求\n\n\
+pinvou3 界面语言为简体中文。跟随用户消息的语言回复;无法判断时用简体中文。\
+代码、路径、工具名、URL 保持原样。";
+
+/// pinvou3 版简体中文 locale 收尾段（替换底座 `LOCALE_CLOSER_ZH_HANS` ~660B）。
+pub const LOCALE_CLOSER_ZH_HANS: &str = "## 语言再提醒\n\n\
+跟随用户最新消息的语言回复;无法判断时用简体中文。";
+
+/// pinvou3 版日语 locale 前导段（替换底座 `LOCALE_PREAMBLE_JA` ~800B,瘦身
+/// 依据同 `LOCALE_PREAMBLE_ZH_HANS`）。
+pub const LOCALE_PREAMBLE_JA: &str = "## 言語要件\n\n\
+pinvou3 の UI 言語は日本語です。ユーザーのメッセージの言語に従って\
+返信し、判断できない場合は日本語を使用してください。コード、パス、\
+ツール名、URL は元のまま。";
+
+/// pinvou3 版日语 locale 收尾段（替换底座 `LOCALE_CLOSER_JA` ~660B）。
+pub const LOCALE_CLOSER_JA: &str = "## 言語再確認\n\n\
+ユーザーの最新メッセージの言語に従って返信してください。\
+判断できない場合は日本語。";
+
+/// Static Execute guidance follows the current turn's permission and mode
+/// posture. Per-turn reminders supply Plan and unattended constraints; this
+/// fragment preserves explicit authorization and refusal boundaries.
+pub const MODE_EXECUTE_MD: &str = "\
+## Mode: Execute
+
+Follow this turn's `<turn_meta>` permission/sandbox posture and `<system-reminder>`.
+Plan is read-only; consultation can be answered without changing files.
+For authorized implementation tasks, act, verify and deliver.
+When authorization is required, describe the concrete proposed change in your
+reply and wait for the user's decision.
+After a permission/approval refusal, stop the blocked operation. Reconsider it
+only when the required authorization or runtime conditions have actually changed;
+do not retry unchanged requests or switch channels to bypass the refusal.";
+
+/// pinvou3 版静态层 composer：接管底座全部编译期静态文案
+/// (taxonomy/base/personality/mode/approval/ContextMgmt/compact 模板)。
+/// 从此底座升级新增的静态块只进 default 合成,不漏进 pinvou3 prompt。
+/// 干掉:Personality(语气并入 base.md §Voice)、prompt-cache 教学、
+/// Session Longevity、Efficient Approvals、Core Tool Taxonomy(instructions
+/// 工具表已覆盖)、Compaction Relay 模板(实证死重:256K 自动压缩走
+/// `canonical_prompt()` 代码拼装、手动压缩走 `create_summary()` 独立 LLM
+/// 调用,二者均不按模板;`.codewhale/handoff.md` 在 pinvou3 无写入通路,
+/// `load_handoff_block` 永远 None——模板既无生产者也无消费者)。
+pub fn compose_static_layers(_ctx: &deepseek_tui::prompts::StaticPromptCtx<'_>) -> String {
+    // 底座宪法层(CONSTITUTION/WORKING RULES)已折叠进 instructions.md —— instructions 是
+    // 唯一 pinvou3 prompt 来源(单模型→多模型适配,2026-06-15 消融实测:base.md 对 Qwen3.6
+    // 可测量价值仅 Voice 语气,核心权威顺序/防编造已并进 instructions §底线)。静态层只剩 Mode。
+    //
+    // 不再按 `ctx.mode` 选块:底座 v0.8.57 把 mode/approval 移到 per-turn,调 composer 钉死传
+    // 常量 Yolo → 静态层恒为 Execute 块(dump 传 plan 实测亦出 `## Mode: Execute`)。Plan/Agent
+    // 的 mode 真相全靠 per-turn reminder,不在静态层;原 Plan/Agent 块是选不中的死代码,已删。
+    MODE_EXECUTE_MD.to_string()
+}
+
+/// 把 pinvou3 版 prompt 文案注入底座的 prompt 合成层。底座用 `OnceLock`,首次
+/// set 生效、后续返回 Err(rejected) —— 幂等,可在每个 `Bridge::boot` 入口重复调用
+/// (忽略后续 Err)。必须在任何 engine spawn 前调用(boot 早于 EnginePool 装配)。
+/// 上游 v0.8.49 起 `set_*_override` 返回 `Result<(), String>`(首次 Ok,重复 Err)。
+pub fn install_prompt_overrides() {
+    let _ = deepseek_tui::prompts::set_base_prompt_override(BASE_PROMPT_MD.to_string());
+    // Swap in the slim locale preamble/closer (see the `LOCALE_PREAMBLE_*`
+    // constant docs): the upstream long-form teaches "think in Chinese too",
+    // which is dropped per product decision (mandating a thinking language
+    // hurts reasoning quality, and the thinking stream's language brings no
+    // user-perceivable benefit; production cloud routes default to
+    // `reasoning_effort=high`, thinking on — not "off" as an earlier comment
+    // claimed), and the long-form still carries base branding while costing
+    // context every turn. Wire one pair each for zh-Hans / ja; the base
+    // leaves en empty, and prefs fills it via `extra_language_directive`.
+    let _ = deepseek_tui::prompts::set_locale_preamble_zh_hans_override(
+        LOCALE_PREAMBLE_ZH_HANS.to_string(),
+    );
+    let _ = deepseek_tui::prompts::set_locale_closer_zh_hans_override(
+        LOCALE_CLOSER_ZH_HANS.to_string(),
+    );
+    let _ = deepseek_tui::prompts::set_locale_preamble_ja_override(LOCALE_PREAMBLE_JA.to_string());
+    let _ = deepseek_tui::prompts::set_locale_closer_ja_override(LOCALE_CLOSER_JA.to_string());
+    // Full takeover of the static layer (fork patch:
+    // set_static_prompt_composer_override). Once set, the base's
+    // Personality/Mode/Approval/ContextMgmt/COMPACT_TEMPLATE/taxonomy
+    // constants never reach the prompt; compose_static_layers emits the
+    // replacement instead. The base override's remaining effect is only to
+    // occupy the base slot and suppress the base's bundled-headless compact
+    // constitution branch; compose_static_layers ignores ctx, and the base.md
+    // body (a pure comment shell) never enters the prompt.
+    let _ = deepseek_tui::prompts::set_static_prompt_composer_override(Box::new(|ctx| {
+        compose_static_layers(ctx)
+    }));
+}
+
+/// present_artifact MCP server 脚本(零依赖 python stdio),编译期内嵌,解包到
+/// `~/.pinvou3/bundle/mcp-servers/`。底座按 mcp.json 用 `python3 <path>` 拉起它。
+pub const PRESENT_ARTIFACT_SERVER_PY: &str =
+    include_str!("../../../../resources/common/bundle/mcp-servers/present_artifact_server.py");
+pub const MCP_PYTHON_DEPENDENCY_RUNNER_PY: &str =
+    include_str!("../../../../resources/common/bundle/mcp-servers/python_dependency_runner.py");
+
+/// Zero-dependency Node.js stdio wrapper for Browser MCP. It coordinates the app-owned
+/// native WebView with Rust BrowserManager, then hosts vendored chrome-devtools-mcp through
+/// `--browser-url`. Like present_artifact, it is embedded at compile time.
+pub const BROWSER_WRAPPER_MJS: &str =
+    include_str!("../../../../resources/common/bundle/mcp-servers/browser-wrapper.mjs");
+pub const BROWSER_WRAPPER_PROTOCOL_MJS: &str =
+    include_str!("../../../../resources/common/bundle/mcp-servers/browser-wrapper-protocol.mjs");
+pub const BROWSER_CORE_PROTOCOL_MJS: &str =
+    include_str!("../../../../resources/common/bundle/mcp-servers/browser-core-protocol.mjs");
+
+// --- 工具市场：内置 MCP server 资源 ---
+// 编译期内嵌资源已收编到 `marketplace::mcp_catalog`（单一真相源：清单、释放、
+// 校验同一份数据）；未安装包不再每启动全量释放到 bundle/mcp-servers/（§4）。
+
+/// Embedded bundle hook scripts — used by the ToolCallBefore hook injected
+/// via the bridge to correct skill-based connectors being mistakenly
+/// introspected as MCP. The sensitive-path/dangerous-command/sudo hard-deny
+/// segments the scripts used to carry have moved to the execpolicy rule
+/// engine (features/assistant/safety_deny_rules).
+pub const DENY_SENSITIVE_PATHS_SH: &str =
+    include_str!("../../../../resources/common/bundle/deny_sensitive_paths.sh");
+pub const DENY_SENSITIVE_PATHS_PS1: &str =
+    include_str!("../../../../resources/common/bundle/deny_sensitive_paths.ps1");
+
+/// Two-layer depth guard for multi-agent sessions. Mounted only in
+/// multi-agent EngineConfig; ordinary conversations do not use it. The
+/// session cap lets first-level agents spawn one more layer; the hook
+/// intercepts the positive depth-override field explicitly passed by the
+/// main session (nested subagent calls bypass ToolCallBefore and are
+/// backstopped by the inherited cap plus admission/concurrency quota);
+/// Workflow top-level `source_path` must switch to inline script/plan,
+/// since the hook cannot inspect file-internal args. The engine side also
+/// has a `path` manual alias not written into the schema (the
+/// `optional_str` fallback on `workflow_source`, not a serde alias); that
+/// alias is not intercepted here (bare-key matching would false-hit nested
+/// `path` fields inside plan payloads). The `path` interception predates
+/// the engine's #5253 min-clamp and was load-bearing before the clamp
+/// landed; the clamp now backstops in-file overrides, so this leftover is
+/// not an execution gap.
+pub const MULTIAGENT_DEPTH_GUARD_SH: &str =
+    include_str!("../../../../resources/common/bundle/multiagent_depth_guard.sh");
+pub const MULTIAGENT_DEPTH_GUARD_PS1: &str =
+    include_str!("../../../../resources/common/bundle/multiagent_depth_guard.ps1");
+
+/// 内嵌的 exec_shell CLI 兼容环境 hook：读取登录 shell 环境并过滤凭证。
+pub const SHELL_ENV_SH: &str = include_str!("../../../../resources/common/bundle/shell_env.sh");
+
+/// Browser MCP Node.js runtime fallback: search PATH when bundled Node.js is unavailable,
+/// which is expected in some development configurations.
+fn find_system_node() -> Option<std::path::PathBuf> {
+    let bin = if cfg!(windows) { "node.exe" } else { "node" };
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(bin))
+            .find(|c| c.is_file())
+    })
+}
+
+/// Returns whether the `browser` entry in mcp.json is historical residue owned by this app.
+/// The current shape uses Node.js as command and puts the wrapper in args[0]. An early build
+/// wrote the wrapper directly as the command in global mcp.json, leaving persistent residue
+/// on development machines that ran it. User-defined servers with the same name, such as
+/// playwright-mcp, match neither shape and must be preserved.
+fn is_browser_wrapper_residue(entry: &serde_json::Value) -> bool {
+    let cmd = entry.get("command").and_then(serde_json::Value::as_str);
+    let wrapper_in_args = entry
+        .get("args")
+        .and_then(|a| a.get(0))
+        .and_then(serde_json::Value::as_str)
+        .map(|a0| a0.ends_with("browser-wrapper.mjs"))
+        .unwrap_or(false);
+    cmd.map(|c| c.ends_with("browser-wrapper.mjs") || wrapper_in_args)
+        .unwrap_or(false)
+}
+
+/// Reserve the model-visible `browser` server name for Pinvou's task-owned
+/// browser inside a work-session config. A user may already own that name in
+/// the global config, so preserve their entry under a deterministic alias
+/// instead of overwriting it or letting it masquerade as the built-in browser.
+///
+/// The first alias is `browser_user`; occupied aliases advance from
+/// `browser_user_2`. The global config is never passed to this helper directly:
+/// callers operate on the parsed per-session copy.
+// Renaming is bounded by the number of user-defined servers, so a u64 suffix
+// cannot overflow in practice; the expect documents that invariant instead of
+// silently wrapping.
+#[allow(clippy::expect_used)]
+fn reserve_work_mode_browser_server_name(
+    servers: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    servers.remove("browser").and_then(|existing| {
+        if is_browser_wrapper_residue(&existing) {
+            return None;
+        }
+
+        let mut suffix = 1_u64;
+        let alias = loop {
+            let candidate = if suffix == 1 {
+                "browser_user".to_string()
+            } else {
+                format!("browser_user_{suffix}")
+            };
+            if !servers.contains_key(&candidate) {
+                break candidate;
+            }
+            suffix = suffix
+                .checked_add(1)
+                .expect("MCP server alias namespace exhausted");
+        };
+        servers.insert(alias.clone(), existing);
+        Some(alias)
+    })
+}
+
+fn install_work_mode_browser_server(
+    servers: &mut serde_json::Map<String, serde_json::Value>,
+    browser_entry: serde_json::Value,
+) -> Option<String> {
+    let migrated_name = reserve_work_mode_browser_server_name(servers);
+
+    servers.insert("browser".to_string(), browser_entry);
+    migrated_name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::features::marketplace::ENGINE_OWNED_MCP_SERVER_KEYS;
+    use crate::platform::credential_store::{
+        CredentialError, CredentialReference, CredentialStore,
+    };
+
+    #[derive(Clone, Default)]
+    struct RejectingCredentialStore;
+
+    impl CredentialStore for RejectingCredentialStore {
+        fn get(&self, _reference: &CredentialReference) -> Result<Option<String>, CredentialError> {
+            Err(CredentialError::new("test credential store unavailable"))
+        }
+
+        fn set(
+            &self,
+            _reference: &CredentialReference,
+            _value: &str,
+        ) -> Result<(), CredentialError> {
+            Err(CredentialError::new("test credential store unavailable"))
+        }
+
+        fn delete(&self, _reference: &CredentialReference) -> Result<(), CredentialError> {
+            Err(CredentialError::new("test credential store unavailable"))
+        }
+    }
+
+    #[test]
+    fn work_mode_browser_server_reserves_name_and_preserves_user_conflicts() {
+        let builtin = serde_json::json!({ "command": "pinvou-wrapper" });
+        let user_browser = serde_json::json!({
+            "command": "playwright-mcp",
+            "env": { "USER_SETTING": "kept" }
+        });
+        let existing_alias = serde_json::json!({ "command": "existing-user-browser" });
+        let existing_numbered_alias = serde_json::json!({ "command": "existing-numbered-browser" });
+        let mut servers = serde_json::json!({
+            "browser": user_browser,
+            "browser_user": existing_alias,
+            "browser_user_2": existing_numbered_alias,
+            "weather": { "command": "weather-mcp" }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let migrated = install_work_mode_browser_server(&mut servers, builtin.clone());
+
+        assert_eq!(migrated.as_deref(), Some("browser_user_3"));
+        assert_eq!(servers["browser"], builtin);
+        assert_eq!(servers["browser_user_3"], user_browser);
+        assert_eq!(servers["browser_user"], existing_alias);
+        assert_eq!(servers["browser_user_2"], existing_numbered_alias);
+        assert_eq!(servers["weather"]["command"], "weather-mcp");
+    }
+
+    #[test]
+    fn work_mode_browser_server_refreshes_its_own_residue_without_aliasing_it() {
+        let builtin = serde_json::json!({ "command": "fresh-pinvou-wrapper" });
+        let mut servers = serde_json::json!({
+            "browser": {
+                "command": "node",
+                "args": ["/old/browser-wrapper.mjs"]
+            },
+            "browser_user": { "command": "user-browser" }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let migrated = install_work_mode_browser_server(&mut servers, builtin.clone());
+
+        assert_eq!(migrated, None);
+        assert_eq!(servers["browser"], builtin);
+        assert_eq!(servers["browser_user"]["command"], "user-browser");
+        assert!(!servers.contains_key("browser_user_2"));
+    }
+
+    #[test]
+    fn disabled_builtin_still_reserves_browser_name_in_session_copy() {
+        let user_browser = serde_json::json!({ "command": "playwright-mcp" });
+        let mut servers = serde_json::json!({
+            "browser": user_browser,
+            "weather": { "command": "weather-mcp" }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let migrated = reserve_work_mode_browser_server_name(&mut servers);
+
+        assert_eq!(migrated.as_deref(), Some("browser_user"));
+        assert!(!servers.contains_key("browser"));
+        assert_eq!(servers["browser_user"], user_browser);
+        assert_eq!(servers["weather"]["command"], "weather-mcp");
+    }
+
+    #[test]
+    fn work_instructions_use_canonical_tools_without_hidden_bash_surface() {
+        let rendered = instructions_md();
+        for retired in [
+            "read_file",
+            "write_file",
+            "exec_shell",
+            "checklist_write",
+            "File(action=",
+            "Bash(action=",
+        ] {
+            assert!(
+                !rendered.contains(retired),
+                "retired tool leaked: {retired}"
+            );
+        }
+        for canonical in ["file_search", "terminal/run", "todo_write", "tool_search"] {
+            assert!(
+                rendered.contains(canonical),
+                "canonical guidance missing: {canonical}"
+            );
+        }
+        for discipline in [
+            "文件内容先用 `read` 核对，再决定修改",
+            "用 `write` 写入后核验实际文件",
+            "`bash` 只执行前台命令，不假定支持后台参数",
+        ] {
+            assert!(
+                rendered.contains(discipline),
+                "file/shell discipline missing: {discipline}"
+            );
+        }
+        // Ordinary sessions eagerly load the presenter; code-mode denial
+        // remains authoritative. Other hosts may defer it, so the text still
+        // teaches discovery/probing before claiming unavailability. Browser
+        // tools remain deferred; initial list absence alone proves nothing.
+        assert!(
+            rendered.contains("工具未出现时先 `tool_search`")
+                && rendered.contains("确认本轮无法呈现时"),
+            "the artifact-card rule must teach tool_search activation before declaring the backend unavailable"
+        );
+        assert!(
+            rendered.contains("工具未出现时，`tool_search` 搜索准确名称 `mcp_browser_list_pages`"),
+            "browser discovery must teach an exact query before concluding the entry is unavailable"
+        );
+    }
+
+    #[test]
+    fn work_instructions_include_browser_capability_section() {
+        // The model's static discovery entry point, `## Browser capabilities`, must render
+        // between `## 工作环境` and `## 工具与事实`. It must name the model-visible tools and
+        // override registry-first guidance because built-in Browser MCP is not in the registry.
+        let rendered = instructions_md();
+        let env_at = rendered
+            .find("## 工作环境")
+            .expect("the '## 工作环境' section must exist");
+        let browser_at = rendered
+            .find("## Browser capabilities")
+            .expect("the Browser capabilities section must exist");
+        let tools_at = rendered
+            .find("## 工具与事实")
+            .expect("the '## 工具与事实' section must exist");
+        assert!(
+            env_at < browser_at && browser_at < tools_at,
+            "Browser capabilities must appear between the Work environment and Tools and facts sections"
+        );
+        assert!(
+            rendered.contains("mcp_browser_"),
+            "the instructions must name model-visible mcp_browser_* tools"
+        );
+        assert!(
+            rendered.contains("registry_sync"),
+            "the instructions must override registry-first guidance for the built-in browser"
+        );
+        assert!(
+            rendered
+                .contains("实际取得图像输入或图像分析结果后，才能声称看到了颜色、布局等视觉细节"),
+            "visual claims require image evidence rather than a successful tool status alone"
+        );
+        assert!(
+            !rendered.contains("take_screenshot` to inspect visual details"),
+            "the instructions must not advertise screenshot output as model visual capability"
+        );
+    }
+
+    #[test]
+    fn browser_unavailability_reason_reports_missing_runtime() {
+        // An empty temporary home lacks the platform automation backend and/or wrapper. The
+        // static probe must return a model-readable, injectable reason instead of silently
+        // hiding browser capability and leaving the model unable to discover it.
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-browser_unavailability_reason_reports_missing_runtime",
+            || {
+                // SAFETY: holding platform::paths::tests::ENV_LOCK; in-process env writes are serialized.
+                unsafe { std::env::remove_var("PINVOU3_CDMCP_BIN") };
+                let bundle = Pinvou3Bundle::paths();
+                let msg = bundle
+                    .browser_unavailability_reason()
+                    .expect("missing prerequisites must return an unavailable reason");
+                if !crate::platform::capabilities::browser_product_enabled() {
+                    assert!(
+                        msg.contains("not enabled in this product build"),
+                        "a closed release gate must report that the product build does not enable browser tools: {msg}"
+                    );
+                }
+                #[cfg(windows)]
+                assert!(
+                    msg.contains("chrome-devtools-mcp"),
+                    "the message must name the missing runtime: {msg}"
+                );
+                #[cfg(target_os = "linux")]
+                assert!(
+                    msg.contains("WebKitWebDriver") || msg.contains("browser wrapper"),
+                    "the message must name the missing Linux WebDriver or wrapper: {msg}"
+                );
+                #[cfg(target_os = "macos")]
+                if crate::platform::capabilities::browser_product_enabled() {
+                    assert!(
+                        msg.contains("browser wrapper"),
+                        "preview or released builds must name the missing macOS wrapper: {msg}"
+                    );
+                }
+                #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+                assert!(
+                    msg.contains("not enabled in this product build"),
+                    "the message must state that this platform has no released automation backend: {msg}"
+                );
+                assert!(
+                    msg.contains("mcp_browser_"),
+                    "the message must identify browser tools as unavailable: {msg}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn browser_last_error_accepts_only_fresh_whitelisted_codes() {
+        let now = 2_000_000_u64;
+        let mappings = super::extraction::BROWSER_LAST_ERROR_HINTS;
+        assert_eq!(
+            mappings.len(),
+            8,
+            "the stable persistence contract has eight codes"
+        );
+        for &(expected_code, expected_hint) in mappings {
+            let known = serde_json::json!({
+                "code": expected_code,
+                "at": now - 10,
+                "reason": r#"C:\Users\private\workspace"#,
+            })
+            .to_string();
+            let actual = super::extraction::browser_last_error_hint(&known, now)
+                .expect("every whitelisted code should have a static hint");
+            assert_eq!(actual, (expected_code, expected_hint));
+            assert!(!actual.1.contains("Users"));
+            assert!(!actual.1.contains("workspace"));
+        }
+
+        let cancelled = format!(r#"{{"code":"browser/request-cancelled","at":{}}}"#, now - 1);
+        assert_eq!(
+            super::extraction::browser_last_error_hint(&cancelled, now),
+            None,
+            "ordinary cancellation is not a persistent availability failure"
+        );
+
+        let legacy_with_path = format!(
+            r#"{{"reason":"transport closed at /Users/private/project","at":{}}}"#,
+            now - 1
+        );
+        assert_eq!(
+            super::extraction::browser_last_error_hint(&legacy_with_path, now),
+            None,
+            "legacy raw reasons must never be copied into model-visible instructions"
+        );
+
+        let expired = format!(
+            r#"{{"code":"browser/host-backend-unavailable","at":{}}}"#,
+            now - 24 * 60 * 60 - 1
+        );
+        assert_eq!(
+            super::extraction::browser_last_error_hint(&expired, now),
+            None,
+            "stale availability failures must expire"
+        );
+
+        let future = format!(
+            r#"{{"code":"browser/host-backend-unavailable","at":{}}}"#,
+            now + 301
+        );
+        assert_eq!(
+            super::extraction::browser_last_error_hint(&future, now),
+            None,
+            "crafted future timestamps must not stay fresh indefinitely"
+        );
+    }
+
+    #[test]
+    fn shared_skeleton_keeps_mode_placeholder_rows_in_place() {
+        let bottom = INSTRUCTIONS_SHARED_MD.find("## 底线").unwrap();
+        let memory = INSTRUCTIONS_SHARED_MD
+            .find("{{PINVOU3_MEMORY_SECTION}}")
+            .unwrap();
+        let env = INSTRUCTIONS_SHARED_MD
+            .find("{{PINVOU3_MODE_ENV_SECTION}}")
+            .unwrap();
+        let tools = INSTRUCTIONS_SHARED_MD.find("## 工具与事实").unwrap();
+        let how = INSTRUCTIONS_SHARED_MD.find("## 怎么干").unwrap();
+        let delivery = INSTRUCTIONS_SHARED_MD.find("## 验证与交付").unwrap();
+        let artifact = INSTRUCTIONS_SHARED_MD
+            .find("{{PINVOU3_MODE_ARTIFACT_RULE}}")
+            .unwrap();
+        assert!(bottom < memory && memory < env && env < tools);
+        assert!(tools < how && how < delivery && delivery < artifact);
+        for enabled in [false, true] {
+            let section = memory_section(enabled);
+            let rendered = INSTRUCTIONS_SHARED_MD.replace("{{PINVOU3_MEMORY_SECTION}}\n", section);
+            assert!(!rendered.contains("{{PINVOU3_MEMORY_SECTION}}"));
+            assert!(rendered.contains(&format!("{section}{{{{PINVOU3_MODE_ENV_SECTION}}}}")));
+            assert_eq!(rendered.contains("## 用户记忆"), enabled);
+        }
+        assert!(memory_section(true).contains("未取得保存结果前，不断言已持久保存"));
+        assert!(!memory_section(true).contains("确认已记下"));
+        assert!(memory_section(false).contains("不声称已长期保存"));
+    }
+
+    #[test]
+    fn code_instructions_render_project_hint_and_drop_artifact_semantics() {
+        let rendered =
+            instructions_code_md("你正在用户的项目目录 `/repo/demo` 中工作,相对路径即相对项目根;");
+        // 工作区占位渲染正确。
+        assert!(rendered.contains("你正在用户的项目目录 `/repo/demo` 中工作"));
+        assert!(!rendered.contains("{{PINVOU3_WORKSPACE_HINT}}"));
+        // 底座执行循环原样引用（上游常量内容的一个稳定锚点）。
+        let core = deepseek_tui::prompts::CORE_EXECUTION_PROFILE_PROMPT.trim();
+        let anchor = core.lines().next().expect("core_execution 非空");
+        assert!(rendered.contains(anchor));
+        assert!(rendered.contains(core));
+        // 无产出物/成品卡语义：work 层的面板与落盘规则不出现（增量段的否定式
+        // 提及“没有产出物面板/不建 tmp/”是刻意保留的行为指引）。
+        assert!(!rendered.contains("mcp_pinvou3_present_artifact"));
+        assert!(!rendered.contains("只有**最终成品**"));
+        assert!(!rendered.contains("自动落到本会话专属工作目录"));
+        assert!(!rendered.contains("产出用**相对路径**写"));
+        // 代码场景纪律与共享红线都在。
+        assert!(rendered.contains("## 代码场景纪律"));
+        assert!(rendered.contains("不主动 commit、push、reset 或 rebase"));
+        assert!(rendered.contains("## 红线"));
+        // 占位行无残留。
+        assert!(!rendered.contains("{{PINVOU3_MODE_ENV_SECTION}}"));
+        assert!(!rendered.contains("{{PINVOU3_MODE_ARTIFACT_RULE}}"));
+        // 骨架结构保持：代码环境段位于 §底线 与 §工具与事实 之间。
+        let bottom = rendered.find("## 底线").unwrap();
+        let env = rendered.find("## 工作环境").unwrap();
+        let tools = rendered.find("## 工具与事实").unwrap();
+        assert!(bottom < env && env < tools);
+    }
+
+    #[test]
+    fn code_instructions_render_temporary_hint() {
+        let rendered = instructions_code_md("你在本会话专属工作目录中工作,相对路径即相对该目录;");
+        assert!(rendered.contains("你在本会话专属工作目录中工作"));
+        assert!(!rendered.contains("项目目录"));
+    }
+
+    #[test]
+    fn work_bound_instructions_render_workspace_hint_without_panel_tmp_semantics() {
+        let rendered = instructions_work_bound_md(
+            "你正在用户选择的工作目录 `/repo/demo` 中工作,相对路径即相对该目录;",
+        );
+        // The workspace placeholder renders correctly.
+        assert!(rendered.contains("你正在用户选择的工作目录 `/repo/demo` 中工作"));
+        assert!(!rendered.contains("{{PINVOU3_WORKSPACE_HINT}}"));
+        // Artifact-panel/tmp discipline must not appear (the environment section's
+        // negative mention of "没有产出物面板与 tmp/ 语义" is a deliberately kept
+        // behavioral hint).
+        assert!(!rendered.contains("自动落到本会话专属工作目录"));
+        assert!(!rendered.contains("只有**最终成品**"));
+        assert!(!rendered.contains("产出用**相对路径**写"));
+        // Browser section and deliverables section kept (plain-session capabilities
+        // unchanged).
+        assert!(rendered.contains("## Browser capabilities"));
+        assert!(rendered.contains("mcp_pinvou3_present_artifact"));
+        // No leftover placeholder lines; skeleton structure preserved: the bound
+        // environment section sits between the §底线 and §工具与事实 sections,
+        // and the Browser capabilities section follows the environment section.
+        assert!(!rendered.contains("{{PINVOU3_MODE_ENV_SECTION}}"));
+        assert!(!rendered.contains("{{PINVOU3_MODE_ARTIFACT_RULE}}"));
+        let bottom = rendered.find("## 底线").unwrap();
+        let env = rendered.find("## 工作环境").unwrap();
+        let browser = rendered.find("## Browser capabilities").unwrap();
+        let tools = rendered.find("## 工具与事实").unwrap();
+        assert!(bottom < env && env < browser && browser < tools);
+    }
+
+    #[test]
+    fn work_instructions_unbound_unaffected_by_bound_variant() {
+        // The bound variant's existence does not affect unbound rendering: the
+        // default work instructions keep their original semantics.
+        let rendered = instructions_md();
+        assert!(rendered.contains("最终成品默认写在 `Current workspace` 给出的实际目录"));
+        assert!(!rendered.contains("用户选择的工作目录"));
+    }
+
+    /// The upstream execution profile remains code-only and occurs once;
+    /// host guidance must preserve independent permissions and lawful recovery.
+    #[test]
+    fn code_instructions_preserve_core_permissions_without_a_host_override() {
+        let code = instructions_code_md("temporary workspace;");
+        let core = deepseek_tui::prompts::CORE_EXECUTION_PROFILE_PROMPT.trim();
+        assert_eq!(code.matches(core).count(), 1);
+        assert!(!instructions_md().contains(core));
+        assert!(!code.contains("gated write 工具走 auto-approval"));
+        assert!(code.contains("相关条件按工具要求有效改变后"));
+        assert!(code.contains("自动批准不扩大"));
+    }
+
+    #[test]
+    fn mode_execute_defers_to_read_only_turn_reminders() {
+        assert!(MODE_EXECUTE_MD.contains("Plan is read-only"));
+        assert!(MODE_EXECUTE_MD.contains("<turn_meta>"));
+        assert!(MODE_EXECUTE_MD.contains("<system-reminder>"));
+        assert!(MODE_EXECUTE_MD.contains("consultation can be answered without changing files"));
+        assert!(MODE_EXECUTE_MD.contains("conditions have actually changed"));
+        assert!(!MODE_EXECUTE_MD.contains("Tools run without per-call approval"));
+    }
+
+    /// 共享骨架的定时红线钉死：模型确实没有任何调度工具（deny 规则还封了
+    /// crontab/schtasks/systemctl 路径）,但 bash 的回合内 `cmd &` 仍然可用——
+    /// 措辞必须限定「回合结束后」,不得写成无条件的「无后台运行能力」。
+    #[test]
+    fn shared_skeleton_describes_the_actual_scheduling_capability() {
+        assert!(INSTRUCTIONS_SHARED_MD.contains("app-automations"));
+        assert!(INSTRUCTIONS_SHARED_MD.contains("Plan 模式"));
+        assert!(INSTRUCTIONS_SHARED_MD.contains("pending 只表示排队"));
+        assert!(
+            !INSTRUCTIONS_SHARED_MD
+                .contains("你没有定时执行、回合结束后继续运行或稍后主动发消息的能力")
+        );
+    }
+
+    fn run_depth_guard(bundle: &Pinvou3Bundle, tool: &str, args: &str) -> std::process::Output {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("powershell.exe");
+            command
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(&bundle.multiagent_depth_guard_ps1);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("bash");
+            command.arg(&bundle.multiagent_depth_guard_sh);
+            command
+        };
+        command
+            .env("DEEPSEEK_TOOL_NAME", tool)
+            .env("DEEPSEEK_TOOL_ARGS", args)
+            .output()
+            .expect("run multi-agent depth guard")
+    }
+
+    fn run_connector_introspection_guard(
+        bundle: &Pinvou3Bundle,
+        tool: &str,
+        args: &str,
+    ) -> std::process::Output {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = std::process::Command::new("powershell.exe");
+            command
+                .arg("-NoProfile")
+                .arg("-ExecutionPolicy")
+                .arg("Bypass")
+                .arg("-File")
+                .arg(&bundle.deny_sensitive_ps1);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = std::process::Command::new("bash");
+            command.arg(&bundle.deny_sensitive_sh);
+            command
+        };
+        command
+            .env("DEEPSEEK_TOOL_NAME", tool)
+            .env("DEEPSEEK_TOOL_ARGS", args)
+            .output()
+            .expect("run connector introspection guard")
+    }
+
+    /// 测试 bundle 解包的两个场景：首次解包成功 + VERSION 匹配时不覆写。
+    /// 借 crate 级唯一 platform::paths::tests::ENV_LOCK 跟其他 mutate PINVOU3_HOME 的测试串行化，
+    /// 不靠唯一 nanos 路径躲 race（仍会读 env var）。
+    #[test]
+    fn ensure_extracted_behavior() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-ensure_extracted_behavior",
+            || {
+                // 1) 首次解包：文件被写入 + VERSION 记录
+                let bundle = Pinvou3Bundle::paths();
+                bundle.ensure_extracted().unwrap();
+                assert!(bundle.mcp_json.is_file());
+                assert!(bundle.deny_sensitive_sh.is_file());
+                assert!(bundle.deny_sensitive_ps1.is_file());
+                assert!(bundle.multiagent_depth_guard_sh.is_file());
+                assert!(bundle.multiagent_depth_guard_ps1.is_file());
+                assert!(bundle.shell_env_sh.is_file());
+                assert!(paths::bundle_version_file().is_file());
+                // present_artifact MCP server 应解包,mcp.json 注册且占位符替换成绝对路径
+                assert!(
+                    paths::bundle_present_artifact_server().is_file(),
+                    "present_artifact server 脚本应被解包"
+                );
+                assert!(
+                    paths::bundle_mcp_python_runner().is_file(),
+                    "Python MCP 依赖启动器应被解包"
+                );
+                let mcp = std::fs::read_to_string(&bundle.mcp_json).unwrap();
+                assert!(
+                    mcp.contains("present_artifact_server.py"),
+                    "mcp.json 应注册 present server 的绝对路径"
+                );
+                assert!(
+                    !mcp.contains("{{PINVOU3_PRESENT_SERVER}}"),
+                    "mcp.json 的 server 路径占位符应被替换"
+                );
+                // present server key 必须是 pinvou3(对齐产品名,消除模型把 pinvou 漂成 pinvou3 的撞脸);
+                // 旧 pinvou 名不残留。
+                let mcp_keys: serde_json::Value = serde_json::from_str(&mcp).unwrap();
+                let server_keys = mcp_keys["servers"].as_object().unwrap();
+                assert!(
+                    server_keys.contains_key("pinvou3") && !server_keys.contains_key("pinvou"),
+                    "present server key 应为 pinvou3、旧 pinvou 不残留,实际={:?}",
+                    server_keys.keys().collect::<Vec<_>>()
+                );
+                // 市场 MCP 包按「能力包」模型按需释放（§4）：启动不再全量释放，未安装的
+                // canva-mcp 在旧布局（bundle/mcp-servers/）与新布局（bundles/<id>/mcp/）
+                // 都不应占盘。
+                assert!(
+                    !paths::bundle_mcp_servers_dir().join("canva-mcp").exists(),
+                    "未安装包不应释放到旧布局"
+                );
+                let canva_pkg_mcp =
+                    crate::features::marketplace::mcp_catalog::package_mcp_dir("canva-mcp");
+                assert!(!canva_pkg_mcp.exists(), "未安装包不应释放到新布局");
+                // 安装后释放到新布局：bundles/<id>/mcp/manifest.json。
+                crate::features::marketplace::MarketplaceManager::new()
+                    .install("canva-mcp", &std::collections::HashMap::new())
+                    .unwrap();
+                let canva_manifest = canva_pkg_mcp.join("manifest.json");
+                assert!(
+                    canva_manifest.is_file(),
+                    "Canva 可画 manifest 应释放到包目录"
+                );
+                let canva_json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&canva_manifest).unwrap())
+                        .unwrap();
+                assert_eq!(canva_json["id"], "canva-mcp");
+                assert_eq!(canva_json["servers"][0]["name"], "canva_mcp");
+                assert!(
+                    !canva_pkg_mcp.join("server.py").exists(),
+                    "Canva 远程 MCP 不应解包本地 server.py"
+                );
+                // 腾讯文档 manifest 应解包,且四个官方远程 server + 无 scheme Authorization 声明完整。
+                // 未安装包在新架构下只住 mcp_catalog 内嵌目录（不落盘）；先登记安装再校验释放。
+                let store = crate::features::marketplace::store::BundleStore::new();
+                store
+                    .upsert(
+                        crate::features::marketplace::store::BundleRecord::installed_now(
+                            "tencent-docs",
+                            crate::features::marketplace::store::BundleSource::Preset,
+                        ),
+                    )
+                    .unwrap();
+                crate::features::marketplace::mcp_catalog::ensure_package_released("tencent-docs")
+                    .expect("腾讯文档包应释放");
+                let tdoc_dir =
+                    crate::features::marketplace::mcp_catalog::package_mcp_dir("tencent-docs");
+                let tdoc_manifest = tdoc_dir.join("manifest.json");
+                assert!(tdoc_manifest.is_file(), "腾讯文档 manifest 应被解包");
+                let tdoc_json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&tdoc_manifest).unwrap())
+                        .unwrap();
+                assert_eq!(tdoc_json["id"], "tencent-docs");
+                let server_names: Vec<&str> = tdoc_json["servers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s["name"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    server_names,
+                    vec!["tencent-docs", "tdoc-slide", "tdoc-doc", "tdoc-sheet"]
+                );
+                assert_eq!(
+                    tdoc_json["secret_headers"][0]["header"], "Authorization",
+                    "Token 走 Authorization 头"
+                );
+                assert_eq!(
+                    tdoc_json["secret_headers"][0]["scheme"], "",
+                    "scheme 必须为空——官方端点要求原始 Token,不能加 Bearer 前缀"
+                );
+                assert!(
+                    !tdoc_dir.join("server.py").exists(),
+                    "腾讯文档远程 MCP 不应解包本地 server.py"
+                );
+                // 已下线 skills(legacy-ppt-workflow / pinvou-review-*)不应再被写出。
+                for retired in [
+                    "legacy-ppt-workflow",
+                    "pinvou-review-plan",
+                    "pinvou-review-final",
+                ] {
+                    assert!(
+                        !bundle.skills_dir.join(retired).exists(),
+                        "{retired} 已下线,不应再解包"
+                    );
+                }
+                let v = std::fs::read_to_string(paths::bundle_version_file()).unwrap();
+                assert_eq!(v.trim(), BUNDLE_VERSION);
+
+                // 2) VERSION 匹配则跳过：故意改 bundle 内文件，再 ensure，不应覆写
+                std::fs::write(&bundle.shell_env_sh, "USER TOUCHED").unwrap();
+                bundle.ensure_extracted().unwrap();
+                let content = std::fs::read_to_string(&bundle.shell_env_sh).unwrap();
+                assert_eq!(
+                    content, "USER TOUCHED",
+                    "VERSION 匹配时不应覆写已存在的 bundle 文件"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn secret_migration_failure_still_releases_runner_and_preserves_retryable_legacy_python_tool() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-secret_migration_failure_still_releases_runner_and_preserves_retryable_legacy_py",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+                let server_root = paths::bundle_mcp_servers_dir();
+
+                let weather_dir = server_root.join("weather");
+                std::fs::create_dir_all(&weather_dir).unwrap();
+                let legacy_weather = br#"{"id":"weather","name":"Weather","description":"d","version":"1","icon":"x","category":"c","mcp_tools":[],"command":"python","args":["server.py"],"env":{"AMAP_KEY":"legacy-fixture-value"}}"#;
+                std::fs::write(weather_dir.join("manifest.json"), legacy_weather).unwrap();
+
+                let gongwen_dir = server_root.join("gongwen");
+                std::fs::create_dir_all(&gongwen_dir).unwrap();
+                std::fs::write(gongwen_dir.join("server.py"), "print('legacy')\n").unwrap();
+                std::fs::write(
+            gongwen_dir.join("manifest.json"),
+            r#"{"id":"gongwen","name":"Gongwen","description":"d","version":"0","icon":"x","category":"c","mcp_tools":["mcp_gongwen_make_gongwen"],"command":"python","args":["server.py"],"companion_skills":["government-writing"]}"#,
+        )
+        .unwrap();
+                let marketplace_dir = paths::pinvou3_home().join("marketplace");
+                std::fs::create_dir_all(&marketplace_dir).unwrap();
+                std::fs::write(marketplace_dir.join("installed.json"), r#"["gongwen"]"#).unwrap();
+                let expected_gongwen = serde_json::json!({
+                    "command": "python",
+                    "args": [gongwen_dir.join("server.py")],
+                    "env": {"KEEP": "configured"},
+                    "enabled": false,
+                    "timeout_ms": 12345,
+                    "future_field": {"preserve": true}
+                });
+                std::fs::write(
+                    paths::mcp_config_path(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "servers": {
+                            "gongwen": expected_gongwen.clone()
+                        }
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                crate::features::marketplace::skill_marketplace::SkillMarketplaceManager::new()
+                    .install("government-writing")
+                    .unwrap();
+
+                let manager = crate::features::marketplace::MarketplaceManager::with_store(
+                    RejectingCredentialStore,
+                );
+                bundle
+                    .ensure_extracted_with_marketplace(&manager, |manager| {
+                        let installed_before =
+                            std::fs::read(marketplace_dir.join("installed.json")).unwrap();
+                        let mcp_before: serde_json::Value = serde_json::from_slice(
+                            &std::fs::read(paths::mcp_config_path()).unwrap(),
+                        )
+                        .unwrap();
+                        let gongwen_before = mcp_before["servers"]["gongwen"].clone();
+                        let failpoint =
+                    crate::features::marketplace::fail_next_managed_dependency_install_for_test();
+                        let errors = manager.repair_installed_python_tools()?;
+                        assert!(
+                    !crate::features::marketplace::
+                        managed_dependency_install_failure_pending_for_test(),
+                    "the high-level transient dependency failure must be consumed"
+                );
+                        drop(failpoint);
+                        assert_eq!(
+                            errors,
+                            vec![
+                                concat!(
+                                    "tool 'gongwen' dependency repair will retry: ",
+                                    "test-injected transient managed dependency install failure"
+                                )
+                                .to_string()
+                            ]
+                        );
+                        assert_eq!(
+                            std::fs::read(marketplace_dir.join("installed.json")).unwrap(),
+                            installed_before
+                        );
+                        let mcp_after: serde_json::Value = serde_json::from_slice(
+                            &std::fs::read(paths::mcp_config_path()).unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(mcp_after["servers"]["gongwen"], gongwen_before);
+                        assert!(!marketplace_dir.join("state-transaction.json").exists());
+                        Ok(errors)
+                    })
+                    .unwrap();
+
+                assert!(paths::bundle_mcp_python_runner().is_file());
+                let released_manifest: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(
+                        crate::features::marketplace::mcp_catalog::package_mcp_dir("gongwen")
+                            .join("manifest.json"),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert!(released_manifest.get("python_dependencies").is_some());
+                assert_eq!(
+                    std::fs::read(weather_dir.join("manifest.json")).unwrap(),
+                    legacy_weather.to_vec(),
+                    "credential failure must preserve the legacy plaintext source"
+                );
+                let installed: Vec<String> = serde_json::from_str(
+                    &std::fs::read_to_string(marketplace_dir.join("installed.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(installed.contains(&"gongwen".to_string()));
+                let mcp: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(paths::mcp_config_path()).unwrap(),
+                )
+                .unwrap();
+                let gongwen = &mcp["servers"]["gongwen"];
+                assert!(gongwen.is_object());
+                assert_eq!(
+                    gongwen["command"],
+                    serde_json::Value::String(paths::python_command())
+                );
+                for field in ["args", "env", "enabled", "timeout_ms", "future_field"] {
+                    assert_eq!(gongwen[field], expected_gongwen[field], "field: {field}");
+                }
+                assert!(!marketplace_dir.join("state-transaction.json").exists());
+                assert!(
+                    paths::bundles_root()
+                        .join("gongwen")
+                        .join("skills")
+                        .join("government-writing")
+                        .exists()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn connector_introspection_guard_matches_complete_names_only() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-connector_introspection_guard_matches_complete_names_only",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                bundle.ensure_extracted().unwrap();
+
+                for tool in ["list_mcp_resources", "list_mcp_resource_templates"] {
+                    for args in [r#"{"server":"wecom"}"#, r#"{"server":"企微"}"#] {
+                        let output = run_connector_introspection_guard(&bundle, tool, args);
+                        assert_eq!(
+                            output.status.code(),
+                            Some(2),
+                            "exact skill-connector names must be redirected: {output:?}"
+                        );
+                        // The stdout JSON reason is the model's only corrective copy (the
+                        // engine folds deny reasons from stdout alone). Pinning the reason
+                        // text also pins the script's UTF-8 stdout encoding: a writer that
+                        // regresses to the console codepage would fail this reason match on
+                        // Windows (PS 5.1 consoles emit GBK without an explicit UTF-8
+                        // StreamWriter) while still exiting 2.
+                        let verdict: serde_json::Value = serde_json::from_slice(&output.stdout)
+                            .expect("single-line UTF-8 deny JSON");
+                        assert_eq!(verdict["decision"], "deny");
+                        let reason = verdict["reason"]
+                            .as_str()
+                            .expect("model-facing deny reason");
+                        assert!(
+                            reason.contains("list_mcp_resources 或 list_mcp_resource_templates"),
+                            "deny reason must reach stdout as intact UTF-8 JSON: {verdict:?}"
+                        );
+                    }
+                    for args in [
+                        r#"{"server":"wecom-bot"}"#,
+                        r#"{"server":"mcp_wecom-bot_send_text"}"#,
+                        r#"{"server":"企微群机器人"}"#,
+                    ] {
+                        let output = run_connector_introspection_guard(&bundle, tool, args);
+                        assert!(
+                            output.status.success(),
+                            "marketplace MCP names containing connector aliases must remain introspectable: {output:?}"
+                        );
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn multiagent_depth_guard_enforces_two_level_inputs() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-multiagent_depth_guard_enforces_two_level_inputs",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                bundle.ensure_extracted().unwrap();
+
+                let positive =
+                    run_depth_guard(&bundle, "agent", r#"{"prompt":"inspect","max_depth":2}"#);
+                assert_eq!(positive.status.code(), Some(2));
+                // The engine reads the deny reason ONLY from stdout JSON (turn_loop
+                // fold_tool_call_before_results); stderr never reaches the model, so
+                // the guidance must ride the stdout contract.
+                let positive_stdout = String::from_utf8_lossy(&positive.stdout);
+                assert!(
+                    positive_stdout.contains("\"decision\":\"deny\"")
+                        && positive_stdout.contains("caps children at two levels"),
+                    "拒绝原因必须以 stdout JSON 抵达模型并能指导重试: {positive:?}"
+                );
+                // The engine renders denial receipts through sanitize_hook_denial_reason
+                // with a 240-char cap and path-like-field redaction, so guidance that is
+                // too long gets cut mid-sentence and slashes/standalone path/file labels
+                // are destroyed. Both deny reasons must fit the budget and survive it.
+                let stdout_reason = |stdout: &str| -> String {
+                    stdout
+                        .trim()
+                        .strip_prefix("{\"decision\":\"deny\",\"reason\":\"")
+                        .and_then(|rest| rest.strip_suffix("\"}"))
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let depth_reason = stdout_reason(&positive_stdout);
+                assert!(
+                    !depth_reason.is_empty() && depth_reason.chars().count() <= 240,
+                    "深度拒绝原因必须完整通过引擎 240 字符回执上限: {depth_reason:?}"
+                );
+
+                let inherited = run_depth_guard(&bundle, "agent", r#"{"prompt":"inspect"}"#);
+                assert!(
+                    inherited.status.success(),
+                    "复杂一级委派省略深度参数时应继承会话两层上限: {inherited:?}"
+                );
+
+                let leaf =
+                    run_depth_guard(&bundle, "agent", r#"{"prompt":"inspect","max_depth":0}"#);
+                assert!(leaf.status.success(), "叶子委派应通过: {leaf:?}");
+
+                let positive_one =
+                    run_depth_guard(&bundle, "agent", r#"{"prompt":"inspect","max_depth":1}"#);
+                assert_eq!(
+                    positive_one.status.code(),
+                    Some(2),
+                    "多智能体会话固定两层,正数覆盖一律拦截(bundle 0.20 决策;引擎 #5253 起覆盖本就只能收窄,拦截保持会话上限权威)"
+                );
+
+                let alias = run_depth_guard(
+                    &bundle,
+                    "agent",
+                    r#"{"prompt":"inspect","max_spawn_depth":2}"#,
+                );
+                assert_eq!(alias.status.code(), Some(2));
+
+                let quoted_example = run_depth_guard(
+                    &bundle,
+                    "agent",
+                    r#"{"prompt":"review this JSON: {\"max_depth\":2}"}"#,
+                );
+                assert!(
+                    quoted_example.status.success(),
+                    "任务正文里的转义示例不得误伤: {quoted_example:?}"
+                );
+
+                let workflow = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"script":"return task({ description: 'x', maxDepth: 1 });"}"#,
+                );
+                assert_eq!(workflow.status.code(), Some(2));
+
+                // Inline JS also accepts the snake_case serde alias; the guard must
+                // catch it too (it previously matched only the quoted "max_depth" or
+                // camelCase maxDepth forms).
+                let workflow_snake = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"script":"return task({ description: 'x', max_depth: 2 });"}"#,
+                );
+                assert_eq!(
+                    workflow_snake.status.code(),
+                    Some(2),
+                    "inline JS 的 snake_case max_depth 覆盖同样必须拦截: {workflow_snake:?}"
+                );
+
+                // TaskOptions' canonical camelCase key also arrives quoted inside
+                // JSON payloads; the guard must catch the quoted form too (it used
+                // to match only bare camelCase, so a quoted "maxDepth" override was
+                // silently allowed through).
+                let workflow_quoted_camel = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"tasks":[{"options":{"maxDepth": 2}}]}"#,
+                );
+                assert_eq!(
+                    workflow_quoted_camel.status.code(),
+                    Some(2),
+                    "workflow JSON 载荷里引号包裹的 camelCase maxDepth 覆盖同样必须拦截: {workflow_quoted_camel:?}"
+                );
+                // The escaped-quote carve-out must cover the camel key as well: a
+                // quoted example inside task prose is not an override.
+                let workflow_camel_example = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"note":"use \"maxDepth\":2 for children"}"#,
+                );
+                assert!(
+                    workflow_camel_example.status.success(),
+                    "正文里的转义 camelCase 示例不得误伤: {workflow_camel_example:?}"
+                );
+
+                // Prose that merely mentions max_depth next to a quote or paren is not
+                // an override: the bare-snake-case class must stay identical across the
+                // .sh and .ps1 guards (a looser Windows class used to false-deny these).
+                // CI executes this test natively on both hook platforms: the Linux
+                // rust-test leg runs the full lib suite (.sh), and the Windows
+                // regression leg runs this filter via its native filter list (.ps1).
+                let workflow_prose =
+                    run_depth_guard(&bundle, "workflow", r#"{"note":"max_depth: 2 here"}"#);
+                assert!(
+                    workflow_prose.status.success(),
+                    "正文里提及 max_depth 不构成覆盖,不得误拦: {workflow_prose:?}"
+                );
+
+                let opaque_workflow = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"source_path":"workflows/review.workflow.js"}"#,
+                );
+                assert_eq!(opaque_workflow.status.code(), Some(2));
+                // The opaque-source reason must survive the engine redactor: it names
+                // the parameter (source_path) without embedding slashes or standalone
+                // path/file labels, which the sanitizer replaces with [path] markers.
+                let opaque_stdout = String::from_utf8_lossy(&opaque_workflow.stdout);
+                let opaque_reason = stdout_reason(&opaque_stdout);
+                assert!(
+                    opaque_reason.contains("source_path reference is rejected")
+                        && !opaque_reason.contains('/')
+                        && !opaque_reason.contains(" path ")
+                        && !opaque_reason.contains(" file ")
+                        && opaque_reason.chars().count() <= 240,
+                    "opaque workflow 拒绝原因必须原样通过引擎脱敏管线: {opaque_reason:?}"
+                );
+
+                // Nested "path" keys inside structured plan payloads are ordinary
+                // field names (child tool args etc.), not the schema-documented
+                // source_path bypass key: the opaque-source trigger must not fire
+                // on them (the guard used to match the bare "path" manual fallback
+                // at any nesting depth and false-denied these calls; the fallback
+                // stays un-intercepted by design, see the hook's header comment).
+                let nested_path = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"plan":{"goal":"summarize docs","children":[{"id":"a","args":{"path":"docs/x.md"}}]}}"#,
+                );
+                assert!(
+                    nested_path.status.success(),
+                    "plan 载荷里的嵌套 path 字段不得触发 source_path 拦截: {nested_path:?}"
+                );
+
+                // Any string-valued "source_path" key still denies: grep cannot
+                // count JSON nesting depth, so nested occurrences inside
+                // free-form payloads (child args bags, responseSchema examples)
+                // are denied conservatively. Pin that behavior so a later edit
+                // cannot quietly narrow the gate past the documented shape
+                // (only the bare "path" carve-out is intentional).
+                let nested_source_path = run_depth_guard(
+                    &bundle,
+                    "workflow",
+                    r#"{"plan":{"goal":"ingest","children":[{"id":"a","args":{"source_path":"notes.md"}}]}}"#,
+                );
+                assert!(
+                    !nested_source_path.status.success(),
+                    "嵌套的字符串型 source_path 键仍应保守拦截（grep 无法计嵌套深度，仅 path 别名是有意放行）: {nested_source_path:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn connector_skill_cache_requires_complete_domain_sets() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-connector_skill_cache_requires_complete_domain_sets",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                // 连接器技能现按包聚合落盘：bundles/<pkg>/skills/<dir>（§4 新布局）。
+                let pkg_skills = |id: &str| paths::bundles_root().join(id).join("skills");
+                std::fs::create_dir_all(pkg_skills("feishu")).unwrap();
+
+                assert!(!bundle.cached_feishu_skills_visible());
+                assert!(!bundle.cached_wecom_skills_visible());
+                assert!(!bundle.cached_dingtalk_skills_visible());
+                assert!(!bundle.cached_tmeet_skills_visible());
+
+                for dir in LARK_SKILL_DIRS {
+                    let path = pkg_skills("feishu").join(dir);
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::fs::write(path.join("SKILL.md"), "test").unwrap();
+                }
+                for dir in WECOM_SKILL_DIRS {
+                    let path = pkg_skills("wecom").join(dir);
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::fs::write(path.join("SKILL.md"), "test").unwrap();
+                }
+                for dir in DINGTALK_SKILL_DIRS {
+                    let path = pkg_skills("dingtalk").join(dir);
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::fs::write(path.join("SKILL.md"), "test").unwrap();
+                }
+                for dir in TMEET_SKILL_DIRS {
+                    let path = pkg_skills("tmeet").join(dir);
+                    std::fs::create_dir_all(&path).unwrap();
+                    std::fs::write(path.join("SKILL.md"), "test").unwrap();
+                }
+                assert!(bundle.cached_feishu_skills_visible());
+                assert!(bundle.cached_wecom_skills_visible());
+                assert!(bundle.cached_dingtalk_skills_visible());
+                assert!(bundle.cached_tmeet_skills_visible());
+
+                std::fs::write(paths::pinvou3_home().join("feishu_disabled"), "1").unwrap();
+                std::fs::write(paths::pinvou3_home().join("wecom_disabled"), "1").unwrap();
+                std::fs::write(paths::pinvou3_home().join("dingtalk_disabled"), "1").unwrap();
+                std::fs::write(paths::pinvou3_home().join("tmeet_disabled"), "1").unwrap();
+                assert!(!bundle.cached_feishu_skills_visible());
+                assert!(!bundle.cached_wecom_skills_visible());
+                assert!(!bundle.cached_dingtalk_skills_visible());
+                assert!(!bundle.cached_tmeet_skills_visible());
+                std::fs::remove_file(paths::pinvou3_home().join("feishu_disabled")).unwrap();
+                std::fs::remove_file(paths::pinvou3_home().join("wecom_disabled")).unwrap();
+                std::fs::remove_file(paths::pinvou3_home().join("dingtalk_disabled")).unwrap();
+                std::fs::remove_file(paths::pinvou3_home().join("tmeet_disabled")).unwrap();
+
+                std::fs::remove_file(
+                    pkg_skills("feishu")
+                        .join(LARK_SKILL_DIRS[0])
+                        .join("SKILL.md"),
+                )
+                .unwrap();
+                std::fs::remove_file(
+                    pkg_skills("wecom")
+                        .join(WECOM_SKILL_DIRS[0])
+                        .join("SKILL.md"),
+                )
+                .unwrap();
+                std::fs::remove_file(
+                    pkg_skills("dingtalk")
+                        .join(DINGTALK_SKILL_DIRS[0])
+                        .join("SKILL.md"),
+                )
+                .unwrap();
+                std::fs::remove_file(
+                    pkg_skills("tmeet")
+                        .join(TMEET_SKILL_DIRS[0])
+                        .join("SKILL.md"),
+                )
+                .unwrap();
+                assert!(!bundle.cached_feishu_skills_visible());
+                assert!(!bundle.cached_wecom_skills_visible());
+                assert!(!bundle.cached_dingtalk_skills_visible());
+                assert!(!bundle.cached_tmeet_skills_visible());
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_env_hook_keeps_cli_context_and_filters_credentials() {
+        use std::collections::HashMap;
+        use std::process::Command;
+
+        // This test neither holds ENV_LOCK nor sets PINVOU3_HOME (see its tail
+        // comment): it names its own scratch dir and removes it directly.
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-shell-env-hook-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            std::path::Path::new(&tmp).join(".bash_profile"),
+            "printf 'PROFILE_STDOUT=must-not-inject'\n\
+             export PATH=/opt/custom-cli/bin:/usr/bin:/bin\n\
+             export CUSTOM_FROM_PROFILE=loaded\n",
+        )
+        .unwrap();
+        let script = std::path::Path::new(&tmp).join("shell_env.sh");
+        std::fs::write(&script, SHELL_ENV_SH).unwrap();
+        let output = Command::new("bash")
+            .arg(&script)
+            .env_clear()
+            .env("HOME", &tmp)
+            .env("USER", "pinvou-test")
+            .env("SHELL", "/bin/bash")
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", "/run/user/1000")
+            .env("CUSTOM_SDK_HOME", "/opt/custom-sdk")
+            .env("HTTPS_PROXY", "http://127.0.0.1:7890")
+            .env("OPENAI_API_KEY", "must-not-leak")
+            .env("PINVOU3_MCP_SECRET_AMAP_KEY", "must-not-leak")
+            .env("SSH_AUTH_SOCK", "/run/user/1000/ssh-agent")
+            .env("NODE_OPTIONS", "--require=/tmp/inject.js")
+            .env(
+                "PRIVATE_INDEX",
+                "https://user:password@example.invalid/simple",
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "shell_env hook failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let vars = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            vars.get("PATH").map(String::as_str),
+            Some("/opt/custom-cli/bin:/usr/bin:/bin")
+        );
+        assert_eq!(
+            vars.get("CUSTOM_FROM_PROFILE").map(String::as_str),
+            Some("loaded")
+        );
+        assert_eq!(
+            vars.get("XDG_RUNTIME_DIR").map(String::as_str),
+            Some("/run/user/1000")
+        );
+        assert_eq!(
+            vars.get("CUSTOM_SDK_HOME").map(String::as_str),
+            Some("/opt/custom-sdk")
+        );
+        assert_eq!(
+            vars.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(
+            !vars.contains_key("PROFILE_STDOUT"),
+            "登录 profile 在 marker 前的 KEY=VALUE 输出不得被注入"
+        );
+        for key in [
+            "OPENAI_API_KEY",
+            "PINVOU3_MCP_SECRET_AMAP_KEY",
+            "SSH_AUTH_SOCK",
+            "NODE_OPTIONS",
+            "PRIVATE_INDEX",
+        ] {
+            assert!(
+                !vars.contains_key(key),
+                "敏感变量 {key} 不得进入 exec_shell"
+            );
+        }
+
+        // This test neither holds ENV_LOCK nor sets PINVOU3_HOME, so it
+        // must not remove or mutate PINVOU3_HOME on its own: a lock-free
+        // removal here would punch through a parallel test's lock-holding
+        // window, and the dingtalk/wecom skill-gate tests then fail
+        // intermittently with assertions reading the wrong root.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 已下架预置技能的清理:市场标记的删、无标记裸残留的删、用户上传(upload:)的保。
+    #[test]
+    fn cleanup_removed_marketplace_skills_respects_upload_marker() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_removed_marketplace_skills_respects_upload_marker",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                std::fs::create_dir_all(&bundle.skills_dir).unwrap();
+
+                // pua:本市场装的(标记匹配)→ 应删
+                let pua = bundle.skills_dir.join("pua");
+                std::fs::create_dir_all(&pua).unwrap();
+                std::fs::write(pua.join(".installed-from"), "pinvou3-marketplace:pua").unwrap();
+                // huashu-nuwa:无标记裸残留 → 应删
+                let nuwa = bundle.skills_dir.join("huashu-nuwa");
+                std::fs::create_dir_all(&nuwa).unwrap();
+                // brainstorming:用户上传的同名 → 应保
+                let brainstorm = bundle.skills_dir.join("brainstorming");
+                std::fs::create_dir_all(&brainstorm).unwrap();
+                std::fs::write(brainstorm.join(".installed-from"), "upload:my.zip").unwrap();
+
+                bundle.cleanup_removed_marketplace_skills().unwrap();
+
+                assert!(!pua.exists(), "市场标记的 pua 应被删");
+                assert!(!nuwa.exists(), "无标记的 huashu-nuwa 残留应被删");
+                assert!(brainstorm.exists(), "用户上传(upload:)的同名目录应保留");
+            },
+        );
+    }
+
+    #[test]
+    fn forkguard_builtin_visual_skill_uses_bundle_root_and_safe_name() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-forkguard_builtin_visual_skill_uses_bundle_root_and_safe_name",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+
+                bundle.write_builtin_skills().unwrap();
+
+                let skill_path = bundle.skills_dir.join("visual-design").join("SKILL.md");
+                let content = std::fs::read_to_string(&skill_path).unwrap();
+                assert!(content.contains("name: visual-design"));
+                assert!(skill_path.starts_with(&bundle.skills_dir));
+            },
+        );
+    }
+
+    /// `BUILTIN_RELEASED_SKILL_DIRS` must mirror the embedded builtin-skills
+    /// resource tree (same pattern as `wecom_skill_dirs_match_embedded_resources`):
+    /// a builtin skill added without extending the constant would be written by
+    /// every launch and deleted by self-heal step 4 in the same run — silently
+    /// invisible forever.
+    #[test]
+    fn builtin_released_skill_dirs_match_embedded_resources() {
+        let mut embedded: Vec<&str> = BUILTIN_SKILLS_DIR
+            .dirs()
+            .map(|d| d.path().to_str().expect("目录名应为 UTF-8"))
+            .collect();
+        embedded.sort_unstable();
+        let mut listed = Pinvou3Bundle::BUILTIN_RELEASED_SKILL_DIRS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            embedded, listed,
+            "BUILTIN_RELEASED_SKILL_DIRS 与 bundle/builtin-skills 实际目录不一致"
+        );
+        for d in listed {
+            assert!(
+                BUILTIN_SKILLS_DIR
+                    .get_file(format!("{d}/SKILL.md"))
+                    .is_some(),
+                "builtin-skills/{d} 缺 SKILL.md"
+            );
+        }
+    }
+
+    /// The other divergence direction: `write_builtin_skills` must release
+    /// exactly the dirs listed in `BUILTIN_RELEASED_SKILL_DIRS` — a skill added
+    /// to the write path without extending the constant would be converged
+    /// away by self-heal step 4 on the same launch.
+    #[test]
+    fn write_builtin_skills_releases_exactly_the_listed_dirs() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-write_builtin_skills_releases_exactly_the_listed_dirs",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+
+                bundle.write_builtin_skills().unwrap();
+
+                let mut written: Vec<String> = std::fs::read_dir(&bundle.skills_dir)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                written.sort_unstable();
+                let mut listed: Vec<String> = Pinvou3Bundle::BUILTIN_RELEASED_SKILL_DIRS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                listed.sort_unstable();
+                assert_eq!(
+                    written, listed,
+                    "write_builtin_skills 的释放面与 BUILTIN_RELEASED_SKILL_DIRS 不一致"
+                );
+            },
+        );
+    }
+
+    /// include_dir! 内嵌树中的 `__pycache__/` 与 `*.pyc` 不得物化到用户 bundle
+    /// (在仓库里直接运行技能脚本会产生这些编译缓存,详见 extract_dir 文档注释)。
+    /// 覆盖实际走 extract_dir 的两棵树(lark skills 与 dws);构建机存在 pycache 时
+    /// 验证排除逻辑生效,不存在时断言"零物化 pyc"作为回归基线。
+    #[test]
+    fn extract_dir_skips_python_compilation_caches() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-extract_dir_skips_python_compilation_caches",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+
+                bundle.apply_feishu_skills(true).unwrap();
+                bundle.apply_dingtalk_skills(true).unwrap();
+
+                let mut caches: Vec<std::path::PathBuf> = Vec::new();
+                fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+                    if let Ok(entries) = std::fs::read_dir(dir) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() {
+                                if p.file_name().is_some_and(|n| n == "__pycache__") {
+                                    out.push(p);
+                                } else {
+                                    walk(&p, out);
+                                }
+                            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pyc")) {
+                                out.push(p);
+                            }
+                        }
+                    }
+                }
+                walk(&bundle.skills_dir, &mut caches);
+                assert!(caches.is_empty(), "物化出了 Python 编译缓存: {caches:?}");
+            },
+        );
+    }
+
+    /// 已下架预置 MCP 工具的清理:目录、installed.json、mcp.json、禁用列表都不应残留。
+    #[test]
+    fn cleanup_removed_marketplace_tools_removes_data_analysis() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_removed_marketplace_tools_removes_data_analysis",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                let data_dir = paths::bundle_mcp_servers_dir().join("data_analysis");
+                std::fs::create_dir_all(&data_dir).unwrap();
+                std::fs::write(
+                    data_dir.join("manifest.json"),
+                    r#"{
+                "id":"data_analysis",
+                "name":"数据分析与可视化",
+                "description":"removed",
+                "version":"1",
+                "icon":"bar-chart-3",
+                "category":"办公",
+                "mcp_tools":["mcp_data_analysis_build_dashboard"],
+                "command":"python",
+                "args":["server.py"]
+            }"#,
+                )
+                .unwrap();
+                let marketplace_dir = paths::pinvou3_home().join("marketplace");
+                std::fs::create_dir_all(&marketplace_dir).unwrap();
+                std::fs::write(
+                    marketplace_dir.join("installed.json"),
+                    r#"["weather","data_analysis"]"#,
+                )
+                .unwrap();
+                std::fs::write(
+            paths::mcp_config_path(),
+            r#"{"servers":{"data_analysis":{"command":"python","args":["server.py"]},"weather":{"command":"python","args":["server.py"]}}}"#,
+        )
+        .unwrap();
+                crate::features::marketplace::scope::save_disabled_bundles_for(
+                    crate::features::marketplace::ConnectorScope::Plain,
+                    &["data_analysis".to_string(), "weather".to_string()],
+                )
+                .unwrap();
+
+                bundle.cleanup_removed_marketplace_tools().unwrap();
+
+                assert!(!data_dir.exists(), "data_analysis 运行目录应被删");
+                let installed =
+                    std::fs::read_to_string(marketplace_dir.join("installed.json")).unwrap();
+                assert!(
+                    !installed.contains("data_analysis"),
+                    "installed.json 不应残留 data_analysis"
+                );
+                let mcp = std::fs::read_to_string(paths::mcp_config_path()).unwrap();
+                assert!(
+                    !mcp.contains("data_analysis"),
+                    "mcp.json 不应残留 data_analysis server"
+                );
+                let disabled = crate::features::marketplace::scope::load_disabled_bundles_for(
+                    crate::features::marketplace::ConnectorScope::Plain,
+                );
+                assert!(
+                    !disabled.contains(&"data_analysis".to_string()),
+                    "disabled_connectors 不应残留 data_analysis"
+                );
+            },
+        );
+    }
+
+    /// 损坏 mcp.json 下的退役清理:uninstall 在写入器处被拒并整体回滚——登记、
+    /// 包目录、坏文件字节必须全部原样保留,等待文件修复后的下次启动重试,
+    /// 而不是销毁一个仍登记在册的工具的包目录。
+    #[test]
+    fn cleanup_defers_when_uninstall_refuses_a_corrupt_mcp_json() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_defers_when_uninstall_refuses_a_corrupt_mcp_json",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                let data_dir = paths::bundle_mcp_servers_dir().join("data_analysis");
+                std::fs::create_dir_all(&data_dir).unwrap();
+                std::fs::write(
+                    data_dir.join("manifest.json"),
+                    r#"{
+                "id":"data_analysis",
+                "name":"数据分析与可视化",
+                "description":"removed",
+                "version":"1",
+                "icon":"bar-chart-3",
+                "category":"办公",
+                "mcp_tools":["mcp_data_analysis_build_dashboard"],
+                "command":"python",
+                "args":["server.py"]
+            }"#,
+                )
+                .unwrap();
+                let marketplace_dir = paths::pinvou3_home().join("marketplace");
+                std::fs::create_dir_all(&marketplace_dir).unwrap();
+                std::fs::write(
+                    marketplace_dir.join("installed.json"),
+                    r#"["data_analysis"]"#,
+                )
+                .unwrap();
+                let mcp_path = paths::mcp_config_path();
+                let corrupt = r#"{"servers": {,"trailing":"comma"}"#;
+                std::fs::write(&mcp_path, corrupt).unwrap();
+
+                bundle.cleanup_removed_marketplace_tools().unwrap();
+
+                assert!(
+                    data_dir.exists(),
+                    "uninstall 被拒后不得删除仍登记在册的工具的包目录"
+                );
+                let installed =
+                    std::fs::read_to_string(marketplace_dir.join("installed.json")).unwrap();
+                assert!(
+                    installed.contains("data_analysis"),
+                    "uninstall 被拒后登记必须原样保留: {installed}"
+                );
+                assert_eq!(
+                    std::fs::read(&mcp_path).unwrap(),
+                    corrupt.as_bytes(),
+                    "坏文件字节必须在被拒的卸载中幸存"
+                );
+            },
+        );
+    }
+
+    /// 旧版 mcp.json 的 present server key 是 `pinvou`(与产品名差一个 3,模型采样必漂成
+    /// pinvou3 → `Failed to find MCP server: pinvou3`)。升级时 ensure_builtin_mcp_servers
+    /// 必须迁成 `pinvou3`、删干净旧 `pinvou`,且不碰 marketplace 已装条目。
+    #[test]
+    fn migrates_legacy_pinvou_server_key_to_pinvou3() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-migrates_legacy_pinvou_server_key_to_pinvou3",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+                std::fs::create_dir_all(bundle.mcp_json.parent().unwrap()).unwrap();
+                // 模拟旧版本写下的 mcp.json:present server 仍叫 pinvou + 一个 marketplace 条目(weather)。
+                std::fs::write(
+            &bundle.mcp_json,
+            r#"{"servers":{"pinvou":{"command":"python3","args":["/old/present.py"]},"weather":{"command":"python3","args":["/x/w.py"]}}}"#,
+        )
+        .unwrap();
+                bundle.ensure_builtin_mcp_servers().unwrap();
+                let mcp: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                        .unwrap();
+                let servers = mcp["servers"].as_object().unwrap();
+                assert!(
+                    servers.contains_key("pinvou3"),
+                    "应迁到 pinvou3,实际={:?}",
+                    servers.keys().collect::<Vec<_>>()
+                );
+                assert!(!servers.contains_key("pinvou"), "旧 pinvou 应删除,不留残");
+                assert!(
+                    servers.contains_key("weather"),
+                    "marketplace 条目 weather 不应被迁移误删"
+                );
+            },
+        );
+    }
+
+    /// 坏 mcp.json(parse 失败)必须自愈:重建骨架并恢复内置 pinvou3 server 条目——
+    /// 早期返回"留给后续启动"会让坏文件永远修不好(present_artifact 永久失效)。
+    #[test]
+    fn ensure_builtin_mcp_servers_repairs_broken_mcp_json() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-ensure_builtin_mcp_servers_repairs_broken_mcp_json",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+                std::fs::create_dir_all(bundle.mcp_json.parent().unwrap()).unwrap();
+                std::fs::write(&bundle.mcp_json, "{ not valid json !!!").unwrap();
+
+                bundle.ensure_builtin_mcp_servers().unwrap();
+
+                let mcp: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                        .expect("自愈后 mcp.json 必须是合法 json");
+                let servers = mcp["servers"].as_object().unwrap();
+                assert!(
+                    servers.contains_key("pinvou3"),
+                    "坏 mcp.json 自愈后应恢复内置 pinvou3 条目,实际={:?}",
+                    servers.keys().collect::<Vec<_>>()
+                );
+                assert!(!servers.contains_key("pinvou"), "旧 pinvou 不残留");
+            },
+        );
+    }
+
+    /// #521/#515 cross-process contention on the boot builtin-refresh write
+    /// path: while a foreign fd holds the `mcp.lock` OS lock, the builtin
+    /// refresh (which owns `with_mcp_json_lock` since #521) must not land its
+    /// write; after the release the pinvou3 entry lands and the marketplace
+    /// sentinel survives. The worker handshake observes the mcp in-process
+    /// mutex, so the absence assert cannot pass before the worker even
+    /// reached the lock (#517 test shape).
+    #[test]
+    fn cross_process_lock_blocks_mcp_builtin_refresh_write_until_release() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cross_process_lock_blocks_mcp_builtin_refresh_write_until_release",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+                let mcp_json = bundle.mcp_json.clone();
+                std::fs::create_dir_all(mcp_json.parent().unwrap()).unwrap();
+                // Seed one marketplace sentinel; the refresh must add pinvou3 without
+                // touching it, contended or not.
+                std::fs::write(
+                    &mcp_json,
+                    r#"{"servers":{"weather":{"command":"python3","args":["/x/w.py"]}}}"#,
+                )
+                .unwrap();
+                let lock_path = crate::features::marketplace::file_lock::lock_path_for(&mcp_json);
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(&lock_path)
+                    .expect("test should be able to open the lock file");
+                let mut foreign = fd_lock::RwLock::new(file);
+                let foreign_guard = foreign
+                    .write()
+                    .expect("test should be able to take the foreign cross-process write lock");
+
+                let worker = std::thread::spawn(move || {
+                    bundle
+                        .ensure_builtin_mcp_servers()
+                        .expect("refresh should succeed once the foreign lock is released");
+                });
+                // Handshake: wait until the worker holds the mcp.json in-process mutex
+                // — with the foreign lock held, it is now parked on (or just failed)
+                // the OS-lock acquisition (#517 test shape).
+                crate::features::marketplace::file_lock::wait_until_process_mutex_parked(
+                    &lock_path, "mcp.json",
+                );
+                // The refresh must not land while the peer holds the lock.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::time::Instant::now() < deadline {
+                    let content = std::fs::read_to_string(&mcp_json).unwrap();
+                    assert!(
+                        !content.contains("\"pinvou3\""),
+                        "mcp.json rewritten while the lock was still held — serialization is broken: {content}"
+                    );
+                    assert!(
+                        content.contains("\"weather\""),
+                        "the marketplace sentinel must survive the contended window: {content}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                drop(foreign_guard);
+                worker
+                    .join()
+                    .expect("worker should finish once the foreign lock is released");
+                let mcp: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&mcp_json).unwrap()).unwrap();
+                assert!(
+                    mcp["servers"].get("pinvou3").is_some(),
+                    "the builtin entry must land after the lock is released: {mcp}"
+                );
+                assert!(
+                    mcp["servers"].get("weather").is_some(),
+                    "the marketplace sentinel must survive: {mcp}"
+                );
+            },
+        );
+    }
+
+    /// The write footprint of ensure_builtin_mcp_servers is pinned to the three
+    /// engine keys pinvou3/pinvou/browser. The observed footprint is cross-checked
+    /// against the marketplace-side `ENGINE_OWNED_MCP_SERVER_KEYS` constant (the
+    /// startup reconcile relies on it to avoid engine keys): adding or renaming a
+    /// builtin server key without updating the constant turns this test red, and
+    /// the marketplace-side exact-set test keeps the constant itself honest, so
+    /// the two sides can no longer drift apart silently.
+    #[test]
+    fn ensure_builtin_mcp_servers_touches_only_engine_owned_keys() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-ensure_builtin_mcp_servers_touches_only_engine_owned_keys",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+                std::fs::create_dir_all(bundle.mcp_json.parent().unwrap()).unwrap();
+                // One entry per engine-key form (pinvou migration / pinvou3 upsert /
+                // browser-wrapper residue cleanup) plus two user-entry sentinels. The
+                // sentinels deliberately use node commands to dodge the stale-python
+                // rewrite path of refresh_mcp_python_commands — this test pins the
+                // key-set footprint, not the python self-heal semantics.
+                std::fs::write(
+            &bundle.mcp_json,
+            r#"{"servers":{
+                "pinvou":{"command":"python3","args":["/old/present.py"]},
+                "pinvou3":{"command":"/usr/bin/obsolete-python","args":["/old/present.py"]},
+                "browser":{"command":"node","args":["/old/browser-wrapper.mjs"]},
+                "user-node":{"command":"node","args":["/opt/user-tool/run.js"],"enabled":false,"custom_hint":"keep"},
+                "user-node2":{"command":"node","args":["/opt/user-tool/run2.js"]}
+            }}"#,
+        )
+        .unwrap();
+                let before: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                        .unwrap();
+                let before_servers = before["servers"].as_object().unwrap();
+
+                bundle.ensure_builtin_mcp_servers().unwrap();
+
+                let mcp: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                        .unwrap();
+                let servers = mcp["servers"].as_object().unwrap();
+                let mut keys: Vec<&str> = servers.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    vec!["pinvou3", "user-node", "user-node2"],
+                    "write footprint must be exactly the three engine keys: pinvou migrated away, pinvou3 upserted, browser residue deleted"
+                );
+                // Real cross-check against the marketplace-side constant: the keys the
+                // upsert actually manages — the engine keys surviving the pass plus the
+                // constant's keys it removed (pinvou migration, browser residue) — must
+                // equal ENGINE_OWNED_MCP_SERVER_KEYS exactly. An engine-side key added
+                // without the constant turns red, and a constant entry the boot path
+                // never touches turns red too; the marketplace-side exact-set test pins
+                // the constant against its literal.
+                let mut managed_keys: Vec<String> = servers
+                    .keys()
+                    .map(String::clone)
+                    .filter(|key| !key.starts_with("user-node"))
+                    .collect();
+                for key in before_servers.keys() {
+                    if ENGINE_OWNED_MCP_SERVER_KEYS.contains(&key.as_str())
+                        && !servers.contains_key(key)
+                    {
+                        managed_keys.push(key.clone());
+                    }
+                }
+                managed_keys.sort_unstable();
+                managed_keys.dedup();
+                let mut expected: Vec<&str> = ENGINE_OWNED_MCP_SERVER_KEYS.to_vec();
+                expected.sort_unstable();
+                assert_eq!(
+                    managed_keys, expected,
+                    "ensure_builtin_mcp_servers' managed key set drifted from \
+             ENGINE_OWNED_MCP_SERVER_KEYS — update the marketplace constant in the same PR"
+                );
+                assert_eq!(
+                    servers["pinvou3"]["command"],
+                    serde_json::Value::String(paths::python_command())
+                );
+                assert_eq!(
+                    servers["user-node"],
+                    serde_json::json!({
+                        "command":"node","args":["/opt/user-tool/run.js"],
+                        "enabled":false,"custom_hint":"keep"
+                    }),
+                    "user entries outside the footprint must be preserved verbatim"
+                );
+                assert_eq!(
+                    servers["user-node2"],
+                    serde_json::json!({
+                        "command":"node","args":["/opt/user-tool/run2.js"]
+                    }),
+                    "user entries outside the footprint must be preserved verbatim"
+                );
+            },
+        );
+    }
+
+    /// write_if_changed:内容逐字节一致时跳过写盘(返回 false 且不动文件);
+    /// 内容不同才实际写入(返回 true)。
+    #[test]
+    fn write_if_changed_skips_rewrite_when_content_identical() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-write_if_changed_skips_rewrite_when_content_identical",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                let target = std::path::Path::new(&paths::pinvou3_home())
+                    .join("nested")
+                    .join("out.txt");
+
+                // 首次:文件不存在 → 实际写入(父目录自动创建)
+                assert!(bundle.write_if_changed(&target, "hello").unwrap());
+                let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+                // 内容一致 → 跳过写盘,mtime 不变
+                assert!(!bundle.write_if_changed(&target, "hello").unwrap());
+                assert_eq!(
+                    std::fs::metadata(&target).unwrap().modified().unwrap(),
+                    mtime,
+                    "内容一致时不应重写文件"
+                );
+                // 内容变化 → 重写
+                assert!(bundle.write_if_changed(&target, "world").unwrap());
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "world");
+            },
+        );
+    }
+
+    /// 已下架工具无任何残留时走快速路径:不实例化 MarketplaceManager 跑 uninstall。
+    /// 可观测证据:uninstall 必写 marketplace/installed.json,快速路径下它不得出现。
+    #[test]
+    fn cleanup_removed_marketplace_tools_fast_path_skips_uninstall() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_removed_marketplace_tools_fast_path_skips_uninstall",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+
+                bundle.cleanup_removed_marketplace_tools().unwrap();
+
+                assert!(
+                    !paths::pinvou3_home()
+                        .join("marketplace")
+                        .join("installed.json")
+                        .exists(),
+                    "无残留时不应触发 uninstall(其必写 installed.json)"
+                );
+            },
+        );
+    }
+
+    /// G8a Upload protection must be fail-closed like the uninstall path's
+    /// `source_may_be_upload`: an unreadable BundleStore means "may be an
+    /// upload" → skip the whole retired-tool cleanup (its last step deletes
+    /// `bundles/<id>` wholesale, which is user content for an upload).
+    #[test]
+    fn cleanup_removed_marketplace_tools_fail_closed_on_unreadable_store() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_removed_marketplace_tools_fail_closed_on_unreadable_store",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+
+                // Corrupt (unparseable) bundles.json.
+                let store_file = paths::pinvou3_home()
+                    .join("marketplace")
+                    .join("bundles.json");
+                std::fs::create_dir_all(store_file.parent().unwrap()).unwrap();
+                std::fs::write(&store_file, "{ not valid json !!!").unwrap();
+                // Residue that would otherwise be cleaned (new-layout package dir).
+                let pkg_dir = paths::bundles_root().join("data_analysis");
+                std::fs::create_dir_all(&pkg_dir).unwrap();
+                std::fs::write(pkg_dir.join("plugin.json"), "{}").unwrap();
+
+                bundle.cleanup_removed_marketplace_tools().unwrap();
+
+                assert!(
+                    pkg_dir.join("plugin.json").is_file(),
+                    "store 不可读时退役清理必须 fail-closed（跳过），不得删包目录"
+                );
+            },
+        );
+    }
+
+    /// Round-32 minor 4 (review #455): an Upload record present BEFORE the
+    /// cleanup skips the whole retired-id decision (top probe) — no uninstall,
+    /// no delete, the user's uploaded pack and its registration stay put.
+    #[test]
+    fn cleanup_removed_marketplace_tools_skips_when_upload_record_present() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_removed_marketplace_tools_skips_when_upload_record_present",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+
+                // Residue that would normally trigger the cleanup…
+                let pkg_dir = paths::bundles_root().join("data_analysis");
+                std::fs::create_dir_all(&pkg_dir).unwrap();
+                std::fs::write(pkg_dir.join("plugin.json"), "{}").unwrap();
+                // …but the id is a user upload: the retired-id protection must win.
+                crate::features::marketplace::store::BundleStore::new()
+                    .upsert(crate::features::marketplace::store::BundleRecord {
+                        id: "data_analysis".to_string(),
+                        source: crate::features::marketplace::store::BundleSource::Upload(
+                            "data_analysis.zip".to_string(),
+                        ),
+                        installed: true,
+                        content_fingerprint: Some("fp".to_string()),
+                        installed_at: "2026-09-30T00:00:00+00:00".to_string(),
+                        degraded: None,
+                        assets: Vec::new(),
+                        extra: serde_json::Map::new(),
+                    })
+                    .unwrap();
+
+                bundle.cleanup_removed_marketplace_tools().unwrap();
+
+                assert!(
+                    pkg_dir.join("plugin.json").is_file(),
+                    "an uploaded pack must never be swept by the retired-tool cleanup"
+                );
+                assert!(
+                    !paths::pinvou3_home()
+                        .join("marketplace")
+                        .join("installed.json")
+                        .exists(),
+                    "the top-probe skip must not run the uninstall (uninstall unconditionally rewrites installed.json)"
+                );
+            },
+        );
+    }
+
+    /// Round-32 minor 4 (review #455): an Upload import landing while the
+    /// cleanup waits on the id's import lock must survive — the lock now
+    /// spans the DECISION (top probe + uninstall + re-probe + delete), so the
+    /// post-lock top probe re-evaluates and defers before any destructive
+    /// step runs. Observable discriminator: the uninstall never runs
+    /// (installed.json never appears), which the round-31 placement (lock
+    /// only around the final delete, uninstall outside) failed.
+    #[test]
+    fn cleanup_upload_landing_under_import_lock_defers_the_whole_decision() {
+        use crate::features::marketplace::plugin_import::import_lock_for;
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-cleanup_upload_landing_under_import_lock_defers_the_whole_decision",
+            || {
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+
+                // Residue so the cleanup would run once it gets the lock.
+                let pkg_dir = paths::bundles_root().join("data_analysis");
+                std::fs::create_dir_all(&pkg_dir).unwrap();
+                std::fs::write(pkg_dir.join("plugin.json"), "{}").unwrap();
+
+                // An import for the same id is mid-flight: it holds the id's import
+                // lock (its landing is serialized under exactly this lock).
+                let gate = import_lock_for("data_analysis");
+                let held = gate.lock().unwrap_or_else(|p| p.into_inner());
+
+                let cleaner =
+                    std::thread::spawn(move || bundle.cleanup_removed_marketplace_tools());
+                // The cleaner can only sit blocked on the import lock. Strictly, the
+                // pre-lock top probe may already have run with a no-record store —
+                // which is exactly why the under-lock re-check (not the probe) is the
+                // load-bearing piece this pin protects.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                // The import lands while the cleanup waits.
+                crate::features::marketplace::store::BundleStore::new()
+                    .upsert(crate::features::marketplace::store::BundleRecord {
+                        id: "data_analysis".to_string(),
+                        source: crate::features::marketplace::store::BundleSource::Upload(
+                            "data_analysis.zip".to_string(),
+                        ),
+                        installed: true,
+                        content_fingerprint: Some("fp".to_string()),
+                        installed_at: "2026-09-30T00:00:00+00:00".to_string(),
+                        degraded: None,
+                        assets: Vec::new(),
+                        extra: serde_json::Map::new(),
+                    })
+                    .unwrap();
+                drop(held);
+
+                cleaner.join().unwrap().unwrap();
+
+                assert!(
+                    pkg_dir.join("plugin.json").is_file(),
+                    "an upload landing under the import lock must never be swept"
+                );
+                assert!(
+                    !paths::pinvou3_home()
+                        .join("marketplace")
+                        .join("installed.json")
+                        .exists(),
+                    "the post-lock top probe must defer BEFORE the uninstall (old placement ran the uninstall outside the lock)"
+                );
+            },
+        );
+    }
+    /// Session Longevity/Efficient Approvals/taxonomy 不得再进 prompt,
+    /// pinvou3 自有的 mode 块 + 瘦身 compact 模板必须在。上游 sync 后此测试
+    /// 失败 = set_static_prompt_composer_override fork patch 被合丢。
+    #[test]
+    fn forkguard_static_composer_takes_over_static_layers() {
+        install_prompt_overrides(); // OnceLock 幂等,谁先调都一样
+
+        // v0.8.57:上游删了 `system_prompt_for_mode(AppMode)`(prompt 改 mode-independent)。
+        // 改用 mode-independent 入口;pinvou3 composer 以常量 Yolo 构造 ctx → 静态层 = base.md
+        // + MODE_EXECUTE_MD(生产单 Yolo-Auto)。原 Plan-mode 断言移除——static prompt 不再分模式
+        // (Plan 前端入口已下线;若恢复,mode 走 per-turn <runtime_prompt> tag,非静态前缀)。
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-forkguard_static_composer_takes_over_static_layers",
+            || {
+                let tmp = paths::pinvou3_home();
+                let prompt = deepseek_tui::prompts::system_prompt_for_mode_with_context_and_skills(
+                    std::path::Path::new(&tmp),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let yolo = deepseek_tui::prompts::system_prompt_flat_text(&prompt);
+                // 干掉的底座块(composer 密封 + gate:Compaction 模板/Sub-agents/Thinking budget/
+                // Tier 体系/全模式 Runtime Policy Reference 实证死重)
+                for gone in [
+                    "Personality: Calm",
+                    "## Session Longevity",
+                    "## Efficient Approvals",
+                    "## Core Tool Taxonomy",
+                    "Compaction Relay Template",
+                    "Sub-agents",
+                    "Thinking budget",
+                    "Tier ",                       // 九层已删,不许残留悬空 tier 引用
+                    "## Runtime Policy Reference", // v0.8.57 上游新增全模式块,composer gate 抑制
+                ] {
+                    assert!(!yolo.contains(gone), "底座静态块应被 composer 干掉: {gone}");
+                }
+                // composer 静态层现在只剩 Mode —— 宪法/裁决/Voice 已折叠进 instructions.md §底线
+                // (单一来源,2026-06-15 第四轮),不再出现在静态层。
+                assert!(
+                    yolo.contains("## Mode: Execute"),
+                    "composer 静态层应含 Mode 块"
+                );
+                for folded in [
+                    "CONSTITUTION OF PINVOU3",
+                    "### When directives conflict",
+                    "### Voice",
+                ] {
+                    assert!(
+                        !yolo.contains(folded),
+                        "宪法层应已折叠出静态层(并入 instructions): {folded}"
+                    );
+                }
+            },
+        );
+    }
+
+    /// forkguard(locale): the slim locale preamble/closer must be wired into
+    /// the base alongside the composer (the four set_locale_*_override calls
+    /// in install_prompt_overrides). After an upstream sync this test failing
+    /// means the four override calls were merge-dropped and zh/ja sessions
+    /// would eat the upstream long-form again (base branding plus the "think
+    /// in Chinese" teaching, which is dropped per product decision).
+    /// Mechanism: the base stores overrides in OnceLocks — first set wins,
+    /// later sets are rejected — so after install the slots must already be
+    /// occupied by the slim text (setting a different value returns Err).
+    /// forkguard(composer): per-turn `<runtime_prompt>` tag 也受 composer gate
+    /// (v0.8.57 上游新增,turn_loop 每请求注入 transient user 消息)。pinvou3 单
+    /// Yolo-Auto 下 tag 恒定零信息,且其解释文档(Runtime Policy Reference)已被
+    /// composer 抑制——无解释 internal tag 会诱发模型复述。
+    ///
+    /// (historical note) The standalone `forkguard_static_composer_gates_runtime_prompt_tag`
+    /// test only re-asserted the `static_prompt_composer_installed()` first check
+    /// below; it was merged into this test as the strict superset.
+    #[test]
+    fn forkguard_locale_bookend_overrides_are_wired() {
+        install_prompt_overrides(); // idempotent: OnceLock slots, first setter wins
+
+        assert!(deepseek_tui::prompts::static_prompt_composer_installed());
+        let reject = |r: Result<(), String>| r.is_err();
+        assert!(reject(
+            deepseek_tui::prompts::set_locale_preamble_zh_hans_override("probe".into())
+        ));
+        assert!(reject(
+            deepseek_tui::prompts::set_locale_closer_zh_hans_override("probe".into())
+        ));
+        assert!(reject(
+            deepseek_tui::prompts::set_locale_preamble_ja_override("probe".into())
+        ));
+        assert!(reject(
+            deepseek_tui::prompts::set_locale_closer_ja_override("probe".into())
+        ));
+    }
+
+    /// forkguard(locale): product decision — locale bookends constrain the
+    /// reply language only and must never mandate a thinking language
+    /// (forcing a model to think in a given language hurts reasoning
+    /// quality, and the thinking stream's language brings no user-perceivable
+    /// benefit). Assert that the four wired constants carry no thinking-
+    /// language teaching; an upstream sync pointing the overrides back at the
+    /// base long-form (its `reasoning_content` teaching, see the base
+    /// `LOCALE_PREAMBLE_ZH_HANS`/`LOCALE_CLOSER_ZH_HANS`) turns this red.
+    #[test]
+    fn forkguard_locale_bookends_never_mandate_thinking_language() {
+        for text in [
+            LOCALE_PREAMBLE_ZH_HANS,
+            LOCALE_CLOSER_ZH_HANS,
+            LOCALE_PREAMBLE_JA,
+            LOCALE_CLOSER_JA,
+        ] {
+            assert!(
+                !text.contains("reasoning_content"),
+                "locale bookend must not mandate a thinking language: {text}"
+            );
+            assert!(
+                !text.contains("思考"),
+                "locale bookend must not mandate a thinking language: {text}"
+            );
+            assert!(
+                !text.to_lowercase().contains("think"),
+                "locale bookend must not mandate a thinking language: {text}"
+            );
+        }
+    }
+
+    /// forkguard(composer): 完整合成路径上,底座在 compose 之外追加的
+    /// Context Management(含 prompt-cache 教学)与 COMPACT_TEMPLATE 也要被
+    /// composer 抑制(prompts.rs 的 static_prompt_composer().is_none() gate)。
+    #[test]
+    fn forkguard_static_composer_suppresses_context_mgmt_appends() {
+        install_prompt_overrides();
+
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-forkguard_static_composer_suppresses_context_mgmt_appends",
+            || {
+                let tmp = paths::pinvou3_home();
+                // v0.8.57:上游把 system prompt 改 mode-independent,该函数签名去掉首个 AppMode 参数。
+                let prompt = deepseek_tui::prompts::system_prompt_for_mode_with_context_and_skills(
+                    std::path::Path::new(&tmp),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let text = deepseek_tui::prompts::system_prompt_flat_text(&prompt);
+                assert!(
+                    !text.contains("## Context Management"),
+                    "Context Management 应被 composer 抑制"
+                );
+                assert!(
+                    !text.contains("## Runtime Policy Reference"),
+                    "Runtime Policy Reference 应被 composer gate 抑制(v0.8.57 新增全模式块)"
+                );
+                assert!(
+                    !text.contains("Prompt-cache awareness"),
+                    "prompt-cache 教学应被 composer 抑制"
+                );
+                // Compaction 模板全删(第二轮瘦身):真实压缩走 canonical_prompt/
+                // create_summary,模板无生产者无消费者。底座原版也不许回流。
+                assert!(
+                    !text.contains("Compaction Relay"),
+                    "Compaction 模板不应出现(pinvou3 已删,底座版也不许回流)"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn dingtalk_skill_gate_extracts_and_removes_official_mono_skill() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-dingtalk_skill_gate_extracts_and_removes_official_mono_skill",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+
+                bundle.apply_dingtalk_skills(true).unwrap();
+                // 新布局：钉钉 mono skill 解包到包目录 bundles/dingtalk/skills/。
+                let pkg_skills = paths::bundles_root().join("dingtalk").join("skills");
+                let skill = pkg_skills.join("dws");
+                assert!(skill.join("SKILL.md").is_file());
+                assert!(
+                    skill
+                        .join("references")
+                        .join("global-reference.md")
+                        .is_file()
+                );
+                assert!(pkg_skills.join("NOTICE-dingtalk.md").is_file());
+
+                bundle.apply_dingtalk_skills(false).unwrap();
+                assert!(!skill.exists());
+                assert!(!pkg_skills.join("NOTICE-dingtalk.md").exists());
+            },
+        );
+    }
+
+    /// `WECOM_SKILL_DIRS` 清单必须与内嵌 wecom-skills 资源树的实际目录一致:
+    /// 漏列会让技能静默不可见(cached_wecom_skills_visible 的 all() 不查多余目录),
+    /// 多列会让门控删除/缓存判定指向不存在的目录——两侧都对齐才有报警。
+    #[test]
+    fn wecom_skill_dirs_match_embedded_resources() {
+        let mut embedded: Vec<&str> = WECOM_SKILLS_DIR
+            .dirs()
+            .map(|d| d.path().to_str().expect("目录名应为 UTF-8"))
+            .collect();
+        embedded.sort_unstable();
+        let mut listed = WECOM_SKILL_DIRS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            embedded, listed,
+            "WECOM_SKILL_DIRS 与 bundle/wecom-skills 实际目录不一致"
+        );
+        // 每个技能目录都必须带 SKILL.md(门控可见性按它判定)
+        for d in WECOM_SKILL_DIRS {
+            assert!(
+                WECOM_SKILLS_DIR.get_file(format!("{d}/SKILL.md")).is_some(),
+                "wecom-skills/{d} 缺 SKILL.md"
+            );
+        }
+    }
+
+    /// 0.1.9 时代的 legacy 目录(wecomcli-msg/schedule)无论显示与否都要被清掉,
+    /// 防残留技能教已死的命令(`msg`/`schedule` 服务)。
+    #[test]
+    fn wecom_skill_gate_cleans_legacy_dirs() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-wecom_skill_gate_cleans_legacy_dirs",
+            || {
+                let bundle = Pinvou3Bundle::paths();
+                std::fs::create_dir_all(&bundle.skills_dir).unwrap();
+
+                for d in WECOM_LEGACY_SKILL_DIRS {
+                    let legacy = bundle.skills_dir.join(d);
+                    std::fs::create_dir_all(&legacy).unwrap();
+                    std::fs::write(legacy.join("SKILL.md"), "legacy").unwrap();
+                }
+
+                // 隐藏门控:清 legacy + 删当前技能
+                bundle.apply_wecom_skills(false).unwrap();
+                for d in WECOM_LEGACY_SKILL_DIRS {
+                    assert!(!bundle.skills_dir.join(d).exists(), "{d} 应被清理");
+                }
+
+                // 显示门控:同样先清 legacy(开头无条件清理),再解包 15 个当前技能
+                for d in WECOM_LEGACY_SKILL_DIRS {
+                    std::fs::create_dir_all(bundle.skills_dir.join(d)).unwrap();
+                }
+                bundle.apply_wecom_skills(true).unwrap();
+                for d in WECOM_LEGACY_SKILL_DIRS {
+                    assert!(!bundle.skills_dir.join(d).exists(), "{d} 应被清理");
+                }
+                // 门控解包目标在按包聚合布局 bundles/wecom/skills/（旧扁平 skills_dir 已退役）
+                let wecom_pkg_skills = crate::platform::paths::bundles_root()
+                    .join("wecom")
+                    .join("skills");
+                for d in WECOM_SKILL_DIRS {
+                    assert!(
+                        wecom_pkg_skills.join(d).join("SKILL.md").is_file(),
+                        "{d} 应被解包"
+                    );
+                }
+            },
+        );
+    }
+
+    /// Verifies the Browser MCP gate defined by the ADR:
+    /// 1. global mcp.json never registers a browser entry and historical residue is removed;
+    /// 2. `work_mode_mcp_config_path` falls back to the global path when prerequisites fail;
+    /// 3. when prerequisites pass, it creates a session-specific global-plus-Pinvou-browser
+    ///    file and deterministically renames any user-owned browser server only in that copy.
+    #[test]
+    fn browser_mcp_entry_is_gated_to_work_mode_config() {
+        crate::platform::test_support::with_temp_home(
+            "pinvou3-bundle-browser_mcp_entry_is_gated_to_work_mode_config",
+            || {
+                // SAFETY: holding platform::paths::tests::ENV_LOCK; in-process env writes are serialized.
+                unsafe { std::env::remove_var("PINVOU3_CDMCP_BIN") };
+                paths::ensure_dirs().unwrap();
+                let bundle = Pinvou3Bundle::paths();
+                std::fs::create_dir_all(bundle.mcp_json.parent().unwrap()).unwrap();
+
+                // 1) Preserve a user-defined browser server in global mcp.json byte-for-byte. Remove
+                //    only historical app-owned residue whose command targets browser-wrapper.mjs.
+                std::fs::write(
+            &bundle.mcp_json,
+            r#"{"servers":{"browser":{"command":"/old/browser"},"weather":{"command":"python3","args":["/x/w.py"]}}}"#,
+        )
+        .unwrap();
+                bundle.ensure_builtin_mcp_servers().unwrap();
+                let mcp: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                        .unwrap();
+                assert!(
+                    mcp["servers"].as_object().unwrap().contains_key("browser"),
+                    "a user-defined browser server must not be deleted"
+                );
+                assert_eq!(
+                    mcp["servers"]["browser"]["command"], "/old/browser",
+                    "a user-defined browser server must remain unchanged"
+                );
+
+                if bundle.browser_mcp_entry().is_none() {
+                    // Even when the built-in backend is unavailable, do not expose a user server
+                    // under the reserved name in Work mode: the Agent would mistake `mcp_browser_*`
+                    // for the same-page embedded browser. Rename only in the session copy and leave
+                    // global configuration unchanged. Builds with complete prerequisites skip this
+                    // branch and use the built-in conflict case below.
+                    let reserved_path = bundle.work_mode_mcp_config_path_for_session("work/gated");
+                    assert_ne!(reserved_path, bundle.mcp_json);
+                    let reserved: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&reserved_path).unwrap())
+                            .unwrap();
+                    assert!(
+                        !reserved["servers"]
+                            .as_object()
+                            .unwrap()
+                            .contains_key("browser")
+                    );
+                    assert_eq!(
+                        reserved["servers"]["browser_user"]["command"],
+                        "/old/browser"
+                    );
+                    let global_after_reservation: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                            .unwrap();
+                    assert_eq!(global_after_reservation, mcp);
+                }
+
+                // 1b) Remove historical app-owned wrapper residue; global configuration never
+                //     registers Browser MCP.
+                std::fs::write(
+            &bundle.mcp_json,
+            r#"{"servers":{"browser":{"command":"/x/browser-wrapper.mjs"},"weather":{"command":"python3","args":["/x/w.py"]}}}"#,
+        )
+        .unwrap();
+                bundle.ensure_builtin_mcp_servers().unwrap();
+                let mcp2: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                        .unwrap();
+                assert!(
+                    !mcp2["servers"].as_object().unwrap().contains_key("browser"),
+                    "historical app-owned browser residue must be removed"
+                );
+
+                // 2) Missing prerequisites (no vendor entry point) fall back to global mcp.json
+                //    without writing a session-specific file.
+                assert_eq!(
+                    bundle.work_mode_mcp_config_path(),
+                    bundle.mcp_json,
+                    "missing prerequisites must return global mcp.json"
+                );
+
+                // 3) Complete prerequisites (Windows vendor, Linux WebKitWebDriver, or macOS
+                //    WKWebView BrowserCore, plus wrapper and Node.js) generate a session-specific
+                //    file. Unreleased platforms must still fail closed.
+                // Round-8 review minor: snapshot the gate vars through the
+                // panic-safe guard BEFORE seeding them — the straight-line
+                // remove_var tail never ran on a mid-test panic, leaking the
+                // three values to later tests. (with_temp_home already holds
+                // ENV_LOCK, so locked_env's non-reentrant lock is not an
+                // option here; capture is the lock-free half of that pair.)
+                let _gate_env = crate::platform::test_support::EnvRestore::capture(&[
+                    "PINVOU3_CDMCP_BIN",
+                    "PINVOU3_WEBKIT_WEBDRIVER_BIN",
+                    "PINVOU3_RESOURCE_DIR",
+                ]);
+                let fake_bin =
+                    std::path::PathBuf::from(&paths::pinvou3_home()).join("fake-cdmcp-entry.js");
+                std::fs::write(&fake_bin, "#!/usr/bin/env node\n").unwrap();
+                #[cfg(windows)]
+                {
+                    let fake_bin_for_env =
+                        std::path::PathBuf::from(format!(r"\\?\{}", fake_bin.display()));
+                    // SAFETY: holding platform::paths::tests::ENV_LOCK; in-process env writes are serialized.
+                    unsafe { std::env::set_var("PINVOU3_CDMCP_BIN", &fake_bin_for_env) };
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    let fake_driver =
+                        std::path::PathBuf::from(&paths::pinvou3_home()).join("WebKitWebDriver");
+                    std::fs::write(&fake_driver, "#!/bin/sh\n").unwrap();
+                    std::fs::set_permissions(&fake_driver, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                    // SAFETY: holding platform::paths::tests::ENV_LOCK; in-process env writes are serialized.
+                    unsafe { std::env::set_var("PINVOU3_WEBKIT_WEBDRIVER_BIN", fake_driver) };
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    // The released macOS build resolves Node from the bundled connector
+                    // runtime. Fabricate it under a fake resource dir (same layout and
+                    // arch mapping as bundled_connector_runtime_paths_for) so the
+                    // complete-prerequisites branch never depends on the machine PATH.
+                    let node_rel = match std::env::consts::ARCH {
+                        "aarch64" => "darwin-arm64/bin/node",
+                        "x86_64" => "darwin-x64/bin/node",
+                        other => panic!("unexpected macOS arch for the fake bundled node: {other}"),
+                    };
+                    let node_bin = std::path::PathBuf::from(&paths::pinvou3_home())
+                        .join("runtime/codex-bridge/node")
+                        .join(node_rel);
+                    std::fs::create_dir_all(node_bin.parent().unwrap()).unwrap();
+                    std::fs::write(&node_bin, "#!/bin/sh\n").unwrap();
+                    // SAFETY: holding platform::paths::tests::ENV_LOCK; in-process env writes are serialized.
+                    unsafe { std::env::set_var("PINVOU3_RESOURCE_DIR", &paths::pinvou3_home()) };
+                }
+                #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+                // SAFETY: holding platform::paths::tests::ENV_LOCK; in-process env writes are serialized.
+                unsafe {
+                    std::env::set_var("PINVOU3_CDMCP_BIN", &fake_bin)
+                };
+                let wrapper = paths::bundle_browser_wrapper();
+                std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
+                std::fs::write(&wrapper, "#!/usr/bin/env node\n").unwrap();
+                let work_path = bundle.work_mode_mcp_config_path();
+                if !crate::platform::capabilities::browser_product_enabled() {
+                    assert_eq!(
+                        work_path, bundle.mcp_json,
+                        "an unreleased product build must not register Browser MCP from environment residue"
+                    );
+                    assert_eq!(
+                        bundle.work_mode_mcp_config_path_for_session("work/session-A"),
+                        bundle.mcp_json,
+                        "an unreleased build without a reserved-name conflict needs no session copy"
+                    );
+                    assert!(
+                        bundle.browser_unavailability_reason().is_some_and(
+                            |reason| reason.contains("not enabled in this product build")
+                        )
+                    );
+                } else {
+                    assert_ne!(
+                        work_path, bundle.mcp_json,
+                        "complete prerequisites must return a session-specific MCP file"
+                    );
+                    let work: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&work_path).unwrap())
+                            .unwrap();
+                    let servers = work["servers"].as_object().unwrap();
+                    assert!(
+                        servers.contains_key("browser"),
+                        "the session-specific file must contain a browser entry"
+                    );
+                    assert!(
+                        servers.contains_key("weather"),
+                        "the marketplace weather entry must be preserved"
+                    );
+                    let args = servers["browser"]["args"].as_array().unwrap();
+                    assert_eq!(
+                        args.len(),
+                        3,
+                        "the browser wrapper must receive only the wrapper, platform backend entry, and host-state file"
+                    );
+                    assert!(
+                        args[0].as_str().unwrap().ends_with("browser-wrapper.mjs"),
+                        "the browser entry must use the wrapper as its entry point"
+                    );
+                    assert!(
+                        !args[0].as_str().unwrap().starts_with(r"\\?\"),
+                        "the wrapper entry passed to Node.js must not retain a Windows verbatim prefix"
+                    );
+                    #[cfg(windows)]
+                    assert!(
+                        !args[1].as_str().unwrap().starts_with(r"\\?\"),
+                        "the MCP entry passed to Node.js must not retain a Windows verbatim prefix"
+                    );
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    assert_eq!(
+                        args[1], "@pinvou/browser-core",
+                        "Linux and macOS must select in-app BrowserCore instead of registering Chrome MCP"
+                    );
+
+                    // 4) Each Work-mode session receives an independent configuration and stable
+                    //    token. The wrapper environment retains the original session_id for host
+                    //    requests, while paths and labels use only the safe token.
+                    let session_path =
+                        bundle.work_mode_mcp_config_path_for_session("work/session-A");
+                    assert_ne!(session_path, work_path);
+                    assert_eq!(
+                        session_path.file_name().and_then(|value| value.to_str()),
+                        Some("f1731564024f1ec5.json")
+                    );
+                    let session: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&session_path).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        session["servers"]["browser"]["env"]["PINVOU3_BROWSER_SESSION_ID"],
+                        "work/session-A"
+                    );
+                    assert_eq!(
+                        session["servers"]["browser"]["env"]["PINVOU3_BROWSER_SESSION_TOKEN"],
+                        crate::platform::paths::browser_session_token("work/session-A")
+                    );
+
+                    // 5) When a user occupies the reserved browser name globally, leave the global
+                    //    file unchanged. Work mode always points browser to the Pinvou wrapper and
+                    //    preserves the user entry after existing deterministic aliases.
+                    let global_with_conflict = serde_json::json!({
+                        "servers": {
+                            "browser": {
+                                "command": "playwright-mcp",
+                                "env": { "USER_SETTING": "kept" }
+                            },
+                            "browser_user": { "command": "existing-user-browser" },
+                            "browser_user_2": { "command": "existing-numbered-browser" },
+                            "weather": { "command": "weather-mcp" }
+                        }
+                    });
+                    std::fs::write(
+                        &bundle.mcp_json,
+                        serde_json::to_string_pretty(&global_with_conflict).unwrap(),
+                    )
+                    .unwrap();
+
+                    let conflict_path =
+                        bundle.work_mode_mcp_config_path_for_session("work/session-conflict");
+                    assert_ne!(conflict_path, bundle.mcp_json);
+                    let conflict: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&conflict_path).unwrap())
+                            .unwrap();
+                    assert!(
+                        conflict["servers"]["browser"]["args"][0]
+                            .as_str()
+                            .unwrap()
+                            .ends_with("browser-wrapper.mjs"),
+                        "the session-reserved browser name must always target the Pinvou wrapper"
+                    );
+                    assert_eq!(
+                        conflict["servers"]["browser_user_3"],
+                        global_with_conflict["servers"]["browser"],
+                        "the conflicting user server must move to the first deterministic free alias"
+                    );
+                    assert_eq!(
+                        conflict["servers"]["browser_user"],
+                        global_with_conflict["servers"]["browser_user"]
+                    );
+                    assert_eq!(
+                        conflict["servers"]["browser_user_2"],
+                        global_with_conflict["servers"]["browser_user_2"]
+                    );
+                    let global_after: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&bundle.mcp_json).unwrap())
+                            .unwrap();
+                    assert_eq!(
+                        global_after, global_with_conflict,
+                        "generating a session copy must not rewrite the user's global mcp.json"
+                    );
+                    assert_eq!(
+                        bundle.browser_unavailability_reason(),
+                        None,
+                        "a globally user-owned browser name must not degrade the embedded browser or inject an error"
+                    );
+                }
+            },
+        );
+    }
+}

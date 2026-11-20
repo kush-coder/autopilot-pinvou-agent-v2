@@ -1,0 +1,224 @@
+import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { CodexAcpView as LazyCodexAcpView } from '../features/codex/LazyCodexAcpView.jsx';
+import { ChatView } from '../features/chat/ChatView.jsx';
+import { VIEW_LOADERS } from './view-loaders.js';
+import { VoiceShortcutRouter } from '../features/voice-composer/VoiceShortcutRouter.jsx';
+// 撕离窗与主窗口共用同一批懒加载视图 chunk(rolldown 自动共享),工厂统一走
+// view-loaders.js 的 VIEW_LOADERS。静态 import 会让对应视图被钉回主 chunk,
+// every view here goes through lazy; each window only actually loads the chunk
+// for its own kind. Two exceptions:
+// - codex: reuses the #159 LazyCodexAcpView wrapper (web capability gating +
+//   checking fallback; internally it also lazy-imports CodexAcpView, sharing
+//   the same chunk);
+// - chat: the main window statically imports ChatView in main.jsx (rendered at
+//   startup), and a detached window loads the same index.html, so the main
+//   chunk is necessarily already loaded; a dynamic import would not produce a
+//   separate chunk, so statically import the same module from the main chunk.
+const LazyKnowledgeView = lazy(() => VIEW_LOADERS.knowledge().then(m => ({ default: m.KnowledgeView })));
+const LazyMonitorView = lazy(() => VIEW_LOADERS.monitor().then(m => ({ default: m.MonitorView })));
+const LazyToolStoreView = lazy(() => VIEW_LOADERS.toolStore().then(m => ({ default: m.ToolStoreView })));
+const LazyCardPoolView = lazy(() => VIEW_LOADERS.cardpool().then(m => ({ default: m.CardPoolView })));
+const DetachedViewFallback = () => <div className="p-6 text-sm opacity-60">…</div>;
+import { useBridgeState } from '../hooks/useBridge.js';
+import { setStreamFadePreference } from '../features/conversation/stream-fade.js';
+import { useSystemDarkMode } from '../hooks/useSystemDarkMode.js';
+import { normalizeColorScheme, readStoredColorScheme, resolveTheme } from '../shared/color-scheme.js';
+import { listenTauri } from '../platform/tauri/client.js';
+import { listAcpSessions } from '../features/codex/acpClient.js';
+import { dict, ensureLanguage, initialSystemLanguage, TAG_TO_LANG, zhDict } from '../shared/i18n.js';
+import { ensurePersonaI18nOverlay } from './personas-overlay.js';
+
+function useDetachedBase() {
+  // `computerUse` is required: ChatView renders the grant/confirm consent
+  // surfaces from that slice, and a detached chat window without it shows no
+  // banner and no dialog while the agent controls the machine (round-10 M1).
+  // Web-safe: the web domain-adapter declares the domain and ChatView
+  // double-gates on `can('computerUse')`.
+  const bs = useBridgeState([
+    'platform', 'sessions', 'chat', 'voice', 'knowledge', 'scheduled', 'monitor',
+    'settings', 'personas', 'computerUse',
+  ]);
+  const [language, setLanguage] = useState(initialSystemLanguage);
+  // Same color-scheme semantics as the main window: `system` follows the OS
+  // live (light when undeterminable). Detached windows have no settings entry,
+  // so the preference is read once from the main settings at bootstrap and
+  // keeps following system flips afterwards (while on `system`). Seed from
+  // the persisted scheme (readStoredColorScheme, same as main.jsx/ReaderApp):
+  // the detached window loads index.html, whose pre-paint script already
+  // applied the stored scheme's class, and reconciling from plain 'system'
+  // would strip it again until the bootstrap settings arrive whenever the
+  // stored pick differs from the OS.
+  const systemDark = useSystemDarkMode();
+  const [colorScheme, setColorScheme] = useState(readStoredColorScheme);
+  const activeTheme = resolveTheme(colorScheme, systemDark);
+  const [, setPersonaI18nTick] = useState(0);
+  const initRef = useRef(false);
+  // Streaming fade-in for chat responses (default on; only an explicit
+  // settings.chat.streaming_animation === false turns it off). Unlike the
+  // one-shot language/theme bootstrap below, this re-derives whenever this
+  // window's settings snapshot refreshes. Settings changes are not broadcast
+  // across windows, so an already-open detached window can lag the main
+  // window's toggle until it reloads settings (self-heals on reopen).
+  const chatStreamingAnimation = !bs || !bs.settings || !bs.settings.chat || bs.settings.chat.streaming_animation !== false;
+  useEffect(() => {
+    setStreamFadePreference(chatStreamingAnimation);
+  }, [chatStreamingAnimation]);
+
+  useEffect(() => {
+    if (initRef.current || !bs || !bs.settings) return;
+    const lang = TAG_TO_LANG[bs.settings.language];
+    // One-shot bootstrap once bridge state is ready (language/theme only take
+    // initial values at detached-window startup, then this window manages them);
+    // initRef blocks repeat writes from later settings changes, keeping the
+    // original one-shot semantics.
+    // en/ja lazy dictionaries: the entry only bootstraps the system language;
+    // the persisted language may not be loaded yet, so ensure it before switching.
+    if (lang) ensureLanguage(lang).then((ok) => { if (ok) setLanguage(lang); }).catch(() => {});
+    setColorScheme(normalizeColorScheme(bs.settings.color_scheme));
+    initRef.current = true;
+  }, [bs]);
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', activeTheme === 'dark');
+  }, [activeTheme]);
+  // 与主窗 App 同一兜底:撕离窗加载同一 index.html,「系统中文 + 英/日 UI」时
+  // index.html 快速路径跳过注入,卡池撕离窗卡名会停在中文。UI 语言为 en/ja 时
+  // 兜底注入 overlay,加载完成 bump 一次让卡名重渲染。
+  useEffect(() => {
+    if (language === 'en' || language === 'ja') {
+      ensurePersonaI18nOverlay(() => setPersonaI18nTick(v => v + 1));
+    }
+  }, [language]);
+
+  // 兜底 zh 是活腿:入口引导失败降级装载 zh 后 zhDict() 非空(与主窗同口径)。
+  return { bs, activeTheme, t: dict[language] || zhDict() };
+}
+
+class DetachedErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { err: null };
+  }
+
+  static getDerivedStateFromError(err) {
+    return { err };
+  }
+
+  componentDidCatch(err, info) {
+    console.error('[detached] panel render failed', err && err.stack ? err.stack : err,
+      info && info.componentStack ? info.componentStack : info);
+  }
+
+  render() {
+    if (this.state.err) {
+      const message = String((this.state.err && this.state.err.message) || this.state.err);
+      return <div className="p-6 text-sm opacity-70">{this.props.t.uiMainApp.panelLoadFailed(message)}</div>;
+    }
+    return this.props.children;
+  }
+}
+
+function DetachedCodexSessionView({ id, theme, t, bs }) {
+  const [sessions, setSessions] = useState(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = null;
+    const refresh = async () => {
+      try {
+        const next = await listAcpSessions();
+        if (!disposed) {
+          setSessions(Array.isArray(next) ? next : []);
+          setLoadFailed(false);
+        }
+      } catch (error) {
+        console.warn('[detached-codex] list sessions failed', error);
+        if (!disposed) setLoadFailed(true);
+      }
+    };
+    refresh();
+    listenTauri('session:deleted', refresh).then(fn => {
+      if (disposed) fn();
+      else unlisten = fn;
+    }).catch(() => {});
+    return () => {
+      disposed = true;
+      if (unlisten) unlisten();
+    };
+  }, [id]);
+
+  if (!id || loadFailed) {
+    return <div className="p-6 text-sm opacity-70">{t.uiMainApp.detachedSessionLoadFailed}</div>;
+  }
+  if (sessions === null) {
+    return <div className="p-6 text-sm opacity-60">…</div>;
+  }
+  if (sessions.every(session => !(session && session.id === id))) {
+    return <div className="p-6 text-sm opacity-70">{t.uiMainApp.detachedSessionMissing}</div>;
+  }
+  return (
+    <Suspense fallback={<DetachedViewFallback />}>
+    <LazyCodexAcpView
+      theme={theme}
+      t={t}
+      sessions={sessions}
+      activeId={id}
+      onActiveSessionChange={() => {}}
+      onSessionsChange={next => setSessions(Array.isArray(next) ? next : [])}
+      onSwitchHomeMode={() => {}}
+      bs={bs}
+      onGotoTools={() => {}}
+      fixedSession
+    />
+    </Suspense>
+  );
+}
+
+// Reuse the same feature views as the main window. Cross-view navigation is a
+// no-op because a detached window intentionally owns one view only.
+const DETACHED_VIEWS = {
+  session: ({ theme, t, bs }) => <ChatView theme={theme} t={t} bs={bs} prefill="" onPrefillConsumed={() => {}} onOpenEditor={() => {}} justInstalledTool={null} setJustInstalledTool={() => {}} onGotoSettings={() => {}} onGotoTools={() => {}} />,
+  'codex-session': ({ id, theme, t, bs }) => <DetachedCodexSessionView id={id} theme={theme} t={t} bs={bs} />,
+  monitor: ({ theme, t, bs }) => <LazyMonitorView theme={theme} t={t} bs={bs} />,
+  cardpool: ({ theme, t, bs }) => <LazyCardPoolView theme={theme} t={t} bs={bs} onAICreate={() => {}} initialMyOnly={false} />,
+  toolstore: ({ theme, t }) => <LazyToolStoreView theme={theme} t={t} onNewChat={() => {}} />,
+  knowledge: ({ theme, t }) => <LazyKnowledgeView theme={theme} t={t} />,
+  outputs: ({ theme, t }) => <LazyKnowledgeView theme={theme} t={t} mode="outputs" />,
+};
+
+// View name for the detached window title bar: maps each kind's raw id to the existing i18n
+// copy shared with the main window sidebar/title bar; unknown kinds (theoretically impossible) fall back to the raw id.
+const DETACHED_KIND_LABEL_KEYS = {
+  session: (t) => t.currentChat,
+  'codex-session': (t) => t.sidebarTaskFilterCodeSessions,
+  monitor: (t) => t.monitor,
+  cardpool: (t) => t.cardPool,
+  toolstore: (t) => t.toolStore,
+  knowledge: (t) => t.knowledge,
+  outputs: (t) => t.outputs,
+};
+
+export function DetachedShell({ kind, id }) {
+  const { bs, activeTheme, t } = useDetachedBase();
+
+  const View = DETACHED_VIEWS[kind] || DETACHED_VIEWS.monitor;
+  const kindLabelFn = DETACHED_KIND_LABEL_KEYS[kind];
+  const kindLabel = kindLabelFn ? kindLabelFn(t) : kind;
+  return (
+    <div className={`h-screen w-screen flex flex-col bg-white text-[#1F1F1F] dark:bg-[#1B1C1D] dark:text-[#E3E3E3]`}>
+      <VoiceShortcutRouter />
+      <div
+        data-tauri-drag-region
+        className="h-9 shrink-0 flex items-center px-3 text-[13px] font-medium select-none"
+        style={{ borderBottom: '1px solid rgba(128,128,128,.2)' }}
+      >
+        <span data-tauri-drag-region className="pointer-events-none">{t.tearoffTitle} · {kindLabel}</span>
+      </div>
+      <div className="flex-1 min-h-0 overflow-auto">
+        {bs
+          ? <DetachedErrorBoundary t={t}><Suspense fallback={<DetachedViewFallback />}><View id={id} theme={activeTheme} t={t} bs={bs} /></Suspense></DetachedErrorBoundary>
+          : <div className="p-6 text-sm opacity-60">…</div>}
+      </div>
+    </div>
+  );
+}

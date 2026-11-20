@@ -1,0 +1,231 @@
+#[cfg(test)]
+mod contract_tests;
+mod dataset;
+mod fetch;
+mod fs_guard;
+mod private_inputs;
+mod scorer;
+mod submission;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_fixtures;
+
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+
+use agent_backend_api::{AttachmentHandle, PrivateInputHandle};
+use benchmark_core::{
+    BenchmarkAdapter, BenchmarkDescriptor, BenchmarkError, BenchmarkId, BenchmarkPlan,
+    BenchmarkTask, CompletedRun, ExecutionKind, ExecutionRequest, OfficialScoreReport,
+    OutputContract, PredictionRetention, PreparedTask, PrivatePredictionContentType,
+    Result as BenchmarkResult, RunContext, Split, SubmissionArtifact, TaskSelection, ToolPolicyId,
+    VerifiedDataset,
+};
+
+pub use dataset::{GAIA_REVISION_MARKER, GaiaAttachment, GaiaDataset, GaiaDatasetError, GaiaRow};
+pub use fetch::{
+    GAIA_READY_MARKER, GaiaAcquisition, GaiaFetchError, GaiaSnapshotManager, GaiaSource,
+    HfSnapshotDownloader, SnapshotDownloadRequest, SnapshotDownloader, SnapshotFetchFailure,
+    SnapshotFileMetadata, SnapshotPreflightRequest,
+};
+pub use private_inputs::GaiaPrivateInputs;
+pub use scorer::question_scorer;
+
+pub const GAIA_DATASET_REVISION: &str = "682dd723ee1e1697e00360edccf2366dc8418dd9";
+pub const GAIA_SCORER_REVISION: &str = "1349a17979f0aca0ee9c46cd7ec26eb2fb41102e";
+pub const GAIA_ADAPTER_VERSION: &str = "pinvou-gaia-adapter/v1";
+pub const GAIA_SPLIT: &str = "validation";
+pub const GAIA_LEVEL: u8 = 1;
+pub const GAIA_PARQUET_SIZE: u64 = 39_524;
+/// Snapshot-relative path of the pinned validation parquet, declared once so
+/// the dataset verifier and the fetch layer cannot drift apart.
+pub(crate) const GAIA_PARQUET_PATH: &str = "2023/validation/metadata.level1.parquet";
+pub const GAIA_PARQUET_SHA256: &str =
+    "5e574b0faeb4603b816e426cf7c7aefb1fe398d32f9c4861e1a4e3304f2b1281";
+/// Byte form of [`GAIA_PARQUET_SHA256`], parsed at compile time so the hex
+/// string stays the single source of truth for the pinned parquet digest.
+pub(crate) const GAIA_PARQUET_SHA256_BYTES: [u8; 32] = parse_sha256_hex(GAIA_PARQUET_SHA256);
+
+const fn parse_sha256_hex(digest: &str) -> [u8; 32] {
+    const fn nibble(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => panic!("sha256 digest must be lowercase hex"),
+        }
+    }
+    let bytes = digest.as_bytes();
+    assert!(bytes.len() == 64, "sha256 digest must have 64 hex digits");
+    let mut parsed = [0_u8; 32];
+    let mut index = 0;
+    while index < 32 {
+        parsed[index] = (nibble(bytes[2 * index]) << 4) | nibble(bytes[2 * index + 1]);
+        index += 1;
+    }
+    parsed
+}
+
+const GAIA_TOOL_POLICY: &str = "pinvou-gaia-public-web/v1";
+const GAIA_OUTPUT_CONTRACT: &str = "gaia-final/v1";
+
+/// Durable private prediction type tag shared with the GAIA scorer and
+/// submission writer. Core persists the resolved candidate answer under this
+/// concrete content type, which is the run-bound scorer tag used to reopen
+/// predictions offline.
+pub(crate) const GAIA_DURABLE_PREDICTION_TYPE: &str = "utf8-text/v1";
+
+pub struct GaiaAdapter {
+    descriptor: BenchmarkDescriptor,
+    scoring_dataset: Option<Arc<GaiaDataset>>,
+}
+
+impl GaiaAdapter {
+    pub fn new() -> Self {
+        Self {
+            descriptor: BenchmarkDescriptor::new(
+                BenchmarkId::new("gaia"),
+                GAIA_ADAPTER_VERSION,
+                GAIA_DATASET_REVISION,
+                GAIA_SCORER_REVISION,
+                vec![Split::new(GAIA_SPLIT)],
+                ExecutionKind::NativeTurn,
+            )
+            // `None` (unbounded) is also the builder default; spelled out so
+            // the adapter's machine-readable manifest mode is explicit.
+            .with_harness_deadline_secs(None),
+            scoring_dataset: None,
+        }
+    }
+
+    pub fn with_dataset(dataset: Arc<GaiaDataset>) -> Self {
+        Self {
+            scoring_dataset: Some(dataset),
+            ..Self::new()
+        }
+    }
+
+    pub fn plan(
+        &self,
+        dataset: &GaiaDataset,
+        _selection: &TaskSelection,
+    ) -> BenchmarkResult<BenchmarkPlan> {
+        let tasks = dataset
+            .rows()
+            .iter()
+            .map(|row| {
+                let task_id = row.task_id();
+                let attachments = row
+                    .attachment()
+                    .map(|_| AttachmentHandle::new(format!("gaia:{task_id}:attachment")))
+                    .into_iter()
+                    .collect();
+                BenchmarkTask::new(
+                    task_id,
+                    Some(GAIA_LEVEL.to_string()),
+                    // No harness wall-clock deadline: the official GAIA
+                    // protocol is not known to define one, so the run is
+                    // bounded only by the engine's own limits (model steps
+                    // per turn, per-turn wall clock, cancellation). A
+                    // harness-side deadline would be an explicit adapter
+                    // change, never a hidden default.
+                    ExecutionRequest::native_turn(
+                        PrivateInputHandle::new(format!("gaia:{task_id}:prompt")),
+                        attachments,
+                        None,
+                        ToolPolicyId::new(GAIA_TOOL_POLICY),
+                        OutputContract::new(GAIA_OUTPUT_CONTRACT),
+                    ),
+                )
+            })
+            .collect();
+        Ok(BenchmarkPlan::new(tasks))
+    }
+}
+
+impl fmt::Debug for GaiaAdapter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GaiaAdapter")
+            .field("descriptor", &self.descriptor)
+            .field(
+                "scoring_dataset",
+                &self.scoring_dataset.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
+}
+
+impl Default for GaiaAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BenchmarkAdapter for GaiaAdapter {
+    fn descriptor(&self) -> &BenchmarkDescriptor {
+        &self.descriptor
+    }
+
+    fn private_output_retention(&self) -> PredictionRetention {
+        PredictionRetention::DurableUntilPurge
+    }
+
+    fn private_prediction_content_type(&self) -> PrivatePredictionContentType {
+        PrivatePredictionContentType::Utf8TextV1
+    }
+
+    fn verify_dataset(&self, dataset_root: &Path) -> BenchmarkResult<VerifiedDataset> {
+        GaiaDataset::verify(dataset_root)
+            .map_err(|error| BenchmarkError::Contract(error.to_string()))?;
+        Ok(VerifiedDataset::new(GAIA_DATASET_REVISION, dataset_root))
+    }
+
+    fn plan(
+        &self,
+        dataset: &VerifiedDataset,
+        selection: &TaskSelection,
+    ) -> BenchmarkResult<BenchmarkPlan> {
+        if dataset.id() != GAIA_DATASET_REVISION {
+            return Err(BenchmarkError::Contract("gaia_revision_mismatch".into()));
+        }
+        if let Some(bound) = &self.scoring_dataset {
+            let root = dataset
+                .root()
+                .canonicalize()
+                .map_err(|_| BenchmarkError::Contract("gaia_revision_mismatch".into()))?;
+            if root != bound.snapshot_root() {
+                return Err(BenchmarkError::Contract("gaia_revision_mismatch".into()));
+            }
+            return GaiaAdapter::plan(self, bound, selection);
+        }
+        let verified = GaiaDataset::verify(dataset.root())
+            .map_err(|error| BenchmarkError::Contract(error.to_string()))?;
+        GaiaAdapter::plan(self, &verified, selection)
+    }
+
+    fn prepare_task(
+        &self,
+        task: &BenchmarkTask,
+        _run: &RunContext,
+    ) -> BenchmarkResult<PreparedTask> {
+        Ok(PreparedTask::new(task.clone()))
+    }
+
+    fn score(&self, run: &CompletedRun) -> BenchmarkResult<OfficialScoreReport> {
+        Ok(self.scoring_dataset.as_ref().map_or_else(
+            || OfficialScoreReport::partial(0, 0, GAIA_SPLIT, &GAIA_LEVEL.to_string()),
+            |dataset| scorer::score_dataset(dataset, run),
+        ))
+    }
+
+    fn write_submission(
+        &self,
+        run: &CompletedRun,
+        destination: &Path,
+    ) -> BenchmarkResult<SubmissionArtifact> {
+        let dataset = self.scoring_dataset.as_deref().ok_or_else(|| {
+            BenchmarkError::Contract("gaia_submission_dataset_unavailable".into())
+        })?;
+        submission::write_submission(dataset, run, destination)
+    }
+}

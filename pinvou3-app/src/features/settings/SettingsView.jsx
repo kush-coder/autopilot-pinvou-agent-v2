@@ -1,0 +1,3990 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Check, ChevronDown, Code, Cpu, Database, Globe, MessageSquare, Plus, RefreshCw, Search, Sparkles, Users, Wrench, X } from '../../components/icons.jsx';
+import { Toggle } from '../../components/Toggle.jsx';
+import PetSettingsSection from '../pet/PetSettingsSection.jsx';
+import { DEFAULT_PET_ID } from '../pet/pet-registry.js';
+import { bridge, isLocalModel, useBridgeState } from '../../hooks/useBridge.js';
+import { can, isWeb } from '../../shared/platform.js';
+import { copyClipboardText } from '../../shared/clipboard.js';
+import { pathBasename } from '../../shared/path-utils.js';
+import { invokeTauri } from '../../platform/tauri/client.js';
+import qwenIcon from '../../brand-icons/qwen.svg';
+import {
+  MODEL_PRESET_DEFS, PROVIDER_KIND_CODING_PLAN, PROVIDER_KIND_OFFICIAL_API, PROVIDER_KIND_CUSTOM,
+  MODEL_CATALOG, CLOUD_MODEL_PROVIDERS,
+  BRAND_ICON_BY_PRESET, BRAND_ICON_BY_VENDOR,
+  presetProviderLabel,
+  normalizedProviderBaseUrl, findCloudProviderForModel, providerLabelForModel, isCodingPlanModel, catalogItemMatchesModel,
+  catalogImageCapableForModel,
+  groupModelsForSelector,
+  selectorMainLabel,
+  reasoningEffortForModelSwitch, normalizeStoredReasoningEffort,
+} from './model-catalog.js';
+import { CommunityPanel } from './CommunityPanel.jsx';
+import { COMMUNITY_DISCUSSIONS_URL } from './community-config.js';
+import { ProvidersSection } from './ProvidersSection.jsx';
+import {
+  VOICE_POSTPROCESS_ENABLED_KEY,
+  VOICE_SHORTCUT_ENABLED_KEY,
+  VOICE_SHORTCUT_SETTINGS_EVENT,
+  setVoicePostprocessEnabled,
+  setVoiceShortcutEnabled,
+  setVoiceShortcutIntroSeen,
+  voicePostprocessEnabled,
+  voiceShortcutEnabled,
+} from '../chat/voice-shortcut-settings.mjs';
+import {
+  GLOBAL_SHORTCUT_DEFAULT_ACCELERATOR,
+  foldGlobalShortcutDraft,
+  formatGlobalShortcutForDisplay,
+  globalShortcutDraftToRust,
+  isPlausibleGlobalShortcutAccelerator,
+  normalizeGlobalShortcutDraft,
+} from './globalShortcutSettings.mjs';
+import { VoiceShortcutIntroModal } from '../voice-composer/VoiceShortcutIntroModal.jsx';
+import { ReasoningTierPicker, useModelReasoningTierState } from './local-server-tiers.jsx';
+import { StatusChip } from './StatusChip.jsx';
+import EndpointModelPicker from './endpoint-model-picker.jsx';
+import {
+  ADD_ALL_BATCH_LIMIT,
+  normalizeDiscoveredRows,
+  savedModelKeys,
+  splitBatchAdd,
+} from './endpoint-model-picker-logic.js';
+
+function isReadonlyModel(model) {
+  return !!(model && (model.readonly || model.system));
+}
+
+// 目录视觉能力标注 → 表单「图片输入能力」档位:
+// true→enabled(支持图片),false→disabled(不支持图片),未命中/未标注→pinvou(自动处理)。
+function imageCapabilityForCatalogModel(model) {
+  const flag = catalogImageCapableForModel(model);
+  return flag === true ? 'enabled' : flag === false ? 'disabled' : 'pinvou';
+}
+
+/**
+ * Model record as passed down from the app shell (`bs.savedModels`) and read
+ * by the model selector / delete dialogs.
+ * @typedef {object} SettingsModelEntry
+ * @property {string} id - Stable model id.
+ * @property {string} [name] - Display name.
+ * @property {string} [model] - Wire model identifier.
+ * @property {string} [alias] - User-set alias.
+ * @property {string} [preset] - Provider preset key.
+ * @property {string} [base_url] - Provider endpoint base URL (vision probing).
+ * @property {boolean} [readonly] - Built-in models cannot be edited.
+ * @property {boolean} [system] - System models cannot be deleted.
+ */
+
+/**
+ * Memory list item from `bs.memory` (preferences / work context / focus /
+ * recent activity lists get their `kind` stamped in before rendering).
+ * @typedef {object} MemoryItem
+ * @property {string} id - Stable memory id.
+ * @property {string} kind - Memory list kind the item belongs to.
+ * @property {string} text - Memory body text.
+ * @property {string} [status] - Lifecycle status ('active' items are shown).
+ * @property {string} [updated_at] - Last update ISO timestamp.
+ * @property {string} [created_at] - Creation ISO timestamp.
+ * @property {string} [last_seen_at] - Last seen ISO timestamp.
+ * @property {string} [last_used_at] - Last used ISO timestamp.
+ */
+
+/**
+ * Memory strings from `t.uiSettingsView` used by formatMemoryTime.
+ * @typedef {object} MemoryCardCopy
+ * @property {string} memoryTimeSaved - Copy when no timestamp exists.
+ * @property {string} memoryTimeToday - Copy for same-day updates.
+ * @property {(days: number) => string} memoryTimeDaysAgo - Copy N days back.
+ * @property {(month: number, day: number) => string} memoryTimeDate - Copy for older dates.
+ */
+
+// Stable default: avoid creating a fresh array literal on every render (react/no-unstable-default-props).
+/** @type {SettingsModelEntry[]} */
+const EMPTY_MODELS = [];
+
+/**
+ * @param {MemoryItem} item - Memory item with timestamps.
+ * @param {MemoryCardCopy} copy - Localized memory card copy.
+ */
+const formatMemoryTime = (item, copy) => {
+  const raw = item.updated_at || item.created_at || item.last_seen_at || item.last_used_at;
+  if (!raw) return copy.memoryTimeSaved;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return copy.memoryTimeSaved;
+  const diff = Date.now() - date.getTime();
+  const day = 24 * 60 * 60 * 1000;
+  if (diff >= 0 && diff < day) return copy.memoryTimeToday;
+  if (diff >= day && diff < 7 * day) return copy.memoryTimeDaysAgo(Math.floor(diff / day));
+  return copy.memoryTimeDate(date.getMonth() + 1, date.getDate());
+};
+
+// Keychain credential check (shared by the model form and the search-source list): credentials exist, or
+// credential_state is explicitly marked configured / env_override.
+function hasStoredCredential(record) {
+  const state = (record && record.credential_state) || ((record && record.has_secret) ? 'configured' : 'missing');
+  return !!(record && record.has_secret) || state === 'configured' || state === 'env_override';
+}
+
+    const SSegmented = ({ options, value, onChange }) => (
+      <div data-testid="settings-segmented" className={`p-1 rounded-full flex flex-wrap justify-end gap-1 max-w-full max-sm:w-full max-sm:flex-nowrap bg-[#E1E5EA] dark:bg-[#131314]`}>
+        {options.map(o => (
+          <button type="button"
+            key={o.key}
+            onClick={() => onChange(o.key)}
+            className={`min-w-[72px] px-4 py-2 rounded-full text-[14px] font-medium transition-colors max-sm:min-w-0 max-sm:flex-1 max-sm:px-2 ${
+              value === o.key ? ('bg-white text-[#0B57D0] shadow-sm dark:bg-[#A8C7FA] dark:text-[#041E49]') : ''
+            }`}
+          >{o.label}</button>
+        ))}
+      </div>
+    );
+
+    // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
+    const ProviderIcon = ({ preset, vendor, providerKind, model, compact = false }) => {
+      const modelId = String(model || '').toLowerCase();
+      if (preset === 'local_vllm' && modelId.includes('qwen')) {
+        return (
+          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-white border border-black/[0.08] dark:border-transparent`}>
+            <img src={qwenIcon} alt="" className={`${compact ? 'h-6 w-6' : 'h-7 w-7'} object-contain`} />
+          </span>
+        );
+      }
+      if (providerKind === PROVIDER_KIND_CODING_PLAN) {
+        const src = BRAND_ICON_BY_VENDOR[vendor];
+        if (src) {
+          const darkBacked = vendor === 'kimi';
+          return (
+            <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden ${darkBacked ? 'bg-[#111827]' : ('bg-white border border-black/[0.08] dark:border-transparent')}`}>
+              <img src={src} alt="" className={`${compact ? 'h-6 w-6' : 'h-7 w-7'} object-contain`} />
+            </span>
+          );
+        }
+        return (
+          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/[0.18] dark:text-[#64B5F6]`}>
+            <Code size={compact ? 17 : 19} strokeWidth={2.2} />
+          </span>
+        );
+      }
+      if (preset === 'local_vllm') {
+        return (
+          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/[0.18] dark:text-[#64B5F6]`}>
+            <Cpu size={compact ? 18 : 20} strokeWidth={2.2} />
+          </span>
+        );
+      }
+      // Vendor-stamped rows must not inherit the shared preset's mark: the
+      // vendors added in the 2026-11-03 catalog refresh (mistral/meta/
+      // together/groq) and the aggregators (openrouter/siliconflow) ride
+      // preset openai_compatible and otherwise wear the OpenAI logo
+      // (2026-11-05 review) — a vendor stamp without a brand mark gets the
+      // neutral Globe tile instead, and the preset brand only wins when no
+      // vendor stamp exists (plain openai_compatible relays).
+      const vendorMark = vendor && BRAND_ICON_BY_VENDOR[vendor];
+      if (vendor && !vendorMark) {
+        return (
+          <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden bg-[#007AFF]/10 text-[#007AFF] dark:bg-[#0A84FF]/[0.18] dark:text-[#64B5F6]`}>
+            <Globe size={compact ? 17 : 19} strokeWidth={2.2} />
+          </span>
+        );
+      }
+      const src = vendorMark || BRAND_ICON_BY_PRESET[preset];
+      if (!src) return null;
+      const darkBacked = preset === 'kimi' || vendor === 'kimi';
+      return (
+        <span className={`${compact ? 'h-8 w-8 rounded-[9px]' : 'h-9 w-9 rounded-[10px]'} shrink-0 flex items-center justify-center overflow-hidden ${darkBacked ? 'bg-[#111827]' : ('bg-white border border-black/[0.08] dark:border-transparent')}`}>
+          <img src={src} alt="" className={`${compact ? 'h-6 w-6' : 'h-7 w-7'} object-contain`} />
+        </span>
+      );
+    };
+
+
+    const WebAccessModal = ({ bs, t, onClose }) => {
+      const canManageWebAccess = can('webAccessAdmin');
+      const [refreshConfirmOpen, setRefreshConfirmOpen] = useState(false);
+      const [actionBusy, setActionBusy] = useState(false);
+      const webAccess = (bs && bs.webAccess) || {};
+      const webAccessActive = !!webAccess.active;
+      const hostWorkspaceAuthorized = !!webAccess.host_workspace_authorized;
+      const statusKey = webAccess.starting ? 'starting' : (webAccess.status || 'idle');
+      const remoteCopy = t.uiRemote;
+      const statusColors = { idle:'#8A9097', starting:'#F9AB00', connecting_relay:'#F9AB00', waiting_web_client:'#F9AB00', web_client_connected:'#34A853', web_client_disconnected:'#F9AB00', revoked:'#EA4335', stopped:'#8A9097', error:'#EA4335' };
+      const statusCopy = remoteCopy.status[statusKey];
+      // 注册终结码的稳定恢复码映射三语文案;缺码(非注册类错误)回退原文。
+      const registerHint = webAccess.last_error_code
+        ? remoteCopy.registerHints?.[webAccess.last_error_code]
+        : null;
+      const webAccessErrorText = registerHint || webAccess.last_error || null;
+      const statusMeta = statusCopy
+        ? { label: statusCopy[0], detail: statusKey === 'error' ? (webAccessErrorText || statusCopy[1]) : statusCopy[1], color: statusColors[statusKey] }
+        : { label: String(statusKey), detail: remoteCopy.updated, color: '#8A9097' };
+
+      async function handleRotateWebAccess() {
+        if (!bridge.available) return;
+        setActionBusy(true);
+        try {
+          await bridge.remoteControl.refreshRemoteControlQr(null);
+          setRefreshConfirmOpen(false);
+        } catch { /* ignore close failure */ } finally {
+          setActionBusy(false);
+        }
+      }
+
+      async function handleDisableWebAccess() {
+        if (!bridge.available) return;
+        setActionBusy(true);
+        try {
+          await bridge.remoteControl.stopRemoteControl();
+          onClose();
+        } catch { /* stop failure surfaced by the banner */ } finally {
+          setActionBusy(false);
+        }
+      }
+
+      // Enable only starts the link; granting host folders stays a separate explicit
+      // consent step, so a single Enable click can never latch folder authorization.
+      async function handleEnableWebAccess() {
+        if (!bridge.available) return;
+        setActionBusy(true);
+        try { await bridge.remoteControl.startRemoteControl({}); }
+        catch { /* start failure surfaced by the banner */ }
+        finally { setActionBusy(false); }
+      }
+
+      async function handleAllowHostWorkspace() {
+        if (!bridge.available) return;
+        setActionBusy(true);
+        try { await bridge.remoteControl.startRemoteControl({ allowHostWorkspace: true }); }
+        catch { /* start failure surfaced by the banner */ }
+        finally { setActionBusy(false); }
+      }
+
+      // 撤销本机目录授权但保持链接：folder 授权的独立收回路径，不复用
+      // Stop（那会断开整条链接）。
+      async function handleRevokeHostWorkspace() {
+        if (!bridge.available) return;
+        setActionBusy(true);
+        try { await bridge.remoteControl.revokeRemoteHostWorkspace(); }
+        catch { /* revoke failure surfaced by the banner */ }
+        finally { setActionBusy(false); }
+      }
+
+      // Escape closes the layered dialog: the rotate-confirm overlay first, then the
+      // modal itself. Skipped while an action is in flight so an in-progress call is
+      // never discarded mid-flight.
+      useEffect(() => {
+        const onModalKeyDown = (e) => {
+          if (e.key !== 'Escape' || actionBusy) return;
+          if (refreshConfirmOpen) setRefreshConfirmOpen(false);
+          else onClose();
+        };
+        window.addEventListener('keydown', onModalKeyDown);
+        return () => window.removeEventListener('keydown', onModalKeyDown);
+      }, [actionBusy, refreshConfirmOpen, onClose]);
+
+      if (!canManageWebAccess) return null;
+
+      return (
+        // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the Escape listener and the close button
+        // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+        <div role="dialog" aria-modal="true" aria-label={remoteCopy.title} className="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/45" onClick={onClose}>
+          {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+          {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+          <div onClick={e => e.stopPropagation()} className={`relative w-full max-w-[420px] rounded-[22px] shadow-2xl p-5 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E3E3E3]`}>
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div>
+                <div className="text-[17px] font-semibold">{remoteCopy.title}</div>
+                <div className={`text-[12px] mt-1 text-[#5F6368] dark:text-[#AEB4BC]`}>{remoteCopy.desc}</div>
+              </div>
+              <button type="button" onClick={onClose} aria-label={remoteCopy.close} className={`w-8 h-8 rounded-full flex items-center justify-center hover:bg-black/5 dark:hover:bg-white/10`}><X size={17} /></button>
+            </div>
+            <div className={`rounded-[16px] border p-3 mb-4 border-black/10 bg-[#F8F9FA] dark:border-white/10 dark:bg-white/[0.035]`}>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex items-start gap-3">
+                  <div className={`mt-0.5 w-9 h-9 rounded-xl flex items-center justify-center shrink-0 bg-white text-[#5F6368] dark:bg-white/5 dark:text-[#C4C7C5]`}><Globe size={17} /></div>
+                  <div className="min-w-0">
+                    <div className="text-[14px] font-medium">{remoteCopy.browser}</div>
+                    <div className={`text-[12px] mt-1 leading-relaxed text-[#6F7378] dark:text-[#9AA0A6]`}>{statusMeta.detail}</div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[11px] bg-white text-[#5F6368] dark:bg-white/5 dark:text-[#C4C7C5]`}>
+                    <span className="w-1.5 h-1.5 rounded-full" style={{ background: statusMeta.color }}></span>{statusMeta.label}
+                  </span>
+                  {webAccessActive && <button type="button" disabled={actionBusy} onClick={handleDisableWebAccess}
+                    className={`px-3 py-1.5 rounded-lg text-[12px] disabled:opacity-50 border border-black/10 hover:bg-black/5 dark:border dark:border-white/10 dark:hover:bg-white/10`}>{remoteCopy.stop}</button>}
+                </div>
+              </div>
+            </div>
+            {webAccess.url ? (
+              <div className={`w-full rounded-[14px] border px-4 py-4 border-black/10 bg-[#F8F9FA] dark:border-white/10 dark:bg-white/5`}>
+                {webAccess.qr_data_url && (
+                  <div className="flex flex-col items-center mb-4">
+                    <div className="p-3 rounded-[16px] bg-white shadow-sm">
+                      <img src={webAccess.qr_data_url} alt={remoteCopy.qrAlt} className="block w-[220px] h-[220px]" />
+                    </div>
+                    <div className={`mt-2 text-[12px] text-[#5F6368] dark:text-[#AEB4BC]`}>{remoteCopy.qrHint}</div>
+                  </div>
+                )}
+                <div className={`mb-1 text-[11px] font-medium text-[#6F7378] dark:text-[#9AA0A6]`}>{remoteCopy.link}</div>
+                <div className={`select-all break-all text-[12px] leading-relaxed text-[#174EA6] dark:text-[#D2E3FC]`}>{webAccess.url}</div>
+                <div className={`mt-2 text-[11px] text-[#777C83] dark:text-[#8F959D]`}>{remoteCopy.linkHint}</div>
+              </div>
+            ) : (
+              <div className={`text-[13px] px-3 py-4 rounded-xl bg-[#F1F3F4] text-[#3C4043] dark:bg-white/5 dark:text-[#C4C7C5]`}>
+                {/* Round-11 复审 minor:错误文本已由状态行 detail 与红色横幅
+                    各渲染一次;占位盒退回「未开启」缺省,同一句恢复提示不再
+                    在 420px 弹窗里连排三遍。 */}
+                {webAccess.starting
+                  ? remoteCopy.generating
+                  : (statusKey === 'error' ? remoteCopy.notStarted : (webAccessErrorText || remoteCopy.notStarted))}
+              </div>
+            )}
+            {webAccessErrorText && <div className="mt-3 text-[12px] text-[#EA4335] break-all">{webAccessErrorText}</div>}
+            {webAccessActive && hostWorkspaceAuthorized && (
+              // 授权状态 affirmative 可见 + 可单独撤销:旧版本「开启访问」顺带
+              // 写下的 allow_host_workspace 不再只能靠 Stop 整体清除。
+              <div className="mt-3 flex items-center justify-between gap-2 rounded-xl px-3 py-2 bg-[#E6F4EA] dark:bg-[#0D2B1A]">
+                <span className="text-[12px] text-[#137333] dark:text-[#81C995]">{remoteCopy.workspaceAllowed}</span>
+                <button type="button" disabled={actionBusy} onClick={handleRevokeHostWorkspace}
+                  className={`px-3 py-1.5 rounded-lg text-[12px] disabled:opacity-50 border border-[#137333]/30 text-[#137333] hover:bg-black/5 dark:border-[#81C995]/30 dark:text-[#81C995] dark:hover:bg-white/10`}>{remoteCopy.revokeWorkspace}</button>
+              </div>
+            )}
+            <div className="mt-4 flex items-center justify-end gap-2">
+              <button type="button" onClick={() => { if (webAccess.url) copyClipboardText(webAccess.url); }}
+                disabled={actionBusy || !webAccess.url}
+                className={`px-3.5 py-2 rounded-full text-[13px] bg-black/5 hover:bg-black/10 disabled:opacity-40 dark:bg-white/10 dark:hover:bg-white/15 dark:disabled:opacity-40`}>{remoteCopy.copy}</button>
+              {webAccessActive && !hostWorkspaceAuthorized && <button type="button" disabled={actionBusy} onClick={handleAllowHostWorkspace}
+                className="px-3.5 py-2 rounded-full text-[13px] bg-[#0B57D0] text-white hover:bg-[#0A4BB8] disabled:opacity-50 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]">{remoteCopy.allowWorkspace}</button>}
+              {webAccessActive ? <button type="button" disabled={actionBusy} onClick={() => setRefreshConfirmOpen(true)}
+                className={`px-3.5 py-2 rounded-full text-[13px] disabled:opacity-50 bg-black/5 hover:bg-black/10 dark:bg-white/10 dark:hover:bg-white/15`}>{remoteCopy.refresh}</button>
+                : <button type="button" disabled={actionBusy} onClick={handleEnableWebAccess}
+                  className="px-3.5 py-2 rounded-full text-[13px] bg-[#0B57D0] text-white hover:bg-[#0A4BB8] disabled:opacity-50 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]">{remoteCopy.enable}</button>}
+            </div>
+            {refreshConfirmOpen && (
+              // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the Escape listener and the cancel button
+              // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+              <div className="absolute inset-0 z-10 flex items-center justify-center p-4 rounded-[22px] bg-black/55" onClick={() => !actionBusy && setRefreshConfirmOpen(false)}>
+                {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+                {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+                <div onClick={e => e.stopPropagation()} className={`w-full max-w-[330px] rounded-[18px] p-5 shadow-2xl bg-white dark:bg-[#2A2B2D]`}>
+                  <div className="text-[16px] font-semibold">{remoteCopy.refreshTitle}</div>
+                  <div className={`text-[13px] leading-relaxed mt-2 text-[#5F6368] dark:text-[#B7BBC0]`}>{remoteCopy.refreshDesc}</div>
+                  <div className="mt-5 flex justify-end gap-2">
+                    <button type="button" disabled={actionBusy} onClick={() => setRefreshConfirmOpen(false)} className={`px-4 py-2 rounded-lg text-[13px] bg-black/5 hover:bg-black/10 dark:bg-white/5 dark:hover:bg-white/10`}>{t.cancel}</button>
+                    <button type="button" disabled={actionBusy} onClick={handleRotateWebAccess} className="px-4 py-2 rounded-lg text-[13px] font-medium bg-[#0B57D0] text-white hover:bg-[#0A4BB8] disabled:opacity-60 dark:bg-[#A8C7FA] dark:text-[#062E6F] dark:hover:bg-[#C2DBFF]">{actionBusy ? remoteCopy.refreshing : remoteCopy.refresh}</button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    };
+
+    // 添加/编辑模型模态弹窗。
+      // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
+    const ModelFormModal = ({ isDark, t, initial, onCancel, onSave, bs, models = EMPTY_MODELS }) => {
+      const settingsCopy = t.uiSettingsDetail;
+      const localVllmSupported = !!(bs.platformCapabilities && bs.platformCapabilities.localVllmSupported);
+      const modelScope = initial.__scope || (initial.preset === 'local_vllm' ? 'local' : 'cloud');
+      const initialProvider = modelScope === 'cloud' ? findCloudProviderForModel(initial) : null;
+      const initialCatalogGroups = MODEL_CATALOG[modelScope] || MODEL_CATALOG.cloud;
+      const initialCatalogMatch = initialCatalogGroups.some(group =>
+        group.preset === initial.preset
+        && (!initialProvider || group.key === initialProvider.key)
+        && group.items.some(item => !item.custom && catalogItemMatchesModel(item, initial.model))
+      );
+      const [name, setName] = useState(initial.name || '');
+      const [alias, setAlias] = useState(initial.alias || '');
+      const [nameTouched, setNameTouched] = useState(!initial.__new && !!initial.name);
+      const [preset, setPreset] = useState(initial.preset || (localVllmSupported ? 'local_vllm' : 'deepseek'));
+      const [providerKey, setProviderKey] = useState(initialProvider ? initialProvider.key : '');
+      const [providerKind, setProviderKind] = useState(initial.provider_kind || (initialProvider && initialProvider.providerKind) || (modelScope === 'cloud' ? PROVIDER_KIND_OFFICIAL_API : ''));
+      const [vendor, setVendor] = useState(initial.vendor || (initialProvider && initialProvider.vendor) || '');
+      const [endpointMode, setEndpointMode] = useState((initialProvider && initialProvider.endpointMode) || '');
+      const [model, setModel] = useState(initial.model || '');
+      const [baseUrl, setBaseUrl] = useState(initial.base_url || '');
+      const [contextWindow, setContextWindow] = useState(initial.context_window_tokens ? String(initial.context_window_tokens) : '');
+      const [maxOutput, setMaxOutput] = useState(initial.max_output_tokens ? String(initial.max_output_tokens) : '');
+      // Thinking effort: initialize from the stored value (normalize first —
+      // legacy records may carry pre-normalization values such as deepseek's
+      // medium), otherwise fall back to the model default (vllm→low (lowest
+      // thinking tier), others→high; models without tiers have no default and
+      // stay null = not explicitly set, so saving does not pollute SavedModel).
+      const [reasoningEffort, setReasoningEffort] = useState(
+        normalizeStoredReasoningEffort(initial, initial.reasoning_effort)
+      );
+      const [apiKey, setApiKey] = useState('');
+      const [keyAction, setKeyAction] = useState(initial.__new ? 'replace' : 'keep_existing');
+      const [showKey, setShowKey] = useState(false);
+      // 「此端点无需鉴权」(auth_mode="none")：云端模型的显式免鉴权声明。本地预设
+      // 有独立的 localKeyEnabled 开关，不受它控制；coding_plan 是托管入口，开关
+      // 不渲染，声明状态也不进入（手改 settings.json 的托管条目由后端归一清空）。
+      const [noAuth, setNoAuth] = useState(!initial.__new && initial.preset !== 'local_vllm' && initial.provider_kind !== PROVIDER_KIND_CODING_PLAN && initial.auth_mode === 'none');
+      // 端口输入框（base_url 行内）的行内校验错误；与 localPortError（检测框）独立。
+      const [baseUrlPortError, setBaseUrlPortError] = useState(null);
+      const [localKeyEnabled, setLocalKeyEnabled] = useState(!initial.__new && initial.preset === 'local_vllm' && !!initial.has_secret);
+      const [pickerOpen, setPickerOpen] = useState(!!initial.__new && initial.preset !== 'local_vllm');
+      const [pickerTab, setPickerTab] = useState(initial.__scope === 'local' ? 'local' : 'cloud');
+      const [providerModelPickerOpen, setProviderModelPickerOpen] = useState(false);
+      const [customModel, setCustomModel] = useState(!!initial.__custom || (!initial.__new && initial.preset !== 'local_vllm' && !initialCatalogMatch));
+      const [keyRevealError, setKeyRevealError] = useState('');
+      const [testing, setTesting] = useState(false);
+      const [testResult, setTestResult] = useState(null);
+      const [localDetecting, setLocalDetecting] = useState(false);
+      const [localDetectResult, setLocalDetectResult] = useState(null);
+      // Optional custom port for local-model auto-detection (raw user input; empty = default ports only).
+      const [localPortDraft, setLocalPortDraft] = useState('');
+      // Inline validation message for the custom port. Kept separate from
+      // localDetectResult so a failed validation never hides previous candidates.
+      const [localPortError, setLocalPortError] = useState(null);
+      // 端点模型自动发现(规格 §2.6):「获取模型列表」按钮显式点击才探测,面板仅
+      // 展示候选行——添加一律由用户在 picker 内逐行/批量显式触发,组件本身绝不
+      // 发请求、绝不自动写库(与本地检测面板同一安全不变量)。
+      const [endpointListing, setEndpointListing] = useState(null);
+      const [endpointPickerOpen, setEndpointPickerOpen] = useState(false);
+      const [fetchingModels, setFetchingModels] = useState(false);
+      // 每次「获取模型列表」点击递增:作为 picker 的 React key,按探测结果重挂
+      // 组件,让 filterDraft/滚动位置在新列表上干净复位(复审 picker minor)。
+      const [endpointFetchSeq, setEndpointFetchSeq] = useState(0);
+      // 探测请求失败(reject)时的行内提示,经 normalizeConnectionTestResult 映射
+      // 为三语 connectionMessages 文案,不透出原始 URL/key。
+      const [fetchModelsMessage, setFetchModelsMessage] = useState(null);
+      // 测试连接成功后按「仅空字段」规则自动填入的端点事实;一次性小字,手动
+      // 改字段或显式换模型即清除,绝不覆盖用户已填值。
+      const [filledFromEndpoint, setFilledFromEndpoint] = useState(false);
+      // 逐行/批量添加后的行内结果:{ ok, text } | null——ok 决定状态行红/绿
+      // (复审 M4:失败曾硬编码绿色);失败时 picker 保持打开重试,同一份提示经
+      // addNotice 透传进 picker,不再被其全屏遮罩挡住。
+      const [endpointAddResult, setEndpointAddResult] = useState(/** @type {{ ok: boolean, text: string } | null} */ (null));
+      const [addingAllModels, setAddingAllModels] = useState(false);
+      // 单行添加在飞(round-3 审 M3):state 驱动 picker 行按钮禁用,ref 同步
+      // 挡同一 tick 的双击(异步 setState 在下一次渲染才可见,挡不住连击)。
+      const [pickSavingModel, setPickSavingModel] = useState(false);
+      const pickInFlightRef = useRef(false);
+      // 「全部添加」挂起批次(应用内 SheetConfirmDialog 确认闸门的数据):先记
+      // (addable, truncated) 快照,确认后才批量落库;取消则原样丢弃。
+      const [addAllModelsConfirm, setAddAllModelsConfirm] = useState(/** @type {{ addable: Array, truncated: boolean } | null} */ (null));
+      // 最新表单字段镜像(复审 M6):「测试连接」是异步探测,resolve 时空字段
+      // 判定必须看当时的输入值,而不是点击瞬间捕获的旧值——否则探测期间用户
+      // 手输的 context/max_output 会被过期的「空」判定清掉。每次渲染同步。
+      const latestFieldsRef = useRef({ contextWindow, maxOutput });
+      latestFieldsRef.current = { contextWindow, maxOutput }; // eslint-disable-line react-hooks/refs -- synchronously mirror the latest field drafts during render so the async probe callback judges emptiness against current values (round-1 review M6)
+      // base URL 同款镜像(复审 M5):探测在飞时改 URL,resolve 后的旧端点结果
+      // 必须作废,不允许在 URL B 的表单头/落库 payload 下展示 URL A 的列表。
+      const baseUrlRef = useRef(baseUrl);
+      baseUrlRef.current = baseUrl; // eslint-disable-line react-hooks/refs -- mirror the live base URL so an in-flight probe result can be discarded when the field moved on (round-1 review M5)
+      // wire 模型 ID 同款镜像(复审 M2):端点事实按模型探得,测试在飞时换了模型
+      // (目录切换/手输 ID/候选行填充),旧模型的数字不得填进新模型的空字段。
+      const modelRef = useRef(model);
+      modelRef.current = model; // eslint-disable-line react-hooks/refs -- synchronously mirror the live wire model so per-model probed facts are discarded when the model moved on (round-2 review M2)
+      // 图片输入能力三档(pinvou/enabled/disabled)与兜底视觉模型引用(阶段 G 设置页控件)。
+      // 已下线的「保存时检测」(auto)档残留值按「自动处理」(pinvou)回显。
+      // 未人工钉死(非 enabled/disabled)时按目录视觉能力标注预填:命中已验证
+      // 多模态条目预填「支持图片」,显式标注不支持预填「不支持图片」,未命中/
+      // 未标注保持「自动处理」。
+      const pinnedImageCapability = initial.image_capability_override === 'enabled'
+        || initial.image_capability_override === 'disabled';
+      const [imageCapability, setImageCapability] = useState(
+        pinnedImageCapability
+          ? initial.image_capability_override
+          : imageCapabilityForCatalogModel(initial.model));
+      // 用户手动改过档位后不再随模型 ID/目录项自动填写,避免覆盖显式选择。
+      const [imageCapabilityTouched, setImageCapabilityTouched] = useState(pinnedImageCapability);
+      const [visionModelId, setVisionModelId] = useState(initial.vision_model_id || '');
+      const [imageCapabilityPickerOpen, setImageCapabilityPickerOpen] = useState(false);
+      const [savingModel, setSavingModel] = useState(false);
+      // 保存失败(连接/写盘错误)行内提示:非空时弹窗保持,交用户修正后重试,
+      // 不静默关闭丢弃表单输入。
+      const [saveError, setSaveError] = useState('');
+      // 视觉模型选择探测:选中模型必须先通过图片识别探测——探测中列表保持
+      // 展开、该行右侧显示忙转圈;通过后收起列表选中,未通过则拒绝并提示排查。
+      const [visionProbingKey, setVisionProbingKey] = useState(null);
+      const [visionProbeError, setVisionProbeError] = useState(null);
+      const [visionModelPickerOpen, setVisionModelPickerOpen] = useState(false);
+      // 测试图片能力(设计 §7.3):仅主动点击触发;表单关键值变化后上一次结果不再可信,清除。
+      const [imageTesting, setImageTesting] = useState(false);
+      const [imageTestResult, setImageTestResult] = useState(null); // { status, verified, summary } | null
+      const localizeProvider = group => group
+        ? { ...group, ...settingsCopy.providerCatalog[group.key] }
+        : null;
+      const baseCatalogGroups = (MODEL_CATALOG[modelScope] || MODEL_CATALOG.cloud).map(localizeProvider);
+      const catalogGroups = !initial.__new && modelScope === 'cloud'
+        ? baseCatalogGroups.filter(group => initialProvider ? group.key === initialProvider.key : group.preset === initial.preset)
+        : baseCatalogGroups;
+      const activeProvider = modelScope === 'cloud'
+        ? localizeProvider(CLOUD_MODEL_PROVIDERS.find(group => group.key === providerKey) || findCloudProviderForModel({ preset, model, base_url: baseUrl, provider_kind: providerKind, vendor }) || null)
+        : null;
+      const isCodingPlan = providerKind === PROVIDER_KIND_CODING_PLAN || (activeProvider && activeProvider.providerKind === PROVIDER_KIND_CODING_PLAN);
+      // 当前表单模型可切换的思考深度档位（底座不支持的模型为空 = 不提供切换）。
+      // 本地/私网 openai_compatible 端点：按 Rust 探测结果下发真实档位
+      // （vllm→四档、ollama→off/high、lmstudio/generic→不支持），避免 UI
+      // 显示档位但 wire 层空操作的「调了个寂寞」。探测+档位+高亮映射的共享胶水
+      // 在 useModelReasoningTierState（与输入框模型选择器同一份）。
+      // Form entry: baseUrl/apiKey are per-keystroke input state, so the probe is debounced 400ms (fires only
+      // after typing stops); for the pre-probe trim and raw-input dependency semantics see useLocalServerKindProbe.
+      const {
+        isLocalCompatible,
+        probePending,
+        reasoningEffortTiers,
+        noControlThinking: localNoControlThinking,
+        reasoningEffortDisplay,
+      } = useModelReasoningTierState({
+        model: { preset, model, vendor, base_url: baseUrl, provider_kind: providerKind },
+        storedEffort: reasoningEffort,
+        baseUrl,
+        apiKey,
+        modelId: initial.__new ? null : initial.id,
+        debounceMs: 400,
+        trimInputs: true,
+        noAuth,
+      });
+      function normalizeConnectionTestResult(value, isCodingPlanProvider) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const code = String(value.code || (value.ok ? 'ok' : 'unknown'));
+          let message = settingsCopy.connectionMessages[code]
+            || (value.ok ? settingsCopy.connectionMessages.ok : settingsCopy.connectionMessages.unknown);
+          if (isCodingPlanProvider && (code === 'endpoint_not_found' || code === 'method_not_allowed')) {
+            message = settingsCopy.codingPlanTestUnavailable;
+          }
+          return {
+            ok: !!value.ok,
+            code,
+            message,
+            detail: value.detail ? String(value.detail) : '',
+          };
+        }
+        // test_model_connection always resolves a serialized object; this
+        // fallback only covers the reject path (a thrown error string).
+        return { ok: false, code: 'unknown', message: settingsCopy.connectionMessages.unknown, detail: String(value || '') };
+      }
+      function applyCatalogItem(group, item) {
+        const p = group.preset;
+        setPreset(p);
+        const defs = MODEL_PRESET_DEFS[p] || MODEL_PRESET_DEFS[localVllmSupported ? 'local_vllm' : 'deepseek'];
+        const nextModel = item.custom ? '' : (item.model || defs.model);
+        const nextBaseUrl = normalizedProviderBaseUrl(group) || defs.baseUrl;
+        setProviderKey(group.key || '');
+        setProviderKind(group.providerKind || ((p === 'openai_compatible' || p === 'openai_responses') ? PROVIDER_KIND_CUSTOM : PROVIDER_KIND_OFFICIAL_API));
+        setVendor(group.vendor || '');
+        setEndpointMode(group.endpointMode || '');
+        setBaseUrl(nextBaseUrl);
+        setModel(nextModel);
+        // 目录项切换是显式换模型:未手动改过档位时按新条目的视觉能力标注预填。
+        if (!imageCapabilityTouched) setImageCapability(imageCapabilityForCatalogModel(nextModel));
+        if (!nameTouched) setName(p === 'local_vllm' ? settingsCopy.localModelName(nextModel) : (item.custom ? group.title : (item.title || presetProviderLabel(p, t))));
+        setContextWindow(p === 'local_vllm' ? '262144' : '');
+        // The output cap is no longer prefilled with 24K: left empty like
+        // cloud/custom, declared uniformly by the runtime window tiers.
+        setMaxOutput('');
+        // 显式换模型:上一次端点探测的自动填入提示已失效,一并清除。
+        setFilledFromEndpoint(false);
+        // 目录切换会改写 base_url(复审 M5 同因):旧 URL 上探到的候选列表、
+        // 打开的 picker 与挂起的批量确认一并作废,绝不许在新 URL 下复用;
+        // 旧 URL 下的添加提示与探测失败提示同因作废(复审 M4 + round-3 minor)。
+        setEndpointListing(null);
+        setEndpointPickerOpen(false);
+        setAddAllModelsConfirm(null);
+        setEndpointAddResult(null);
+        setFetchModelsMessage(null);
+        // Reset the thinking effort to the new entry's default tier when the
+        // catalog item changes (vllm→low (lowest thinking tier), others→high;
+        // models without tiers get null = not explicitly set). Pass nextBaseUrl
+        // so the tier is decided by the new route.
+        setReasoningEffort(reasoningEffortForModelSwitch({ preset: p, model: nextModel, vendor: group.vendor || vendor, base_url: nextBaseUrl }));
+        setApiKey('');
+        setKeyAction(initial.__new ? 'replace' : 'keep_existing');
+        // 显式换模型/入口：免鉴权声明按记录重置。声明保存在模型条目上，手动
+        // 编辑 URL 不会自动清除（指向新端点是否免鉴权由用户判断；如需收回，
+        // 直接关开关即可），仅在显式切换模型/入口时恢复默认的鉴权规则。
+        setNoAuth(false);
+        setBaseUrlPortError(null);
+        setCustomModel(!!item.custom);
+        setProviderModelPickerOpen(false);
+        setPickerOpen(false);
+      }
+      // 手输编辑会改变 reasoning-effort route 的字段（model ID / base_url）后，把思考
+      // 深度归一到新 route：仍在档位表内的值保留（不覆盖用户有效选择，如 vLLM 的 high、
+      // 非 K3 moonshot 的 off），不在档位表内的按底座真实等价值回落（如 K3 的 off→low、
+      // medium→high，或 openai_compatible 改到官方 deepseek 端点后档位从无到有 → 默认
+      // high）。与目录选择（chooseModel / applyCatalogItem）的「重置到默认」区分：目录
+      // 选择是显式换模型，手输是改字段，保留有效值更符合直觉且不会误清用户的旧选择。
+      function renormalizeReasoningEffort(modelDescriptor) {
+        setReasoningEffort(normalizeStoredReasoningEffort(modelDescriptor, reasoningEffort));
+      }
+      function handleModelIdChange(value) {
+        setModel(value);
+        renormalizeReasoningEffort({ preset, model: value, vendor, base_url: baseUrl });
+        // 手输模型 ID 是显式换模型(round-3 审 minor:此前只有目录项切换/
+        // chooseModel 清除):上一次端点探测的自动填入提示已失效,一并清除,
+        // 不让旧模型的「已从端点填入」小字挂在新模型下面误导。
+        setFilledFromEndpoint(false);
+        // 手输模型 ID 命中目录标注同样预填;手动改过档位后不再跟随。
+        if (!imageCapabilityTouched) setImageCapability(imageCapabilityForCatalogModel(value));
+      }
+      function handleBaseUrlChange(value) {
+        setBaseUrl(value);
+        // URL 已被直接编辑：旧端口校验错误针对的是改写前的地址，随编辑清除，
+        // 避免红色提示挂在已修正的 URL 上（端口框下次输入会重新校验）。
+        setBaseUrlPortError(null);
+        renormalizeReasoningEffort({ preset, model, vendor, base_url: value });
+        // base URL 变更即失效既有探测结果(复审 M5):URL A 上探到的列表绝不许
+        // 在 URL B 的表单里打开或落库(picker 头部与保存 payload 都按当前输入
+        // 的 URL 走),挂起的批量确认一并丢弃;旧 URL 下的添加提示与探测失败
+        // 提示同因作废(round-3 审 minor:fetchModelsMessage 此前漏在失效
+        // 清扫外,旧 URL 的红色失败提示会挂在新 URL 下)。
+        setEndpointListing(null);
+        setEndpointPickerOpen(false);
+        setAddAllModelsConfirm(null);
+        setEndpointAddResult(null);
+        setFetchModelsMessage(null);
+      }
+      // 解析 http/https URL；其余 scheme（或无法解析）返回 null。端口框只在
+      // 可解析的 http(s) 地址上工作，避免 "127.0.0.1:8003"（无 scheme）被
+      // new URL 误判成 protocol="127.0.0.1:" 的怪异 URL。
+      function parseHttpUrl(value) {
+        try {
+          const parsed = new URL(value);
+          return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed : null;
+        } catch {
+          return null;
+        }
+      }
+      // base_url 的显式端口（无显式端口 = ''，即走 scheme 默认）。
+      // 端口框输入 → 原位改写 base_url 的端口（保留 scheme/host/path）。
+      // 校验口径与本地检测端口框一致：空串 = 移除显式端口（走 scheme 默认）；
+      // 非纯数字或超出 1-65535（含 0）只报错不改 URL，输入框值始终由 base_url
+      // 派生，因此非法输入会被弹回上一个合法值。
+      function handleBaseUrlPortChange(raw) {
+        const trimmed = raw.trim();
+        if (trimmed === '') {
+          const parsed = parseHttpUrl(baseUrl);
+          if (!parsed) return;
+          parsed.port = '';
+          setBaseUrlPortError(null);
+          handleBaseUrlChange(serializeParsedBaseUrl(parsed));
+          return;
+        }
+        const port = /^\d+$/.test(trimmed) ? Number(trimmed) : NaN;
+        if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+          setBaseUrlPortError(settingsCopy.localPortInvalid);
+          return;
+        }
+        const parsed = parseHttpUrl(baseUrl);
+        if (!parsed) return;
+        parsed.port = String(port);
+        setBaseUrlPortError(null);
+        handleBaseUrlChange(serializeParsedBaseUrl(parsed));
+      }
+      // URL API 的 toString 在空路径时补一个尾斜杠；只剥这个补出来的斜杠，
+      // 不顺手动用户自己写的路径尾斜杠（如 .../v1/ —— 与直接编辑 URL 行的
+      // 行为一致，手动输入不归一化）。裸主机（pathname === '/'）上用户自己
+      // 写的根斜杠无法与 WHATWG 补出的斜杠区分，会被一并剥掉（round-7
+      // review：注释如实披露这一例；HTTP 语义上两者等价，无行为影响）。
+      function serializeParsedBaseUrl(parsed) {
+        const serialized = parsed.toString();
+        return parsed.pathname === '/' ? serialized.replace(/\/$/, '') : serialized;
+      }
+      // 测试连接成功后,把端点探测到的 context/max_output 仅填入空字段
+      // (规格 §2.6:绝不覆盖非空值)。空字段判定读 latestFieldsRef(复审 M6):
+      // resolve 时刻的最新输入,而非点击瞬间捕获的旧值。context_window_tokens/
+      // max_output_tokens 是可选新字段,老后端不返回时 Number() 落 NaN 自然跳过。
+      function applyProbedFacts(result) {
+        if (!result || typeof result !== 'object' || !result.ok) return;
+        const probedContext = Number(result.context_window_tokens);
+        const probedOutput = Number(result.max_output_tokens);
+        let filled = false;
+        if (!latestFieldsRef.current.contextWindow && Number.isFinite(probedContext) && probedContext > 0) { setContextWindow(String(probedContext)); filled = true; }
+        if (!latestFieldsRef.current.maxOutput && Number.isFinite(probedOutput) && probedOutput > 0) { setMaxOutput(String(probedOutput)); filled = true; }
+        if (filled) setFilledFromEndpoint(true);
+      }
+      async function handleTest() {
+        if (!bridge.available) return;
+        setTesting(true); setTestResult(null);
+        // 测试连接要与保存后的鉴权形态一致：免鉴权声明生效时不携带已输入
+        // 的 key（开关开着时 key 行隐藏，但已输入的 key 仍残留 state）。
+        const testKey = !isLocalPreset && !isCodingPlan && noAuth
+          ? ''
+          : keyAction === 'replace' || (isLocalPreset && localKeyEnabled) ? apiKey.trim() : '';
+        // resolve 时刻守卫(复审 M5):点击瞬间快照 base URL,resolve 时发现
+        // 表单已改走就整份丢弃——结果(含失败结果)属于旧端点,静默丢弃,
+        // 不打扰用户。
+        const probedBaseUrl = baseUrl.trim();
+        try {
+          // noAuth 随请求下发：后端据此跳过已保存凭据回退（残留 key 不得
+          // 在保存前发往新填的 URL，与保存后的鉴权形态完全一致）。
+          const result = await bridge.models.testModelConnection(baseUrl.trim(), testKey, initial.__new ? null : initial.id, !isLocalPreset && !isCodingPlan && noAuth);
+          if (baseUrlRef.current.trim() !== probedBaseUrl) return;
+          setTestResult(normalizeConnectionTestResult(result, isCodingPlan));
+          // round-3 审 M2:端点事实按**已保存记录**的 model 字段探得并匹配
+          // (后端经 fact_model 回带这个名字),编辑表单里未保存的 model-ID
+          // 改动会让表单模型与事实模型分叉——旧守卫拿表单模型跟自己比,
+          // 分叉时旧模型的数字会填进新模型的空字段并存盘。守卫对齐到
+          // fact_model:表单当前模型仍是事实所属模型才填;fact_model 缺席
+          // (新建表单/未知 id)时结果必无事实字段,照旧调用为空操作。
+          const factModel = typeof result.fact_model === 'string' ? result.fact_model.trim() : '';
+          if (!factModel || modelRef.current.trim() === factModel) applyProbedFacts(result);
+        } catch (e) {
+          if (baseUrlRef.current.trim() !== probedBaseUrl) return;
+          setTestResult(normalizeConnectionTestResult(e, isCodingPlan));
+        }
+        finally { setTesting(false); }
+      }
+      // 获取模型列表(规格 §2.6):仅由按钮显式点击触发(无 effect/启动期调用,
+      // settings_ui_smoke 源码守卫钉住);凭据阶梯与 handleTest 一致——表单新填
+      // key 优先。列表只写入 state 打开 picker,不落库。
+      async function handleFetchModels() {
+        if (!bridge.available || typeof bridge.models.probeEndpointModels !== 'function' || fetchingModels) return;
+        const probedBaseUrl = baseUrl.trim();
+        if (!probedBaseUrl) return;
+        const probedAuth = !isLocalPreset && !isCodingPlan && noAuth ? '' : keyAction === 'replace' || (isLocalPreset && localKeyEnabled) ? apiKey.trim() : '';
+        const probedPreset = preset;
+        // 探测序号递增:picker 以此为 key 重挂,新列表的 filter/滚动干净复位。
+        setEndpointFetchSeq(seq => seq + 1);
+        setFetchingModels(true);
+        // 新一轮探测开始:上一次探测提示与逐行/批量添加的行内结果一并作废(复审 M4)。
+        setFetchModelsMessage(null);
+        setEndpointAddResult(null);
+        try {
+          const listing = await bridge.models.probeEndpointModels({
+            baseUrl: probedBaseUrl,
+            // 与 handleTest/图片能力测试同一口径(round-5 审 M1,#851 一致性):
+            // 免鉴权声明生效时不携带已输入的 key——开关开着时 key 行隐藏,
+            // 但已输入的 key 仍残留 state;探测要与保存后的鉴权形态一致
+            // (免鉴权记录运行时不发鉴权头),残留 key 也不得发往新填的 URL。
+            apiKey: probedAuth,
+            preset: probedPreset,
+          });
+          // 复审 M5:探测在飞时用户改了 base URL → 这份 URL A 的结果作废
+          // (baseUrlRef 是 resolve 时刻的实时输入);静默丢弃,不打扰用户。
+          if (baseUrlRef.current.trim() !== probedBaseUrl) return;
+          // review P2 2026-11-17:凭据/协议维度并入失效键——在飞时换 key、
+          // 切免鉴权或换 preset,旧凭证探得的列表不得在新凭证下打开
+          // (picker 的 Add 会按当前凭证落库,旧列表的模型可能无权访问)。
+          if (probeAuthRef.current !== probedAuth) return;
+          if (probePresetRef.current !== probedPreset) return;
+          setEndpointListing(listing && typeof listing === 'object' ? listing : { status: 'error', models: [] });
+          setEndpointPickerOpen(true);
+        } catch (e) {
+          // round-3 审 minor:reject 路径与 try 路径同一 resolve 时刻守卫——
+          // URL A 的探测失败不许以红色提示挂在已改走的 URL B 表单下
+          // (handleTest 的 catch 早已同款守卫,这里是补齐)。
+          if (baseUrlRef.current.trim() !== probedBaseUrl) return;
+          // reject 路径同键(review P2 2026-11-17):旧凭证的探测失败同样不得
+          // 以提示挂在新凭证表单下。
+          if (probeAuthRef.current !== probedAuth) return;
+          if (probePresetRef.current !== probedPreset) return;
+          setFetchModelsMessage(normalizeConnectionTestResult(e, isCodingPlan));
+        }
+        finally { setFetchingModels(false); }
+      }
+      // picker 逐行「添加」(聊天线):构建 draft(当前 preset/base_url/表单 key)
+      // → bridge.models.saveModel(桥内自带 loadModels 刷新),成功后行内提示;
+      // 失败保持弹窗与提示,不静默丢弃。
+      function buildEndpointModelPayload(row, overrides) {
+        // 与 doSave 同一凭据阶梯 + 免鉴权声明,收口后 picker 添加的记录不会在
+        // chat 门被免鉴权声明外的凭据要求挡住。
+        const nextKeyAction = isLocalPreset
+          ? (localKeyEnabled && apiKey.trim() ? 'replace' : 'keep_existing')
+          : cloudCredentialAction();
+        const nextApiKey = isLocalPreset
+          ? (localKeyEnabled && apiKey.trim() ? apiKey.trim() : '')
+          : (!noAuthActive && apiKey.trim() ? apiKey.trim() : '');
+        // 与 buildLocalModelPayload 同一教义:listing 带 server_kind 时
+        // ollama / lm_studio 行的 context_window_tokens 是运行时生效值
+        // (/api/ps 生效窗口、loaded_context_length),持久化成声明会在
+        // resolve_context_window 里永久 min-clamp 后续探测——存 null,
+        // 行内徽章照常显示探测值,仅落库被闸。
+        const serverKind = endpointListing && typeof endpointListing === 'object' ? endpointListing.server_kind : null;
+        const runtimeProbedLane = serverKind === 'ollama' || serverKind === 'lm_studio';
+        return {
+          id: makeModelId(),
+          name: row.title || row.id,
+          preset: overrides && overrides.preset !== undefined ? overrides.preset : preset,
+          alias: null,
+          context_window_tokens: runtimeProbedLane ? null : row.contextWindowTokens,
+          max_output_tokens: row.maxOutputTokens,
+          model: row.id,
+          base_url: overrides && overrides.baseUrl !== undefined ? overrides.baseUrl : baseUrl.trim(),
+          api_key: nextApiKey,
+          credential_action: nextKeyAction,
+          provider_kind: providerKind || null,
+          vendor: vendor || null,
+          endpoint_mode: endpointMode || null,
+          auth_mode: !isLocalPreset && !isCodingPlan && noAuth ? 'none' : null,
+          image_capability_override: imageCapability || 'pinvou',
+          vision_model_id: null,
+          reasoning_effort: null,
+        };
+      }
+      async function handleEndpointModelPick(row) {
+        // round-3 审 M3:单行添加此前没有在飞守卫——savingModel/addingAllModels
+        // 都不在这条路径上置位,行按钮也只在 alreadySaved 后才禁用,快速
+        // 双击会以两个新 id 把同一 (model, base_url) 落库两次。ref 在同步
+        // 序列里立即置位挡住同一 tick 的第二次点击,state 驱动行按钮禁用
+        // (保存 IPC + 刷新链路的窗口内不给可点的第二下)。round-4 M4 补充:
+        // 批量确认弹窗挂着时同样禁入——挂起批次是「添加前」的旧快照,单行
+        // 若在其窗口内落库,确认后的批量保存会把它当未保存行再落一次。
+        if (pickInFlightRef.current || savingModel || addingAllModels || addAllModelsConfirm) return;
+        pickInFlightRef.current = true;
+        setPickSavingModel(true);
+        try {
+          await onSave(buildEndpointModelPayload(row));
+          setEndpointAddResult({ ok: true, text: settingsCopy.addedCount(1) });
+        } catch (e) {
+          // 失败:picker 保持打开供重试,提示以 addNotice 就地透传(复审 M4)。
+          setEndpointAddResult({ ok: false, text: settingsCopy.imageCapabilitySaveFailed(String(e && e.message ? e.message : e)) });
+        }
+        finally {
+          pickInFlightRef.current = false;
+          setPickSavingModel(false);
+        }
+      }
+      // 「全部添加」(聊天线):先与已保存模型按 (model id + base_url) 去重,把
+      // (addable, truncated) 快照进应用内确认弹窗(原生 confirm 在 Tauri
+      // WebView2 不渲染;>100 时提示截断到 100)。确认是硬闸门:入口只记录挂起
+      // 批次、绝不落库(settings_ui_smoke 源码守卫钉住)。
+      async function handleAddAllEndpointModels() {
+        // round-4 M4(批量×单行交错):单行添加在飞时(pickInFlightRef 同步挡
+        // 同 tick、pickSavingModel/savingModel 盖保存 IPC+刷新窗口)禁入——
+        // 此刻的去重快照会把正在保存的那一行当成未保存,确认后重复落库。
+        if (addingAllModels || pickInFlightRef.current || pickSavingModel || savingModel || !endpointListing) return;
+        const { addable, truncated } = splitBatchAdd(normalizeDiscoveredRows(endpointListing), endpointSavedKeys, baseUrl.trim(), ADD_ALL_BATCH_LIMIT);
+        if (addable.length === 0) return;
+        // round-5 审 m1(键盘可达的拆批):确认弹窗没有焦点陷阱,键盘用户可
+        // 以在批量保存循环进行中改 URL(URL 变更清扫只摘弹窗,已开跑的循环
+        // 不受影响)。去重与落库都以确认时刻的快照为准——循环内的 payload
+        // 用快照 URL/preset,后改的 URL 只影响下一轮,绝不产生 A/B 拆批。
+        setAddAllModelsConfirm({ addable, truncated, baseUrl: baseUrl.trim(), preset });
+      }
+      // 确认后的批量保存(复审 M9):逐行 saveModel 带 deferRefresh 跳过桥内
+      // 的三连 reload(100 行 × 3 次 IPC 的风暴),循环结束后统一刷新一次;
+      // 失败路径也补一次刷新,让已落库的前缀行正确出现在列表里。全部成功才
+      // 关 picker 并提示数量;失败保持弹窗与提示,不静默丢弃。老桌面/web 桥
+      // 没有 reloadSavedModels 时回退旧行为(逐行全量刷新,不加 options)。
+      async function confirmAddAllEndpointModels() {
+        if (!addAllModelsConfirm || addingAllModels) return;
+        const { addable, baseUrl: confirmBaseUrl, preset: confirmPreset } = addAllModelsConfirm;
+        const batchReloadAvailable = bridge.available && typeof bridge.models.reloadSavedModels === 'function';
+        setAddingAllModels(true);
+        let added = 0;
+        try {
+          for (const row of addable) {
+            // 快照 URL/preset(round-5 审 m1):循环期间改 URL 只影响下一轮,
+            // 本批行永远落在确认时刻的端点上。
+            await onSave(buildEndpointModelPayload(row, { baseUrl: confirmBaseUrl, preset: confirmPreset }), batchReloadAvailable ? { deferRefresh: true } : undefined);
+            added += 1;
+          }
+          if (batchReloadAvailable) await bridge.models.reloadSavedModels();
+          setEndpointAddResult({ ok: true, text: settingsCopy.addedCount(added) });
+          setEndpointPickerOpen(false);
+        } catch (e) {
+          if (batchReloadAvailable) {
+            try { await bridge.models.reloadSavedModels(); } catch { /* best-effort: keep the save error visible */ }
+          }
+          // 中途失败:已落库的前缀行保留,picker 保持打开并就地透传失败原因
+          // (表单状态行在遮罩下方不可见,复审 M4)。
+          setEndpointAddResult({ ok: false, text: settingsCopy.imageCapabilitySaveFailed(String(e && e.message ? e.message : e)) });
+        }
+        finally { setAddingAllModels(false); setAddAllModelsConfirm(null); }
+      }
+      // Escape 逐层关(round-5 审 m1,与 ACP 线 ProviderFormModal 的窗口级
+      // 监听同款;聊天线此前只有 X 按钮能关 picker):视觉顶层先关——批量
+      // 确认弹窗(z-120)先于 picker(z-100);批量保存在飞时不入(忙碌中
+      // 丢弃确认只会把「是否完成」变得不可见)。onClose 的清扫语义与 X
+      // 按钮一致(摘 picker + 行内添加结果)。
+      useEffect(() => {
+        if (!endpointPickerOpen && !addAllModelsConfirm) return;
+        const onPickerKeyDown = e => {
+          if (e.key !== 'Escape') return;
+          if (addAllModelsConfirm && !addingAllModels) setAddAllModelsConfirm(null);
+          else if (endpointPickerOpen) { setEndpointPickerOpen(false); setEndpointAddResult(null); }
+        };
+        window.addEventListener('keydown', onPickerKeyDown);
+        return () => window.removeEventListener('keydown', onPickerKeyDown);
+      }, [endpointPickerOpen, addAllModelsConfirm, addingAllModels]);
+      // 测试图片能力(设计 §7.3):与测试连接同一模式——表单未保存也按当前表单值发测,
+      // 凭据优先用新填的 key,否则由后端按 model_id 读已保存凭据。
+      function normalizeImageCapabilityTestResult(value) {
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          const status = ['supported', 'unsupported', 'unverified', 'error'].includes(value.status) ? value.status : 'error';
+          return {
+            status,
+            verified: !!value.verified,
+            summary: value.summary ? String(value.summary) : '',
+            // http_status is the frontend's billing signal: 402 maps to the
+            // tri-lingual connectionMessages.billing copy (the Rust-side
+            // summary is contracted to carry no hardcoded language prefix;
+            // see settings.rs).
+            httpStatus: value.http_status == null ? null : Number(value.http_status),
+          };
+        }
+        return { status: 'error', verified: false, summary: String(value || ''), httpStatus: null };
+      }
+      async function handleImageCapabilityTest() {
+        if (!bridge.available || !bridge.models.testImageInputCapability) return;
+        setImageTesting(true); setImageTestResult(null);
+        // 与 handleTest 同口径：免鉴权声明生效时不携带残留的已输入 key。
+        const testKey = !isLocalPreset && !isCodingPlan && noAuth
+          ? ''
+          : keyAction === 'replace' || (isLocalPreset && localKeyEnabled) ? apiKey.trim() : '';
+        try {
+          // 与 handleTest 同口径：noAuth 随请求下发，后端据此跳过已保存凭据回退。
+          const result = await bridge.models.testImageInputCapability(model.trim(), baseUrl.trim(), testKey, initial.__new ? null : initial.id, !isLocalPreset && !isCodingPlan && noAuth);
+          setImageTestResult(normalizeImageCapabilityTestResult(result));
+        } catch (e) {
+          setImageTestResult({ status: 'error', verified: false, summary: String(e && e.message ? e.message : e), httpStatus: null });
+        }
+        finally { setImageTesting(false); }
+      }
+      const isLocalPreset = preset === 'local_vllm';
+      // 端点探测的有效鉴权载荷同款镜像(review P2 2026-11-17):探测在飞时换 key
+      // 或切免鉴权姿态,旧账号的列表不得在新凭证下打开——凭据维度并入失效键。
+      // (镜像必须位于 isLocalPreset/isCodingPlan 声明之后:render 路径在此处
+      // 直读它们,声明前直读是 TDZ 崩溃——noInvalidUseBeforeDeclaration。)
+      const probeAuthRef = useRef('');
+      probeAuthRef.current = !isLocalPreset && !isCodingPlan && noAuth ? '' : keyAction === 'replace' || (isLocalPreset && localKeyEnabled) ? apiKey.trim() : ''; // eslint-disable-line react-hooks/refs -- synchronously mirror the effective auth payload
+      // 协议 preset 同款镜像:同 URL 同凭证但 preset 切换,列表语义同样属于旧协议。
+      const probePresetRef = useRef(preset);
+      probePresetRef.current = preset; // eslint-disable-line react-hooks/refs -- synchronously mirror the live protocol preset
+      // base_url 的解析结果：端口框的回显值与只读态都由它派生（URL 不可解析
+      // 时端口框只读置空）。
+      const parsedBaseUrl = parseHttpUrl(baseUrl);
+      const showProviderModelField = !isLocalPreset && !!activeProvider && Array.isArray(activeProvider.items) && activeProvider.items.length > 0;
+      const showModelIdField = isLocalPreset || customModel || showProviderModelField;
+      // API 地址字段：本地预设始终可见（端口写在 URL 里）；云端预设全部可见
+      // （默认填官方端点，用户可改指向自建网关/带自定义端口的反代）。coding_plan
+      // 是托管入口，端点由平台管理，不开放编辑。
+      const showBaseUrlField = !isCodingPlan;
+      // 「免鉴权」的 UI 活性:noAuth 是表单状态,但托管入口上开关不渲染 ——
+      // 开着开关把 URL 改写成托管端点会让开关行消失,而载荷侧 auth_mode 与
+      // 凭据删除都已按 !isCodingPlan 同口径归一。UI 渲染(开关、Key 行、提示)
+      // 必须跟随同一口径回到未声明形态,否则出现「提示在、开关无、Key 行藏」
+      // 的死局,且开关开着时输入的 key 会被静默丢弃。
+      const noAuthActive = !isLocalPreset && !isCodingPlan && noAuth;
+      const showCustomCloudKeyField = !isLocalPreset && customModel && !noAuthActive;
+      const showLocalKeyField = isLocalPreset && localKeyEnabled;
+      const showNoAuthToggle = !isLocalPreset && !isCodingPlan;
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronous setState in this effect is intentional: mirrors the backend snapshot into local state once it lands, avoiding first-frame flicker; the keyless posture is part of the same freshness contract — a posture flip changes what a re-test would send, so the banner must not survive it (round-6 review). keyRevealError rides the same invalidation (round-7 review): the row hiding must not leave a stale reveal-failure message that reappears when the toggle flips back off.
+      useEffect(() => { setImageTestResult(null); setKeyRevealError(''); }, [model, baseUrl, apiKey, preset, noAuthActive]);
+      const showDisplayNameField = isLocalPreset && !initial.__new;
+      const showAliasField = !isLocalPreset;
+      const showConfigFields = showAliasField || showDisplayNameField || showModelIdField || showBaseUrlField || showCustomCloudKeyField || showNoAuthToggle;
+      const selectedProvider = isLocalPreset ? presetProviderLabel(preset, t) : (activeProvider ? (activeProvider.configTitle || activeProvider.title) : presetProviderLabel(preset, t));
+      const selectedModelLabel = model || settingsCopy.customModel;
+      const modalTitle = initial.__new
+        ? (isCodingPlan ? settingsCopy.addProvider(selectedProvider) : t.modelFormAddTitle)
+        : (isCodingPlan ? settingsCopy.editProvider(selectedProvider) : t.modelFormEditTitle);
+      const saveName = showDisplayNameField || isLocalPreset ? (name.trim() || settingsCopy.localModelName(model.trim())) : (model.trim() || selectedProvider);
+      const credentialState = initial.credential_state || (initial.has_secret ? 'configured' : 'missing');
+      const hasSavedKey = hasStoredCredential(initial);
+      const hasUsableApiKey = isLocalPreset || noAuthActive || hasSavedKey || !!apiKey.trim();
+      const canSave = !!(saveName && model.trim() && baseUrl.trim() && hasUsableApiKey);
+      async function toggleApiKeyVisibility() {
+        const nextVisible = !showKey;
+        if (nextVisible && hasSavedKey && !apiKey.trim() && credentialState !== 'env_override' && initial.id && bridge.models.revealModelApiKey) {
+          try {
+            setKeyRevealError('');
+            const savedKey = await bridge.models.revealModelApiKey(initial.id);
+            if (savedKey) setApiKey(savedKey);
+          } catch (error) {
+            setKeyRevealError(String(error || settingsCopy.apiKeyReadFailed));
+          }
+        }
+        setShowKey(nextVisible);
+      }
+      // 保存时的凭据编辑动作（云端/自定义路径）：免鉴权声明显式删除已存凭据
+      // （避免留下永远用不到的明文/钥匙串残留），本就没有凭据时 replace 落成
+      // missing 即可；其余沿用既有语义（新填/首次保存 → replace，否则保留）。
+      // 与 auth_mode 载荷同口径排除 coding_plan：托管归属随 base_url 实时
+      // 判定，开关开着时把 URL 改写成托管端点会隐藏开关行，但 noAuth 状态
+      // 残留——凭据删除不得被这个残留触发（声明不落盘却删了凭据）。
+      function cloudCredentialAction() {
+        if (!isCodingPlan && noAuth) return hasSavedKey ? 'delete' : 'replace';
+        return apiKey.trim() || initial.__new || !hasSavedKey ? 'replace' : 'keep_existing';
+      }
+      // 保存只落盘,不做连接/识图探测:图片输入能力默认「自动处理」
+      // (pinvou 档,内置已验证能力表兜底);需要确证时用表单内「测试图片能力」。
+      async function doSave() {
+        if (!canSave || savingModel) return;
+        const id = initial.__new ? makeModelId() : initial.id;
+        const contextTokens = Number(contextWindow);
+        const outputTokens = Number(maxOutput);
+        const nextKeyAction = isLocalPreset
+          ? (localKeyEnabled && apiKey.trim() ? 'replace' : 'keep_existing')
+          : cloudCredentialAction();
+        const nextApiKey = isLocalPreset
+          ? (localKeyEnabled && apiKey.trim() ? apiKey.trim() : '')
+          // noAuthActive（round-5 review）:与 noAuthActive 派生同一口径,
+          // 不用裸 noAuth——「开关开着但 URL 指向托管端点」时输入的 key
+          // 不能既显示又被静默丢弃。
+          : (!noAuthActive && apiKey.trim() ? apiKey.trim() : '');
+        setSavingModel(true);
+        setSaveError('');
+        try {
+          await onSave({
+            id, name: saveName, preset,
+            alias: showAliasField ? (alias.trim() || null) : null,
+            context_window_tokens: Number.isFinite(contextTokens) && contextTokens > 0 ? contextTokens : null,
+            max_output_tokens: Number.isFinite(outputTokens) && outputTokens > 0 ? outputTokens : null,
+            // 仅当前表单模型支持档位时保存；手输 model 变为无档位模型时置 null(#209)。
+            reasoning_effort: reasoningEffortTiers.length > 0 ? (reasoningEffort || null) : null,
+            model: model.trim(), base_url: baseUrl.trim(),
+            api_key: nextApiKey, credential_action: nextKeyAction,
+            provider_kind: providerKind || null,
+            vendor: vendor || null,
+            endpoint_mode: endpointMode || null,
+            // 端点鉴权声明：勾选「此端点无需鉴权」存 "none"（后端归一、直通
+            // 底座 auth_mode）；默认档存 null（按 provider/端点规则决定）。
+            // coding_plan 是托管入口，不接收声明（开关对其不渲染）。
+            auth_mode: !isLocalPreset && !isCodingPlan && noAuth ? 'none' : null,
+            // 图片能力/视觉模型(阶段 G):选了自身等同未配置。
+            image_capability_override: imageCapability || 'pinvou',
+            vision_model_id: visionModelId && visionModelId !== id ? visionModelId : null,
+          });
+          onCancel();
+        } catch (e) {
+          // 保存失败(连接/写盘错误):保持弹窗并给行内提示,不丢弃表单输入。
+          setSaveError(String(e && e.message ? e.message : e));
+        } finally {
+          setSavingModel(false);
+        }
+      }
+      // 视觉模型选择:一律识图探测(无表内加速)——识别出测试图(supported)
+      // 才收起列表并选中;未通过则列表保持展开、该模型被拒绝并提示排查,
+      // 用户可继续选择其他模型。
+      async function handleVisionModelChoose(key) {
+        if (visionProbingKey) return; // 探测中忽略其他点击
+        setVisionProbeError(null);
+        if (!key) {
+          setVisionModelId('');
+          setVisionModelPickerOpen(false);
+          return;
+        }
+        const candidate = visionCandidates.find(item => item.id === key);
+        if (!candidate || !bridge.available || !bridge.models.testImageInputCapability) {
+          setVisionModelId(key);
+          setVisionModelPickerOpen(false);
+          return;
+        }
+        setVisionProbingKey(key); // 列表保持展开,该行右侧显示忙转圈
+        try {
+          const result = await bridge.models.testImageInputCapability(
+            candidate.model || candidate.name || '',
+            candidate.base_url || '',
+            '',
+            candidate.id,
+          );
+          if (result && result.status === 'supported') {
+            setVisionModelId(key);
+            setVisionModelPickerOpen(false); // 成功按最终结果收起列表
+          } else {
+            setVisionProbeError(settingsCopy.visionModelProbeError(
+              result && result.summary ? result.summary : ''));
+          }
+        } catch (e) {
+          setVisionProbeError(settingsCopy.visionModelProbeError(
+            String(e && e.message ? e.message : e)));
+        } finally {
+          setVisionProbingKey(null);
+        }
+      }
+      function makeModelId() {
+      // eslint-disable-next-line react-hooks/purity, sonarjs/pseudo-random -- id generation via Date.now/Math.random is existing behavior, runs only once at creation
+        return 'm_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+      }
+      function localCandidateRows(result) {
+        const candidates = (result && Array.isArray(result.candidates)) ? result.candidates : [];
+        return candidates.flatMap(candidate => {
+          // 新后端 models 为 [{id, loaded}]；兼容旧后端的字符串数组。
+          const entries = Array.isArray(candidate.models) && candidate.models.length
+            ? candidate.models.map(m => (typeof m === 'string' ? { id: m, loaded: null } : m))
+            : (candidate.model ? [{ id: candidate.model, loaded: null }] : []);
+          return entries.map((entry, index) => ({
+            key: `${candidate.base_url || 'local'}:${entry.id}`,
+            model: entry.id,
+            loaded: entry.loaded === undefined ? null : entry.loaded,
+            base_url: candidate.base_url || '',
+            provider: candidate.provider || 'local',
+            label: candidate.label || settingsCopy.localModel,
+            max_model_len: index === 0 ? candidate.max_model_len : null,
+          })).filter(row => row.model && row.base_url);
+        }).sort((a, b) => (a.loaded === false ? 1 : 0) - (b.loaded === false ? 1 : 0)); // 已加载/未知的排前，未加载的沉底
+      }
+      function buildLocalModelPayload(row) {
+        // Ollama/LM Studio 的 max_model_len 是运行时生效值（/api/ps 的生效
+        // 上下文、/api/v0/models 的 loaded_context_length），随加载状态与
+        // 服务端配置变化：不能持久化为用户声明——声明在
+        // resolve_context_window 里永久 min-clamp 后续探测，且本表单对
+        // local 预设隐藏该字段，用户无法纠正。引擎在每次 spawn 时按服务
+        // 类别原生探测实时采纳（Ollama /api/ps→show、LM Studio
+        // /api/v0/models），存 null 即可。vLLM 的 /v1/models max_model_len
+        // 是部署配置，保持既有持久化语义。
+        const runtimeProbedProvider = row.provider === 'ollama' || row.provider === 'lm_studio';
+        return {
+          id: makeModelId(),
+          name: settingsCopy.localModelName(row.model),
+          preset: 'local_vllm',
+          context_window_tokens: runtimeProbedProvider ? null : (row.max_model_len || null),
+          max_output_tokens: null,
+          model: row.model,
+          base_url: row.base_url,
+          api_key: '',
+          credential_action: 'keep_existing',
+        };
+      }
+      // 本机模型检测（本地选择页「检测」按钮）：只列出候选行，绝不自动填充表单——
+      // Ollama/LM Studio 的列表接口返回全部已下载模型，JIT 机制下加载未运行模型可能
+      // 静默载入几十 GB；候选是否添加由用户显式点击决定（安全不变量，由
+      // tests/settings_ui_smoke.js 的源码守卫钉住）。
+      async function handleLocalDetect() {
+        if (!bridge.available || !bridge.vllm.discoverLocalVllm || localDetecting) return;
+        // Optional custom port: the draft keeps the raw input as typed; anything
+        // outside 1-65535 (or not plain digits) shows an inline error and issues no probe.
+        const rawPort = localPortDraft.trim();
+        let customPort = null;
+        if (rawPort !== '') {
+          const portNumber = /^\d+$/.test(rawPort) ? Number(rawPort) : NaN;
+          if (!Number.isSafeInteger(portNumber) || portNumber < 1 || portNumber > 65535) {
+            setLocalPortError(settingsCopy.localPortInvalid);
+            return;
+          }
+          customPort = portNumber;
+        }
+        setLocalPortError(null);
+        setLocalDetecting(true);
+        setLocalDetectResult(null);
+        try {
+          const result = await bridge.vllm.discoverLocalVllm({
+            currentBaseUrl: null,
+            savedBaseUrl: null,
+            customPort,
+          });
+          setLocalDetectResult({ candidates: (result && result.candidates) || [] });
+        } catch (error) {
+          setLocalDetectResult({ error: String(error || t.uiSettingsView.detectFailed) });
+        } finally {
+          setLocalDetecting(false);
+        }
+      }
+      function startManualLocalModel() {
+        const defs = MODEL_PRESET_DEFS.local_vllm;
+        setPreset('local_vllm');
+        setModel('');
+        setBaseUrl(defs.baseUrl);
+        setName(settingsCopy.localModelName(''));
+        setContextWindow('');
+        setMaxOutput('');
+        setApiKey('');
+        setKeyAction('keep_existing');
+        setLocalKeyEnabled(false);
+        // 本地预设走自己的 localKeyEnabled 开关；清掉云端残留的免鉴权声明与端口错误。
+        setNoAuth(false);
+        setBaseUrlPortError(null);
+        setCustomModel(true);
+        setPickerOpen(false);
+        // 显式切换路由与 applyCatalogItem 同一纪律(复审 minor-14):残留的端点
+        // 探测状态(候选列表/picker/挂起批量/添加提示)一律清空,绝不许在手动
+        // 本地模型表单下复用上一个表单的探测结果。
+        setEndpointListing(null);
+        setEndpointPickerOpen(false);
+        setAddAllModelsConfirm(null);
+        setEndpointAddResult(null);
+        setFetchModelsMessage(null);
+        // 手动添加本地模型是显式切换:未手动改过档位时回到「自动处理」。
+        if (!imageCapabilityTouched) setImageCapability(imageCapabilityForCatalogModel(''));
+        // Local model → manual add is an explicit route switch: drop the
+        // draft's leftover thinking effort and fall back to the vLLM default
+        // lowest thinking tier low. Otherwise the high a fresh DeepSeek draft
+        // starts with would be kept as a legitimate vLLM tier and saved as an
+        // explicit reasoning_effort=high, bypassing the bridge's "vllm→low"
+        // default constraint. Same switch semantics as applyCatalogItem /
+        // chooseModel.
+        setReasoningEffort(reasoningEffortForModelSwitch({ preset: 'local_vllm', model: '', vendor, base_url: defs.baseUrl }));
+      }
+      const catalogSectionTitleClass = `px-1 mb-2 text-[12px] leading-4 font-semibold text-[#8A8A8E] dark:text-[#8E8E93]`;
+      const catalogGroupClass = `overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`;
+      const formGroup = `overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`;
+      const formDivider = 'border-black/[0.10] dark:border-white/[0.10]';
+      // 「获取模型列表」与「测试连接」共用同一颗蓝色胶囊按钮(样式去重,主入口
+      // chunk 有启动预算红线)。
+      const actionPillClass = 'shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium disabled:opacity-45 bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/[0.16] dark:bg-[#0A84FF]/20 dark:text-[#0A84FF] dark:hover:bg-[#0A84FF]/[0.28]';
+      // Custom-entry description for the provider model picker and the catalog
+      // picker: both key off the same group fields (key/providerKind/preset).
+      const customModelDescFor = (group, copy) => (group && group.key === 'tencent_token_plan'
+        ? copy.customTokenPlanDesc
+        : (group && group.providerKind === PROVIDER_KIND_CODING_PLAN
+          ? copy.customCodingPlanDesc
+          : (group && group.preset === 'local_vllm'
+            ? copy.customLocalDesc
+            : (group && (group.preset === 'openai_compatible' || group.preset === 'openai_responses') ? copy.customCompatibleDesc : copy.customModelDesc))));
+      const renderProviderModelField = () => {
+        const items = activeProvider ? activeProvider.items : [];
+        const known = items.some(item => !item.custom && catalogItemMatchesModel(item, model));
+        const selectedItem = known ? items.find(item => !item.custom && catalogItemMatchesModel(item, model)) : null;
+        const selectedLabel = customModel || !known ? `${settingsCopy.customModel} ID` : ((selectedItem && selectedItem.title) || model);
+        const chooseModel = (item) => {
+          const nextModel = (!item || item.custom) ? '' : item.model;
+          if (!item || item.custom) {
+            setCustomModel(true);
+            setModel('');
+            if (!nameTouched) setName(activeProvider ? (activeProvider.configTitle || activeProvider.title) : selectedProvider);
+          } else {
+            setCustomModel(false);
+            setModel(item.model);
+            if (!nameTouched) setName(item.title || item.model);
+          }
+          // 同一 provider 内换模型时重置思考深度到新模型的默认档位：K2.6 选 off 后切 K3
+          // 会残留不在 K3 档位表内的 off，界面无高亮且保存仍写旧值；与 applyCatalogItem 一致。
+          setReasoningEffort(reasoningEffortForModelSwitch({ preset, model: nextModel, vendor, base_url: baseUrl }));
+          // Explicit model switches also reset the manual context window and the output cap so neither leaks across models (same reset discipline as applyCatalogItem).
+          setContextWindow('');
+          setMaxOutput('');
+          setFilledFromEndpoint(false);
+          // 与 applyCatalogItem 一致:未手动改过档位时按新条目的视觉能力标注预填。
+          if (!imageCapabilityTouched) setImageCapability(imageCapabilityForCatalogModel(nextModel));
+          setProviderModelPickerOpen(false);
+        };
+        return (
+          <>
+            <button
+              type="button"
+              onClick={() => setProviderModelPickerOpen(open => !open)}
+              className={`w-full min-h-[54px] flex items-center gap-3 px-4 py-2.5 text-left border-b last:border-b-0 ${formDivider}`}
+            >
+              <span className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{t.uiSettingsView.modelLabel}</span>
+              <span className={`min-w-0 flex-1 text-right text-[14px] leading-5 truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{selectedLabel}</span>
+              <ChevronDown
+                size={16}
+                className={`shrink-0 transition-transform ${providerModelPickerOpen ? 'rotate-180' : ''} text-[#8A8A8E] dark:text-[#8E8E93]`}
+              />
+            </button>
+            {providerModelPickerOpen && (
+              <div className={`border-b last:border-b-0 ${formDivider}`}>
+                {items.map(item => {
+                  const active = item.custom ? (customModel || !known) : (!customModel && catalogItemMatchesModel(item, model));
+                  return (
+                    <button
+                      type="button"
+                      key={item.custom ? '__custom__' : item.model}
+                      onClick={() => chooseModel(item)}
+                      className={`w-full min-h-[50px] flex items-center gap-3 pl-7 pr-4 py-2.5 text-left border-b last:border-b-0 border-black/[0.08] hover:bg-black/[0.035] dark:border-white/[0.08] dark:hover:bg-white/[0.06]`}
+                    >
+                      <span className="min-w-0 flex-1">
+                        <span className={`block text-[14px] leading-5 truncate ${active ? ('text-[#007AFF] dark:text-[#64B5F6]') : ('text-[#1C1C1E] dark:text-[#F2F2F7]')}`}>{item.custom ? ((activeProvider && settingsCopy.customModelTitles[activeProvider.key]) || settingsCopy.customModelTitle(selectedProvider)) : (item.title || item.model || `${settingsCopy.customModel} ID`)}</span>
+                        {(item.desc || item.custom) && <span className={`block mt-0.5 text-[12px] leading-[16px] truncate text-[#8A8A8E] dark:text-[#8E8E93]`}>{item.custom
+                          ? customModelDescFor(activeProvider, settingsCopy)
+                          : (settingsCopy.modelDescriptions[item.desc] || item.desc)}</span>}
+                      </span>
+                      {active && <Check size={17} strokeWidth={2.4} className={'text-[#007AFF] dark:text-[#64B5F6]'} />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {(customModel || !known) && renderInlineField({
+              label: settingsCopy.modelId,
+              value: model,
+              onChange: e => handleModelIdChange(e.target.value),
+              placeholder: isCodingPlan ? t.uiSettingsView.codingPlanModelIdPlaceholder : settingsCopy.modelIdPlaceholder,
+            })}
+          </>
+        );
+      };
+      const renderInlineField = ({ label, value, onChange, placeholder, type = 'text', trailing, readOnly = false, testId, inputMode, spellCheck }) => (
+        <div className={`min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b last:border-b-0 ${formDivider}`}>
+          {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and input are siblings; the label has no htmlFor association, switching to span would deviate from the existing structure */}
+          <label className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{label}</label>
+          <input
+            type={type}
+            value={value}
+            onChange={onChange}
+            readOnly={readOnly}
+            placeholder={placeholder}
+            data-testid={testId}
+            inputMode={inputMode}
+            spellCheck={spellCheck}
+            className={`min-w-0 flex-1 bg-transparent text-right text-[14px] leading-5 outline-none text-[#1C1C1E] placeholder:text-[#8A8A8E] dark:text-[#F2F2F7] dark:placeholder:text-[#636366] ${readOnly ? 'cursor-default' : ''}`}
+          />
+          {trailing}
+        </div>
+      );
+      // API Key input row (three isomorphic sites: cloud provider preset / custom cloud key / local key): the row
+      // content is verbatim identical — the show/hide button goes through toggleApiKeyVisibility (edit mode can
+      // reveal the stored key), and non-empty input sets keyAction='replace'; withBorder only differs in the row
+      // divider (a lone row in a form group has none, multi-row groups carry border-b last:border-b-0).
+      const renderApiKeyField = ({ withBorder = false }) => (
+        <div className={withBorder ? `min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b last:border-b-0 ${formDivider}` : 'min-h-[54px] flex items-center gap-3 px-4 py-2.5'}>
+          {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and input are siblings; the label has no htmlFor association, switching to span would deviate from the existing structure */}
+          <label className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>API Key</label>
+          {/* Always type="text" + WebkitTextSecurity masking: type=password triggers the WebView2 built-in eye button (duplicating the show/hide toggle), same as ProviderFormModal.
+              type=password implied autoCorrect/autoCapitalize/spellCheck off; type=text does not, and handing a secret to the platform spellchecker (or letting autocapitalize mangle a pasted key) is not acceptable — so they are set explicitly, matching ProviderFormModal. */}
+          <input type="text" data-testid="model-api-key-input"
+            autoComplete="off" autoCorrect="off" autoCapitalize="off" spellCheck={false}
+            value={apiKey} onChange={e => { setApiKey(e.target.value); if (e.target.value.trim()) setKeyAction('replace'); }}
+            style={showKey ? undefined : { WebkitTextSecurity: 'disc' }}
+            placeholder={hasSavedKey ? '••••••••' : settingsCopy.apiKeyPlaceholder}
+            className={`min-w-0 flex-1 bg-transparent text-right text-[14px] leading-5 outline-none text-[#1C1C1E] placeholder:text-[#8A8A8E] dark:text-[#F2F2F7] dark:placeholder:text-[#636366]`} />
+          <button type="button" onClick={toggleApiKeyVisibility} className="shrink-0 text-[14px] text-[#007AFF]">{showKey ? settingsCopy.hide : settingsCopy.show}</button>
+        </div>
+      );
+      // 「此端点无需鉴权」开关行（auth_mode="none"）：云端模型的显式免鉴权声明。
+      // 开启后隐藏 API Key 输入行，保存时置 auth_mode="none" 并删除已存凭据。
+      const renderNoAuthToggleRow = (withBorder = false) => (
+        <div className={withBorder ? `min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b last:border-b-0 ${formDivider}` : 'min-h-[54px] flex items-center gap-3 px-4 py-2.5'}>
+          {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and toggle button are siblings; the toggle carries aria-pressed itself */}
+          <label className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{settingsCopy.noAuthToggleLabel}</label>
+          <button type="button" onClick={() => setNoAuth(v => !v)} data-testid="model-form-no-auth-toggle"
+            className={`ml-auto h-8 min-w-[52px] rounded-full px-1 flex items-center transition-colors ${noAuth ? 'bg-[#007AFF]' : ('bg-[#D1D1D6] dark:bg-[#3A3A3C]')}`}
+            aria-pressed={noAuth}>
+            <span className={`block h-6 w-6 rounded-full bg-white shadow-sm transition-transform ${noAuth ? 'translate-x-5' : 'translate-x-0'}`} />
+          </button>
+        </div>
+      );
+      const renderCloudProviderPicker = () => {
+        const bySection = ['coding_plan', 'official_api', 'aggregator', 'custom'].map(section => ({
+          section,
+          title: settingsCopy.catalogSections[section],
+          groups: catalogGroups.filter(group => (group.section || 'official_api') === section),
+        })).filter(item => item.groups.length > 0);
+        return (
+          <div className="space-y-4">
+            {bySection.map(section => (
+              <section key={section.section}>
+                <div className={catalogSectionTitleClass}>{section.title}</div>
+                <div className={catalogGroupClass}>
+                  {section.groups.map(group => {
+                    const first = group.items.find(item => !item.custom) || group.items[0] || {};
+                    return (
+                      <button
+                        type="button"
+                        key={group.key}
+                        onClick={() => applyCatalogItem(group, first)}
+                        className={`w-full min-h-[58px] px-3.5 py-2.5 flex items-center gap-3 text-left border-b last:border-b-0 border-black/[0.10] hover:bg-black/[0.035] dark:border-white/[0.10] dark:hover:bg-white/[0.06]`}
+                      >
+                        <ProviderIcon preset={group.preset} vendor={group.vendor} providerKind={group.providerKind} compact />
+                        <span className="min-w-0 flex-1">
+                          <span className={`block text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{group.title}</span>
+                          <span className={`block mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{group.desc || first.desc || ''}</span>
+                        </span>
+                        <ChevronDown size={16} className={`-rotate-90 shrink-0 text-[#C7C7CC] dark:text-[#636366]`} />
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </div>
+        );
+      };
+      const renderCatalogPicker = () => (
+        <div className="space-y-4">
+          {catalogGroups.map(group => (
+            <section key={group.key}>
+              {/* Header shows the group's own localized title (en/ja via the
+                  providerCatalog overlay, zh via the catalog's inline
+                  titles) — the raw preset label would misbrand every
+                  vendor group riding a shared preset as "OpenAI
+                  Compatible" (2026-11-04 round-4 review). The local group
+                  also has en/ja overlays but keeps its localized preset
+                  label on purpose: the overlay titles drop the (default)
+                  marker the preset label carries (本地模型（默认）), and
+                  the marker matters (corrected 2026-11-05 review — the
+                  earlier "no overlay" note was wrong). */}
+              <div className={catalogSectionTitleClass}>{group.key === 'local' ? presetProviderLabel(group.preset, t) : group.title}</div>
+              <div className={catalogGroupClass}>
+                {group.items.map(item => {
+                  const active = preset === group.preset && !item.custom && catalogItemMatchesModel(item, model);
+                  const itemTitle = item.custom ? (settingsCopy.customModelTitles[group.key] || settingsCopy.customModelTitle(presetProviderLabel(group.preset, t))) : item.title;
+                  const itemDescription = item.custom
+                    ? customModelDescFor(group, settingsCopy)
+                    : (settingsCopy.modelDescriptions[item.desc] || item.desc);
+                  return (
+                    <button
+                      type="button"
+                      key={`${group.key}-${itemTitle}`}
+                      onClick={() => applyCatalogItem(group, item)}
+                      className={`w-full min-h-[56px] px-3.5 py-2.5 flex items-center gap-3 text-left border-b last:border-b-0 ${active ? 'bg-[#007AFF]/10' : ''} border-black/[0.10] hover:bg-black/[0.035] dark:border-white/[0.10] dark:hover:bg-white/[0.06]`}
+                    >
+                      <ProviderIcon preset={group.preset} vendor={group.vendor} providerKind={group.providerKind} compact />
+                      <span className="min-w-0 flex-1">
+                        <span className={`block text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{itemTitle}</span>
+                        <span className={`block mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{itemDescription}</span>
+                      </span>
+                      {active ? <Check size={16} className="shrink-0 text-[#007AFF]" /> : <ChevronDown size={16} className={`-rotate-90 shrink-0 text-[#C7C7CC] dark:text-[#636366]`} />}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+          ))}
+        </div>
+      );
+      const renderLocalPicker = () => {
+        const rows = localCandidateRows(localDetectResult);
+        const mutedText = 'text-[#8A8A8E] dark:text-[#98989D]';
+        const actionClass = `shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/[0.16] dark:bg-[#0A84FF]/20 dark:text-[#0A84FF] dark:hover:bg-[#0A84FF]/[0.28]`;
+        return (
+          <div className="space-y-4">
+            <section>
+              <div className={catalogGroupClass}>
+                <div className={`min-h-[56px] px-3.5 py-2.5 flex items-center gap-3 text-left border-b last:border-b-0 border-black/[0.10] dark:border-white/[0.10]`}>
+                  <ProviderIcon preset="local_vllm" compact />
+                  <span className="min-w-0 flex-1">
+                    <span className={`block text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{settingsCopy.autoDetectLocalModel}</span>
+                    <span className={`block mt-0.5 text-[12px] leading-[17px] truncate ${mutedText}`}>{settingsCopy.localDetectionTargets}</span>
+                  </span>
+                  {/* Optional custom port: empty scans default ports only; raw input is kept
+                      as typed and validated when Detect runs. */}
+                  <span className={`shrink-0 text-[12px] leading-[17px] ${mutedText}`}>{settingsCopy.localPortLabel}</span>
+                  <input
+                    value={localPortDraft}
+                    onChange={e => { setLocalPortDraft(e.target.value); setLocalPortError(null); }}
+                    placeholder={settingsCopy.localPortPlaceholder}
+                    aria-label={settingsCopy.localPortLabel}
+                    data-testid="local-detect-port"
+                    disabled={localDetecting}
+                    inputMode="numeric"
+                    spellCheck={false}
+                    className={`shrink-0 w-[72px] min-h-8 px-2.5 rounded-lg text-right text-[13px] leading-[32px] outline-none bg-black/[0.04] text-[#1C1C1E] placeholder:text-[#8A8A8E] dark:bg-white/[0.08] dark:text-[#F2F2F7] dark:placeholder:text-[#636366] disabled:opacity-45`}
+                  />
+                  <button type="button" disabled={localDetecting} onClick={handleLocalDetect}
+                    className={`${actionClass} disabled:opacity-45`}>{localDetecting ? t.detectingLocalVllm : (localDetectResult ? settingsCopy.redetect : settingsCopy.detect)}</button>
+                </div>
+                {localPortError && (
+                  <div className={`px-3.5 py-3 text-[12px] leading-5 border-b last:border-b-0 border-black/[0.10] text-[#C5221F] dark:border-white/[0.10] dark:text-[#F28B82]`}>{localPortError}</div>
+                )}
+                {localDetectResult && localDetectResult.error && (
+                  <div className={`px-3.5 py-3 text-[12px] leading-5 border-b last:border-b-0 border-black/[0.10] text-[#C5221F] dark:border-white/[0.10] dark:text-[#F28B82]`}>{localDetectResult.error}</div>
+                )}
+                {localDetectResult && !localDetectResult.error && rows.length === 0 && (
+                  <div className={`px-3.5 py-3 text-[13px] leading-5 border-b last:border-b-0 border-black/[0.10] text-[#8A8A8E] dark:border-white/[0.10] dark:text-[#98989D]`}>{settingsCopy.noRunningLocalModel}</div>
+                )}
+                {rows.map(row => (
+                  <div key={row.key} className={`min-h-[58px] px-3.5 py-2.5 flex items-center gap-3 text-left border-b last:border-b-0 border-black/[0.10] dark:border-white/[0.10]`}>
+                    <ProviderIcon preset="local_vllm" compact />
+                    <span className="min-w-0 flex-1">
+                      <span className={`flex items-center gap-1.5 text-[15px] leading-5 font-normal text-[#1C1C1E] dark:text-[#F2F2F7]`}>
+                        <span className="truncate">{row.model}</span>
+                        {row.loaded === false && (
+                          <span className={`shrink-0 text-[12px] px-2 py-0.5 rounded-md bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}>{settingsCopy.modelNotLoadedTag}</span>
+                        )}
+                      </span>
+                      <span className={`block mt-0.5 text-[12px] leading-[17px] truncate ${mutedText}`}>
+                        {row.loaded === false ? `${row.label} · ${row.base_url} · ${settingsCopy.modelNotLoadedHint}` : `${row.label} · ${row.base_url}`}
+                      </span>
+                    </span>
+                    <button type="button" onClick={() => onSave(buildLocalModelPayload(row))}
+                      className={actionClass}>{settingsCopy.add}</button>
+                  </div>
+                ))}
+              </div>
+            </section>
+            <section>
+              <div className={catalogGroupClass}>
+                <button type="button" onClick={startManualLocalModel}
+                  className={`w-full min-h-[56px] px-3.5 py-2.5 flex items-center gap-3 text-left hover:bg-black/[0.035] dark:hover:bg-white/[0.06]`}>
+                  <ProviderIcon preset="local_vllm" compact />
+                  <span className="min-w-0 flex-1">
+                    <span className={`block text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{settingsCopy.manualLocalModel}</span>
+                    <span className={`block mt-0.5 text-[12px] leading-[17px] truncate ${mutedText}`}>{settingsCopy.manualLocalModelDesc}</span>
+                  </span>
+                  <ChevronDown size={16} className={`-rotate-90 shrink-0 text-[#C7C7CC] dark:text-[#636366]`} />
+                </button>
+              </div>
+            </section>
+          </div>
+        );
+      };
+      // 图片输入能力 + 兜底视觉模型(阶段 G):与发送时后端复核同一组 SavedModel 字段。
+      const imageCapabilityOptions = [
+        // pinvou 决策(pinvou,默认):内置已验证表判断,不探测;能(enabled)/
+        // 不能(disabled):人工钉死。
+        { key: 'pinvou', label: settingsCopy.imageCapabilityPinvou },
+        { key: 'enabled', label: settingsCopy.imageCapabilityEnabled },
+        { key: 'disabled', label: settingsCopy.imageCapabilityDisabled },
+      ];
+      // 视觉兜底候选:显示除当前模型外的全部模型,不做能力过滤——选择时
+      // 一律识图探测,supported 才允许选中(探测是唯一闸门;disabled 可能是
+      // 历史探测误判残留,不应隐藏,如 kimi-for-coding)。
+      const visionCandidates = (models || []).filter(item => item && item.id && item.id !== initial.id);
+      // 端点面板的「已保存」标记与批量去重键(规格 §2.6:model id + base_url)。
+      // 不 memo 化:React Compiler 在本组件的早退结构上无法保持手工 memo
+      // (preserve-manual-memoization lint),而重复构建键集是亚毫秒级开销。
+      const endpointSavedKeys = savedModelKeys(models);
+      // 老版本桌面/被拒 web 白名单下 bridge.models.probeEndpointModels 不存在:
+      // 探活禁用按钮并给 title 提示(与 testImageInputCapability 同款惯例)。
+      const probeEndpointModelsAvailable = !!(bridge.available && typeof bridge.models.probeEndpointModels === 'function');
+      const visionOptions = [
+        { key: '', label: settingsCopy.visionModelNone },
+        ...visionCandidates.map(item => ({ key: item.id, label: selectorMainLabel(item, t) || item.model })),
+      ];
+      const renderPickerRow = ({ testId, label, value, options, currentKey, open, onToggle, onChoose, probingKey, probeError }) => (
+        <>
+          <button
+            type="button"
+            data-testid={`${testId}-toggle`}
+            onClick={onToggle}
+            className={`w-full min-h-[54px] flex items-center gap-3 px-4 py-2.5 text-left border-b last:border-b-0 ${formDivider}`}
+          >
+            <span className={`shrink-0 text-[14px] leading-5 ${isDark ? 'text-[#F2F2F7]' : 'text-[#1C1C1E]'}`}>{label}</span>
+            <span className={`min-w-0 flex-1 text-right text-[14px] leading-5 truncate ${isDark ? 'text-[#F2F2F7]' : 'text-[#1C1C1E]'}`}>{value}</span>
+            <ChevronDown
+              size={16}
+              className={`shrink-0 transition-transform ${open ? 'rotate-180' : ''} ${isDark ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}
+            />
+          </button>
+          {open && (
+            <div className={`border-b last:border-b-0 ${formDivider}`}>
+              {options.map(option => {
+                const active = option.key === currentKey;
+                const probing = probingKey === option.key;
+                return (
+                  <button
+                    type="button"
+                    data-testid={`${testId}-option-${option.key || 'none'}`}
+                    key={option.key || '__none__'}
+                    onClick={() => onChoose(option.key)}
+                    disabled={probingKey ? !probing : false}
+                    className={`w-full min-h-[50px] flex items-center gap-3 pl-7 pr-4 py-2.5 text-left border-b last:border-b-0 ${isDark ? 'border-white/[0.08] hover:bg-white/[0.06]' : 'border-black/[0.08] hover:bg-black/[0.035]'} ${probing ? 'opacity-70' : ''}`}
+                  >
+                    <span className={`min-w-0 flex-1 text-[14px] leading-5 truncate ${active ? (isDark ? 'text-[#64B5F6]' : 'text-[#007AFF]') : (isDark ? 'text-[#F2F2F7]' : 'text-[#1C1C1E]')}`}>{option.label}</span>
+                    {probing ? (
+                      <span data-testid={`${testId}-probing`} className="shrink-0 flex items-center gap-1.5 text-[12px] leading-4 text-[#0A84FF]">
+                        <RefreshCw size={13} className="animate-spin" />
+                        {settingsCopy.visionModelProbing}
+                      </span>
+                    ) : active ? <Check size={17} strokeWidth={2.4} className={isDark ? 'text-[#64B5F6]' : 'text-[#007AFF]'} /> : null}
+                  </button>
+                );
+              })}
+              {probeError && (
+                <div data-testid={`${testId}-probe-error`} className={`px-7 py-2.5 text-[12px] leading-4 border-b last:border-b-0 ${isDark ? 'text-[#FFD60A] border-white/[0.08]' : 'text-[#B25E00] border-black/[0.08]'}`}>{probeError}</div>
+              )}
+            </div>
+          )}
+        </>
+      );
+      // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
+      const renderImageInputSection = () => {
+        const capabilityLabel = (imageCapabilityOptions.find(option => option.key === imageCapability) || imageCapabilityOptions[0]).label;
+        const visionLabel = (visionOptions.find(option => option.key === visionModelId) || visionOptions[0]).label;
+        // 结果文案:supported 附模型回复摘要;仅当结果为 supported 且档位为「自动处理」时提示可设「支持图片」。
+        // unverified(未识别出测试色 / 400 非图片拒绝)统一「原因未知」,不得宣称支持或不支持。
+        const imageTestText = imageTestResult
+          ? imageTestResult.status === 'supported'
+            ? settingsCopy.imageCapabilityTestSupported
+              + (imageTestResult.summary ? ` · ${settingsCopy.imageCapabilityTestReply(imageTestResult.summary)}` : '')
+              + (imageCapability === 'pinvou' ? ` · ${settingsCopy.imageCapabilityTestEnableHint}` : '')
+            : imageTestResult.status === 'unsupported'
+              ? settingsCopy.imageCapabilityTestUnsupported + (imageTestResult.summary ? ` · ${imageTestResult.summary}` : '')
+              : imageTestResult.status === 'unverified'
+                // 后端 summary 已自带「未能正确识别图像，原因未知」完整句,直接展示避免重复。
+                ? (imageTestResult.summary || settingsCopy.imageCapabilityTestUnverified)
+                // A 402 billing failure matches the connection test: reuse
+                // the tri-lingual connectionMessages.billing copy - the Rust
+                // side only passes http_status and the raw provider summary,
+                // never a single-language guidance string.
+                : imageTestResult.httpStatus === 402
+                  ? settingsCopy.connectionMessages.billing + (imageTestResult.summary ? ` · ${imageTestResult.summary}` : '')
+                  : settingsCopy.imageCapabilityTestError + (imageTestResult.summary ? ` · ${imageTestResult.summary}` : '')
+          : settingsCopy.imageCapabilityTestHint;
+        const imageTestColor = imageTestResult
+          ? imageTestResult.status === 'supported'
+            ? (isDark ? 'text-[#93D5A6]' : 'text-[#137333]')
+            : imageTestResult.status === 'unsupported'
+              ? (isDark ? 'text-[#FFD60A]' : 'text-[#FF9500]')
+              : imageTestResult.status === 'unverified'
+                ? (isDark ? 'text-[#FFD60A]' : 'text-[#B25E00]')
+                : 'text-[#FF3B30]'
+          : (isDark ? 'text-[#98989D]' : 'text-[#8A8A8E]');
+        return (
+          <section>
+            <div className={formGroup}>
+              {renderPickerRow({
+                testId: 'image-capability',
+                label: settingsCopy.imageCapability,
+                value: capabilityLabel,
+                options: imageCapabilityOptions,
+                currentKey: imageCapability,
+                open: imageCapabilityPickerOpen,
+                onToggle: () => { setImageCapabilityPickerOpen(open => !open); setVisionModelPickerOpen(false); },
+                onChoose: key => { setImageCapability(key); setImageCapabilityTouched(true); setImageCapabilityPickerOpen(false); },
+              })}
+              {renderPickerRow({
+                testId: 'vision-model',
+                label: settingsCopy.visionModel,
+                value: visionLabel,
+                options: visionOptions,
+                currentKey: visionModelId,
+                open: visionModelPickerOpen,
+                onToggle: () => { setVisionModelPickerOpen(open => !open); setImageCapabilityPickerOpen(false); },
+                onChoose: handleVisionModelChoose,
+                // 选择探测:探测中该行右侧显示忙转圈,未通过在该行下方提示排查。
+                probingKey: visionProbingKey,
+                probeError: visionProbeError,
+              })}
+            </div>
+            <div className={`px-1 mt-1.5 text-[12px] leading-4 ${isDark ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}>{settingsCopy.visionModelDesc}</div>
+            {/* §11.8/§11.9 静态隐私说明:云端模型图片随消息外发,本地模型图片不离开本机。 */}
+            <div data-testid="image-privacy-desc" className={`px-1 mt-1 text-[12px] leading-4 ${isDark ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}>{settingsCopy.imagePrivacyDesc}</div>
+            <div className={`mt-3 ${formGroup}`}>
+              <div className={`min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b last:border-b-0 ${formDivider}`}>
+                <span data-testid="image-capability-test-result" className={`min-w-0 flex-1 text-[13px] leading-5 ${imageTestColor}`}>
+                  {imageTestText}
+                </span>
+                <button type="button" data-testid="image-capability-test" onClick={handleImageCapabilityTest}
+                  disabled={imageTesting || !model.trim() || !baseUrl.trim()}
+                  className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium disabled:opacity-45 ${isDark ? 'bg-[#0A84FF]/20 text-[#0A84FF] hover:bg-[#0A84FF]/[0.28]' : 'bg-[#007AFF]/10 text-[#007AFF] hover:bg-[#007AFF]/[0.16]'}`}>
+                  {imageTesting ? t.testingConn : settingsCopy.imageCapabilityTest}
+                </button>
+              </div>
+            </div>
+          </section>
+        );
+      };
+      if (initial.__new && pickerOpen) {
+        return (
+          <div data-testid="model-form-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 px-4 animate-in fade-in duration-150">
+            {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling; cancel button in the modal header */}
+            <div data-testid="model-form-dialog" role="dialog" aria-modal="true"
+              onClick={e => e.stopPropagation()}
+              className={`w-[440px] max-w-[90vw] max-h-[76vh] flex flex-col overflow-hidden rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+              {/* 滚动必须收敛在内层 min-h-0 容器上，不要放回圆角弹窗本体：在
+                  fixed + backdrop-filter 祖先链下，个别 WebKit 内核（用户反馈的
+                  环境无法复现，疑为 webkit2gtk/旧 WebView）不会为「max-h +
+                  overflow-y-auto 同元素」的组合建立滚动区，模型列表下半部分
+                  无法滚动选择。内层 flex 滚动区在所有内核行为一致。 */}
+              <div data-testid="model-form-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain custom-scrollbar">
+              <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b border-black/[0.10] dark:border-white/[0.10]`}>
+                <div>
+                  <h2 className="text-[20px] leading-6 font-semibold">{t.modelFormAddTitle}</h2>
+                  <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{settingsCopy.chooseModelDesc}</p>
+                </div>
+                <button type="button" data-testid="model-form-cancel" onClick={onCancel} className={`h-9 w-9 shrink-0 rounded-full flex items-center justify-center bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}><X size={18} /></button>
+              </div>
+              <div className="px-5 pt-4">
+                <div className={`p-1 rounded-full grid grid-cols-2 gap-1 bg-[#F2F2F7] dark:bg-[#2C2C2E]`}>
+                  {[
+                    { key: 'cloud', label: settingsCopy.cloudModels },
+                    { key: 'local', label: settingsCopy.localModels },
+                  ].map(tab => (
+                    <button key={tab.key} type="button" onClick={() => setPickerTab(tab.key)}
+                      className={`h-9 rounded-full text-[14px] font-medium transition-colors ${pickerTab === tab.key ? ('bg-white text-[#007AFF] shadow-sm dark:bg-[#3A3A3C] dark:text-[#F2F2F7]') : ('text-[#636366] dark:text-[#C7C7CC]')}`}>
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="px-5 py-4">{pickerTab === 'local' ? renderLocalPicker() : renderCloudProviderPicker()}</div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+      return (
+        <div data-testid="model-form-backdrop" className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 animate-in fade-in duration-150">
+          {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling; cancel button in the modal header */}
+          <div data-testid="model-form-dialog" role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}
+            className={`w-[430px] max-w-[90vw] max-h-[76vh] flex flex-col overflow-hidden rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+            {/* 同上方 picker 弹窗：滚动收敛在内层 min-h-0 容器，不放圆角弹窗本体。 */}
+            <div data-testid="model-form-scroll" className="min-h-0 flex-1 overflow-y-auto overscroll-contain custom-scrollbar">
+            <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b ${formDivider}`}>
+              <div>
+                <h2 className="text-[20px] leading-6 font-semibold">{modalTitle}</h2>
+      {/* eslint-disable-next-line sonarjs/no-nested-template-literals -- nested templates map 1:1 to the i18n copy structure; flattening hurts readability */}
+                <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{isLocalPreset ? selectedModelLabel : `${isCodingPlan ? `Coding Plan · ${settingsCopy.toolCalling}` : selectedProvider + ' · ' + selectedModelLabel}`}</p>
+              </div>
+              <button type="button" data-testid="model-form-cancel" onClick={onCancel} className={`h-9 w-9 shrink-0 rounded-full flex items-center justify-center bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}><X size={18} /></button>
+            </div>
+            <div className="space-y-4 px-5 py-4">
+              <div className={`overflow-hidden rounded-[18px] border border-black/[0.08] bg-white dark:border-white/[0.10] dark:bg-[#2C2C2E]`}>
+                {isLocalPreset ? (
+                  <div className="w-full min-h-[62px] px-4 py-3 flex items-center gap-3 text-left">
+                    <ProviderIcon preset={preset} vendor={vendor} providerKind={providerKind} compact />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[15px] leading-5 font-normal truncate">{selectedProvider}</span>
+                      <span className={`block mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{selectedModelLabel}</span>
+                    </span>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setPickerOpen(v => !v)}
+                    className={`w-full min-h-[62px] px-4 py-3 flex items-center gap-3 text-left hover:bg-black/[0.035] dark:hover:bg-white/[0.05]`}
+                  >
+                    <ProviderIcon preset={preset} vendor={vendor} providerKind={providerKind} compact />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[15px] leading-5 font-normal truncate">{selectedProvider}</span>
+                      <span className={`block mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{selectedModelLabel}</span>
+                    </span>
+                    <span className="shrink-0 text-[14px] text-[#007AFF]">{pickerOpen ? settingsCopy.collapse : settingsCopy.change}</span>
+                  </button>
+                )}
+                {pickerOpen && !isLocalPreset && (
+                  <div className={`border-t px-4 py-4 border-black/[0.12] dark:border-white/[0.10]`}>
+                    {renderCatalogPicker()}
+                  </div>
+                )}
+              </div>
+              {!isLocalPreset && !customModel && (
+                <section>
+                  <div className={formGroup}>
+                    {!noAuthActive && renderApiKeyField({ withBorder: false })}
+                    {showNoAuthToggle && renderNoAuthToggleRow(!noAuthActive)}
+                  </div>
+                  {!noAuthActive && keyRevealError && <div className="px-1 mt-1.5 text-[12px] leading-4 text-[#FF3B30]">{keyRevealError}</div>}
+                </section>
+              )}
+              {showConfigFields && (
+                <section>
+                  <div className={formGroup}>
+                    {showAliasField && renderInlineField({
+                      label: settingsCopy.modelAlias,
+                      value: alias,
+                      onChange: e => setAlias(e.target.value),
+                      placeholder: settingsCopy.modelAliasPlaceholder,
+                      testId: 'model-form-alias',
+                    })}
+                    {showDisplayNameField && renderInlineField({
+                      label: t.modelDisplayName,
+                      value: name,
+                      onChange: e => { setNameTouched(true); setName(e.target.value); },
+                      placeholder: settingsCopy.localModel,
+                    })}
+                    {showProviderModelField && renderProviderModelField()}
+                    {showModelIdField && !showProviderModelField && renderInlineField({ label: isLocalPreset ? settingsCopy.localModelId : settingsCopy.modelId, value: model, onChange: e => handleModelIdChange(e.target.value), placeholder: isLocalPreset ? '' : settingsCopy.modelIdPlaceholder })}
+                    {showCustomCloudKeyField && renderApiKeyField({ withBorder: true })}
+                    {showNoAuthToggle && customModel && renderNoAuthToggleRow(true)}
+                    {showBaseUrlField && renderInlineField({
+                      label: t.customBaseUrl,
+                      value: baseUrl,
+                      onChange: e => handleBaseUrlChange(e.target.value),
+                    })}
+                    {/* 端口独立成行（不并入 URL 行）：URL 行的受控 input 与同行
+                        相邻 input 在个别内核下选择/点击行为互相干扰（三连击全选
+                        失效 → 编辑 URL 打错字，settings_ui_smoke 的 Tachyon
+                        档位钉即此），独立行让 URL 行保持与既有表单一致的 DOM
+                        契约。URL 不可解析（非 http/https）时只读，值由 baseUrl
+                        派生；清空 = 移除显式端口（走 scheme 默认）。显式写默认
+                        端口（https 443 / http 80）会被 WHATWG URL 规范化丢弃
+                        （等价 URL），端口框随之回显为空，属预期行为。 */}
+                    {showBaseUrlField && renderInlineField({
+                      label: settingsCopy.localPortLabel,
+                      value: parsedBaseUrl ? (parsedBaseUrl.port || '') : '',
+                      onChange: e => handleBaseUrlPortChange(e.target.value),
+                      placeholder: settingsCopy.localPortPlaceholder,
+                      testId: 'model-form-base-url-port',
+                      inputMode: 'numeric',
+                      spellCheck: false,
+                      readOnly: !parsedBaseUrl,
+                    })}
+                    {baseUrlPortError && <div className="px-4 pb-2 text-[12px] leading-4 text-[#FF3B30]">{baseUrlPortError}</div>}
+                    {noAuthActive && <div className="px-4 pb-3 text-[12px] leading-4 text-[#8A8A8E] dark:text-[#8E8E93]">{settingsCopy.noAuthHint}</div>}
+                    {/* Context window (optional for cloud models): a newly released
+                        model ID not yet in the catalog cannot be resolved by it, so
+                        the runtime falls back to the conservative 128K window.
+                        Declaring the vendor's rated value here makes route_limits
+                        prefer it; empty = null = today's default (existing doSave
+                        semantics, no change to any stored behavior). local_vllm
+                        presets do not show this field (the probed max_model_len is
+                        the authoritative window); an openai_compatible endpoint
+                        pointing at localhost still shows it, with over-declared
+                        values min-clamped against the runtime probe. Input is
+                        truncated to 9 digits: context_window_tokens is persisted
+                        as u32, so longer input would fail save_model with a raw
+                        deserialization error (or Infinity silently saving null). */}
+                    {!isLocalPreset && renderInlineField({
+                      label: t.modelContextWindow,
+                      value: contextWindow,
+                      onChange: e => { setContextWindow(e.target.value.replaceAll(/[^0-9]/g, '').slice(0, 9)); setFilledFromEndpoint(false); }, // eslint-disable-line sonarjs/concise-regex -- keep [^0-9] literal instead of \D; readability first
+                      placeholder: settingsCopy.modelContextWindowPlaceholder,
+                      testId: 'model-form-context-window',
+                      inputMode: 'numeric',
+                      spellCheck: false,
+                    })}
+                    {/* Max output (optional for cloud models): resolved_output_limit
+                        prefers the user declaration; empty = declared uniformly by
+                        the runtime window tiers. Same u32 9-digit truncation as the
+                        context window (max_output_tokens persists as u32). */}
+                    {!isLocalPreset && renderInlineField({
+                      label: settingsCopy.modelMaxOutput,
+                      value: maxOutput,
+                      onChange: e => { setMaxOutput(e.target.value.replaceAll(/[^0-9]/g, '').slice(0, 9)); setFilledFromEndpoint(false); }, // eslint-disable-line sonarjs/concise-regex -- keep [^0-9] literal instead of \D; readability first, same as the context window row
+                      placeholder: settingsCopy.modelMaxOutputPlaceholder,
+                      testId: 'model-form-max-output',
+                      inputMode: 'numeric',
+                      spellCheck: false,
+                    })}
+                    {isLocalPreset && (
+                      <div className={`min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b last:border-b-0 ${formDivider}`}>
+                        {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and toggle button are siblings; the toggle carries aria-pressed itself */}
+                        <label className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{settingsCopy.apiKeyRequired}</label>
+                        <button type="button" onClick={() => setLocalKeyEnabled(v => !v)}
+                          className={`ml-auto h-8 min-w-[52px] rounded-full px-1 flex items-center transition-colors ${localKeyEnabled ? 'bg-[#007AFF]' : ('bg-[#D1D1D6] dark:bg-[#3A3A3C]')}`}
+                          aria-pressed={localKeyEnabled}>
+                          <span className={`block h-6 w-6 rounded-full bg-white shadow-sm transition-transform ${localKeyEnabled ? 'translate-x-5' : 'translate-x-0'}`} />
+                        </button>
+                      </div>
+                    )}
+                    {showLocalKeyField && renderApiKeyField({ withBorder: true })}
+                  </div>
+                  {!isLocalPreset && (
+                    <>
+                      <div className={`px-1 mt-1.5 text-[12px] leading-4 ${isDark ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}>{settingsCopy.modelContextWindowHint}</div>
+                      <div className={`px-1 mt-1 text-[12px] leading-4 ${isDark ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}>{settingsCopy.modelMaxOutputHint}</div>
+                      {/* 一次性小字:测试连接成功后按空字段规则自动填入的提示;手动改字段即清除。 */}
+                      {filledFromEndpoint && (
+                        <div data-testid="model-form-filled-from-endpoint" className={`px-1 mt-1 text-[12px] leading-4 ${isDark ? 'text-[#30D158]' : 'text-[#137333]'}`}>{settingsCopy.filledFromEndpoint}</div>
+                      )}
+                    </>
+                  )}
+                </section>
+              )}
+              {renderImageInputSection()}
+              {(showConfigFields && (reasoningEffortTiers.length > 0 || isLocalCompatible || localNoControlThinking)) && (
+                <section>
+                  <div className={formGroup}>
+                    <div className="min-h-[54px] flex items-center gap-3 px-4 py-2.5">
+                      <span className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{settingsCopy.reasoningEffort}</span>
+                      <ReasoningTierPicker
+                        t={t}
+                        variant="form"
+                        tiers={reasoningEffortTiers}
+                        selected={reasoningEffortDisplay}
+                        onSelect={setReasoningEffort}
+                        pending={probePending}
+                        noControlThinking={localNoControlThinking}
+                      />
+                    </div>
+                  </div>
+                </section>
+              )}
+              {showConfigFields && (
+                <section>
+                  <div className={formGroup}>
+                    <div className="min-h-[54px] flex items-center gap-3 px-4 py-2.5">
+                      <span className={`min-w-0 flex-1 text-[13px] leading-5 ${testResult ? (testResult.ok ? ('text-[#137333] dark:text-[#93D5A6]') : 'text-[#FF3B30]') : ('text-[#8A8A8E] dark:text-[#98989D]')}`}>
+                        {testResult ? testResult.message : settingsCopy.testBeforeSave}
+                      </span>
+                      {/* 获取模型列表:仅显式点击触发探测(规格 §2.6);bridge 方法未
+                          就绪(老桌面/白名单未放行)时探活禁用并以 title 提示。 */}
+                      <button type="button" data-testid="settings-model-fetch-lists" onClick={handleFetchModels}
+                        disabled={fetchingModels || !baseUrl.trim() || !probeEndpointModelsAvailable}
+                        title={probeEndpointModelsAvailable ? undefined : settingsCopy.fetchUnavailable}
+                        className={actionPillClass}>
+                        {fetchingModels ? settingsCopy.fetchingModelList : settingsCopy.fetchModelList}
+                      </button>
+                      <button type="button" onClick={handleTest} disabled={testing || !baseUrl.trim()}
+                        className={actionPillClass}>
+                        {testing ? t.testingConn : t.testConnection}
+                      </button>
+                    </div>
+                  </div>
+                  {(fetchModelsMessage || endpointAddResult) && (
+                    // 复审 M4:添加结果按 .ok 双色显示,不再硬编码绿色;失败时
+                    // picker 保持打开,同一份提示经 addNotice 在 picker 内可见。
+                    <div data-testid="model-form-fetch-lists-status" className={`px-1 mt-1.5 text-[12px] leading-4 ${fetchModelsMessage ? (fetchModelsMessage.ok ? 'text-[#137333] dark:text-[#93D5A6]' : 'text-[#FF3B30]') : (endpointAddResult.ok ? 'text-[#137333] dark:text-[#93D5A6]' : 'text-[#FF3B30]')}`}>
+                      {fetchModelsMessage ? fetchModelsMessage.message : endpointAddResult.text}
+                    </div>
+                  )}
+                </section>
+              )}
+            </div>
+            {/* 保存失败行内提示:弹窗保持,交用户修正后重试。 */}
+            {saveError && (
+              <div data-testid="model-form-save-error" className={`px-5 py-3 border-t ${formDivider}`}>
+                <div className={`text-[13px] leading-5 ${isDark ? 'text-[#FF453A]' : 'text-[#D70015]'}`}>
+                  {settingsCopy.imageCapabilitySaveFailed(saveError)}
+                </div>
+              </div>
+            )}
+            <div className={`flex justify-end gap-2 px-5 py-4 border-t ${formDivider}`}>
+              <button type="button" data-testid="model-form-cancel" onClick={onCancel} className={`h-10 px-4 rounded-full text-[15px] font-normal transition-colors text-[#007AFF] hover:bg-black/[0.04] dark:text-[#0A84FF] dark:hover:bg-white/[0.06]`}>{t.cpCancel}</button>
+              <button type="button" data-testid="model-form-save" onClick={() => doSave()} disabled={!canSave || savingModel}
+                className="h-10 px-5 rounded-full bg-[#007AFF] text-white text-[15px] font-semibold transition-colors disabled:opacity-35">
+                {savingModel ? settingsCopy.saving : t.modelSaveBtn}
+              </button>
+            </div>
+            </div>
+          </div>
+          {/* 端点模型选择面板(规格 §2.6):纯 props 驱动,绝不自行发请求、
+              绝不自动添加;聊天线传 onAddAll(批量 confirm 在父层),ACP 线复用时不传。 */}
+          <EndpointModelPicker
+            key={endpointFetchSeq}
+            open={endpointPickerOpen}
+            onClose={() => { setEndpointPickerOpen(false); setEndpointAddResult(null); }}
+            listing={endpointListing}
+            loading={fetchingModels}
+            onPick={handleEndpointModelPick}
+            onAddAll={handleAddAllEndpointModels}
+            baseUrl={baseUrl.trim()}
+            savedKeys={endpointSavedKeys}
+            addNotice={endpointAddResult}
+            pickBusy={pickSavingModel || savingModel}
+            t={t}
+          />
+          {/* 「全部添加」应用内确认弹窗(Tauri WebView2 不渲染原生 confirm;与
+              MemoryDeleteDialog 同一 SheetConfirmDialog 配方,z-[110] 压过
+              picker 的 z-[100]):标题=数量+与已保存模型去重说明,截断时 desc
+              追加提示;确认前不落库,取消不动任何状态。 */}
+          {addAllModelsConfirm && (
+            <SheetConfirmDialog
+              testid="add-all-models-confirm"
+              confirmTestId="add-all-models-confirm-ok"
+              title={settingsCopy.addAllConfirm(addAllModelsConfirm.addable.length)}
+              desc={addAllModelsConfirm.truncated ? settingsCopy.addAllTruncated(ADD_ALL_BATCH_LIMIT) : undefined}
+              confirmLabel={addingAllModels ? settingsCopy.saving : settingsCopy.addAllModels}
+              cancelLabel={settingsCopy.cancel}
+              onConfirm={confirmAddAllEndpointModels}
+              onCancel={() => setAddAllModelsConfirm(null)}
+              busy={addingAllModels}
+            />
+          )}
+        </div>
+      );
+    };
+
+    // ==========================================
+    // Settings subcomponents (module scope: types stay stable across renders, avoiding subtree remounts)
+    // ==========================================
+    /** @param {{ title?: string, children: import('react').ReactNode, footer?: string }} props - Section chrome. */
+    const IOSSection = ({ title, children, footer }) => (
+      <section className="mb-6">
+        {title && <div className={`px-3 mb-2 text-[12px] font-semibold text-[#8A8A8E] dark:text-[#8E8E93]`}>{title}</div>}
+        <div className={`overflow-hidden rounded-[18px] bg-white dark:bg-[#2C2C2E]`}>{children}</div>
+        {footer && <div className={`px-3 mt-2 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]`}>{footer}</div>}
+      </section>
+    );
+    /** @param {{ label: string, desc?: string, value?: string, children?: import('react').ReactNode, onClick?: () => void, danger?: boolean }} props - Row content and optional click behavior. */
+    const IOSRow = ({ label, desc, value, children, onClick, danger }) => {
+      const RowTag = onClick ? 'button' : 'div';
+      return (
+      <RowTag
+        type={onClick ? 'button' : undefined}
+        onClick={onClick}
+        className={`w-full min-h-[58px] flex flex-wrap items-center gap-3 px-4 py-2.5 text-left border-b last:border-b-0 max-sm:flex-col max-sm:items-stretch ${
+          'border-black/[0.12] text-[#1C1C1E] dark:border-white/[0.10] dark:text-[#F2F2F7]'
+        } ${onClick ? ('hover:bg-black/[0.035] dark:hover:bg-white/[0.05]') : ''}`}
+      >
+        <div className="flex-1 min-w-[120px] max-sm:min-w-0">
+          <div className={`text-[15px] leading-5 font-normal whitespace-nowrap ${danger ? 'text-[#FF3B30]' : ''}`}>{label}</div>
+          {desc && <div className={`mt-0.5 text-[13px] leading-5 text-[#8A8A8E] dark:text-[#98989D]`}>{desc}</div>}
+        </div>
+        {value && <div className={`text-[14px] shrink-0 text-[#8A8A8E] dark:text-[#98989D]`}>{value}</div>}
+        {children}
+      </RowTag>
+      );
+    };
+    /** @param {{ checked: boolean, onChange: (checked: boolean) => void }} props - Switch state. */
+    const IOSSwitch = ({ checked, onChange, disabled, 'aria-label': ariaLabel }) => <Toggle checked={checked} onChange={onChange} disabled={disabled} size="md" aria-label={ariaLabel} />;
+    /** @param {{ id: string, icon: import('react').ReactNode, label: string, dot?: boolean, active: boolean, onSelect: (id: string) => void }} props - Sidebar section entry. */
+    const SectionButton = ({ id, icon, label, dot, active, onSelect }) => (
+      <button
+        type="button"
+        data-testid={`settings-section-${id}`}
+        onClick={() => onSelect(id)}
+        className={`w-full h-10 px-3 rounded-[14px] flex items-center gap-2.5 text-[14px] transition-colors max-sm:w-auto max-sm:shrink-0 ${
+          active
+            ? ('bg-[#D8EAFE] text-[#007AFF] dark:bg-[#173A5E] dark:text-[#64B5F6]')
+            : ('text-[#1C1C1E] hover:bg-black/[0.04] dark:text-[#F2F2F7] dark:hover:bg-white/[0.06]')
+        }`}
+      >
+        <span className={`w-7 h-7 rounded-[9px] flex items-center justify-center ${active ? 'bg-[#007AFF]/10' : ('bg-black/[0.05] dark:bg-white/[0.08]')}`}>{icon}</span>
+        <span className="font-semibold truncate">{label}</span>
+        {dot && <span className="ml-auto w-2.5 h-2.5 rounded-full bg-[#FF3B30]" />}
+      </button>
+    );
+    /** @param {{ children: import('react').ReactNode }} props - Grouped rows. */
+    const Group = ({ children }) => (
+      <div className={`overflow-hidden rounded-[18px] border bg-white border-black/[0.03] dark:bg-[#2C2C2E] dark:border-white/[0.04]`}>{children}</div>
+    );
+    /** @param {{ children: import('react').ReactNode }} props - Small section heading. */
+    const SectionTitle = ({ children }) => (
+      <div className={`px-3 mb-2 text-[12px] leading-4 font-semibold text-[#8A8A8E] dark:text-[#8E8E93]`}>{children}</div>
+    );
+    /** @param {{ active: boolean }} props - Selection state. */
+    const RadioDot = ({ active }) => (
+      <span className={`block w-5 h-5 rounded-full border-[3px] ${active ? 'border-[#007AFF]' : ('border-[#AEAEB2] dark:border-[#636366]')}`}>
+        {active && <span className="block w-2 h-2 rounded-full bg-[#007AFF] mx-auto mt-[3px]" />}
+      </span>
+    );
+    /** @param {{ children: import('react').ReactNode, tone?: string }} props - Inline status chip. Shared implementation: StatusChip.jsx. */
+    const Tag = ({ children, tone = 'green' }) => <StatusChip variant="tag" tone={tone}>{children}</StatusChip>;
+    /**
+     * @param {{
+     *   provider: string, isNew: boolean, onClose: () => void, searchOptions: { key: string, label: string, desc: string }[],
+     *   searchHasKey: (provider: string) => boolean,
+     *   settingsCopy: { editSearch: string, apiKeyPlaceholder: string, show: string, hide: string, save: string, cancel: string },
+     *   onAddSearchProvider?: (provider: string) => void, setSearchApiKey: (key: string, provider: string) => void,
+     *   setRestartDialog: (next: string | null) => void,
+     * }} props - Search-source editor modal state and actions.
+     */
+    const SearchSourceModal = ({ provider, isNew, onClose, searchOptions, searchHasKey, settingsCopy, onAddSearchProvider, setSearchApiKey, setRestartDialog }) => {
+      const option = searchOptions.find(x => x.key === provider);
+      const [showSearchKey, setShowSearchKey] = useState(false);
+      const [draftKey, setDraftKey] = useState('');
+      const hasSavedKey = searchHasKey(provider);
+      const canSaveSearch = !!String(draftKey || '').trim();
+      useEffect(() => {
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the in-progress draft when switching search providers while the modal is open; controlled mirror of the provider prop
+        setDraftKey('');
+        setShowSearchKey(false);
+      }, [provider]);
+      return (
+        // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the close button at the modal top-right
+        // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 animate-in fade-in duration-150" onClick={onClose}>
+          {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+          {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+          <div onClick={e => e.stopPropagation()}
+            className={`w-[430px] max-w-[90vw] max-h-[76vh] overflow-y-auto custom-scrollbar rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+            <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b border-black/[0.10] dark:border-white/[0.10]`}>
+              <div>
+                <h2 className="text-[20px] leading-6 font-semibold">{settingsCopy.editSearch}</h2>
+                <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{option ? option.label : provider}</p>
+              </div>
+              <button type="button" onClick={onClose} className={`h-9 w-9 shrink-0 rounded-full flex items-center justify-center bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}><X size={18} /></button>
+            </div>
+            <div className="space-y-4 px-5 py-4">
+              <section>
+                <div className={`overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`}>
+                  <div className={`min-h-[54px] flex items-center gap-3 px-4 py-2.5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>
+                  {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and input are siblings; the label has no htmlFor association, switching to span would deviate from the existing structure */}
+                  <label className="shrink-0 text-[14px] leading-5">API Key</label>
+                  <input type="text" value={draftKey} onChange={e => setDraftKey(e.target.value)}
+                    autoCorrect="off" autoCapitalize="off" spellCheck={false}
+                    // biome-ignore lint/a11y/noAutofocus: the edit-search-source modal focuses the key input on open; focus is the input intent
+                    autoFocus
+                    placeholder={hasSavedKey ? '••••••••' : settingsCopy.apiKeyPlaceholder}
+                    style={showSearchKey ? undefined : { WebkitTextSecurity: 'disc' }}
+                    className={`min-w-0 flex-1 bg-transparent text-right text-[14px] leading-5 outline-none placeholder:text-[#8A8A8E] dark:placeholder:text-[#636366]`} />
+                  <button type="button" onClick={() => setShowSearchKey(v => !v)} className="shrink-0 text-[14px] text-[#007AFF]">{showSearchKey ? settingsCopy.hide : settingsCopy.show}</button>
+                  </div>
+                </div>
+              </section>
+            </div>
+            <div className={`flex justify-end gap-2 px-5 py-4 border-t border-black/[0.10] dark:border-white/[0.10]`}>
+              <button type="button" onClick={onClose} className={`h-10 px-4 rounded-full text-[15px] font-normal transition-colors text-[#007AFF] hover:bg-black/[0.04] dark:text-[#0A84FF] dark:hover:bg-white/[0.06]`}>{settingsCopy.cancel}</button>
+              <button type="button" onClick={() => {
+                if (!canSaveSearch) return;
+                if (isNew) onAddSearchProvider && onAddSearchProvider(provider);
+                if (draftKey.trim()) setSearchApiKey(draftKey, provider);
+                onClose();
+                setRestartDialog('search');
+              }} disabled={!canSaveSearch} className="h-10 px-5 rounded-full bg-[#007AFF] text-white text-[15px] font-semibold transition-colors disabled:opacity-35">{settingsCopy.save}</button>
+            </div>
+          </div>
+        </div>
+      );
+    };
+    /** @param {{ type: string, settingsCopy: { restartSearchTitle: string, restartLanguageTitle: string, restartSearchDesc: string, restartLanguageDesc: string, later: string, restartNow: string }, onSaveSearchConfig?: () => unknown, onConfirmSearchConfig: () => unknown, setRestartDialog: (next: string | null) => void }} props - Restart prompt state and actions. */
+    const RestartDialog = ({ type, settingsCopy, onSaveSearchConfig, onConfirmSearchConfig, setRestartDialog }) => (
+      <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/35 backdrop-blur-md px-4">
+        <div className={`w-[340px] overflow-hidden rounded-[18px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7]`}>
+          <div className="px-6 pt-6 pb-5 text-center">
+            <h3 className="text-[18px] font-semibold">{type === 'search' ? settingsCopy.restartSearchTitle : settingsCopy.restartLanguageTitle}</h3>
+            <p className={`mt-2 text-[14px] leading-5 text-[#8A8A8E] dark:text-[#98989D]`}>{type === 'search' ? settingsCopy.restartSearchDesc : settingsCopy.restartLanguageDesc}</p>
+          </div>
+          <div className={`grid grid-cols-2 border-t border-black/[0.12] dark:border-white/[0.12]`}>
+            <button type="button" onClick={async () => {
+              if (type === 'search' && onSaveSearchConfig) {
+                const saved = await onSaveSearchConfig();
+                if (saved === false) return;
+              }
+              setRestartDialog(null);
+            }} className={`h-12 text-[17px] font-semibold border-r border-black/[0.12] text-[#007AFF] dark:border-white/[0.12] dark:text-[#0A84FF]`}>{settingsCopy.later}</button>
+            <button type="button" onClick={() => { setRestartDialog(null); type === 'search' ? onConfirmSearchConfig() : (bridge.available && bridge.updater.restartApp?.()); }} className="h-12 text-[17px] font-semibold text-[#007AFF]">{settingsCopy.restartNow}</button>
+          </div>
+        </div>
+      </div>
+    );
+    // iOS-style confirm dialog (stacked buttons: red confirm on top, blue cancel below; backdrop click does not close).
+    // Four isomorphic sites: model delete / search source delete / memory delete / feedback close; RestartDialog (two-column grid, wider) is not one of them.
+    // Optional testid/confirmTestId mount the test pins the memory-delete and feedback-close dialogs need; desc is omitted where the dialog carries no description row.
+    // Optional busy disables both buttons so an in-flight batch (add-all) cannot be double-submitted or dismissed mid-loop.
+    const SheetConfirmDialog = ({ title, desc, confirmLabel, cancelLabel, onConfirm, onCancel, testid, confirmTestId, busy = false }) => (
+      <div data-testid={testid} className="fixed inset-0 z-[110] flex items-center justify-center bg-black/35 backdrop-blur-md px-4">
+        <div className={`w-[270px] overflow-hidden rounded-[14px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7]`}>
+          <div className="px-5 pt-5 pb-4 text-center">
+            <h3 className="text-[17px] leading-6 font-semibold">{title}</h3>
+            {desc && <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{desc}</p>}
+          </div>
+          <div className={`border-t border-black/[0.12] dark:border-white/[0.12]`}>
+            <button type="button" data-testid={confirmTestId} onClick={onConfirm} disabled={busy} className={`w-full h-12 text-[17px] font-semibold text-[#FF3B30] border-b border-black/[0.12] dark:border-white/[0.12] disabled:opacity-45`}>{confirmLabel}</button>
+            <button type="button" onClick={onCancel} disabled={busy} className="w-full h-12 text-[17px] font-semibold text-[#007AFF] disabled:opacity-45">{cancelLabel}</button>
+          </div>
+        </div>
+      </div>
+    );
+    /** @param {{ model: SettingsModelEntry, settingsCopy: { deleteModelTitle: string, deleteModelDesc: string, deleteModel: string, cancel: string }, onDeleteModel: (model: SettingsModelEntry) => void, setModelDeleteConfirm: (next: SettingsModelEntry | null) => void }} props - Delete-model confirm state and actions. */
+    const ModelDeleteDialog = ({ model, settingsCopy, onDeleteModel, setModelDeleteConfirm }) => (
+      <SheetConfirmDialog
+        title={settingsCopy.deleteModelTitle}
+        desc={settingsCopy.deleteModelDesc}
+        confirmLabel={settingsCopy.deleteModel}
+        cancelLabel={settingsCopy.cancel}
+        onConfirm={() => { onDeleteModel(model); setModelDeleteConfirm(null); }}
+        onCancel={() => setModelDeleteConfirm(null)}
+      />
+    );
+    /** @param {{ source: { key: string, label: string }, settingsCopy: { deleteSearchTitle: string, deleteSearchDesc: (label: string) => string, deleteSearch: string, cancel: string }, onDeleteSearchProvider?: (key: string) => void, setSearchDeleteConfirm: (next: { key: string, label: string } | null) => void, setRestartDialog: (next: string | null) => void }} props - Delete-search confirm state and actions. */
+    const SearchDeleteDialog = ({ source, settingsCopy, onDeleteSearchProvider, setSearchDeleteConfirm, setRestartDialog }) => (
+      <SheetConfirmDialog
+        title={settingsCopy.deleteSearchTitle}
+        desc={settingsCopy.deleteSearchDesc(source.label)}
+        confirmLabel={settingsCopy.deleteSearch}
+        cancelLabel={settingsCopy.cancel}
+        onConfirm={() => { onDeleteSearchProvider && onDeleteSearchProvider(source.key); setSearchDeleteConfirm(null); setRestartDialog('search'); }}
+        onCancel={() => setSearchDeleteConfirm(null)}
+      />
+    );
+    /** @param {{ item: MemoryItem, copy: { memoryDeleteConfirm: string }, detailCopy: { delete: string, cancel: string }, onConfirmDelete: (item: MemoryItem) => void, setMemoryDeleteConfirm: (next: MemoryItem | null) => void }} props - Delete-memory confirm state and actions. The native window.confirm does not render in Tauri WebView2, so this uses the same in-app confirm dialog as the model/search deletes. */
+    const MemoryDeleteDialog = ({ item, copy, detailCopy, onConfirmDelete, setMemoryDeleteConfirm }) => (
+      <SheetConfirmDialog
+        testid="memory-delete-confirm"
+        confirmTestId="memory-delete-confirm-ok"
+        title={copy.memoryDeleteConfirm}
+        confirmLabel={detailCopy.delete}
+        cancelLabel={detailCopy.cancel}
+        onConfirm={() => { onConfirmDelete(item); setMemoryDeleteConfirm(null); }}
+        onCancel={() => setMemoryDeleteConfirm(null)}
+      />
+    );
+    // Post-completion grace window (ms) for the settings toggle's synchronous
+    // single-flight guard: it swallows the trailing click of a double-click,
+    // whose second press can land before React commits the disabled state.
+    // Mirrors DOUBLE_CLICK_GUARD_MS in features/computer-use/ComputerUseConsent.jsx.
+    const COMPUTER_USE_TOGGLE_GUARD_MS = 200;
+    /**
+     * The virtual-display status hint lines under the preference row
+     * (extracted so the section component stays inside its
+     * cognitive-complexity budget). Driven by the status projection:
+     * "unavailable" renders the localized lead line plus the backend's
+     * English diagnostic (never localized, shown verbatim under the lead —
+     * the install guidance must stay visible exactly while a session runs
+     * on a probe-red host); a failed write replaces the status line with
+     * the error until the next attempt.
+     *
+     * R11: a live PHYSICAL session renders the dedicated live-physical
+     * line. "disabled"'s copy reads "Off —" (true about where NEW sessions
+     * will run) but contradicts a switch showing ON when the preference
+     * was flipped on mid-session — the exact artifact the R10 fix resolved
+     * for the "unavailable" leg, now completed for the "available" leg.
+     * "active" keeps its line and GAINS the live-physical line: with one
+     * virtual and one physical session both live, the aggregate word must
+     * not hide the session on the real screen. Fail-neutral: an older
+     * backend without the field keeps the previous rendering.
+     *
+     * R12: the live-physical copy is split into the FACT ("a session is
+     * currently using your real screen" — true whenever physicalSessionLive)
+     * and the future-isolation PROMISE ("new sessions will use the isolated
+     * display" — true only while the persisted preference is on AND the
+     * probe is up, i.e. never under "unavailable", and under "disabled"
+     * only while the switch is ON). The R11 single-line shape promised
+     * isolation under an OFF switch and next to the "no isolated display
+     * available" lead — an over-claim in both legs. Note the two
+     * projections: the switch binds `!== false` (default-on for a legacy
+     * backend's checked state) while the promise needs the strict
+     * `=== true` — promising isolation requires backend truth, not a
+     * default.
+     */
+    const VirtualDisplayStatusLines = ({ t, virtualError, virtualState, virtualDetail, physicalSessionLive, preferVirtual }) => {
+      const physicalLive = physicalSessionLive === true;
+      const promiseIsolated = preferVirtual === true;
+      // "disabled" + live physical + pref ON: the "Off —" copy would
+      // contradict the ON switch (the R11 artifact) — the fact + promise
+      // lines REPLACE it. With the pref OFF the "Off —" copy is true and
+      // stays, with the fact line appended.
+      const replaceDisabledLine = virtualState === 'disabled' && physicalLive && promiseIsolated;
+      const virtualHint = virtualState === 'ready'
+        ? t.uiComputerUse.virtualStateReady
+        : virtualState === 'active'
+          ? t.uiComputerUse.virtualStateActive
+          : replaceDisabledLine
+            ? null
+            : virtualState === 'disabled'
+              ? t.uiComputerUse.virtualStateDisabled
+              : null;
+      const virtualUnavailable = virtualState === 'unavailable';
+      // The FACT is true whenever a physical session is live — INCLUDING
+      // the replace-disabled leg: there the "Off —" copy is replaced, but
+      // the live-session fact must still render next to the promise (the
+      // user who flipped the preference ON mid-session must not lose the
+      // only line saying a session is driving their real screen right
+      // now; R13 — gating it on `!replaceDisabledLine` rendered the
+      // promise alone in that leg, contradicting the R12 split comment
+      // above).
+      const showFact = physicalLive;
+      // The promise rides only a state where the backend can deliver it:
+      // "active" proves the isolated stack is working, and the
+      // pref-ON "disabled" leg replaced the line above. "unavailable" (the
+      // probe is down) never promises — and neither does any leg carrying a
+      // non-empty `virtualDetail`: the detail is the backend's recorded
+      // "something is wrong" fact (e.g. the last virtual creation failed),
+      // and a live "active" row CAN ride a red snapshot (the vocabulary
+      // answers the session's own target, not the probe). Promising
+      // isolation while the next creation would resolve physical is the
+      // R18 hole; the detail gate keeps the promise silent until the
+      // backend's own fact clears (the detail renders under "unavailable").
+      const showPromise =
+        promiseIsolated &&
+        physicalLive &&
+        !virtualDetail &&
+        (replaceDisabledLine || virtualState === 'active');
+      return (
+        <>
+          <span className="block">{t.uiComputerUse.settingsVirtualHint}</span>
+          {virtualError ? (
+            <span className="block mt-0.5">
+              {/* The session truth survives the write error: a failed
+                  preference write used to replace ALL status lines,
+                  suppressing the live-physical fact while a session kept
+                  driving the user's real screen (R15). The fact is server
+                  truth, not an outcome of the failed write. */}
+              {showFact && (
+                <span className="block">{t.uiComputerUse.virtualStatePhysicalLive}</span>
+              )}
+              <span className="block">{virtualError}</span>
+            </span>
+          ) : virtualUnavailable ? (
+            <span className="block mt-0.5">
+              <span className="block">{t.uiComputerUse.virtualStateUnavailableLead}</span>
+              {virtualDetail && <span className="block">{virtualDetail}</span>}
+              {physicalLive && (
+                <span className="block">{t.uiComputerUse.virtualStatePhysicalLive}</span>
+              )}
+            </span>
+          ) : (
+            (virtualHint || showFact || showPromise) && (
+              <span className="block mt-0.5">
+                {virtualHint && <span className="block">{virtualHint}</span>}
+                {showFact && (
+                  <span className="block">{t.uiComputerUse.virtualStatePhysicalLive}</span>
+                )}
+                {showPromise && (
+                  <span className="block">{t.uiComputerUse.virtualStatePhysicalNextVirtual}</span>
+                )}
+              </span>
+            )
+          )}
+        </>
+      );
+    };
+    /**
+     * Computer-use settings row as a self-contained component so the failed
+     * write can surface an inline error (the old code did `catch(() => {})`,
+     * so a failed enable looked like the switch bouncing back with no
+     * explanation). Also consumes the status projection's platform_supported:
+     * on a platform without a backend the toggle is disabled instead of
+     * letting users enable something that cannot work.
+     *
+     * Lives at module scope (stable component identity across parent
+     * renders). The switch disables itself while a write is in flight so
+     * rapid clicks cannot interleave contradictory set_enabled calls
+     * (matching the consent dialog's single-flight standard).
+     */
+    const ComputerUseSettingSection = ({ t, platformCapabilities }) => {
+      const slice = useBridgeState(['computerUse']);
+      const computerUse = (slice && slice.computerUse) || {};
+      const [actionError, setActionError] = useState('');
+      const [pending, setPending] = useState(false);
+      // Synchronous single-flight (review finding): the disabled attribute
+      // only updates one render after the click, so a double-click could fire
+      // two concurrent set_enabled calls. This ref is checked inside the
+      // event handler, before React commits anything — same pattern as the
+      // consent dialog's useConsentAction flightRef.
+      const flightRef = useRef({ busy: false, settledAt: 0 });
+      const unsupported = computerUse.platformSupported === false;
+      // Virtual-display preference row (frozen status contract: the backend
+      // always reports `preferVirtualDisplay`). The switch binds to the
+      // PERSISTED PREFERENCE, not the derived state (review finding): an
+      // active virtual session with the preference off must show the switch
+      // OFF while the state-driven hint line below keeps describing the live
+      // session ("Agent is working in an isolated virtual display…") — the
+      // live backend's target was decided once, at creation, so the state
+      // legitimately disagrees with the preference. While the projection is
+      // still "unknown" (no authoritative read yet), the row stays RENDERED
+      // (discoverability: the user must see the option exists before the
+      // first status lands; hiding it here would fight the section's
+      // unsupported gate above, which remains the only hider) but the switch
+      // is disabled AND unchecked: unchecked because the slice's default
+      // (true, mirroring the backend default) is not an authoritative answer,
+      // and a checked-ON-disabled switch would assert a preference nobody
+      // confirmed yet. No authoritative read also means no preference write
+      // is submitted (an older backend without the command would only produce
+      // a confusing failure). Same single-flight pattern as the master toggle
+      // above, with its own ref so the two switches never block each other.
+      const virtualState = computerUse.virtualDisplayState || 'unknown';
+      const virtualUnknown = virtualState === 'unknown';
+      const virtualPref = computerUse.preferVirtualDisplay !== false;
+      const virtualDetail = typeof computerUse.virtualDisplayDetail === 'string'
+        ? computerUse.virtualDisplayDetail
+        : '';
+      const [virtualPending, setVirtualPending] = useState(false);
+      const [virtualError, setVirtualError] = useState('');
+      const virtualFlightRef = useRef({ busy: false, settledAt: 0 });
+      // Per-platform note rows: gated on the dedicated semantic capability
+      // `virtualDisplayNote` ("windows" | "macos" | "linux" from
+      // get_platform_capabilities) — the capability is the semantic source;
+      // an older proxy that keyed these rows off the dependency-installer
+      // bits (usesBundledDependencyInstaller / usesHomebrewDependencyInstaller)
+      // broke the moment installer semantics changed, so it is gone. Static
+      // product notes about the stack's real fidelity/lifecycle shape — they
+      // render whenever this platform has a note (not only while the feature
+      // toggle is on), so the absolute-sounding virtual hint above never
+      // stands on the page without its platform caveat next to it.
+      const showWindowsVirtualNote = platformCapabilities?.virtualDisplayNote === 'windows';
+      const showMacosVirtualNote = platformCapabilities?.virtualDisplayNote === 'macos';
+      const showLinuxVirtualNote = platformCapabilities?.virtualDisplayNote === 'linux';
+      // R16: when the capability is absent or unverified (an older proxy
+      // that predates `virtualDisplayNote`), all three platform note rows
+      // are skipped — the hint above, whose copy claims the display "never
+      // shows on your screen", would then stand on the page with NO caveat
+      // next to it, contradicting this block's own comment. The
+      // unknown-platform honesty line (the same fallback class the grant
+      // dialog uses) keeps the absolute claim from shipping unqualified on
+      // any backend.
+      const showUnknownVirtualNote =
+        !showWindowsVirtualNote && !showMacosVirtualNote && !showLinuxVirtualNote;
+      // An emergency stop latches `stopped` without touching the toggle: the
+      // switch still reads ON but every consent surface is dead until the
+      // user toggles off and back on (set_enabled's re-enable is the only
+      // resume path). Without this hint the stop state is invisible in
+      // settings — the safety loop's exit must be discoverable.
+      //
+      // Gated on the toggle still reading ON: the hint tells the user to turn
+      // the feature off and back on, so showing it next to a switch they have
+      // already turned off asked them to redo the step they had just taken —
+      // halfway through the only recovery path the feature offers.
+      const stopped = !!computerUse.stopped && !!computerUse.enabled;
+      // macOS permission onboarding: one snapshot fetch on mount (and a
+      // re-read after the user answers the OS dialogs). Null = unknown or no
+      // permission flow (web stub rejection, older backend, non-macOS): the
+      // row stays hidden instead of showing permanently-false toggles. A
+      // `false` grant is advisory — TCC applies a fresh grant to processes
+      // launched after it, so the hint always pairs a miss with the restart
+      // step instead of polling for a flip.
+      const [permStatus, setPermStatus] = useState(null);
+      const [permBusy, setPermBusy] = useState(false);
+      useEffect(() => {
+        if (unsupported) return;
+        if (!bridge.available || !bridge.computerUse) return;
+        let cancelled = false;
+        bridge.computerUse.permissionStatus()
+          .catch(() => null)
+          .then((status) => { if (!cancelled) setPermStatus(status || null); });
+        return () => { cancelled = true; };
+      }, [unsupported]);
+      const refreshPermStatus = () => {
+        if (!bridge.available || !bridge.computerUse) return Promise.resolve(null);
+        return bridge.computerUse.permissionStatus()
+          .catch(() => null)
+          .then((status) => { setPermStatus(status || null); return status; });
+      };
+      const permMissing = !!permStatus && permStatus.supported
+        && (permStatus.screen_recording === false || permStatus.accessibility === false);
+      const permValue = permStatus && permStatus.supported
+        ? `${t.uiComputerUse.permScreenRecording} ${permStatus.screen_recording ? t.uiComputerUse.permGranted : t.uiComputerUse.permNotGranted} · ${t.uiComputerUse.permAccessibility} ${permStatus.accessibility ? t.uiComputerUse.permGranted : t.uiComputerUse.permNotGranted}`
+        : null;
+      const openPermissionDialogs = () => {
+        if (!bridge.available || !bridge.computerUse || permBusy) return;
+        setPermBusy(true);
+        // A rejection here must not hide the row: keep the last snapshot and
+        // surface the failure through the section's actionError slot (same
+        // surface as the toggle), then re-read whatever the dialogs changed.
+        bridge.computerUse.requestPermissions()
+          .catch((error) => setActionError(t.uiComputerUse.actionFailed(String(error && error.message ? error.message : error))))
+          .finally(() => { setPermBusy(false); void refreshPermStatus(); });
+      };
+      return (
+        <IOSSection title={t.uiComputerUse.settingsSection}>
+          {permValue && (
+            <IOSRow
+              label={t.uiComputerUse.permTitle}
+              desc={permMissing ? t.uiComputerUse.permRestartHint : undefined}
+            >
+              <div className="flex flex-col items-end gap-1.5 max-sm:items-stretch">
+                <span className={`text-[12px] leading-4 ${permMissing ? 'text-[#FF9500] dark:text-[#FF9F0A]' : 'text-[#8A8A8E] dark:text-[#98989D]'}`}>{permValue}</span>
+                {permMissing && (
+                  <button type="button" disabled={permBusy} onClick={openPermissionDialogs}
+                    className={`px-3 py-1.5 rounded-lg text-[12px] border border-black/10 hover:bg-black/5 disabled:opacity-50 dark:border dark:border-white/10 dark:hover:bg-white/10`}>{t.uiComputerUse.permRequest}</button>
+                )}
+              </div>
+            </IOSRow>
+          )}
+          <IOSRow
+            label={t.uiComputerUse.settingsToggle}
+            desc={
+              unsupported
+                ? t.uiComputerUse.platformUnsupportedHint
+                : (actionError ||
+                  (stopped ? t.uiComputerUse.settingsStoppedHint : t.uiComputerUse.settingsHint))
+            }
+          >
+            <IOSSwitch
+              checked={!!computerUse.enabled}
+              disabled={unsupported || pending}
+              onChange={(value) => {
+                const flight = flightRef.current;
+                if (flight.busy || Date.now() - flight.settledAt < COMPUTER_USE_TOGGLE_GUARD_MS) return;
+                if (!bridge.available || !bridge.computerUse) return;
+                flight.busy = true;
+                setActionError('');
+                setPending(true);
+                bridge.computerUse.setEnabled(value)
+                  .then(() => {
+                    // Only a success arms the cooldown guard: a failure
+                    // leaves the switch immediately clickable to retry (the
+                    // consent dialog states this rule explicitly; match it).
+                    flight.settledAt = Date.now();
+                  })
+                  .catch((error) => {
+                    setActionError(t.uiComputerUse.actionFailed(String(error && error.message ? error.message : error)));
+                  })
+                  .finally(() => {
+                    flight.busy = false;
+                    setPending(false);
+                  });
+              }}
+            />
+          </IOSRow>
+          {!unsupported && (
+            <IOSRow
+              label={t.uiComputerUse.settingsVirtualToggle}
+              desc={
+                <VirtualDisplayStatusLines
+                  t={t}
+                  virtualError={virtualError}
+                  virtualState={virtualState}
+                  virtualDetail={virtualDetail}
+                  physicalSessionLive={computerUse.physicalSessionLive}
+                  preferVirtual={computerUse.preferVirtualDisplay}
+                />
+              }
+            >
+              <IOSSwitch
+                checked={virtualUnknown ? false : virtualPref}
+                disabled={virtualPending || virtualUnknown}
+                onChange={(value) => {
+                  const flight = virtualFlightRef.current;
+                  if (flight.busy || Date.now() - flight.settledAt < COMPUTER_USE_TOGGLE_GUARD_MS) return;
+                  if (!bridge.available || !bridge.computerUse) return;
+                  flight.busy = true;
+                  setVirtualError('');
+                  setVirtualPending(true);
+                  // The wrapper re-reads the authoritative status before
+                  // resolving, so the switch and the hint line below it move
+                  // to the persisted value (or roll back on failure) without
+                  // a separate refresh here.
+                  bridge.computerUse.setVirtualDisplayPreference(value)
+                    .then(() => {
+                      flight.settledAt = Date.now();
+                    })
+                    .catch((error) => {
+                      setVirtualError(t.uiComputerUse.actionFailed(String(error && error.message ? error.message : error)));
+                    })
+                    .finally(() => {
+                      flight.busy = false;
+                      setVirtualPending(false);
+                    });
+                }}
+              />
+            </IOSRow>
+          )}
+          {showWindowsVirtualNote && (
+            <div className="px-4 py-2.5 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]">
+              {t.uiComputerUse.virtualNoteWindows}
+            </div>
+          )}
+          {showMacosVirtualNote && (
+            <div className="px-4 py-2.5 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]">
+              {t.uiComputerUse.virtualNoteMacos}
+            </div>
+          )}
+          {showLinuxVirtualNote && (
+            <div className="px-4 py-2.5 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]">
+              {t.uiComputerUse.virtualNoteLinux}
+            </div>
+          )}
+          {showUnknownVirtualNote && (
+            <div className="px-4 py-2.5 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]">
+              {t.uiComputerUse.virtualNoteUnknownPlatform}
+            </div>
+          )}
+        </IOSSection>
+      );
+    };
+
+    /**
+     * Global bring-to-front shortcut (default combo Ctrl/Cmd+Alt+P, presents
+     * the window while Pinvou runs in the background; OFF by default).
+     * Desktop-only: the web lane renders none of this section (caller !isWeb
+     * gate); with globalShortcutsAvailable=false the switch and input grey
+     * out and the desc shows the unsupported copy. The switch and the combo
+     * input share one single-flight command channel (each call submits the
+     * full enabled+accelerator config, same flightRef pattern as
+     * ComputerUse); "invalid"/"conflict" write the localized error into the
+     * owning row's desc slot (conflict's technical message goes to console
+     * only), and a failed save reverts the UI by simply not mirroring. An
+     * enabled request answered disabled with a message (session cannot
+     * support it) still commits, but the switch row's desc turns into the
+     * unsupported copy.
+     *
+     * State model: `enabled` and the saved accelerator are read LIVE from
+     * the bridge settings slice — the bridge mirror refreshes that slice
+     * after every committed save (registered or disabled, always reporting
+     * the persisted accelerator), so the UI derives from the disk mirror, a
+     * failed save rolls the toggle back for free, and a pre-snapshot toggle
+     * cannot submit a stale combo: the whole section stays disabled until
+     * the slice exists. Only the accelerator input is local (display form);
+     * it follows the saved combo while untouched, and the dirty check
+     * compares display forms.
+     * Persistence is owned exclusively by set_global_shortcut_config (the
+     * bridge syncs the settings snapshot); update_settings is never used.
+     * @param {{ t: object, platformCapabilities: { globalShortcutsAvailable?: boolean } }} props - Dictionary and platform capability slice.
+     */
+    const GlobalShortcutSettingSection = ({ t, platformCapabilities }) => {
+      const copy = t.uiSettings;
+      const slice = useBridgeState(['settings']);
+      // Live disk-mirror state; `null` while the settings snapshot has not
+      // loaded. Rendering interactive defaults before it arrives would let a
+      // toggle submit the default combo over whatever disk holds. A failed
+      // get_settings leaves a truthy fallback {theme, color_scheme, language}
+      // in the slice — not disk truth for this section — so the gate also
+      // requires the shortcut fields to be present.
+      const rawSettings = (slice && slice.settings) || null;
+      const prefs = rawSettings && typeof rawSettings.global_shortcut_enabled === 'boolean'
+        ? rawSettings
+        : null;
+      const available = !!(platformCapabilities && platformCapabilities.globalShortcutsAvailable);
+      // Rust defaults global_shortcut_enabled to false: only an explicit true
+      // shows as on; unloaded settings render as off (and stay disabled).
+      const enabled = prefs ? prefs.global_shortcut_enabled === true : false;
+      const savedAccelerator = prefs
+        ? (normalizeGlobalShortcutDraft(prefs.global_shortcut_accelerator) || GLOBAL_SHORTCUT_DEFAULT_ACCELERATOR)
+        : GLOBAL_SHORTCUT_DEFAULT_ACCELERATOR;
+      const [draftAccelerator, setDraftAccelerator] = useState(() => formatGlobalShortcutForDisplay(savedAccelerator));
+      const [actionError, setActionError] = useState('');
+      const [errorSlot, setErrorSlot] = useState('toggle');
+      const [pending, setPending] = useState(false);
+      // Same synchronous single-flight as ComputerUseSettingSection: the
+      // disabled attribute lags one render, so a double-click would fire two
+      // concurrent commands — the ref intercepts inside the event handler.
+      const flightRef = useRef({ busy: false });
+      // The input follows the saved combo while the user has not typed:
+      // the settings snapshot may load after mount, and a racing save
+      // mirror may change the saved combo later. editedRef marks a
+      // user-touched draft, syncedFoldRef the fold of the saved combo the
+      // draft currently displays. draftRef mirrors the draft for the async
+      // completion handlers, which would otherwise read a stale render-time
+      // value.
+      const draftRef = useRef(draftAccelerator);
+      const editedRef = useRef(false);
+      const syncedFoldRef = useRef(foldGlobalShortcutDraft(draftAccelerator));
+      const updateDraft = useCallback((value) => {
+        draftRef.current = value;
+        setDraftAccelerator(value);
+      }, []);
+      useEffect(() => {
+        if (editedRef.current) return;
+        const display = formatGlobalShortcutForDisplay(savedAccelerator);
+        const fold = foldGlobalShortcutDraft(display);
+        if (fold === syncedFoldRef.current) return;
+        syncedFoldRef.current = fold;
+        updateDraft(display);
+      }, [savedAccelerator, updateDraft]);
+      const applyConfig = (nextEnabled, nextAccelerator, slot) => {
+        if (flightRef.current.busy) return;
+        if (!prefs || !bridge.available || !bridge.settings || typeof bridge.settings.setGlobalShortcutConfig !== 'function') return;
+        flightRef.current.busy = true;
+        setActionError('');
+        setPending(true);
+        bridge.settings.setGlobalShortcutConfig(nextEnabled, nextAccelerator)
+          .then((result) => {
+            const status = result && result.status;
+            if (status === 'registered' || status === 'disabled') {
+              // `enabled` and `savedAccelerator` are live bridge-mirror
+              // state: the wrapper refreshed the slice before this callback
+              // ran, so both already describe the committed save, and a
+              // failed save reverts them by not mirroring at all. Only the
+              // draft needs local care: fold it back in sync when it
+              // matches the submitted combo modulo case/whitespace/alias
+              // spelling (Rust already normalized; do not leave a phantom
+              // dirty flag behind); otherwise treat it as a combo the user
+              // is still editing and leave it alone.
+              if (result && typeof result.accelerator === 'string' && result.accelerator) {
+                const normalized = normalizeGlobalShortcutDraft(result.accelerator);
+                const draft = draftRef.current;
+                if (foldGlobalShortcutDraft(draft) === foldGlobalShortcutDraft(formatGlobalShortcutForDisplay(nextAccelerator))
+                  || foldGlobalShortcutDraft(draft) === foldGlobalShortcutDraft(nextAccelerator)) {
+                  editedRef.current = false;
+                  const display = formatGlobalShortcutForDisplay(normalized);
+                  syncedFoldRef.current = foldGlobalShortcutDraft(display);
+                  updateDraft(display);
+                }
+              }
+              // disabled + message only happens when the session cannot
+              // support shortcuts (e.g. Wayland): the intent was persisted,
+              // but the switch row's desc must show the localized
+              // unsupported notice instead of a silent success.
+              if (status === 'disabled' && nextEnabled === true && result.message) {
+                setActionError(copy.globalShortcutUnsupportedDesc);
+                setErrorSlot('toggle');
+              }
+              return;
+            }
+            if (status === 'conflict' && result && result.message) {
+              console.warn('[settings] global shortcut conflict detail', result.message);
+            }
+            setActionError(status === 'invalid' ? copy.globalShortcutInvalid
+              : status === 'conflict' ? copy.globalShortcutConflict
+              : copy.globalShortcutSaveFailed);
+            setErrorSlot(slot);
+          })
+          .catch((error) => {
+            // The wrapper contract never rejects (hard failures resolve
+            // null); this only guards against an unexpected exception
+            // latching the flight flag.
+            console.warn('[settings] global shortcut config failed', error);
+            setActionError(copy.globalShortcutSaveFailed);
+            setErrorSlot(slot);
+          })
+          .finally(() => {
+            flightRef.current.busy = false;
+            setPending(false);
+          });
+      };
+      // Dirty check compares display forms: draft holds the display form,
+      // savedAccelerator the machine-canonical string.
+      const acceleratorDirty = normalizeGlobalShortcutDraft(draftAccelerator) !== formatGlobalShortcutForDisplay(savedAccelerator);
+      const acceleratorPlausible = isPlausibleGlobalShortcutAccelerator(draftAccelerator);
+      // Errors land in the owning row's slot regardless of availability: on
+      // an unavailable session the only operable action is switching a
+      // residual shortcut off, and a failed disable must be visible instead
+      // of console-only.
+      const toggleDesc = actionError && errorSlot === 'toggle'
+        ? actionError
+        : available ? copy.globalShortcutEnableDesc : copy.globalShortcutUnsupportedDesc;
+      const acceleratorDesc = actionError && errorSlot === 'accelerator' ? actionError : undefined;
+      const saveAccelerator = () => {
+        // Plausibility gates the click, not the button: a never-valid draft
+        // (dangling separator, modifiers only) keeps Save enabled and
+        // explains itself here instead of wedging silently (same pattern as
+        // the localPort row).
+        if (!acceleratorPlausible) {
+          setActionError(copy.globalShortcutInvalid);
+          setErrorSlot('accelerator');
+          return;
+        }
+        applyConfig(enabled, globalShortcutDraftToRust(draftAccelerator), 'accelerator');
+      };
+      return (
+        <IOSSection title={copy.globalShortcuts}>
+          <IOSRow label={copy.globalShortcutEnable} desc={toggleDesc}>
+            {/* An unavailable session may still switch off a residual
+                enabled=true (the Rust disable path deliberately has no
+                availability gate — it is always safe); only turning the
+                shortcut ON needs a capable session. The whole section stays
+                disabled until the settings snapshot has loaded. */}
+            <IOSSwitch
+              checked={enabled}
+              disabled={!prefs || (!available && !enabled) || pending}
+              aria-label={copy.globalShortcutEnable}
+              onChange={value => applyConfig(!!value, savedAccelerator, 'toggle')}
+            />
+          </IOSRow>
+          <IOSRow label={copy.globalShortcutAccelerator} desc={acceleratorDesc}>
+            <div className="flex items-center gap-2 max-sm:w-full">
+              <input
+                type="text"
+                value={draftAccelerator}
+                onChange={e => {
+                  editedRef.current = true;
+                  // Same pattern as the localPort row: typing invalidates
+                  // the row's error, so a fixed-up draft no longer shows
+                  // the stale invalid copy next to it.
+                  if (errorSlot === 'accelerator') setActionError('');
+                  updateDraft(e.target.value);
+                }}
+                disabled={!prefs || !available || pending}
+                placeholder={copy.globalShortcutPlaceholder}
+                aria-label={copy.globalShortcutAccelerator}
+                data-testid="global-shortcut-accelerator"
+                autoCorrect="off" autoCapitalize="off" spellCheck={false}
+                className="h-8 w-36 rounded-lg border border-black/[0.12] bg-transparent px-2.5 text-[13px] leading-5 outline-none focus:border-[#007AFF] disabled:opacity-45 dark:border-white/[0.14] dark:focus:border-[#0A84FF] max-sm:w-full"
+              />
+              <button
+                type="button"
+                data-testid="global-shortcut-save"
+                disabled={!prefs || !available || pending || !acceleratorDirty}
+                onClick={saveAccelerator}
+                className="h-8 shrink-0 rounded-full bg-[#007AFF]/10 px-3 text-[13px] font-medium text-[#007AFF] transition-colors hover:bg-[#007AFF]/20 disabled:opacity-35 dark:bg-[#0A84FF]/20 dark:text-[#0A84FF]"
+              >{t.uiSettingsDetail.save}</button>
+            </div>
+          </IOSRow>
+        </IOSSection>
+      );
+    };
+
+    // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
+    const SettingsView = ({ activeTheme, colorScheme, onColorSchemeChange, language, setLanguage, superPerm, setSuperPerm, taskCompletedNotif, setTaskCompletedNotif, inputNeededNotif, setInputNeededNotif, setSettingsToast, searchProvider, setSearchProvider, enabledSearchProviders, onAddSearchProvider, onDeleteSearchProvider, setSearchApiKey, savedModels, activeModelId, onSaveModel, onDeleteModel, onSetActiveModel, onSaveSearchConfig, onConfirmSearchConfig, onMemoryEnabledChange, onPetEnabledChange, bs, t, sidebarDateGrouping = true, onSidebarDateGroupingChange, chatStreamingAnimation = true, onChatStreamingAnimationChange, updateFocusTick, onCloseSettings, initialSection = 'general' }) => {
+      const settingsCopy = t.uiSettingsDetail;
+      // 会话备份导入（export_session 的逆操作）：命令侧自开文件对话框，用户
+      // 取消返回 null；结果按 imported/skipped_existing/failed 组 toast。
+      // 处理器住在懒加载的 SettingsView 里（不再占主入口 chunk）。
+      const [importingSessions, setImportingSessions] = useState(false);
+      const handleImportSessionArchive = useCallback(async () => {
+        // import_session_archive 不经引擎（纯本地 store + 原生对话框）：
+        // bridge 断连不拦截，只挡并发重入（r7 minor）。
+        if (importingSessions) return;
+        setImportingSessions(true);
+        try {
+          const result = await invokeTauri('import_session_archive');
+          if (!result) return;
+          // 逐条失败原因落到 console（toast 只放计数——失败串含 id/原因，
+          // 不适合塞进 pill；此前原因哪都不出现，用户只见「1 failed」无从
+          // 判断是保留 id 还是 schema 超限）。
+          for (const failure of [...(result.failed || []), ...(result.artifacts_failed || [])]) {
+            console.warn(`[sessions] import ${failure.session_id}: ${failure.reason}`);
+          }
+          const artifactsFailedCount = (result.artifacts_failed || []).length;
+          setSettingsToast({
+            // 四计数汇总 + 缺产物补救指引是长文案：单行 pill 3 秒会把「删会话
+            // 重导入」的恢复路径整个截掉（重导入又命中 skip-existing）——
+            // 长文案自带 8 秒时长（r7 minor）。
+            text: t.uiSettings.importSessionsDone(
+              (result.imported || []).length,
+              (result.skipped_existing || []).length,
+              (result.failed || []).length,
+              // 部分导入（缺 artifacts）计数：Rust SessionImportSummary.artifacts_failed。
+              artifactsFailedCount,
+            ),
+            duration: artifactsFailedCount > 0 || (result.failed || []).length > 0 ? 8000 : 3000,
+            // multiline（r8）：长文案在窄窗口上单行 truncate 仍会裁掉补救指引
+            // 的尾部——四计数汇总只在有缺产/失败时才是长文案。
+            multiline: artifactsFailedCount > 0 || (result.failed || []).length > 0,
+          });
+        } catch (error) {
+          const detail = String((error && error.message) || error || t.unknownError);
+          console.warn('import session archive failed', error);
+          setSettingsToast({ text: `${t.uiSettings.importSessionsFailed}: ${detail}`, duration: 8000, multiline: true });
+        } finally {
+          setImportingSessions(false);
+        }
+      }, [importingSessions, setSettingsToast, t]);
+      const platformCapabilities = (bs && bs.platformCapabilities) || {};
+      const showSuperPermissionSettings = !!platformCapabilities.showSuperPermissionSettings;
+      const usesBundledDependencyInstaller = !!platformCapabilities.usesBundledDependencyInstaller;
+      const usesHomebrewDependencyInstaller = !!platformCapabilities.usesHomebrewDependencyInstaller;
+      // 「ACP 管理」（原 Provider 管理）并入模型设置页：activeSection 用 'model'，
+      // modelTab 区分「模型 / ACP 管理」两个子页；深链 initialSection='providers'
+      // （代码页错误横幅等入口）映射为模型页 + ACP 子页。
+      const [activeSection, setActiveSection] = useState(initialSection === 'providers' ? 'model' : (initialSection || 'general'));
+      const [modelTab, setModelTab] = useState(initialSection === 'providers' ? 'acp' : 'models');
+      const canUsePet = can('pet');
+      const canUseSuperPermission = can('superPermission');
+      const canUseComputerUse = can('computerUse');
+      const canUpdateApp = can('appUpdate');
+      const canInstallDependencies = can('dependencyInstall');
+      const canConfigureDesktopNotifications = can('desktopNotifications');
+      const canManageModels = can('modelManagement');
+      const acpProvidersTabVisible = !!platformCapabilities.codexAcpSupported;
+      // The native hook for the global Alt voice shortcut only works on Windows; grey the
+      // toggle out with an explanation on other platforms (the in-window Alt fallback path
+      // still works) so macOS/Linux users never get a dead switch.
+      const voiceShortcutNativeAvailable = !!platformCapabilities.voiceShortcutNative;
+      const canPickHostFiles = can('hostFilePicker');
+      const [editingModel, setEditingModel] = useState(null);
+      const [modelDeleteConfirm, setModelDeleteConfirm] = useState(/** @type {SettingsModelEntry | null} */ (null));
+      const [editingSearch, setEditingSearch] = useState(null);
+      const [pendingSearchProvider, setPendingSearchProvider] = useState(null);
+      const [searchDeleteConfirm, setSearchDeleteConfirm] = useState(/** @type {{ key: string, label: string } | null} */ (null));
+      const [searchPickerOpen, setSearchPickerOpen] = useState(false);
+      const [restartDialog, setRestartDialog] = useState(/** @type {string | null} */ (null));
+      const modelEnvLocked = (bs && bs.effectiveModelConfig && bs.effectiveModelConfig.env_overrides) || [];
+      const [feedbackOpen, setFeedbackOpen] = useState(false);
+      const [feedbackDraft, setFeedbackDraft] = useState({ type: 'issue', title: '', description: '', attachments: [] });
+      const [feedbackStatus, setFeedbackStatus] = useState({ state: 'idle', message: '' });
+      const [feedbackNotice, setFeedbackNotice] = useState('');
+      const [feedbackCloseConfirm, setFeedbackCloseConfirm] = useState(false);
+      const versionUpdateRef = useRef(null);
+      const hasUpdate = !!(bs && bs.updateInfo && bs.updateInfo.available);
+      const memorySettingsVisible = !!(bs && bs.settings && bs.settings.language === 'zh-Hans');
+      const [voiceShortcutsEnabled, setVoiceShortcutsEnabled] = useState(() => voiceShortcutEnabled());
+      const [voiceShortcutIntroOpen, setVoiceShortcutIntroOpen] = useState(false);
+      const [voicePostprocessOn, setVoicePostprocessOn] = useState(() => voicePostprocessEnabled());
+      const feedbackTypes = [
+        { key: 'issue', label: t.feedbackIssue },
+        { key: 'suggestion', label: t.feedbackSuggestion },
+      ];
+      const feedbackAllowedExt = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'mp4', 'mov', 'webm']);
+      const feedbackVideoExt = new Set(['mp4', 'mov', 'webm']);
+      const feedbackBaseName = p => pathBasename(p, { fallback: String(p || '') });
+      const feedbackExt = p => {
+        const name = feedbackBaseName(p);
+        const idx = name.lastIndexOf('.');
+        return idx >= 0 ? name.slice(idx + 1).toLowerCase() : '';
+      };
+      useEffect(() => {
+        if (!canUpdateApp || !updateFocusTick || !versionUpdateRef.current) return;
+        requestAnimationFrame(() => {
+          versionUpdateRef.current && versionUpdateRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+      }, [canUpdateApp, updateFocusTick]);
+      useEffect(() => {
+        if (initialSection === 'providers') {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronous setState in this effect is intentional: mirrors the backend snapshot into local state once it lands, avoiding first-frame flicker
+          setActiveSection('model');
+          setModelTab('acp');
+        } else if (initialSection) {
+          setActiveSection(initialSection);
+        }
+      }, [initialSection]);
+      // Cold-start status read: until a session exists nothing else polls
+      // computer-use status, so the platform_supported grey-out would never
+      // learn the platform is unsupported. One session-less refreshStatus on
+      // mount fills enabled/platform_supported; with a session active it
+      // degenerates to the ordinary status read.
+      useEffect(() => {
+        if (!canUseComputerUse || !bridge.available || !bridge.computerUse) return;
+        bridge.computerUse.refreshStatus(bs && bs.activeSessionId).catch(() => {});
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only: the read is idempotent and must not refire on every bs change
+      }, []);
+      useEffect(() => {
+        if (!feedbackNotice) return;
+        const timer = window.setTimeout(() => setFeedbackNotice(''), 2600);
+        return () => window.clearTimeout(timer);
+      }, [feedbackNotice]);
+      useEffect(() => {
+        function syncVoiceShortcutSetting(event) {
+          // storage changes for other keys do not trigger a re-read; a clear with key===null
+          // says nothing about the authoritative switch (Rust-side settings.json, replayed at
+          // startup) and is ignored too — same exact-key filtering as the Router, so a cleared
+          // store's default-false mirror cannot overwrite the display state.
+          if (event && event.type === 'storage' && event.key
+            && event.key !== VOICE_SHORTCUT_ENABLED_KEY
+            && event.key !== VOICE_POSTPROCESS_ENABLED_KEY) return;
+          if (event && event.type === 'storage' && !event.key) return;
+          if (event && event.detail && typeof event.detail.enabled === 'boolean') {
+            setVoiceShortcutsEnabled(event.detail.enabled);
+            return;
+          }
+          if (event && event.detail && typeof event.detail.postprocessEnabled === 'boolean') {
+            setVoicePostprocessOn(event.detail.postprocessEnabled);
+            return;
+          }
+          setVoiceShortcutsEnabled(voiceShortcutEnabled());
+          setVoicePostprocessOn(voicePostprocessEnabled());
+        }
+        window.addEventListener(VOICE_SHORTCUT_SETTINGS_EVENT, syncVoiceShortcutSetting);
+        window.addEventListener('storage', syncVoiceShortcutSetting);
+        return () => {
+          window.removeEventListener(VOICE_SHORTCUT_SETTINGS_EVENT, syncVoiceShortcutSetting);
+          window.removeEventListener('storage', syncVoiceShortcutSetting);
+        };
+      }, []);
+      function handleVoiceShortcutsEnabledChange(enabled) {
+        setVoiceShortcutsEnabled(!!enabled);
+        setVoiceShortcutEnabled(!!enabled);
+      }
+      function handleVoicePostprocessEnabledChange(enabled) {
+        setVoicePostprocessOn(!!enabled);
+        setVoicePostprocessEnabled(!!enabled);
+      }
+      function markVoiceShortcutIntroSeen() {
+        setVoiceShortcutIntroSeen(true);
+      }
+      function handleVoiceShortcutInfoOpen(event) {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        setVoiceShortcutIntroOpen(true);
+      }
+      function handleVoiceShortcutInfoClose() {
+        markVoiceShortcutIntroSeen();
+        setVoiceShortcutIntroOpen(false);
+      }
+      function handleVoiceShortcutInfoEnable(enabled) {
+        handleVoiceShortcutsEnabledChange(!!enabled);
+        markVoiceShortcutIntroSeen();
+        setVoiceShortcutIntroOpen(false);
+      }
+      const resetFeedback = () => {
+        setFeedbackDraft({ type: 'issue', title: '', description: '', attachments: [] });
+        setFeedbackStatus({ state: 'idle', message: '' });
+      };
+      const closeFeedback = () => {
+        const dirty = feedbackDraft.title.trim() || feedbackDraft.description.trim() || feedbackDraft.attachments.length > 0;
+        if (dirty && !feedbackCloseConfirm) {
+          // The native window.confirm does not render in Tauri WebView2; in-app
+          // dialogs do (same as ProviderFormModal / MemoryDeleteDialog). Show the
+          // in-app confirm layer first and close only after confirmation.
+          setFeedbackCloseConfirm(true);
+          return;
+        }
+        setFeedbackCloseConfirm(false);
+        setFeedbackOpen(false);
+      };
+      const pickFeedbackAttachments = async () => {
+        if (!bridge.available || !bridge.files.pickFeedbackFiles) {
+          setFeedbackStatus({ state: 'failed_validation', message: t.feedbackPickUnavailable });
+          return;
+        }
+        const paths = await bridge.files.pickFeedbackFiles();
+        if (!paths || paths.length === 0) return;
+        setFeedbackDraft(prev => {
+          const next = [...prev.attachments];
+          for (const path of paths) {
+            if (next.length >= 5) {
+              setFeedbackStatus({ state: 'failed_validation', message: t.feedbackTooManyFiles });
+              break;
+            }
+            const ext = feedbackExt(path);
+            if (!feedbackAllowedExt.has(ext)) {
+              setFeedbackStatus({ state: 'failed_validation', message: t.feedbackUnsupportedFile });
+              continue;
+            }
+            const name = feedbackBaseName(path);
+            next.push({
+              path,
+              name,
+              media_type: feedbackVideoExt.has(ext) ? 'video' : 'image',
+              mime: null,
+              size_bytes: null,
+            });
+          }
+          return { ...prev, attachments: next };
+        });
+      };
+      const submitFeedbackDraft = async () => {
+        if (!feedbackDraft.description.trim()) {
+          setFeedbackStatus({ state: 'failed_validation', message: t.feedbackBodyRequired });
+          return;
+        }
+        setFeedbackStatus({ state: 'submitting', message: '' });
+        try {
+          const receipt = await bridge.feedback.submitFeedback({
+            type: feedbackDraft.type,
+            title: feedbackDraft.title.trim() || null,
+            description: feedbackDraft.description,
+            entry_point: 'settings',
+            error_summary: null,
+            attachments: feedbackDraft.attachments,
+            privacy_notice_version: '2026-06-24',
+          });
+          if (receipt && receipt.status === 'submitted') {
+            setFeedbackNotice(receipt.message || t.feedbackSubmitted);
+            resetFeedback();
+            // The submit-success path bypasses the closeFeedback exit; without this
+            // reset a stale confirm layer would linger over a reopened panel.
+            setFeedbackCloseConfirm(false);
+            setFeedbackOpen(false);
+            return;
+          }
+          setFeedbackStatus({
+            state: 'failed_retryable',
+            message: (receipt && receipt.message) || '',
+          });
+        } catch (e) {
+          setFeedbackStatus({ state: 'failed_validation', message: String(e) });
+        }
+      };
+      // 进设置页自动体检一次可选依赖装齐没; 之后用户可手动「重新检测」
+      useEffect(() => {
+        if (!canInstallDependencies || !bridge.available || (bs && (bs.deps || bs.depsChecking))) return;
+        let cancelled = false;
+        const run = () => { if (!cancelled) bridge.dependencies.checkDependencies(); };
+        if (window.requestIdleCallback) {
+          const idleId = window.requestIdleCallback(run, { timeout: 1200 });
+          return () => {
+            cancelled = true;
+            if (window.cancelIdleCallback) window.cancelIdleCallback(idleId);
+          };
+        }
+        const timerId = window.setTimeout(run, 300);
+        return () => {
+          cancelled = true;
+          window.clearTimeout(timerId);
+        };
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- dependency list manually reviewed: completing it would cause duplicate requests or polling loops
+      }, []);
+      const actionButton = (tone = 'blue') => {
+        if (tone === 'green') return 'text-[#34C759] hover:bg-[#34C759]/10';
+        if (tone === 'red') return 'text-[#FF3B30] hover:bg-[#FF3B30]/10';
+        return 'text-[#007AFF] hover:bg-[#007AFF]/10';
+      };
+      // filter already returns a fresh array; no extra spread needed.
+      const userModels = (savedModels || []).filter(model => model && model.id);
+      const searchOptions = [
+        { key: 'bing', label: 'Bing', desc: settingsCopy.searchDescriptions.bing },
+        { key: 'metaso', label: t.uiSettingsView.searchProviderMetaso, desc: settingsCopy.searchDescriptions.metaso },
+        { key: 'bocha', label: t.uiSettingsView.searchProviderBocha, desc: settingsCopy.searchDescriptions.bocha },
+        { key: 'baidu', label: t.uiSettingsView.searchProviderBaidu, desc: settingsCopy.searchDescriptions.baidu },
+        { key: 'tavily', label: 'Tavily', desc: settingsCopy.searchDescriptions.tavily },
+      ];
+      // main.jsx's enabledSearchProviders state always seeds 'bing', so no union needed here.
+      const enabledSearchSet = new Set(enabledSearchProviders || []);
+      const enabledSearchList = searchOptions.filter(item => enabledSearchSet.has(item.key));
+      const searchCredentialFor = provider => {
+        const credentials = (bs && bs.settings && bs.settings.search && bs.settings.search.credentials) || {};
+        return credentials[provider] || {};
+      };
+      const searchHasKey = provider => hasStoredCredential(searchCredentialFor(provider));
+      const newModelDraft = preset => {
+        const defs = MODEL_PRESET_DEFS[preset] || MODEL_PRESET_DEFS.deepseek;
+        return {
+          __new: true,
+          id: '',
+          name: preset === 'local_vllm' ? settingsCopy.localDefaultName : presetProviderLabel(preset, t),
+          preset,
+          context_window_tokens: preset === 'local_vllm' ? 262144 : null,
+          // The output cap is not prefilled: declared uniformly by the
+          // runtime window tiers (route_limits_for_model).
+          max_output_tokens: null,
+          model: defs.model,
+          base_url: defs.baseUrl,
+          api_key: '',
+          __scope: preset === 'local_vllm' ? 'local' : 'cloud',
+        };
+      };
+      const memoryEnabled = !!(bs && bs.settings && bs.settings.memory_enabled);
+      const memory = (bs && bs.memory) || {};
+      const memoryWarning = Array.isArray(memory.warnings) ? memory.warnings[0] : null;
+      const memoryWarningCode = memoryWarning && typeof memoryWarning === 'object' ? memoryWarning.code : '';
+      const memoryError = memory.error || memoryWarning;
+      const memoryErrorMessage = memory.error
+        ? settingsCopy.memoryLoadFailed
+        : memoryWarningCode === 'runtime_refresh_failed'
+          ? settingsCopy.memoryRuntimeRefreshFailed
+          : memoryWarningCode === 'memory_topic_cleanup_required'
+            ? settingsCopy.memoryTopicCleanupRequired
+          : memoryWarningCode === 'snapshot_refresh_failed'
+            ? settingsCopy.memorySnapshotRefreshFailed
+            : settingsCopy.memorySourceUnavailable;
+      const identity = (memory.profile && memory.profile.identity) || {};
+      const longTermItems = [
+        ...(memory.preferences || []).map(item => ({ ...item, kind: 'preference', type: settingsCopy.memoryTypes.preference })),
+        ...(memory.work_context || []).map(item => ({ ...item, kind: 'work_context', type: settingsCopy.memoryTypes.work_context })),
+      ];
+      const recentItems = [
+        ...(memory.current_focus || []).filter(item => item.status !== 'archived').map(item => ({ ...item, kind: 'current_focus', type: settingsCopy.memoryTypes.current_focus })),
+        ...(memory.recent_activity || []).filter(item => item.status !== 'archived').map(item => ({ ...item, kind: 'recent_activity', type: settingsCopy.memoryTypes.recent_activity })),
+      ];
+      const [memoryOrganizing, setMemoryOrganizing] = useState(false);
+      const [memoryOrganizeMessage, setMemoryOrganizeMessage] = useState('');
+      const [memoryLastOrganizedAt, setMemoryLastOrganizedAt] = useState('');
+      // Same app-language relative format as the neighboring memory cards
+      // (formatMemoryTime), not the browser-locale string: the two render side
+      // by side and must not disagree under an OS/app language mismatch.
+      const formatMemoryOrganizedAt = finishedAt => {
+        const time = new Date(finishedAt);
+        return Number.isNaN(time.getTime()) ? '' : formatMemoryTime({ updated_at: finishedAt }, t.uiSettingsView);
+      };
+      const loadMemoryOrganizeHistory = () => {
+        if (!bridge.available || !bridge.memory.loadOrganizeHistory) return;
+        bridge.memory.loadOrganizeHistory().then(history => {
+          if (history && history[0] && history[0].finished_at) {
+            setMemoryLastOrganizedAt(formatMemoryOrganizedAt(history[0].finished_at));
+          }
+        }).catch(() => {});
+      };
+      const organizeMemoryNow = async () => {
+        if (!bridge.available || !bridge.memory.organizeMemory || memoryOrganizing) return;
+        setMemoryOrganizing(true);
+        // Drop the previous run's result/error up front: leaving it rendered
+        // next to the spinner reads as if it described the run in progress.
+        setMemoryOrganizeMessage('');
+        try {
+          const result = await bridge.memory.organizeMemory();
+          const report = (result && result.report) || {};
+          const count = map => Object.values(map || {}).reduce((acc, n) => acc + (n || 0), 0);
+          setMemoryOrganizeMessage(report.no_change
+            ? t.uiSettingsView.memoryOrganizeNoChange
+            : t.uiSettingsView.memoryOrganizeSummary(count(report.merged), count(report.updated), count(report.deleted)));
+          loadMemoryOrganizeHistory();
+        } catch (error) {
+          // organizeMemory failures only throw without writing state: memory.error
+          // is the dedicated load-failure channel (rendered uniformly as the
+          // "加载失败" (load failed) copy, which would mislead about the cause),
+          // so the concrete reason is surfaced right here to the organize result line.
+          const reason = (error && error.message) || String(error);
+          setMemoryOrganizeMessage(t.uiSettingsView.memoryOrganizeFailed(reason));
+        } finally {
+          setMemoryOrganizing(false);
+        }
+      };
+      useEffect(() => {
+        if (activeSection === 'memory' && memoryEnabled && bridge.available && bridge.memory.loadMemoryOverview) bridge.memory.loadMemoryOverview();
+        if (activeSection === 'memory' && memoryEnabled) loadMemoryOrganizeHistory();
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- dependency list manually reviewed: history load follows the same gated section-open trigger as the overview load
+      }, [activeSection, memoryEnabled]);
+      useEffect(() => {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- synchronous setState in this effect is intentional: mirrors the backend snapshot into local state once it lands, avoiding first-frame flicker
+        if (updateFocusTick) setActiveSection('update');
+      }, [updateFocusTick]);
+      const [memoryEditor, setMemoryEditor] = useState(null);
+      const [memorySaving, setMemorySaving] = useState(false);
+      const [memoryEditorError, setMemoryEditorError] = useState('');
+      const [profileSaveError, setProfileSaveError] = useState('');
+      const [memoryDeleteConfirm, setMemoryDeleteConfirm] = useState(/** @type {MemoryItem | null} */ (null));
+      const [memoryDeleteError, setMemoryDeleteError] = useState('');
+      // The three memory error banners (delete / profile-save / load-or-warning) share the
+      // identical banner chrome and priority order; only the copy differs, so collapse them
+      // into one computed message and render a single banner.
+      const memoryBannerMessage = memoryDeleteError
+        ? settingsCopy.memoryDeleteFailed
+        : profileSaveError
+          ? settingsCopy.memorySaveFailed
+          : memoryError
+            ? memoryErrorMessage
+            : '';
+      const openMemoryItemViewer = item => {
+        setMemoryEditor({
+          mode: 'memory',
+          kind: item.kind,
+          id: item.id,
+          title: settingsCopy.memoryDetail,
+          subtitle: '',
+          label: settingsCopy.content,
+          value: item.text || item.content || '',
+          multiline: true,
+        });
+      };
+      const saveMemoryEditor = async () => {
+        if (!memoryEditor || !bridge.available || memorySaving) return;
+        const text = String(memoryEditor.value || '').trim();
+        setMemorySaving(true);
+        setMemoryEditorError('');
+        setProfileSaveError('');
+        // The delete-failure banner is not sticky: it ranks first in the banner
+        // chain, so a save must clear it to make room for the latest error.
+        setMemoryDeleteError('');
+        try {
+          if (memoryEditor.mode === 'memory') {
+            if (!text || !bridge.memory.updateMemoryItem) return;
+            await bridge.memory.updateMemoryItem(memoryEditor.kind, memoryEditor.id, { text });
+          } else if (memoryEditor.mode === 'profile') {
+            if (!bridge.memory.saveMemoryProfilePatch) return;
+            await bridge.memory.saveMemoryProfilePatch({ [memoryEditor.key]: text });
+          }
+          setMemoryEditor(null);
+        } catch (error) {
+          setMemoryEditorError(String(error));
+          setProfileSaveError(String(error));
+        } finally {
+          setMemorySaving(false);
+        }
+      };
+      /** @param {MemoryItem} item - Memory item; only records the pending item — confirmDeleteItem performs the actual delete after confirmation. */
+      const deleteItem = item => {
+        if (!item || !bridge.memory.deleteMemoryItem) return;
+        // The native window.confirm does not render in Tauri WebView2; in-app
+        // dialogs do (same as ProviderFormModal / ToolStoreView). Record the
+        // pending item first and delete only after confirmation.
+        setMemoryDeleteError('');
+        setMemoryDeleteConfirm(item);
+      };
+      /** @param {MemoryItem} item - Memory item confirmed for deletion (the only confirmed path that calls deleteMemoryItem). */
+      const confirmDeleteItem = async item => {
+        if (!item || !bridge.memory.deleteMemoryItem) return;
+        try {
+          await bridge.memory.deleteMemoryItem(item.kind, item.id);
+          setMemoryDeleteError('');
+        } catch (error) {
+          // The bridge already recorded the error in bs.memory and rethrew;
+          // surface it here as the delete-failure banner instead of leaving a
+          // floating promise rejection. The non-empty fallback guarantees the
+          // banner always renders.
+          setMemoryDeleteError(String(error?.message || error || 'delete failed'));
+        }
+      };
+      const editProfile = key => {
+        const label = key === 'call_name' ? settingsCopy.userCallName : settingsCopy.assistantNickname;
+        setMemoryEditorError('');
+        setMemoryEditor({
+          mode: 'profile',
+          key,
+          title: settingsCopy.editTitle(label),
+          subtitle: key === 'call_name' ? settingsCopy.callNameDesc : settingsCopy.assistantNameDesc,
+          label,
+          value: identity[key] || '',
+          multiline: false,
+        });
+      };
+      const renderModelRows = (models, totalCount) => models.length ? models.map(m => {
+        const total = totalCount == null ? models.length : totalCount;
+        const isActive = m.id === activeModelId;
+        const isLocal = isLocalModel(m);
+        const isReadonly = isReadonlyModel(m);
+        const codingPlan = isCodingPlanModel(m);
+        const providerLabel = providerLabelForModel(m, t);
+        // Alias gating is preset-only, matching the form, selector labels, and
+        // Rust `normalize_alias`; `isLocal`'s extra loopback check applies to
+        // icon/tag/scope only, so a loopback custom endpoint keeps its alias here.
+        const alias = m.preset === 'local_vllm' ? '' : String(m.alias || '').trim();
+        const title = alias || m.model || m.name;
+        return (
+          <div key={m.id} className={`min-h-[60px] grid grid-cols-[24px_32px_minmax(0,1fr)_auto] items-center gap-3 px-4 py-3 border-b last:border-b-0 border-black/[0.12] dark:border-white/[0.10]`}>
+            <button type="button" onClick={() => !isActive && onSetActiveModel(m.id)} className="shrink-0" title={t.setActiveModel}>
+              <RadioDot active={isActive} />
+            </button>
+            <ProviderIcon preset={m.preset || (isLocal ? 'local_vllm' : 'openai_compatible')} vendor={m.vendor} providerKind={m.provider_kind} model={m.model} compact />
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className={`text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{title}</span>
+                {isLocal && <Tag tone="gray">{settingsCopy.localModel}</Tag>}
+                {codingPlan && <Tag tone="gray">Coding Plan</Tag>}
+                {isActive && <Tag>{settingsCopy.defaultTag}</Tag>}
+              </div>
+              <div className={`mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{providerLabel} · {m.model}</div>
+            </div>
+            <div className="shrink-0 flex items-center gap-2">
+              {!isReadonly && <button type="button" onClick={() => setEditingModel({ ...m, __scope: isLocal ? 'local' : 'cloud' })} className={`min-h-8 px-3 rounded-full text-[14px] font-medium ${actionButton('blue')}`}>{settingsCopy.edit}</button>}
+              {!isReadonly && total > 1 && <button type="button" onClick={() => setModelDeleteConfirm(m)} className={`min-h-8 px-3 rounded-full text-[14px] font-medium ${actionButton('red')}`}>{settingsCopy.delete}</button>}
+            </div>
+          </div>
+        );
+      }) : <div className={`px-4 py-4 text-[14px] text-[#8A8A8E] dark:text-[#98989D]`}>{settingsCopy.noModels}</div>;
+      const petEnabled = !!(bs && bs.settings && bs.settings.pet && bs.settings.pet.enabled);
+      const selectedPetId = (bs && typeof bs.selectedPet === 'string' && bs.selectedPet) || DEFAULT_PET_ID;
+      const handlePetSelect = id => {
+        if (!bridge.available || !bridge.settings.setSelectedPet) return Promise.resolve();
+        return bridge.settings.setSelectedPet(id);
+      };
+      const renderGeneral = () => {
+        const voiceShortcutLabel = (
+          <span className="inline-flex min-w-0 items-center gap-1.5">
+            <span className="truncate">{t.uiSettings.voiceShortcutEnable}</span>
+            <button
+              type="button"
+              data-testid="voice-shortcut-info"
+              aria-label={t.uiSettings.voiceShortcutHelp}
+              title={t.uiSettings.voiceShortcutHelp}
+              onClick={handleVoiceShortcutInfoOpen}
+              className={`inline-flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full text-[12px] font-semibold leading-none transition-colors ${
+                'bg-[#E5E5EA] text-[#6E6E73] hover:bg-[#D1D1D6] active:bg-[#C7C7CC] dark:bg-white/[0.10] dark:text-[#C7C7CC] dark:hover:bg-white/[0.16] dark:active:bg-white/[0.20]'
+              }`}
+            >
+              ?
+            </button>
+          </span>
+        );
+        return (
+        <>
+          <IOSSection title={t.uiSettings.appearance}>
+            <IOSRow label={t.uiSettings.language} desc={t.uiSettings.languageDesc}>
+              <SSegmented value={language} onChange={v => { setLanguage(v); setRestartDialog('language'); }} options={[{ key: 'zh', label: '中文' }, { key: 'en', label: 'English' }, { key: 'ja', label: '日本語' }]} />
+            </IOSRow>
+            <IOSRow label={t.uiSettings.theme} desc={t.uiSettings.themeDesc}>
+              <SSegmented value={colorScheme} onChange={onColorSchemeChange} options={[{ key: 'system', label: t.followSystem }, { key: 'light', label: t.light }, { key: 'dark', label: t.dark }]} />
+            </IOSRow>
+          </IOSSection>
+          <IOSSection title={t.sidebarSection}>
+            <IOSRow label={t.sidebarDateGrouping} desc={t.sidebarDateGroupingDesc}>
+              <IOSSwitch checked={sidebarDateGrouping} onChange={onSidebarDateGroupingChange} />
+            </IOSRow>
+          </IOSSection>
+          {/* Chat behavior gets its own group. The web lane cannot persist
+              this key (WebSettingsPatch has no `chat` field and hard-rejects
+              the patch), so the section stays desktop-only like the voice
+              postprocess toggle instead of rendering an empty titled group. */}
+          {!isWeb && (
+          <IOSSection title={t.chatSection}>
+            <IOSRow label={t.chatStreamingAnimation} desc={t.chatStreamingAnimationDesc}>
+              <IOSSwitch checked={chatStreamingAnimation} onChange={onChatStreamingAnimationChange} />
+            </IOSRow>
+          </IOSSection>
+          )}
+          {canConfigureDesktopNotifications && (
+          <IOSSection title={t.uiSettings.notifications}>
+            <IOSRow label={t.uiSettings.taskNotice} desc={t.uiSettings.taskNoticeDesc}>
+              <IOSSwitch checked={taskCompletedNotif} onChange={setTaskCompletedNotif} />
+            </IOSRow>
+            {/* The task-completion switch is the master switch (its payload
+                carries enabled). The input row's effective display derives as
+                intent && master and is disabled while the master is off —
+                otherwise the switch would show on yet never fire; the Rust
+                delivery gate requires the same effective rule
+                (enabled && task_completed && needs_input). */}
+            <IOSRow label={t.uiSettings.inputNotice} desc={t.uiSettings.inputNoticeDesc}>
+              <IOSSwitch
+                checked={inputNeededNotif && taskCompletedNotif}
+                disabled={!taskCompletedNotif}
+                onChange={setInputNeededNotif}
+              />
+            </IOSRow>
+          </IOSSection>
+          )}
+          <IOSSection title={t.uiSettings.voiceShortcuts}>
+            <IOSRow label={voiceShortcutLabel} desc={voiceShortcutNativeAvailable ? t.uiSettings.voiceShortcutEnableDesc : (isWeb ? t.uiSettings.voiceShortcutWebDesc : t.uiSettings.voiceShortcutUnsupportedDesc)}>
+              {/* On non-Windows platforms, in-window Alt remains an available capability
+                  (except the global hook), so the toggle must stay operable; ANDing in
+                  nativeAvailable would make it impossible to turn the shortcut off here
+                  after enabling it in the intro. */}
+              <IOSSwitch checked={voiceShortcutsEnabled} onChange={handleVoiceShortcutsEnabledChange} />
+            </IOSRow>
+            {/* The web lane has no smart-organize pipeline at all (no
+                postprocess invoke in the web bridge), so rendering the
+                toggle there would be a dead switch contradicting
+                voiceShortcutWebDesc. */}
+            {!isWeb && (
+              <IOSRow label={t.uiSettings.voicePostprocess} desc={t.uiSettings.voicePostprocessDesc}>
+                <IOSSwitch checked={voicePostprocessOn} onChange={handleVoicePostprocessEnabledChange} />
+              </IOSRow>
+            )}
+          </IOSSection>
+          {voiceShortcutIntroOpen && (
+            <VoiceShortcutIntroModal
+              isDark={activeTheme === 'dark'}
+              copy={t}
+              shortcutEnabled={voiceShortcutsEnabled}
+              closeLabel={t.voiceIntroDone}
+              primaryLabel={voiceShortcutsEnabled ? t.voiceIntroDone : (t.voiceShortcutEnableTitle || t.uiSettings.voiceShortcutEnable)}
+              onClose={handleVoiceShortcutInfoClose}
+              onToggleShortcut={handleVoiceShortcutInfoEnable}
+            />
+          )}
+          {/* The global shortcut is a desktop capability: the web lane has
+              neither the command nor any global-window concept, so hide the
+              whole section (same gating pattern as the notifications
+              section's can gate). */}
+          {!isWeb && (
+            <GlobalShortcutSettingSection t={t} platformCapabilities={platformCapabilities} />
+          )}
+          {canUsePet && (
+          <section className="mb-6">
+            <div className={`px-3 mb-2 text-[12px] font-semibold text-[#8A8A8E] dark:text-[#8E8E93]`}>{t.uiSettings.desktopAssistant}</div>
+            <div className={`overflow-hidden rounded-[18px] bg-white dark:bg-[#2C2C2E]`}>
+              <div className={`w-full min-h-[58px] flex flex-wrap items-center gap-3 px-4 py-2.5 text-left border-b ${
+                'border-black/[0.12] text-[#1C1C1E] dark:border-white/[0.10] dark:text-[#F2F2F7]'
+              } ${petEnabled ? '' : 'last:border-b-0'}`}>
+                <div className="flex-1 min-w-[120px]">
+                  <div className="text-[15px] leading-5 font-normal whitespace-nowrap">{t.uiSettings.pet}</div>
+                  <div className={`mt-0.5 text-[13px] leading-5 text-[#8A8A8E] dark:text-[#98989D]`}>{t.uiSettings.petDesc}</div>
+                </div>
+                <IOSSwitch checked={petEnabled} onChange={onPetEnabledChange} />
+              </div>
+              {petEnabled && (
+                <div className={`px-4 pb-4 border-t border-black/[0.12] dark:border-white/[0.10]`}>
+                  <PetSettingsSection
+                    enabled={petEnabled}
+                    selectedPetId={selectedPetId}
+                    t={t}
+                    onSelect={handlePetSelect}
+                  />
+                </div>
+              )}
+            </div>
+          </section>
+          )}
+          {/* 会话备份导入：桌面独占（web 车道无文件对话框，也不该触及宿主
+              会话存储），放在通用页尾部与导出入口（侧栏会话菜单）互为闭环。 */}
+          {!isWeb && setSettingsToast && (
+            <IOSSection title={t.uiSettings.sessionsSection}>
+              <IOSRow label={t.uiSettings.importSessionsArchive} desc={t.uiSettings.importSessionsDesc}>
+                <button type="button" data-testid="settings-import-sessions" disabled={importingSessions}
+                  onClick={handleImportSessionArchive}
+                  className={`min-h-8 px-3 rounded-full text-[14px] font-medium ${importingSessions ? 'opacity-60 cursor-not-allowed' : ''} ${actionButton('blue')}`}>
+                  {importingSessions ? t.uiSettings.importingSessions : t.uiSettings.importSessionsArchive}
+                </button>
+              </IOSRow>
+            </IOSSection>
+          )}
+        </>
+        );
+      };
+      const renderModels = () => (
+        <>
+          {acpProvidersTabVisible && (
+            // 左上角小胶囊切换：模型 / ACP 管理（替代原列表上方「模型」小字标题；
+            // 原侧栏「Provider 管理」分节并入为子页）
+            <div data-testid="settings-model-tabs" className="mb-3 inline-flex items-center gap-0.5 p-0.5 rounded-full bg-black/[0.05] dark:bg-white/[0.07]">
+              {[
+                { key: 'models', label: t.uiSettings.model },
+                { key: 'acp', label: t.uiSettings.providers },
+              ].map(tab => (
+                <button key={tab.key} type="button" data-testid={`settings-model-tab-${tab.key}`} onClick={() => setModelTab(tab.key)}
+                  className={`h-7 px-3 rounded-full text-[12px] font-semibold transition-colors ${modelTab === tab.key ? ('bg-white text-[#007AFF] shadow-sm dark:bg-[#3A3A3C] dark:text-[#F2F2F7]') : ('text-[#8A8A8E] hover:text-[#636366] dark:text-[#8E8E93] dark:hover:text-[#C7C7CC]')}`}>
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {modelTab === 'acp' && acpProvidersTabVisible ? (
+            <ProvidersSection t={t} />
+          ) : (
+          <section className="mb-6">
+            {/* 有 ACP 子页时顶端胶囊切换已承担「模型」标题语义，不再重复小字标题 */}
+            {!acpProvidersTabVisible && <SectionTitle>{settingsCopy.modelSection}</SectionTitle>}
+            <Group>
+              {(() => {
+                const { preset, custom } = groupModelsForSelector(userModels);
+                const any = preset.length > 0 || custom.length > 0;
+                return (
+                  <>
+                    {!any && renderModelRows([], userModels.length)}
+                    {preset.length > 0 && (
+                      <>
+                        <div className="px-4 pt-2 pb-1 text-[12px] font-semibold text-[#8A8A8E] dark:text-[#8E8E93]">{t.modelGroupPreset}</div>
+                        {renderModelRows(preset, userModels.length)}
+                      </>
+                    )}
+                    {custom.length > 0 && (
+                      <>
+                        <div className={`px-4 pt-2 pb-1 text-[12px] font-semibold text-[#8A8A8E] dark:text-[#8E8E93]${preset.length > 0 ? ' border-t border-black/[0.12] dark:border-white/[0.10]' : ''}`}>{t.modelGroupCustom}</div>
+                        {renderModelRows(custom, userModels.length)}
+                      </>
+                    )}
+                  </>
+                );
+              })()}
+              <button type="button" data-testid="settings-model-add" onClick={() => setEditingModel(newModelDraft('deepseek'))}
+                className={`w-full min-h-[52px] flex items-center justify-center gap-2 px-4 text-[16px] font-normal border-t border-black/[0.12] text-[#007AFF] hover:bg-black/[0.035] dark:border-white/[0.10] dark:text-[#0A84FF] dark:hover:bg-white/[0.05]`}>
+                <Plus size={18} />
+                <span>{settingsCopy.addModel}</span>
+              </button>
+            </Group>
+            {modelEnvLocked.length > 0 && <div className={`px-3 mt-2 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]`}>{settingsCopy.envManaged}</div>}
+          </section>
+          )}
+        </>
+      );
+      const renderSearch = () => (
+        <>
+          <section className="mb-6">
+            <SectionTitle>{settingsCopy.searchList}</SectionTitle>
+            <div className={`px-3 mb-2 text-[12px] leading-relaxed text-[#8A8A8E] dark:text-[#8E8E93]`}>{settingsCopy.searchSourceHint}</div>
+            <Group>
+            {enabledSearchList.map(item => {
+              return (
+                <div key={item.key} className={`min-h-[60px] grid grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-[14px] px-4 py-3 border-b last:border-b-0 border-black/[0.12] dark:border-white/[0.10]`}>
+                  <button type="button" onClick={() => { setSearchProvider(item.key); setRestartDialog('search'); }} className="shrink-0" title={settingsCopy.setDefault}>
+                    <RadioDot active={searchProvider === item.key} />
+                  </button>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className={`text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{item.label}</span>
+                      {item.key === searchProvider && <Tag>{settingsCopy.defaultTag}</Tag>}
+                    </div>
+                    <div className={`mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{item.desc}</div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {item.key !== 'bing' && <button type="button" onClick={() => { setPendingSearchProvider(null); setEditingSearch(item.key); }} className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium ${actionButton('blue')}`}>{settingsCopy.edit}</button>}
+                    {item.key !== 'bing' && <button type="button" onClick={() => setSearchDeleteConfirm(item)} className={`shrink-0 min-h-8 px-3 rounded-full text-[14px] font-medium ${actionButton('red')}`}>{settingsCopy.delete}</button>}
+                  </div>
+                </div>
+              );
+            })}
+            <button type="button" onClick={() => setSearchPickerOpen(true)}
+              className={`w-full min-h-[52px] flex items-center justify-center gap-2 px-4 text-[16px] font-normal border-t border-black/[0.12] text-[#007AFF] hover:bg-black/[0.035] dark:border-white/[0.10] dark:text-[#0A84FF] dark:hover:bg-white/[0.05]`}>
+              <Plus size={18} />
+              <span>{settingsCopy.addSearch}</span>
+            </button>
+            </Group>
+          </section>
+        </>
+      );
+      const renderMemoryList = (items, empty) => items.length ? items.map(item => {
+        const text = item.text || item.content || settingsCopy.unnamedMemory;
+        return (
+          <div key={`${item.kind}-${item.id}`} className={`min-h-[92px] flex items-start gap-4 px-4 py-3.5 border-b last:border-b-0 border-black/[0.12] dark:border-white/[0.10]`}>
+            <div className="min-w-0 flex-1">
+              <div className={`text-[15px] leading-6 whitespace-pre-wrap break-words line-clamp-3 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{text}</div>
+            </div>
+            <div className="shrink-0 mt-0.5 flex items-center gap-2">
+              <button type="button" onClick={() => openMemoryItemViewer(item)} className={`text-[14px] px-3 py-1.5 rounded-full ${actionButton('blue')}`}>{settingsCopy.view}</button>
+              <button type="button" data-testid="memory-item-delete" onClick={() => deleteItem(item)} className={`text-[14px] px-3 py-1.5 rounded-full ${actionButton('red')}`}>{settingsCopy.delete}</button>
+            </div>
+          </div>
+        );
+      }) : <IOSRow label={empty} />;
+      const renderMemory = () => (
+        <>
+          <IOSSection>
+            <IOSRow label={settingsCopy.enableMemory} desc={settingsCopy.enableMemoryDesc}>
+              <IOSSwitch checked={memoryEnabled} onChange={onMemoryEnabledChange} />
+            </IOSRow>
+          </IOSSection>
+          {memoryEnabled && (
+            <>
+              {memoryBannerMessage && (
+                <div data-testid="memory-settings-error" role="alert" aria-live="polite" className={`mb-4 rounded-[14px] bg-[#FF3B30]/10 px-4 py-3 text-[13px] leading-5 text-[#FF3B30]`}>
+                  {memoryBannerMessage}
+                </div>
+              )}
+              <IOSSection>
+                <IOSRow label={t.uiSettingsView.memoryOrganize} desc={t.uiSettingsView.memoryOrganizeDesc}>
+                  <button
+                    type="button"
+                    data-testid="memory-organize-section"
+                    onClick={organizeMemoryNow}
+                    disabled={!bridge.available || memoryOrganizing}
+                    className={`shrink-0 inline-flex items-center gap-1.5 text-[14px] px-3 py-1.5 rounded-full disabled:opacity-50 ${actionButton('blue')}`}
+                  >
+                    <Sparkles size={13} className={memoryOrganizing ? 'animate-spin' : ''} />
+                    {memoryOrganizing ? t.uiSettingsView.memoryOrganizing : t.uiSettingsView.memoryOrganize}
+                  </button>
+                </IOSRow>
+                {memoryOrganizeMessage && (
+                  <div data-testid="memory-organize-result" className={`px-4 py-2.5 text-[13px] leading-5 text-[#8A8A8E] dark:text-[#98989D]`}>{memoryOrganizeMessage}</div>
+                )}
+                {memoryLastOrganizedAt && (
+                  <div data-testid="memory-last-organized" className={`px-4 py-2.5 text-[13px] leading-5 text-[#8A8A8E] dark:text-[#98989D]`}>{t.uiSettingsView.memoryLastOrganized(memoryLastOrganizedAt)}</div>
+                )}
+              </IOSSection>
+              <IOSSection title={settingsCopy.profile}>
+                <div data-testid="memory-profile-call-name">
+                  <IOSRow label={settingsCopy.userCallName} desc={settingsCopy.callNameDesc} value={identity.call_name || settingsCopy.notSet} onClick={() => editProfile('call_name')}>
+                    <ChevronDown size={22} className="-rotate-90 opacity-35" />
+                  </IOSRow>
+                </div>
+                <IOSRow label={settingsCopy.assistantNickname} desc={settingsCopy.assistantNameDesc} value={identity.assistant_alias || 'PINVOU'} onClick={() => editProfile('assistant_alias')}>
+                  <ChevronDown size={22} className="-rotate-90 opacity-35" />
+                </IOSRow>
+              </IOSSection>
+              <IOSSection title={settingsCopy.longMemory}>{renderMemoryList(longTermItems, settingsCopy.noLongMemory)}</IOSSection>
+              <IOSSection title={settingsCopy.shortMemory}>{renderMemoryList(recentItems, settingsCopy.noShortMemory)}</IOSSection>
+            </>
+          )}
+        </>
+      );
+      // eslint-disable-next-line sonarjs/cognitive-complexity -- settings page aggregates many form branches; splitting needs a dedicated design; tracked via this suppression for now
+      const renderUpdate = () => {
+        const upd = bs && bs.updateInfo;
+        const currentVersion = (bs && bs.appVersion) || (upd && upd.current_version) || '—';
+        const notes = (upd && String(upd.notes || '').trim()) || t.uiSettings.noReleaseNotes;
+        const updateChecking = !!(bs && bs.updateChecking);
+        const updateDownloading = !!(bs && bs.updateDownloading);
+        const updateCancelling = !!(bs && bs.updateCancelling);
+        const updateReady = !!(bs && bs.updateReady);
+        const updateProgress = (bs && bs.updateProgress) || 0;
+        const isWindowsUpdate = upd && upd.platform === 'windows';
+        // The localized hint replaces the raw backend string (it may carry request
+        // details and be untranslated); the raw cause stays in bridge state and
+        // is logged by the updater for diagnostics.
+        const updateError = bs && bs.updateError
+          ? t.updateInstallFailed
+          : (bs && bs.updateCheckError && bs.updateCheckError !== 'latest' ? t.updateCheckFailed : '');
+        const updateStatusDesc = updateDownloading
+          ? (updateProgress >= 100 ? t.uiSettings.installingUpdate : t.uiSettings.downloading(updateProgress))
+          : updateReady
+            ? (isWindowsUpdate ? t.updateInstallerStarted : t.updateComplete)
+            : (upd && upd.available ? `v${upd.latest_version}` : (bs && bs.updateCheckError === 'latest' ? t.upToDate : ''));
+        const updateButtonLabel = updateChecking
+          ? t.checking
+          : updateDownloading
+            ? (updateProgress >= 100 ? t.installing : (updateCancelling ? t.cancelling : t.uiSettings.cancelDownload))
+            : updateReady
+              ? (isWindowsUpdate ? t.uiSettings.installerStarted : t.restartNow)
+              : (upd && upd.available ? (upd.platform === 'linux' ? t.downloadInstallRestart : t.downloadInstall) : t.checkUpdate);
+        const updateButtonDisabled = !bridge.available || updateChecking || updateCancelling || (updateDownloading && updateProgress >= 100) || (updateReady && isWindowsUpdate);
+        const handleUpdateAction = () => {
+          if (!bridge.available || updateChecking) return;
+          if (updateDownloading) {
+            if (updateProgress < 100 && !updateCancelling) bridge.updater.cancelUpdate();
+            return;
+          }
+          if (updateReady) {
+            if (!isWindowsUpdate) bridge.updater.restartApp();
+            return;
+          }
+          if (upd && upd.available) bridge.updater.downloadAndInstallUpdate();
+          else bridge.updater.checkForUpdate();
+        };
+        return (
+          <div ref={versionUpdateRef} id="settings-version-update">
+            <IOSSection title={t.uiSettings.version}>
+              <IOSRow label={t.uiSettings.currentVersion} value={`v${currentVersion}`} />
+              <IOSRow label={upd && upd.available ? t.newVersionFound : t.checkUpdate} desc={updateStatusDesc}>
+              <button type="button" data-settings-update-action="true" onClick={handleUpdateAction} disabled={updateButtonDisabled} className="h-9 px-4 rounded-full bg-[#007AFF] text-white text-[14px] font-semibold whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed">{updateButtonLabel}</button>
+            </IOSRow>
+            </IOSSection>
+            {updateError && (
+              <div className="px-3 -mt-3 mb-4 text-[12px] leading-5 text-[#EA4335] break-words">{String(updateError)}</div>
+            )}
+            <section className="mb-6">
+              <div className={`px-3 mb-2 text-[12px] font-semibold text-[#8A8A8E] dark:text-[#8E8E93]`}>{t.uiSettings.releaseNotes}</div>
+              <div className={`rounded-[18px] px-4 py-3.5 text-[14px] leading-6 whitespace-pre-line bg-white text-[#1C1C1E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7]`}>{notes}</div>
+            </section>
+          </div>
+        );
+      };
+      const renderPermissions = () => {
+        const deps = (bs && bs.deps) || [];
+        const checking = !!(bs && bs.depsChecking);
+        const installing = !!(bs && bs.depsInstalling);
+        const installError = bs && bs.depsInstallError;
+        const installProgress = bs && bs.depsInstallProgress;
+        const missing = deps.filter(dep => !dep.installed);
+        const hasInstallableMissing = missing.some(dep => String(dep.install_action || dep.apt || '').trim());
+        const checked = deps.length > 0;
+        const busy = checking || installing;
+        // 安装中实时进度文案:优先用后端 deps:install_progress 事件(逐包 + brew 输出行),
+        // 解决一键安装全程只有静态「安装中…」像卡死的问题(尤其 libreoffice cask 长尾)。
+        const progressText = (installing && installProgress)
+          ? `${installProgress.package}（${installProgress.current}/${installProgress.total}）${installProgress.detail ? ' ' + installProgress.detail : ''}`
+          : null;
+        return (
+          <>
+            {showSuperPermissionSettings && (
+              <IOSSection title={settingsCopy.system}>
+                <IOSRow label={settingsCopy.advancedPermission} desc={settingsCopy.advancedPermissionDesc}>
+                  <IOSSwitch checked={!!superPerm} onChange={setSuperPerm} />
+                </IOSRow>
+              </IOSSection>
+            )}
+            {canUseComputerUse && <ComputerUseSettingSection t={t} platformCapabilities={platformCapabilities} />}
+            {canInstallDependencies && <div id="settings-dependencies">
+              <IOSSection
+                title={t.depCheckTitle}
+                footer={usesHomebrewDependencyInstaller ? t.depInstallNoteMac : (usesBundledDependencyInstaller ? t.depInstallNoteWindows : t.depInstallNote)}
+              >
+                <IOSRow
+                  label={checking ? t.depChecking : (checked ? (missing.length ? `${missing.length}${t.depMissingSuffix}` : t.depAllOk) : t.depCheckTitle)}
+                  desc={progressText || (installing ? t.depInstalling : (installError ? String(installError) : ''))}
+                >
+                  <button type="button"
+                    onClick={() => bridge.available && bridge.dependencies.checkDependencies()}
+                    disabled={!bridge.available || busy}
+                    className={`h-9 px-4 rounded-full text-[14px] font-semibold disabled:opacity-50 bg-[#E5E5EA] text-[#007AFF] dark:bg-white/[0.08] dark:text-[#0A84FF]`}
+                  >{checking ? t.depChecking : t.depRecheck}</button>
+                </IOSRow>
+                {missing.map(dep => (
+                  <IOSRow key={dep.key} label={t[`dep_${dep.key}`] || dep.key} desc={((dep.hint && (t[`depHint_${dep.hint}`] || dep.hint)) || dep.apt || '').trim()}>
+                    <Tag tone="gray">{settingsCopy.missing}</Tag>
+                  </IOSRow>
+                ))}
+                {hasInstallableMissing && (
+                  <IOSRow label={usesBundledDependencyInstaller ? settingsCopy.installMissing : t.depGoInstall}>
+                    <button type="button"
+                      onClick={() => bridge.available && bridge.dependencies.installDependencies?.()}
+                      disabled={!bridge.available || busy}
+                      className="h-9 px-4 rounded-full bg-[#007AFF] text-white text-[14px] font-semibold disabled:opacity-50"
+                    >{installing ? (progressText || t.depInstalling) : t.depInstallBtn}</button>
+                  </IOSRow>
+                )}
+              </IOSSection>
+            </div>}
+          </>
+        );
+      };
+      const renderCommunity = () => (
+        <CommunityPanel
+          copy={t}
+          onOpenDiscussions={() => {
+            if (!bridge.available || !bridge.artifacts?.openUserExternalUrl) return;
+            bridge.artifacts.openUserExternalUrl(COMMUNITY_DISCUSSIONS_URL).catch(() => {});
+          }}
+        />
+      );
+      const renderHelp = () => (
+        <IOSSection>
+          <IOSRow label={settingsCopy.feedbackTitle} desc={settingsCopy.feedbackDesc}>
+            <button type="button" onClick={() => setFeedbackOpen(true)} className="h-9 px-4 rounded-full bg-[#007AFF] text-white text-[14px] font-semibold">{settingsCopy.submitFeedback}</button>
+          </IOSRow>
+        </IOSSection>
+      );
+      const renderContent = () => {
+        if (activeSection === 'model') return renderModels();
+        if (activeSection === 'search') return renderSearch();
+        if (activeSection === 'memory') return renderMemory();
+        if (activeSection === 'community') return renderCommunity();
+        if (activeSection === 'permissions') return renderPermissions();
+        if (activeSection === 'update') return renderUpdate();
+        if (activeSection === 'help') return renderHelp();
+        return renderGeneral();
+      };
+      const sectionTitle = (activeSection === 'model' && modelTab === 'acp' && acpProvidersTabVisible)
+        ? t.uiSettings.providers
+        : ({
+            general: t.uiSettings.general,
+            model: t.uiSettings.model,
+            search: t.uiSettings.search,
+            memory: t.uiSettings.memory,
+            community: t.uiSettings.community,
+            permissions: t.uiSettings.permissions,
+            update: t.uiSettings.update,
+            help: t.uiSettings.help,
+          }[activeSection] || t.uiSettings.general);
+      return (
+        // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the close button inside the settings window
+        // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center px-3 py-3 sm:px-5 sm:py-5 bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200"
+          onClick={(event) => {
+            if (event.target === event.currentTarget && onCloseSettings) {
+              onCloseSettings();
+            }
+          }}
+        >
+          {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+          {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+          <div
+            data-testid="settings-dialog"
+            style={{ width: 'min(920px, calc(100vw - 24px))', height: 'min(620px, calc(100vh - 24px))' }}
+            onClick={(event) => event.stopPropagation()}
+            className={`relative flex flex-col sm:flex-row overflow-hidden rounded-[24px] border shadow-[0_22px_58px_rgba(0,0,0,0.34)] border-white/70 bg-[#F2F2F7] text-[#1C1C1E] dark:border-white/[0.14] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}
+          >
+            {/* 窄屏:Tab 条与关闭键同排,X 在滚动区外侧,Tab 滚动不会穿到它底下;
+                桌面:包裹层 display:contents 不参与布局,维持左栏 + 悬浮 X 不变 */}
+            <div className={`sm:contents max-sm:flex max-sm:items-center max-sm:shrink-0 max-sm:border-b border-black/[0.12] dark:border-white/[0.12]`}>
+            <aside
+              data-testid="settings-nav"
+              className={`w-full sm:w-[clamp(150px,24vw,210px)] shrink-0 max-sm:flex-1 max-sm:min-w-0 overflow-x-auto sm:overflow-x-hidden sm:overflow-y-auto custom-scrollbar max-sm-hide-scrollbar sm:border-r px-3 sm:px-4 py-3 sm:py-7 max-sm:flex max-sm:items-center max-sm:gap-2 border-black/[0.12] dark:border-white/[0.12]`}
+            >
+              <div className={`mb-4 px-1 text-[12px] font-semibold max-sm:hidden text-[#8A8A8E] dark:text-[#8E8E93]`}>{t.uiSettings.common}</div>
+              <div className="space-y-2 max-sm:flex max-sm:space-y-0 max-sm:gap-2">
+                <SectionButton id="general" icon={<Sparkles size={17} />} label={t.uiSettings.general} active={activeSection === 'general'} onSelect={setActiveSection} />
+                <SectionButton id="model" icon={<Cpu size={17} />} label={t.uiSettings.model} active={activeSection === 'model'} onSelect={setActiveSection} />
+                <SectionButton id="search" icon={<Search size={17} />} label={t.uiSettings.search} active={activeSection === 'search'} onSelect={setActiveSection} />
+                {memorySettingsVisible && <SectionButton id="memory" icon={<Database size={17} />} label={t.uiSettings.memory} active={activeSection === 'memory'} onSelect={setActiveSection} />}
+              </div>
+              <div className={`mt-7 mb-4 px-1 text-[12px] font-semibold max-sm:hidden text-[#8A8A8E] dark:text-[#8E8E93]`}>{t.uiSettings.system}</div>
+              <div className="space-y-2 max-sm:flex max-sm:space-y-0 max-sm:gap-2">
+                {canUseSuperPermission && <SectionButton id="permissions" icon={<Wrench size={17} />} label={t.uiSettings.permissions} active={activeSection === 'permissions'} onSelect={setActiveSection} />}
+                {canUpdateApp && <SectionButton id="update" icon={<RefreshCw size={17} />} label={t.uiSettings.update} dot={hasUpdate} active={activeSection === 'update'} onSelect={setActiveSection} />}
+                <SectionButton id="help" icon={<MessageSquare size={17} />} label={t.uiSettings.help} active={activeSection === 'help'} onSelect={setActiveSection} />
+                <SectionButton id="community" icon={<Users size={17} />} label={t.uiSettings.community} active={activeSection === 'community'} onSelect={setActiveSection} />
+              </div>
+            </aside>
+            {onCloseSettings && (
+              <button type="button" data-testid="settings-close" onClick={onCloseSettings} aria-label={settingsCopy.closeSettings} className={`sm:absolute sm:right-5 sm:top-5 z-20 h-9 w-9 shrink-0 max-sm:mr-3 rounded-full flex items-center justify-center bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}>
+                <X size={18} />
+              </button>
+            )}
+            </div>
+            <main data-testid="settings-content" className="w-full flex-1 min-w-0 min-h-0 overflow-y-auto custom-scrollbar px-4 sm:px-6 md:px-8 py-4 sm:py-7">
+              <div className="max-w-[680px]">
+                <div className="mb-5 sm:mb-6">
+                  <h1 className="text-[22px] sm:text-[24px] leading-tight font-semibold tracking-normal">{sectionTitle}</h1>
+                </div>
+                {renderContent()}
+              </div>
+            </main>
+          </div>
+          {canManageModels && editingModel && (
+            <ModelFormModal isDark={activeTheme === 'dark'} t={t} initial={editingModel} bs={bs} models={userModels}
+              onCancel={() => setEditingModel(null)}
+              // 保存/错误提示由弹窗内部控制关闭(保存失败保持打开展示行内错误)。
+              onSave={onSaveModel} />
+          )}
+          {modelDeleteConfirm && <ModelDeleteDialog model={modelDeleteConfirm} settingsCopy={settingsCopy} onDeleteModel={onDeleteModel} setModelDeleteConfirm={setModelDeleteConfirm} />}
+          {searchDeleteConfirm && <SearchDeleteDialog source={searchDeleteConfirm} settingsCopy={settingsCopy} onDeleteSearchProvider={onDeleteSearchProvider} setSearchDeleteConfirm={setSearchDeleteConfirm} setRestartDialog={setRestartDialog} />}
+          {/* Delete confirm: same iOS dialog recipe as ModelDeleteDialog / SearchDeleteDialog (backdrop click does not close) */}
+          {memoryDeleteConfirm && (
+            <MemoryDeleteDialog
+              item={memoryDeleteConfirm}
+              copy={t.uiSettingsView}
+              detailCopy={settingsCopy}
+              onConfirmDelete={confirmDeleteItem}
+              setMemoryDeleteConfirm={setMemoryDeleteConfirm}
+            />
+          )}
+          {searchPickerOpen && (
+            // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the in-modal cancel button
+            // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 px-4 animate-in fade-in duration-150" onClick={() => setSearchPickerOpen(false)}>
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+              {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+              <div onClick={e => e.stopPropagation()}
+                className={`w-[440px] max-w-[90vw] max-h-[76vh] overflow-y-auto custom-scrollbar rounded-[22px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+                <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b border-black/[0.10] dark:border-white/[0.10]`}>
+                  <div>
+                    <h2 className="text-[20px] leading-6 font-semibold">{settingsCopy.addSearch}</h2>
+                    <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{settingsCopy.addSearchDesc}</p>
+                  </div>
+                  <button type="button" onClick={() => setSearchPickerOpen(false)} className={`h-9 w-9 shrink-0 rounded-full flex items-center justify-center bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}><X size={18} /></button>
+                </div>
+                <div className="px-5 py-4">
+                  <div className={`overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`}>
+                    {searchOptions.filter(item => !enabledSearchSet.has(item.key)).map(item => (
+                      <button key={item.key} type="button" onClick={() => {
+                          setSearchPickerOpen(false);
+                          if (item.key === 'bing') {
+                            onAddSearchProvider && onAddSearchProvider(item.key);
+                            setRestartDialog('search');
+                          } else {
+                            setPendingSearchProvider(item.key);
+                            setEditingSearch(item.key);
+                          }
+                        }}
+                        className={`w-full min-h-[56px] px-3.5 py-2.5 flex items-center gap-3 text-left border-b last:border-b-0 border-black/[0.10] hover:bg-black/[0.035] dark:border-white/[0.10] dark:hover:bg-white/[0.06]`}>
+                        <span className="min-w-0 flex-1">
+                          <span className={`block text-[15px] leading-5 font-normal truncate text-[#1C1C1E] dark:text-[#F2F2F7]`}>{item.label}</span>
+                          <span className={`block mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>{item.desc}</span>
+                        </span>
+                        <ChevronDown size={16} className={`-rotate-90 shrink-0 text-[#C7C7CC] dark:text-[#636366]`} />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {editingSearch && <SearchSourceModal provider={editingSearch} isNew={pendingSearchProvider === editingSearch} onClose={() => { setEditingSearch(null); setPendingSearchProvider(null); }} searchOptions={searchOptions} searchHasKey={searchHasKey} settingsCopy={settingsCopy} onAddSearchProvider={onAddSearchProvider} setSearchApiKey={setSearchApiKey} setRestartDialog={setRestartDialog} />}
+          {memoryEditor && (
+            // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the close button at the modal top-right
+            // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 px-4" onClick={() => { if (!memorySaving) setMemoryEditor(null); }}>
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+              {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+              <div onClick={e => e.stopPropagation()} className={`w-full max-w-[500px] rounded-[24px] shadow-2xl bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}>
+                <div className={`px-6 py-4 flex items-start justify-between border-b border-black/[0.12] dark:border-white/[0.12]`}>
+                  <div>
+                    <h2 className="text-[22px] leading-7 font-semibold">{memoryEditor.title}</h2>
+                    <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{memoryEditor.subtitle}</p>
+                  </div>
+                  <button type="button" onClick={() => setMemoryEditor(null)} disabled={memorySaving} className={`h-10 w-10 rounded-full flex items-center justify-center bg-[#E5E5EA] dark:bg-white/[0.08] disabled:opacity-40`}><X size={20} /></button>
+                </div>
+                <div className="px-6 py-5">
+                  {/* biome-ignore lint/a11y/noLabelWithoutControl: the label actually wraps the input control (textarea/input inside a ternary branch); static analysis cannot see it */}
+                  <label className="block">
+                    <span className={`block px-1 mb-2 text-[13px] font-semibold text-[#8A8A8E] dark:text-[#98989D]`}>{memoryEditor.label}</span>
+                    {memoryEditor.multiline ? (
+                      <textarea
+                        value={memoryEditor.value}
+                        onChange={e => setMemoryEditor(prev => ({ ...prev, value: e.target.value }))}
+                        rows={5}
+                        className={`w-full rounded-[16px] px-4 py-3 text-[15px] leading-6 outline-none resize-none bg-[#F2F2F7] text-[#1C1C1E] placeholder:text-[#8A8A8E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7] dark:placeholder:text-[#636366]`}
+                      />
+                    ) : (
+                      <input
+                        data-testid="memory-editor-input"
+                        value={memoryEditor.value}
+                        onChange={e => setMemoryEditor(prev => ({ ...prev, value: e.target.value }))}
+                        className={`w-full rounded-[16px] px-4 py-3 text-[15px] outline-none bg-[#F2F2F7] text-[#1C1C1E] placeholder:text-[#8A8A8E] dark:bg-[#2C2C2E] dark:text-[#F2F2F7] dark:placeholder:text-[#636366]`}
+                      />
+                    )}
+                  </label>
+                  {memoryEditorError && <div data-testid="memory-editor-error" role="alert" aria-live="assertive" className="mt-3 text-[13px] leading-5 text-[#FF3B30]">{settingsCopy.memorySaveFailed}</div>}
+                  <div className="mt-6 flex justify-end gap-2.5">
+                    <button type="button" onClick={() => setMemoryEditor(null)} disabled={memorySaving} className={`h-10 px-4 rounded-full text-[14px] font-semibold bg-[#E5E5EA] dark:bg-[#2C2C2E] disabled:opacity-40`}>{settingsCopy.cancel}</button>
+                    <button type="button" data-testid="memory-editor-save" onClick={saveMemoryEditor} disabled={memorySaving} className="h-10 px-4 rounded-full bg-[#007AFF] text-white text-[14px] font-semibold disabled:opacity-40">{memorySaving ? settingsCopy.saving : settingsCopy.save}</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {restartDialog && <RestartDialog type={restartDialog} settingsCopy={settingsCopy} onSaveSearchConfig={onSaveSearchConfig} onConfirmSearchConfig={onConfirmSearchConfig} setRestartDialog={setRestartDialog} />}
+          {feedbackOpen && (
+            // biome-ignore lint/a11y/useKeyWithClickEvents: background click-to-close layer; keyboard path handled by the in-modal close button
+            // biome-ignore lint/a11y/noStaticElementInteractions: background click-to-close layer; non-interactive container
+            <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 px-4 animate-in fade-in duration-150" onClick={closeFeedback}>
+              {/* biome-ignore lint/a11y/useKeyWithClickEvents: click-bubbling stop layer; keyboard events need no bubbling */}
+              {/* biome-ignore lint/a11y/noStaticElementInteractions: click-bubbling stop layer; non-interactive container */}
+              <div
+                onClick={e => e.stopPropagation()}
+                data-feedback-dialog="true"
+                className={`w-[430px] max-w-[90vw] max-h-[76vh] overflow-y-auto rounded-[22px] shadow-2xl custom-scrollbar bg-white text-[#1C1C1E] dark:bg-[#1C1C1E] dark:text-[#F2F2F7]`}
+              >
+                <div className={`px-5 py-4 flex items-start justify-between gap-4 border-b border-black/[0.10] dark:border-white/[0.10]`}>
+                  <div className="min-w-0">
+                    <h2 className="text-[20px] leading-6 font-semibold">{t.feedbackDialogTitle}</h2>
+                    <p className={`mt-1 text-[13px] leading-[18px] text-[#8A8A8E] dark:text-[#98989D]`}>{t.feedbackDesc}</p>
+                  </div>
+                  <button type="button" onClick={closeFeedback} className={`h-9 w-9 shrink-0 rounded-full flex items-center justify-center bg-[#E5E5EA] text-[#636366] dark:bg-white/[0.08] dark:text-[#C7C7CC]`}><X size={18} /></button>
+                </div>
+                <div className="space-y-4 px-5 py-4">
+                  <section>
+                    <div className={`overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`}>
+                      <div className="min-h-[54px] flex items-center gap-3 px-4 py-2.5">
+                        {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and segmented picker (custom component) are siblings */}
+                        <label className={`shrink-0 text-[14px] leading-5 text-[#1C1C1E] dark:text-[#F2F2F7]`}>{t.feedbackType}</label>
+                        <SSegmented value={feedbackDraft.type} onChange={type => setFeedbackDraft(prev => ({ ...prev, type }))} options={feedbackTypes} />
+                      </div>
+                    </div>
+                  </section>
+                  <section>
+                    <div className={`overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`}>
+                      <div className={`min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b border-black/[0.10] dark:border-white/[0.10]`}>
+                        {/* biome-ignore lint/a11y/noLabelWithoutControl: field label and input are siblings; the label has no htmlFor association, switching to span would deviate from the existing structure */}
+                        <label className="shrink-0 text-[14px] leading-5">{t.feedbackSubject}</label>
+                        <input value={feedbackDraft.title} maxLength={120} onChange={e => setFeedbackDraft(prev => ({ ...prev, title: e.target.value }))}
+                        placeholder={t.feedbackSubjectPh}
+                        className={`min-w-0 flex-1 bg-transparent text-right text-[14px] leading-5 outline-none placeholder:text-[#8A8A8E] dark:placeholder:text-[#636366]`} />
+                      </div>
+                      <div className="px-4 py-3">
+                        <div className="mb-2 text-[14px] leading-5">{t.feedbackBody}</div>
+                        <textarea value={feedbackDraft.description} maxLength={5000} onChange={e => setFeedbackDraft(prev => ({ ...prev, description: e.target.value }))}
+                        placeholder={t.feedbackBodyPh} rows={5}
+                        className={`w-full resize-none bg-transparent text-[14px] leading-6 outline-none placeholder:text-[#8A8A8E] dark:placeholder:text-[#636366]`} />
+                      </div>
+                    </div>
+                  </section>
+                  <section>
+                    <div className={`overflow-hidden rounded-[16px] bg-[#F2F2F7] dark:bg-[#2C2C2E]`}>
+                      <div className={`min-h-[54px] flex items-center gap-3 px-4 py-2.5 border-b ${feedbackDraft.attachments.length > 0 ? ('border-black/[0.10] dark:border-white/[0.10]') : 'border-transparent'}`}>
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[14px] leading-5">{t.feedbackAttachments}</div>
+                          <div className={`mt-0.5 text-[12px] leading-[17px] truncate text-[#8A8A8E] dark:text-[#98989D]`}>
+                            {feedbackDraft.attachments.length > 0 ? `${feedbackDraft.attachments.length}/5` : t.feedbackNoAttachments}
+                          </div>
+                        </div>
+                        {canPickHostFiles && <button type="button" onClick={pickFeedbackAttachments} className="shrink-0 text-[14px] text-[#007AFF]">{t.feedbackAddAttachment}</button>}
+                      </div>
+                      {feedbackDraft.attachments.length > 0 && (
+                        <div>
+                        {feedbackDraft.attachments.map((a, idx) => (
+                          <div key={`${a.path}-${idx}`} className={`min-h-[48px] flex items-center justify-between gap-3 px-4 py-2.5 border-b last:border-b-0 border-black/[0.10] dark:border-white/[0.10]`}>
+                            <span className={`min-w-0 truncate text-[13px] text-[#636366] dark:text-[#C7C7CC]`}>{a.name}</span>
+                            <button type="button" onClick={() => setFeedbackDraft(prev => ({ ...prev, attachments: prev.attachments.filter((_, i) => i !== idx) }))} className="shrink-0 text-[14px] text-[#FF3B30]">{t.cpDelete}</button>
+                          </div>
+                        ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className={`px-1 mt-1.5 text-[12px] leading-4 text-[#8A8A8E] dark:text-[#8E8E93]`}>{t.feedbackAttachmentHint}</div>
+                  </section>
+                  <div className={`px-1 text-[12px] leading-5 text-[#8A8A8E] dark:text-[#98989D]`}>{t.feedbackPrivacy}</div>
+                  {feedbackStatus.message && (
+                    // Failure banner: the success path toasts, closes the window, and resets state directly; the state machine
+                    // has no 'submitted' state carrying a message, so the green banner is unreachable.
+                    <div className={`rounded-[14px] px-4 py-3 text-[14px] bg-[#FF3B30]/15 text-[#FF3B30]`}>
+                      {feedbackStatus.message}
+                    </div>
+                  )}
+                </div>
+                <div className={`flex justify-end gap-2 px-5 py-4 border-t border-black/[0.10] dark:border-white/[0.10]`}>
+                    <button type="button" onClick={closeFeedback} className={`h-10 px-4 rounded-full text-[15px] font-normal transition-colors text-[#007AFF] hover:bg-black/[0.04] dark:text-[#0A84FF] dark:hover:bg-white/[0.06]`}>{t.cancel}</button>
+                    {feedbackStatus.state === 'failed_retryable' && (
+                      <button type="button" onClick={submitFeedbackDraft} className={`h-10 px-4 rounded-full text-[15px] font-normal transition-colors text-[#007AFF] hover:bg-black/[0.04] dark:text-[#0A84FF] dark:hover:bg-white/[0.06]`}>{t.feedbackRetry}</button>
+                    )}
+                    <button type="button" onClick={submitFeedbackDraft} disabled={feedbackStatus.state === 'submitting'} className="h-10 px-5 rounded-full bg-[#007AFF] text-white text-[15px] font-semibold disabled:opacity-35">
+                      {feedbackStatus.state === 'submitting' ? t.feedbackSubmitting : t.feedbackSubmit}
+                    </button>
+                </div>
+              </div>
+            </div>
+          )}
+          {/* Feedback-close confirm layer: sits above the feedback panel (z-[100]), same recipe as MemoryDeleteDialog (backdrop click does not close) */}
+          {feedbackOpen && feedbackCloseConfirm && (
+            <SheetConfirmDialog
+              testid="feedback-close-confirm"
+              confirmTestId="feedback-close-confirm-ok"
+              title={t.feedbackCloseConfirm}
+              confirmLabel={t.feedbackCloseAnyway}
+              cancelLabel={t.cancel}
+              onConfirm={() => { setFeedbackCloseConfirm(false); closeFeedback(); }}
+              onCancel={() => setFeedbackCloseConfirm(false)}
+            />
+          )}
+          {feedbackNotice && (
+            <div className="fixed left-1/2 bottom-8 z-[130] -translate-x-1/2 px-4 py-2.5 rounded-full bg-black/80 text-white text-[14px] shadow-xl backdrop-blur-md">
+              {feedbackNotice}
+            </div>
+          )}
+        </div>
+      );
+    };
+
+
+    // ==========================================
+    // Chat View (Gemini Centered Style + Messages)
+    // ==========================================
+    // 安装工具后新建会话弹出的介绍卡片（纯前端，不发 LLM query，点 chip 才发消息）
+
+export { WebAccessModal, SettingsView };

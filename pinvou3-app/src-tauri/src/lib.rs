@@ -1,0 +1,3818 @@
+//! Pinvou Agent Tauri 后端入口。
+
+mod app;
+mod core;
+pub mod features;
+pub mod platform;
+
+// The Windows unit-test harness imports TaskDialogIndirect. Link the same
+// Common Controls v6 manifest resource as the Tauri executable so the loader
+// can start the harness before any Rust test code runs.
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+#[link(
+    name = "pinvou3_lib_test_resource",
+    kind = "static",
+    modifiers = "+whole-archive"
+)]
+unsafe extern "C" {}
+
+use std::io::Write as _;
+
+use tauri::Manager;
+
+#[cfg(feature = "benchmark-hooks")]
+pub use features::assistant::product_runtime::{agentic_task, headless_bridge};
+
+/// Facade for the automation scheduler foundation, consumed only by the
+/// `scheduled` family of pinvou-cli: definitions and run records live behind
+/// the public API of CodeWhale `codewhale-tui`'s (this crate's
+/// `deepseek-tui` alias) `automation_manager`, while the architecture guard
+/// `rust_cli_reaches_past_pinvou3_lib` requires pinvou-cli to reach the
+/// foundation through pinvou3_lib surfaces only — the same precedent as the
+/// `pub mod` opened on `features::projects` for the CLI. Only the entries
+/// the CLI `scheduled` family actually consumes are re-exported; the GUI
+/// itself keeps using `deepseek_tui::...` directly, not through this facade.
+pub mod automation_foundation {
+    pub use deepseek_tui::automation_manager::{
+        AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedule,
+        AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest,
+    };
+}
+
+/// Facade for the OpenCode gateway session-affinity helpers, consumed by the
+/// `models` family of pinvou-cli: `models test` mirrors the GUI's
+/// `probe_model_connection`, which must attach `x-opencode-session` itself
+/// when the base URL is an OpenCode gateway endpoint (the Go gateway
+/// rejects hand-rolled auxiliary clients without it since 2026-09; see
+/// `core::model_endpoint`). Same precedent as the `automation_foundation`
+/// facade: only the entries the CLI actually consumes are re-exported, and
+/// the GUI keeps calling `crate::core::model_endpoint` directly.
+pub mod model_probe {
+    pub use crate::core::model_endpoint::{
+        error_chain_looks_like_tls, is_anthropic_api_url, is_opencode_gateway_base_url,
+        model_probe_http_code, model_probe_transport_code, models_probe_url,
+        opencode_session_id_for, strip_v1_suffix,
+    };
+}
+
+use crate::app::commands;
+use crate::features::{
+    assistant::{engine_pool::EnginePool, platform::bridge},
+    connectors::connector_cli,
+    files::file_watcher,
+    knowledge,
+    monitor::MonitorState,
+    pet::{pet_window, selected_pet},
+    remote_control::RemoteControlManager,
+    remote_knowledge::RemoteKnowledgeService,
+    scheduled::tasks as scheduled_tasks,
+    sessions::SessionStore,
+};
+use crate::platform::{notifications, startup};
+
+const RELEASE_ENV_DEFAULTS: &[(&str, &str)] = &[
+    // —— vLLM 后端：BASE_URL/MODEL/API_KEY 已在 bridge/mod.rs 有默认常量，
+    // 这里只补 run-dev.sh 额外注入但 Rust 没默认的 ——
+    // ⚠️ 不再注入 DEEPSEEK_PROVIDER：它会被 bridge.provider() 当成 env 覆盖
+    //   （env 优先级高于 preset），在「添加模型」多 provider 方案下钉死路由——
+    //   切到 kimi/openai/qwen 等仍被当 vllm，且设置页误报「环境变量已锁定 provider」。
+    //   provider 现由 active_model.preset 决定（LocalVllm→vllm 默认仍成立）。
+    ("DEEPSEEK_ALLOW_INSECURE_HTTP", "1"),
+    ("DEEPSEEK_FORCE_HTTP1", "1"),
+    // 不再注入 DEEPSEEK_MAX_OUTPUT_TOKENS：它会把所有模型（含云端）的输出上限
+    // 钉死在 24576。底座对 ≥500K 窗口模型默认 64K（API_MAX_OUTPUT_TOKENS），
+    // Cloud models should land on the base fallback; local models and custom
+    // endpoints share the operator window tiers (route_limits_for_model),
+    // equally independent of this env.
+    // 与 CodeWhale 的 stream_chunk_timeout 默认值保持一致。
+    ("DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS", "300"),
+    // SSE 首响应头超时(open timeout):底座只认 env,默认 45s 是为云端调的。
+    // 本地统一内存设备大上下文 SubAgent 请求首 token TTFT 偶发 >45s → 误杀子 agent。
+    // 280s 与
+    // ~/.deepseek config 的 subagent api_timeout=300 对齐(步级超时须更大)。
+    ("DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS", "280"),
+];
+
+/// §6 keychain snapshot composition (review #484 round-13 M4 extracted & pinned;
+/// round-14 fixed a doc misplacement): code/ACP sessions read the session-agents
+/// record (authoritative); an empty record falls back to the pure-binding sidecar;
+/// both empty = single root (the base normalizes by cwd). Previously an inline
+/// closure — audit mutations (deleting the agents-first branch) kept all host tests
+/// green; promoting it to a free function pins the delivery priority by behavior tests.
+///
+/// Round-19 minor 6 (re-check at delivery): intake soft-keeps non-existent or
+/// non-directory extra roots — stored by lexical spelling (may be rebuilt later).
+/// If such a spelling later materializes as a symlink to `/` (or an ancestor of
+/// the primary root), per-turn canonicalization would admit the widened target.
+/// The composition point re-checks two hard invariants on **normalizable** extra
+/// roots (filesystem root / ancestor of the primary root, the same judgment as
+/// `validate_workspace_roots`); a hit is dropped from the delivery set and
+/// logged — fail-safe toward narrowing, the session continues; spellings still
+/// non-existent / non-normalizable keep the soft-keep semantics.
+///
+/// Round-21 M1 (ancestor exemption): align's §9.7 semantics swaps **all** of the
+/// project's roots into the keychain — a project may by design override a member
+/// session's cwd, so the `[cwd, ancestor]` shape is deliberately persisted (pin:
+/// `compose_delivers_a_project_backed_ancestor_root`, the persisted-shape
+/// complement of `align_persists_a_project_ancestor_root_by_design`). The
+/// "ancestor of the primary root" re-check must therefore distinguish provenance:
+/// an ancestor **matching a fold key of a root the owning project has registered
+/// right now** (the same authority align itself consults, `resolve_session_project`) is
+/// backed by the project's existence and delivered as usual; an unbacked ancestor
+/// (missed by the caller's intake, project deleted/re-rooted) is still dropped. A
+/// filesystem root is never exempt. Backing keys resolve lazily on the first
+/// ancestor hit; the delivery hot path does no project-store reads.
+pub(crate) fn compose_workspace_roots(
+    agents: &crate::features::codex_acp::SessionAgentStore,
+    bindings: &crate::features::sessions::SessionStore,
+    projects: &crate::features::projects::ProjectStore,
+    session_id: &str,
+) -> Vec<std::path::PathBuf> {
+    // Round-40 M6: both fields from ONE sidecar read per store — the old
+    // shape stat'd/opened/parsed the same file twice per session per
+    // refresh (inline on the async runtime).
+    let (agent_roots, agent_provenance) = agents.session_workspace_keychain(session_id);
+    let (mut recorded, explicit_provenance) = if !agent_roots.is_empty() {
+        (agent_roots, agent_provenance)
+    } else {
+        bindings.session_workspace_keychain(session_id)
+    };
+    // Round-32 minor 4: a degenerate primary (relative/empty — only a
+    // hand-edited artifact) can never prefix-match, so the re-check loop
+    // below would silently no-op; the foundation admits nothing for that
+    // shape, and compose mirrors it by returning empty rather than
+    // delivering unverifiable spellings.
+    if recorded
+        .first()
+        .is_some_and(|primary| primary.as_os_str().is_empty() || !primary.is_absolute())
+    {
+        return Vec::new();
+    }
+    if recorded.len() < 2 {
+        return recorded;
+    }
+    // Round-31 minor 10: a hand-edited over-cap record would display more
+    // roots than the engine delivers (the inverse of the display ==
+    // engine-effective invariant) and drive an unbounded canonicalize+stat
+    // loop per spawn/list refresh — cap at the foundation's ceiling here,
+    // matching its primary+64 normalize semantics.
+    if recorded.len() > codewhale_core::MAX_WORKSPACE_ROOTS + 1 {
+        recorded.truncate(codewhale_core::MAX_WORKSPACE_ROOTS + 1);
+    }
+    use crate::features::sessions::{is_filesystem_root, lexical_normalize};
+    let identity_key = |path: &std::path::Path| {
+        crate::platform::os::filesystem_path_identity_key(&path.to_string_lossy())
+    };
+    let primary_lexical = lexical_normalize(&recorded[0]);
+    // Round-37 M7: canonical primary for the widening judgment (same fix
+    // as the validator — the two must not drift).
+    let primary_comparison =
+        crate::features::sessions::primary_comparison_spelling(&primary_lexical);
+    // Round-21 M1: lazily-resolved fold keys of the owning project's
+    // registered roots — the ancestor-exemption authority (see the doc
+    // comment above). `None` = not yet resolved; an empty vec = resolved
+    // with no backing (every subsequent ancestor is dropped).
+    // Round-40 (zhuowp P2): the EXPLICIT provenance keys ride alongside —
+    // an ancestor align itself granted stays delivered after the backing
+    // project mutates (folder removed / project deleted / session moved
+    // out); the grant's authority is its recorded provenance, not mutable
+    // project state. Symlink widening is still rejected: a provenance key
+    // matches the canonicalized recorded spelling only.
+    let provenance_keys: Vec<String> = explicit_provenance
+        .iter()
+        .map(|root| identity_key(root))
+        .collect();
+    let mut backing_keys: Option<Vec<String>> = None;
+    let mut delivered = Vec::with_capacity(recorded.len());
+    delivered.push(recorded[0].clone());
+    for root in recorded.iter().skip(1) {
+        let Ok(canonical) = root.canonicalize() else {
+            delivered.push(root.clone());
+            continue;
+        };
+        if !canonical.is_dir() {
+            delivered.push(root.clone());
+            continue;
+        }
+        let canonical = std::path::PathBuf::from(crate::platform::os::platform_compat_path(
+            &canonical.to_string_lossy(),
+        ));
+        let canonical_lexical = lexical_normalize(&canonical);
+        if is_filesystem_root(&canonical_lexical) {
+            // Log hygiene (CodeQL cleartext-logging, same convention as the
+            // rebind lane): log only the failure category, never user paths.
+            eprintln!(
+                "[sessions] a soft-kept workspace root resolved to a widening target at delivery; dropped"
+            );
+            continue;
+        }
+        let widens_to_ancestor = primary_lexical != canonical_lexical
+            && primary_comparison.starts_with(&canonical_lexical);
+        if widens_to_ancestor {
+            let backed_by_project = {
+                let keys = backing_keys.get_or_insert_with(|| {
+                    projects
+                        .resolve_session_project(session_id, &recorded[0])
+                        .map(|project| {
+                            project
+                                .roots
+                                .iter()
+                                .map(|root| identity_key(root))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                });
+                keys.iter()
+                    .any(|key| *key == identity_key(&canonical_lexical))
+            };
+            let explicitly_granted = provenance_keys
+                .iter()
+                .any(|key| *key == identity_key(&canonical_lexical));
+            if !backed_by_project && !explicitly_granted {
+                // Same log-hygiene convention as the fs-root drop above.
+                eprintln!(
+                    "[sessions] a soft-kept workspace root resolved to a widening target at delivery; dropped"
+                );
+                continue;
+            }
+            // Round-21 M1: an ancestor root that matches the owning
+            // project's registered root is delivered — align persisted it
+            // deliberately (§9.7) and the chip/copy already promised it.
+            // Round-40 (zhuowp P2): an ancestor align itself granted is
+            // delivered on its recorded provenance for the same reason —
+            // the UI promised the snapshot keeps it.
+        }
+        delivered.push(root.clone());
+    }
+    delivered
+}
+
+/// 为 release 安装包（.deb 双击启动场景）注入 run-dev.sh 里集中处理的运行时 env。
+/// dev 启动走 run-dev.sh 已经 export 过的不会被覆盖（var_os().is_none() 守门）。
+fn ensure_release_env() {
+    use std::env;
+    crate::platform::ui_cache::configure_runtime_environment();
+    for (k, v) in RELEASE_ENV_DEFAULTS {
+        if env::var_os(k).is_none() {
+            // SAFETY: ensure_release_env is only called by the first line of
+            // run() and by the headless benchmark host startup sequence
+            // (headless_bridge.rs run_headless_host, before the tokio runtime
+            // is built); at both call sites the process has only the main
+            // thread — no concurrent env readers (audit conclusion: the first
+            // thread spawn is the 16MiB async runtime built later in run(),
+            // after this function); calls inside tests run under ENV_LOCK
+            // serialization.
+            unsafe { env::set_var(k, v) };
+        }
+    }
+
+    {
+        if let Some(old) = env::var_os("PATH") {
+            let mut dirs = Vec::new();
+            // Versioned CLI asset dirs (one per lock-pinned artifact) must come
+            // BEFORE the legacy-layout dir: the pinned copy is hash-verified and
+            // is the authoritative runtime. With the legacy dir first, a stale
+            // old-version binary left there shadows the upgraded CLI for every
+            // PATH-based consumer (observed: a leftover wecom-cli 0.1.9 kept
+            // running after the upgrade to 1.2.1). The legacy dir itself stays
+            // on PATH (after the versioned dirs): binaries not yet migrated,
+            // or whose pinned version is not installed, still resolve by name
+            // (it is their only local runtime).
+            for (name, pin) in crate::platform::connector_lock::all_artifact_pins() {
+                dirs.push(crate::platform::paths::assets_cli_dir(&name, &pin.version));
+            }
+            if let Some(connector_bin) = crate::platform::paths::managed_connector_bin_dir() {
+                dirs.push(connector_bin);
+            }
+            // npm reads both spellings (NPM_CONFIG_PREFIX and
+            // npm_config_prefix); uppercase wins when both are set — the
+            // same two-spelling read posix.rs's vendor-CLI scan uses.
+            if let Ok(prefix) =
+                env::var("NPM_CONFIG_PREFIX").or_else(|_| env::var("npm_config_prefix"))
+            {
+                dirs.push(std::path::Path::new(&prefix).join("bin"));
+            }
+            if let Some(home) = env::var_os("HOME") {
+                let home = std::path::Path::new(&home);
+                dirs.push(home.join(".npm-global").join("bin"));
+                dirs.push(home.join(".local").join("bin"));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                dirs.push(std::path::PathBuf::from("/opt/homebrew/bin"));
+                dirs.push(std::path::PathBuf::from("/usr/local/bin"));
+                dirs.push(std::path::PathBuf::from(
+                    "/Applications/LibreOffice.app/Contents/MacOS",
+                ));
+            }
+            dirs.extend(env::split_paths(&old));
+            if let Ok(joined) = env::join_paths(dirs) {
+                // SAFETY: same as above; run() single-threaded startup, no concurrent env readers.
+                unsafe { env::set_var("PATH", joined) };
+            }
+        }
+    }
+}
+
+/// 进程级选定并安装 rustls 的 CryptoProvider(aws-lc-rs)。
+///
+/// 幂等:`install_default` 返回 `Err` 表示已装过(本次或之前的 reqwest/tungstenite 调用),
+/// 用 `drop` 吞掉即可,不会二次注册。装在 `run()` 最前,保证后续 reqwest / relay 的
+/// `connect_async` 都用已确定的 provider,避开「aws-lc-rs + ring 同时启用时无参
+/// ClientConfig::builder().expect() panic」(见 Cargo.toml rustls 注释)。
+fn install_rustls_provider() {
+    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+}
+
+const SESSION_BROWSER_CLEANUP_INITIAL_RETRY: std::time::Duration =
+    std::time::Duration::from_millis(250);
+const SESSION_BROWSER_CLEANUP_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+const SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY: usize = 8;
+const SESSION_BROWSER_CLEANUP_ATTEMPT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+#[derive(Debug)]
+struct SessionBrowserCleanupSchedule {
+    ready_at: std::time::Instant,
+    retry_delay: std::time::Duration,
+    failed_attempts: u64,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct SessionBrowserCleanupClaim {
+    session_id: String,
+    retry_delay: std::time::Duration,
+    failed_attempts: u64,
+}
+
+#[derive(Default)]
+struct SessionBrowserCleanupQueueState {
+    pending: std::collections::HashMap<String, SessionBrowserCleanupSchedule>,
+    in_flight: std::collections::HashSet<String>,
+    rerun_requested: std::collections::HashSet<String>,
+    next_sequence: u64,
+}
+
+#[derive(Default)]
+struct SessionBrowserCleanupQueue {
+    state: std::sync::Mutex<SessionBrowserCleanupQueueState>,
+    notify: tokio::sync::Notify,
+}
+
+impl SessionBrowserCleanupQueue {
+    fn enqueue(&self, session_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.pending.contains_key(session_id) {
+            return;
+        }
+        if state.in_flight.contains(session_id) {
+            // A durable deletion notification can race with a successful
+            // cleanup attempt just before it clears the browser deny marker.
+            // Preserve one rerun without creating another concurrent attempt.
+            state.rerun_requested.insert(session_id.to_string());
+            return;
+        }
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let inserted = state
+            .pending
+            .insert(
+                session_id.to_string(),
+                SessionBrowserCleanupSchedule {
+                    ready_at: std::time::Instant::now(),
+                    retry_delay: SESSION_BROWSER_CLEANUP_INITIAL_RETRY,
+                    failed_attempts: 0,
+                    sequence,
+                },
+            )
+            .is_none();
+        drop(state);
+        if inserted {
+            self.notify.notify_one();
+        }
+    }
+
+    fn claim_ready_up_to(
+        &self,
+        now: std::time::Instant,
+        limit: usize,
+    ) -> Vec<SessionBrowserCleanupClaim> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut claimed = Vec::new();
+        while claimed.len() < limit {
+            // Prefer never-attempted obligations over retries, then preserve
+            // FIFO order within the same retry generation. A continuously
+            // failing task therefore cannot starve a later unique deletion.
+            let selected = state
+                .pending
+                .iter()
+                .filter(|(_, schedule)| schedule.ready_at <= now)
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.failed_attempts
+                        .cmp(&right.failed_attempts)
+                        .then_with(|| left.ready_at.cmp(&right.ready_at))
+                        .then_with(|| left.sequence.cmp(&right.sequence))
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(session_id, _)| session_id.clone());
+            let Some(session_id) = selected else {
+                break;
+            };
+            // session_id was selected from state.pending above under the same
+            // lock, so the entry must still be present.
+            #[allow(clippy::expect_used)]
+            let schedule = state
+                .pending
+                .remove(&session_id)
+                .expect("selected cleanup schedule must remain pending");
+            let inserted = state.in_flight.insert(session_id.clone());
+            debug_assert!(inserted, "cleanup queue must claim each id only once");
+            claimed.push(SessionBrowserCleanupClaim {
+                session_id,
+                retry_delay: schedule.retry_delay,
+                failed_attempts: schedule.failed_attempts,
+            });
+        }
+        claimed
+    }
+
+    fn complete_attempt(
+        &self,
+        claim: SessionBrowserCleanupClaim,
+        succeeded: bool,
+        now: std::time::Instant,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let removed = state.in_flight.remove(&claim.session_id);
+        debug_assert!(removed, "completed cleanup must own an active claim");
+        let rerun_requested = state.rerun_requested.remove(&claim.session_id);
+        if succeeded && !rerun_requested {
+            return;
+        }
+
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let schedule = if succeeded {
+            SessionBrowserCleanupSchedule {
+                ready_at: now,
+                retry_delay: SESSION_BROWSER_CLEANUP_INITIAL_RETRY,
+                failed_attempts: 0,
+                sequence,
+            }
+        } else {
+            SessionBrowserCleanupSchedule {
+                ready_at: now + claim.retry_delay,
+                retry_delay: next_session_browser_cleanup_retry(claim.retry_delay),
+                failed_attempts: claim.failed_attempts.saturating_add(1),
+                sequence,
+            }
+        };
+        state.pending.insert(claim.session_id, schedule);
+    }
+
+    fn next_ready_delay(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .values()
+            .map(|schedule| schedule.ready_at.saturating_duration_since(now))
+            .min()
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .len()
+    }
+
+    #[cfg(test)]
+    fn in_flight_len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight
+            .len()
+    }
+}
+
+fn next_session_browser_cleanup_retry(current: std::time::Duration) -> std::time::Duration {
+    current
+        .saturating_mul(2)
+        .min(SESSION_BROWSER_CLEANUP_MAX_RETRY)
+}
+
+fn session_browser_cleanup_failure_kind(error: &str) -> &'static str {
+    if error == "browser manager is unavailable" {
+        "browser-manager-unavailable"
+    } else if error.starts_with("browser cleanup attempt timed out") {
+        "timeout"
+    } else {
+        "cleanup-error"
+    }
+}
+
+async fn cleanup_deleted_session_browser_once(
+    app: tauri::AppHandle,
+    claim: SessionBrowserCleanupClaim,
+) -> (SessionBrowserCleanupClaim, bool) {
+    let result = match tokio::time::timeout(SESSION_BROWSER_CLEANUP_ATTEMPT_TIMEOUT, async {
+        match app.try_state::<features::browser::BrowserManager>() {
+            Some(browser) => browser.delete_for_session(&claim.session_id).await,
+            None => Err("browser manager is unavailable".to_string()),
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "browser cleanup attempt timed out after {} seconds",
+            SESSION_BROWSER_CLEANUP_ATTEMPT_TIMEOUT.as_secs()
+        )),
+    };
+    if let Err(error) = &result {
+        let attempt = claim.failed_attempts.saturating_add(1);
+        let failure_kind = session_browser_cleanup_failure_kind(error);
+        eprintln!(
+            "[sessions] browser cleanup failed for a deleted session \
+             (reason {failure_kind}, attempt {attempt}); retrying in {} ms",
+            claim.retry_delay.as_millis()
+        );
+    }
+    (claim, result.is_ok())
+}
+
+async fn reconcile_orphaned_session_browser_files_until_success(
+    app: tauri::AppHandle,
+    store: SessionStore,
+) {
+    let mut retry_delay = SESSION_BROWSER_CLEANUP_INITIAL_RETRY;
+    let mut attempt = 1_u64;
+
+    loop {
+        let result = store
+            .list()
+            .and_then(|mut sessions| {
+                sessions.extend(store.list_scheduled()?);
+                Ok(sessions)
+            })
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| format!("failed to read all existing task records: {error}"))
+            .and_then(|active_session_ids| {
+                app.try_state::<features::browser::BrowserManager>()
+                    .ok_or_else(|| "browser manager is unavailable".to_string())?
+                    .reconcile_session_files(&active_session_ids)
+            });
+
+        match result {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!(
+                    "[sessions] startup browser orphan reconciliation failed \
+                     (attempt {attempt}); retrying in {} ms: {error}",
+                    retry_delay.as_millis()
+                );
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = next_session_browser_cleanup_retry(retry_delay);
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// Wire the feature-neutral SessionStore lifecycle seam to browser teardown at
+/// the application composition root. Sessions never depend on browser code;
+/// other per-session resources can subscribe to the same seam later.
+///
+/// There is deliberately no process-lifetime deletion replay. Store boot can
+/// prune sessions before this hook is registered, but no WebView from a prior
+/// process survives; `reconcile_orphaned_session_browser_files_until_success`
+/// scans and retries removal of their durable browser artifacts immediately
+/// afterwards.
+fn spawn_deleted_session_browser_cleanup(app: tauri::AppHandle, store: SessionStore) {
+    let deletion_queue = std::sync::Arc::new(SessionBrowserCleanupQueue::default());
+    let app_for_hook = app.clone();
+    let queue_for_hook = deletion_queue.clone();
+    store.register_session_deleted_hook(std::sync::Arc::new(move |session_id: &str| {
+        // Deny late wrapper work synchronously at the durable deletion commit
+        // point. WebView/file teardown is fallible and stays in the async retry
+        // worker below so the session deletion path never blocks on browser I/O.
+        if let Some(browser) = app_for_hook.try_state::<features::browser::BrowserManager>() {
+            browser.mark_session_deleted(session_id);
+        }
+        // The obligation map coalesces repeated idempotent notifications.
+        // Notify retains a permit across the claim-to-wait race, so no durable
+        // cleanup request can be lost.
+        queue_for_hook.enqueue(session_id);
+    }));
+
+    tauri::async_runtime::spawn(async move {
+        use futures_util::{StreamExt, stream::FuturesUnordered};
+
+        let mut cleanups = FuturesUnordered::new();
+
+        loop {
+            let available = SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY.saturating_sub(cleanups.len());
+            for claim in deletion_queue.claim_ready_up_to(std::time::Instant::now(), available) {
+                cleanups.push(cleanup_deleted_session_browser_once(app.clone(), claim));
+            }
+
+            // At capacity, notifications cannot open another slot. Await one
+            // bounded attempt directly so a hot producer cannot starve
+            // completions by repeatedly waking the select branch.
+            if cleanups.len() >= SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY {
+                if let Some((claim, succeeded)) = cleanups.next().await {
+                    deletion_queue.complete_attempt(claim, succeeded, std::time::Instant::now());
+                }
+                continue;
+            }
+
+            let retry_delay = deletion_queue.next_ready_delay(std::time::Instant::now());
+            let retry_ready = async move {
+                match retry_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(retry_ready);
+            tokio::select! {
+                _ = deletion_queue.notify.notified() => {}
+                _ = &mut retry_ready => {}
+                Some((claim, succeeded)) = cleanups.next(), if !cleanups.is_empty() => {
+                    deletion_queue.complete_attempt(
+                        claim,
+                        succeeded,
+                        std::time::Instant::now(),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Funnel for process env writes inside the single-threaded startup window
+/// (besides the release defaults of `ensure_release_env`).
+///
+/// Since edition 2024, `set_var` is unsafe and requires no concurrent env
+/// readers or writers. This function is called only from the head region of
+/// `run()` and from the headless benchmark host startup sequence
+/// (`headless_bridge.rs run_headless_host`, before the tokio runtime is
+/// built); at both call sites the process has only the main thread (the same
+/// proven window as `ensure_release_env`). From the multi-threaded phase (the
+/// Tauri setup onward) process env writes are forbidden entirely: MCP secrets
+/// travel via keyring + in-process registry through the foundation resolver
+/// hook, so the runtime no longer needs any env writes.
+///
+/// What it writes:
+/// - `PINVOU3_SESSION_ARTIFACTS`: the binary artifacts landing dir for MCP
+///   stdio subprocesses such as PPT / official-document tools (fixed to
+///   `sessions/default/artifacts/`; a stdio server cannot reliably perceive
+///   the current GUI session — concrete ownership is decided by tool events
+///   carrying `session_id` and by frontend persistence).
+/// - OS-specific startup writes (`platform::os::startup_platform_env`): on
+///   Windows, configure the ONNX Runtime dylib path and prepend LibreOffice
+///   to `PATH`; no-op on other platforms.
+pub(crate) fn startup_process_env() {
+    // SAFETY: single-threaded startup window (see the function docs); no
+    // concurrent env readers.
+    unsafe {
+        std::env::set_var(
+            "PINVOU3_SESSION_ARTIFACTS",
+            crate::platform::paths::default_session_artifacts_dir(),
+        )
+    };
+    crate::platform::os::startup_platform_env();
+}
+
+/// Verdict for one navigation candidate on the main webview.
+enum MainNavigationVerdict {
+    /// Allow the navigation. `initial_origin` carries the origin to record as
+    /// the baseline when the baseline has not been established yet.
+    Allow { initial_origin: Option<String> },
+    /// Deny the navigation. `detail` carries the startup diagnostic to log
+    /// (`None` for the silent case: an embedded-document URL arriving before
+    /// any main origin exists must not claim the baseline slot).
+    Block { detail: Option<String> },
+}
+
+/// Pure decision for one navigation on the main webview; side effects (baseline
+/// write, startup marks) stay with the `on_navigation` closure so this remains
+/// unit-testable on every platform.
+///
+/// `iframe[srcdoc]` — the carrier of the HTML artifact preview — surfaces as an
+/// `about:srcdoc` navigation of the host webview on WebKitGTK and macOS
+/// WKWebView (WebView2 raises main-frame navigation events only, so the guard
+/// never sees iframe loads on Windows). PR #116 allowed those two internal
+/// URLs on Linux only, leaving the artifact preview permanently black on
+/// macOS: the placeholder background rendered while the iframe navigation was
+/// denied. This decision keeps the guard's original intent — only the two
+/// browser-internal empty-document URLs are exempt after the main origin is
+/// established; any external origin (main frame or iframe) still goes through
+/// the initial-origin baseline — and applies it platform-wide.
+fn decide_main_navigation(url: &tauri::Url, initial_origin: Option<&str>) -> MainNavigationVerdict {
+    if matches!(url.as_str(), "about:blank" | "about:srcdoc") {
+        return match initial_origin {
+            Some(_) => MainNavigationVerdict::Allow {
+                initial_origin: None,
+            },
+            None => MainNavigationVerdict::Block { detail: None },
+        };
+    }
+    let scheme = url.scheme();
+    let host = url.host_str().unwrap_or_default();
+    let port = url
+        .port_or_known_default()
+        .map_or_else(|| "-".to_string(), |port| port.to_string());
+    let origin = format!("{scheme}://{host}:{port}");
+    match initial_origin {
+        None => MainNavigationVerdict::Allow {
+            initial_origin: Some(origin),
+        },
+        Some(allowed) if allowed == &origin => MainNavigationVerdict::Allow {
+            initial_origin: None,
+        },
+        Some(_) => MainNavigationVerdict::Block {
+            detail: Some(format!("scheme={scheme} host={host} port={port}")),
+        },
+    }
+}
+
+/// Shared asynchronous child-process harvesting before exit and restart. Managed
+/// state is not guaranteed to be dropped (kill_on_drop runs only when Child drops),
+/// so explicitly stop ACP/connector children to prevent orphans. Each closure is
+/// idempotent; even shutdown(), the highest timeout risk, only sends a oneshot and
+/// kills without a long wait.
+pub(crate) async fn harvest_child_processes(app: &tauri::AppHandle) {
+    if let Some(acp_pool) = app.try_state::<crate::features::codex_acp::AcpPool>() {
+        acp_pool.shutdown_all().await;
+    }
+    if let Some(connector_conn) =
+        app.try_state::<crate::features::connectors::connector_cli::ConnectorConn>()
+    {
+        connector_conn.kill_all_pids();
+    }
+    // computer_use arm: the linux virtual display stack (Xvfb/WM trees) is NOT
+    // kill_on_drop-wired, so a clean exit or restart would otherwise orphan it
+    // until the next startup sweep. Kill pidfile-recorded trees from THIS
+    // process now. Peer-instance safety: the single-instance plugin
+    // (tauri-plugin-single-instance) makes a concurrent second instance
+    // impossible, and the sweep only ever reaches pidfiles under THIS home's
+    // virtual-display root whose recorded identity (role + kernel start time)
+    // verifies — the worst a bypassed single-instance edge could hit is a
+    // same-user peer's genuine, correctly targeted trees (an availability
+    // loss, never a wrong kill). Sweep failures are logged inside the sweep
+    // and never block shutdown (non-fatal by contract).
+    features::computer_use::sweep_virtual_display_orphans();
+    // In-memory sessions: tool Drop is not guaranteed on the exit path, and
+    // process death does NOT undo a synthetic press already posted into a
+    // target app (a CGEventPostToPid press leaves the app button-held after
+    // our process is gone). Fire the same emergency release the stop paths
+    // use (releases all three buttons, closes persistent grants) and wait a
+    // bounded, completion-driven grace: healthy sub-second releases return
+    // early, a wedged cleanup gives up at the budget (R13 — the flat 2 s
+    // sleep paid the full budget even when every release finished in
+    // milliseconds). The grace is paid ONLY when a session is actually
+    // registered: the shared state is managed unconditionally, so an
+    // ungated wait taxed every quit and restart of the app — including
+    // users who never enabled computer use — with zero sessions live (R11
+    // minor). The blocking wait rides spawn_blocking so the harvest never
+    // parks a tokio worker; the exit path still awaits it via block_on.
+    // A worker wedged mid-action cannot be waited out here (the control
+    // request's budget is minutes) — that residual strand stays, disclosed
+    // by the macOS target note; the Linux stack evaporates with Xvfb and
+    // the Windows job's kill-on-close fires at process death regardless.
+    const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+    if let Some(shared) =
+        app.try_state::<std::sync::Arc<features::computer_use::ComputerUseShared>>()
+    {
+        if shared.backends.has_live_sessions() {
+            let shared = std::sync::Arc::clone(&shared);
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                shared
+                    .backends
+                    .emergency_release_all_and_wait(RELEASE_GRACE);
+            })
+            .await;
+        }
+    }
+}
+
+/// Every `app.restart()` call must pass through this funnel. The browser first saves
+/// restore manifests and destroys native surfaces, then asynchronous children are
+/// harvested. The caller invokes the non-returning restart immediately afterward.
+pub(crate) async fn prepare_app_restart(app: &tauri::AppHandle) {
+    features::system_tray::before_restart(app).await;
+    if let Some(browser) = app.try_state::<features::browser::BrowserManager>() {
+        browser.shutdown_before_restart().await;
+    }
+    harvest_child_processes(app).await;
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// 全 crate 唯一的 `generate_context!()` 展开点。
+///
+/// macOS 的 embed_plist 用 `#[no_mangle] static _EMBED_INFO_PLIST` 让重复
+/// 展开成为链接错误;GUI(`run`)与 headless 评测宿主(benchmark-hooks)必须
+/// 共用这里的单一 Context 构造,不得在别处再展开该宏。
+// The generate_context! macro expansion internally calls process::exit (a
+// missing context means the app cannot start); this is Tauri macro behavior,
+// not a code path of this repo, so it is exempted.
+#[allow(clippy::exit)]
+pub fn build_tauri_context() -> tauri::Context {
+    tauri::generate_context!()
+}
+
+/// 空转探针插件：只为在 Tauri 初始化到该位置时打一条 startup 计时点，把原本
+/// 不透明的插件初始化时间段暴露出来（主窗口在 setup hook 之前创建，见 run()
+/// 内首个 `.plugin(...)` 处的注释）。计时点名由插件名推导：
+/// `startup-probe-<x>` → `tauri:plugin_<x>_ready`（`-` 转 `_`）。
+fn startup_probe_plugin(name: &'static str) -> tauri::plugin::TauriPlugin<tauri::Wry> {
+    let mark = format!(
+        "tauri:plugin_{}_ready",
+        name.trim_start_matches("startup-probe-").replace('-', "_")
+    );
+    tauri::plugin::Builder::<tauri::Wry, ()>::new(name)
+        .setup(move |_app, _api| {
+            startup::mark(&mark);
+            Ok(())
+        })
+        .build()
+}
+
+/// The startup-timeline signature of a failed knowledge init. The state is
+/// never managed on failure and nothing retries it in-process (whether the
+/// store was refused as too-new or the open failed transiently), so the
+/// `:error` line carrying the cause is the failure's only durable mark —
+/// stderr alone is lost on windowed Windows builds, and
+/// `knowledge_service:done` is reserved for a successful init so the
+/// timeline cannot read a dead service as "finished fine".
+fn mark_knowledge_service_failed(error: impl std::fmt::Display) {
+    let detail = format!("{error:#}");
+    crate::platform::startup::mark_with_detail("rust", "knowledge_service:error", &detail);
+    eprintln!("[pinvou3-app] knowledge service init failed: {detail}");
+}
+
+/// Best-effort removal of a purged session's entry from the codex_acp agents
+/// index (`session-agents.json`). Retention evictions and scheduled cleanups
+/// delete the saved-session record and its directory, but that index is owned
+/// by `features::codex_acp` (the sessions purge cannot touch it), so a stale
+/// entry used to outlive its owner and feed the boot-time sidecar backfill —
+/// resurrecting ghost `sessions/<id>/` directories on every startup. The
+/// user-delete path already removes the entry in the `delete_session` command;
+/// this leg covers the GUI purge paths that have no app handle at hook time
+/// (runtime retention evictions, scheduled-run cleanups) via the
+/// `SessionPurgedHook` (same dependency inversion as the other hook legs —
+/// sessions must not depend on codex_acp in reverse). The windowless host
+/// registers no purge hooks; dead code-mode entries its evictions leave
+/// behind are converged by the boot scan's prune at the next GUI start
+/// (dead ACP-mode entries are inert and intentionally left in place).
+/// Failure tolerance matches the other purge legs: a missing entry is fine,
+/// and any error is logged without aborting or rolling back the eviction
+/// itself.
+pub(crate) fn remove_agents_index_entry(
+    agents: &crate::features::codex_acp::SessionAgentStore,
+    session_id: &str,
+) {
+    if let Err(error) = agents.remove(session_id) {
+        eprintln!("[pinvou3-app] remove session-agents.json entry after purge failed: {error:#}");
+    }
+}
+
+pub fn run() {
+    // WebKitGTK reads its RemoteInspector endpoint while constructing the first
+    // WebContext, so the browser feature must reserve it before Tauri starts.
+    features::browser::prepare_process_environment();
+    // 必须最先执行:进程级选定 rustls CryptoProvider。
+    // 见 Cargo.toml 的 rustls/reqwest 注释——reqwest 0.13 自带 aws-lc-rs 但只「借用」
+    // provider,不写入默认槽;而 oauth2(经 reqwest 0.12)把 rustls 0.23 的 `ring` feature
+    // 也拉进图,使 rustls 同时启用 aws-lc-rs + ring 两个 provider。tokio-tungstenite 0.30
+    // 的 TLS 连接器走无参 ClientConfig::builder(),两 provider 共存时会 panic。此处选定
+    // aws-lc-rs(FIPS 可候选、性能优于 ring),在任何 TLS 连接之前装好。
+    install_rustls_provider();
+    ensure_release_env();
+    startup_process_env();
+    // GUI 宿主同样必须给 tokio worker 大栈:底座 engine 一次 dispatch 在 debug
+    // 构建下实测栈高水位 2.25–2.5MiB(见 CodeWhale/crates/tui/src/lib.rs 的
+    // headless 同款修复说明),tokio 默认 2MiB worker 栈会被顶穿——栈溢出不是
+    // panic,catch_unwind 看不到,进程直接 0xc00000fd/SIGABRT。headless 路径
+    // 已同款修复(headless_bridge.rs run_windowless_host),此处补齐 GUI 路径;
+    // 勿"优化"回默认 runtime。runtime 本体绑定在本函数作用域,随 run() 活到
+    // 进程退出。
+    // A runtime build failure (outside OOM-killed process death) leaves the
+    // app without async execution — no degradation path, fail fast.
+    #[allow(clippy::expect_used)]
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .expect("build GUI async runtime");
+    tauri::async_runtime::set(async_runtime.handle().clone());
+    startup::init();
+    startup::mark("environment:ready");
+    // 必须早于 Tauri Builder/WebView 创建：避免升级后 WebKit 复用旧 index.html，
+    // 却在新包内找不到旧 CSS，退化成裸 HTML 页面。
+    crate::platform::ui_cache::migrate_before_webview();
+    let initial_navigation_reported =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let main_navigation_origin = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let builder = tauri::Builder::default()
+        // These no-op probe plugins bracket Tauri's own plugin initialization.
+        // The main window is created by Tauri before the application setup hook,
+        // so their lifecycle hooks expose time that was previously one opaque gap.
+        .plugin({
+            let initial_navigation_reported = initial_navigation_reported.clone();
+            let main_navigation_origin = main_navigation_origin.clone();
+            tauri::plugin::Builder::<_, ()>::new("startup-probe-runtime")
+                .setup(|_app, _api| {
+                    startup::mark("tauri:runtime_created");
+                    Ok(())
+                })
+                .on_window_ready(|window| {
+                    if window.label() == "main" {
+                        startup::mark("tauri:main_window_ready");
+                    }
+                })
+                .on_webview_ready(|webview| {
+                    if webview.label() == "main" {
+                        startup::mark("tauri:main_webview_ready");
+                    }
+                })
+                .on_navigation(move |webview, url| {
+                    use std::sync::atomic::Ordering;
+
+                    if webview.label() != "main" {
+                        return true;
+                    }
+                    let mut initial_origin = main_navigation_origin
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match decide_main_navigation(url, initial_origin.as_deref()) {
+                        MainNavigationVerdict::Allow {
+                            initial_origin: baseline,
+                        } => {
+                            if let Some(baseline) = baseline {
+                                if !initial_navigation_reported.swap(true, Ordering::Relaxed) {
+                                    startup::mark_with_detail(
+                                        "rust",
+                                        "tauri:main_navigation",
+                                        &format!("scheme={}", url.scheme()),
+                                    );
+                                }
+                                *initial_origin = Some(baseline);
+                            }
+                            true
+                        }
+                        MainNavigationVerdict::Block { detail } => {
+                            if let Some(detail) = detail {
+                                startup::mark_with_detail(
+                                    "rust",
+                                    "tauri:main_navigation_blocked",
+                                    &detail,
+                                );
+                            }
+                            false
+                        }
+                    }
+                })
+                .build()
+        })
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_window("main") {
+                crate::platform::window_startup::activate_main_window(window, "single_instance");
+            }
+        }))
+        .plugin(startup_probe_plugin("startup-probe-single-instance"))
+        .plugin(tauri_plugin_notification::init())
+        .plugin(startup_probe_plugin("startup-probe-notification"))
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(startup_probe_plugin("startup-probe-dialog"));
+    // System-wide bring-to-front shortcut (off by default, opt-in like the
+    // voice shortcut; default accelerator Ctrl/Cmd+Alt+P when enabled —
+    // configurable in settings). Registered ONLY on sessions where it can
+    // actually work: on Wayland the X11 grabs behind the plugin would be
+    // silently dead (XWayland's X server receives no system-wide keys), and
+    // with no X server to connect to at all the plugin's manager thread
+    // cannot attach (its connection failure is swallowed on that thread, so
+    // every later register would silently no-op rather than error — on Linux
+    // manager creation itself is infallible, which is exactly why a dead
+    // registration would go unnoticed). The same availability flag gates
+    // every later apply (`features::global_shortcut`), so plugin presence and
+    // the feature gate can never disagree.
+    // No plugin-level handler here: it would fire for ANY shortcut registered
+    // on this shared plugin. Scoping is bound per shortcut at registration
+    // time — `features::global_shortcut` registers through `on_shortcut`,
+    // whose handler triggers strictly on Pressed (Released stays a no-op) and
+    // only for the combo that registration created.
+    let builder = if crate::platform::capabilities::current().global_shortcuts_available {
+        builder
+            .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+            .plugin(startup_probe_plugin("startup-probe-global-shortcut"))
+    } else {
+        builder
+    };
+    let builder = builder
+        .on_page_load(|webview, payload| {
+            startup::mark_with_detail(
+                "rust",
+                "webview:page_load",
+                &format!("label={} event={:?}", webview.label(), payload.event()),
+            );
+        })
+        .setup(|app| {
+            startup::mark("setup:start");
+            // Steer terminal consumer assembly: the in-flight settlement of
+            // cross-session message delivery (features::messaging) is driven
+            // by the forwarder's SteerCommitted/SteerDropped events. The hook
+            // is injected along the dependency direction (messaging →
+            // assistant); assistant never depends back on the consumer
+            // feature (the architecture guard's feature-cycle line). Engines
+            // spawn lazily on a session's first send, so this registration
+            // precedes any steer event.
+            if features::assistant::steer_outcomes
+                ::register_steer_resolution_hook(features::messaging::resolve_pending_steer)
+                .is_err()
+            {
+                // Same best-effort stderr shape as the plugin-attach arm
+                // below: `eprintln!` panics when the stderr write fails
+                // (no console on packaged Windows) and a panic inside setup
+                // takes boot down. The branch is unreachable today (single
+                // registration site above), but it must stay harmless — the
+                // module doc's "logs the refusal" only holds if this write
+                // cannot take the process down.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[pinvou3] steer resolution hook registered twice; keeping the first"
+                );
+            }
+            // The disabled_bundles migration verdict must be frozen here: the
+            // broad upgrade signal (settings.json/session dirs exist ⇒ upgrade
+            // install) gets polluted by bridge boot's first-startup behavior
+            // (ensure_dirs writes sessions/default/artifacts/ itself and
+            // backfills a default settings.json); if a fresh install's first
+            // read happens after those writes, it is misjudged as an upgrade
+            // and flips back to the old AllowAll-everything posture (review
+            // #455 blocking item). This read triggers the migration and
+            // persists the frozen fresh-vs-upgrade verdict, ahead of every
+            // first-startup write.
+            startup::mark("disabled_bundles_migration:start");
+            crate::features::marketplace::scope::load_disabled_bundles_startup_mirrored();
+            startup::mark("disabled_bundles_migration:done");
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                crate::platform::paths::set_runtime_resource_dir(resource_dir);
+            }
+            let _ = std::thread::Builder::new()
+                .name("draft-attachment-sweep".to_string())
+                .spawn(|| {
+                    features::files::attachment_upload::sweep_stale_draft_attachments();
+                });
+            features::browser::install_automation_context(app);
+            #[cfg(target_os = "macos")]
+            features::updater::cleanup_stale_backup();
+            // Attach the logging backend in ALL builds, not just debug: without
+            // it every log:: line — connector and updater failure causes among
+            // them — is a no-op in release and the raw cause of a failure is
+            // lost. LogDir is the OS-standard per-app log directory and the
+            // plugin's default rotation keeps the file bounded (KeepOne, 40KB).
+            // The Stdout target is debug-only: packaged Windows runs without a
+            // console (`windows_subsystem = "windows"`), where stdout writes
+            // fail and fern's error fallback then panics the logging thread
+            // and starves the file target chained after it — release runs
+            // everywhere read the file instead, terminal dev runs keep stdout.
+            // An unusable log directory must not take boot down, so an attach
+            // failure only leaves a best-effort stderr note and startup
+            // continues without the backend.
+            let mut log_targets = vec![tauri_plugin_log::Target::new(
+                tauri_plugin_log::TargetKind::LogDir { file_name: None },
+            )];
+            if cfg!(debug_assertions) {
+                log_targets.push(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ));
+            }
+            if let Err(e) = app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .targets(log_targets)
+                    .build(),
+            ) {
+                // Best-effort only: `eprintln!` panics when the stderr write
+                // fails (no console on packaged Windows), and a panic inside
+                // setup takes boot down — the exact scenario this arm exists
+                // to survive.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[pinvou3] failed to attach the logging plugin: {e}"
+                );
+            }
+            startup::mark("setup:plugins_ready");
+            // Log-attached; only now can a log::warn! reach the log file. The
+            // degraded-XWayland-session diagnostic is emitted here instead of
+            // inside capabilities::current(), whose first call (builder
+            // construction) runs before any logger exists.
+            crate::platform::capabilities::warn_if_global_shortcut_session_is_ambiguous();
+            crate::platform::window_startup::arm_hidden_main_window_fallback(app.handle());
+
+            // Linux webview(webkit2gtk)默认拒绝 getUserMedia,语音输入点麦克风会被拒。
+            // 给 main 窗口 webview 挂 permission-request:只放行 UserMedia(麦克风/摄像头)
+            // 请求,定位/通知等其余权限仍按默认拒绝。Windows/macOS 的 WebView2/WKWebView
+            // 自带系统级麦克风授权,不走这条。
+            #[cfg(target_os = "linux")]
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.with_webview(|webview| {
+                        use webkit2gtk::glib::prelude::ObjectExt;
+                        use webkit2gtk::{PermissionRequestExt, WebViewExt};
+                        let wv = webview.inner();
+                        wv.connect_permission_request(|_wv, req| {
+                            if req.type_().name() == "WebKitUserMediaPermissionRequest" {
+                                req.allow();
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    });
+                }
+            }
+
+            // 必须早于 SessionStore boot：归档退役宿主并清除绑定，避免内存态与磁盘态打架。
+            startup::mark("retired_features:start");
+            if let Err(error) = crate::features::retirement::retire_removed_features() {
+                eprintln!("[pinvou3-app] retired feature cleanup failed (will retry next boot): {error}");
+                startup::mark_with_detail("rust", "retired_features:error", &error);
+            }
+            startup::mark("retired_features:done");
+
+            // 多对话历史 store：用 ~/.pinvou3/sessions/ 隔离 deepseek-tui 全局目录。
+            // 必须先 boot 这个，engine forwarder 需要它跟踪 active session 的 mode_state
+            // 以便 TurnComplete 时判定是否 emit chat:plan_ready。
+            startup::mark("session_store:start");
+            let session_store = match SessionStore::boot_for_process_startup() {
+                Ok(store) => {
+                    // sidecar(per-session 模型 / 置顶 / 隐藏)已由 SessionStore::boot_inner
+                    // 在 boot 时统一加载,setup 不再重复读同一批文件。
+                    eprintln!("[pinvou3-app] session store ready");
+                    Some(store)
+                }
+                Err(e) => {
+                    eprintln!("[pinvou3-app] session store boot failed: {e:#}");
+                    None
+                }
+            };
+            startup::mark("session_store:done");
+            if let Some(store) = session_store.clone() {
+                app.handle().manage(store);
+            }
+            // 项目层(会话逻辑归档分组):纯偏好数据,boot 永不失败,损坏按空
+            // 状态降级。与 session store 的两处接线:
+            // 1) 启动对账——保留策略可能在删除钩子注册前已淘汰会话,剔除孤儿
+            //    归属条目,防映射表膨胀;
+            // 2) 删除钩子——运行期删除会话时同步摘除归属条目。
+            let projects_store = features::projects::ProjectStore::boot();
+            if let Some(store) = session_store.as_ref() {
+                if let Ok(all_sessions) = store.list_sessions_cached() {
+                    let existing: std::collections::HashSet<String> =
+                        all_sessions.iter().map(|metadata| metadata.id.clone()).collect();
+                    let pruned = projects_store.retain_sessions(&existing);
+                    if pruned > 0 {
+                        eprintln!(
+                            "[pinvou3-app] projects store pruned {pruned} orphan assignments"
+                        );
+                    }
+                }
+                let hook_store = projects_store.clone();
+                // 钩子驱动的归属变更也发 list_changed:否则会话删除后项目组的
+                // 成员计数在下次项目操作/整表刷新前是陈旧的(评审 #447 finding 12)。
+                // boot 对账(上文 retain_sessions)不发——前端尚未启动,启动后
+                // 首次拉取即最新。
+                let hook_app = app.handle().clone();
+                store.register_session_deleted_hook(std::sync::Arc::new(move |session_id: &str| {
+                    if hook_store.forget_session(session_id) {
+                        use tauri::Emitter;
+                        let _ = hook_app.emit(
+                            "projects:list_changed",
+                            serde_json::json!({ "action": "session_forgotten" }),
+                        );
+                    }
+                }));
+            }
+            app.handle().manage(projects_store.clone());
+            // Round-21 M1: the workspace-roots delivery resolver exempts
+            // ancestors backed by the owning project's registered roots, so
+            // it needs the projects store alongside the two binding stores.
+            let projects_for_roots_resolver = projects_store.clone();
+            let remote_control_manager = RemoteControlManager::new(app.handle().clone());
+            let remote_event_transport = remote_control_manager.clone();
+            let remote_event_endpoint = remote_control_manager.clone();
+            app.handle().manage(platform::app_events::AppEventBus::new(
+                move |event, payload| remote_event_transport.forward_local_event(event, payload),
+                move || remote_event_endpoint.has_active_web_transport(),
+            ));
+            app.handle().manage(remote_control_manager.clone());
+            // 多 session 并发:存 EnginePool(lazy spawn,首条消息才为该 session 起 engine)。
+            // boot bridge 在 pool::new 里做一次(写盘 / 设 env 只能一次)。
+            let handle = app.handle().clone();
+            let store_for_engine = session_store.unwrap_or_else(|| {
+                // store boot 失败时退化用一份临时 store（让 engine 至少能起来）；
+                // 实际使用 session 相关命令会失败,但聊天能跑
+                //
+                // If the second boot still fails (e.g. read-only disk), no
+                // usable store can be constructed and there is no available
+                // failure path on the engine surface — the app is unusable.
+                // Failing fast via panic beats running degraded, so expect
+                // is kept here.
+                #[allow(clippy::expect_used)]
+                || -> SessionStore {
+                    SessionStore::boot_for_process_startup().expect("session store boot fallback")
+                }()
+            });
+            // Install the browser transient-protocol startup barrier before any Engine,
+            // scheduler, or remote producer. spawn_watch synchronously isolates the
+            // previous process's host-request directory before accepting current requests.
+            // Installing it after engine_pool could misclassify a boot-time scheduled
+            // task's valid request as a crash artifact and remove it.
+            {
+                let mgr = features::browser::BrowserManager::new();
+                mgr.bind_app(app.handle().clone());
+                let browser_session_store = store_for_engine.clone();
+                mgr.bind_session_validator(std::sync::Arc::new(move |session_id| {
+                    browser_session_store.load(session_id).is_ok()
+                }));
+                app.manage(mgr);
+                features::browser::BrowserManager::spawn_watch(app.handle().clone());
+                spawn_deleted_session_browser_cleanup(
+                    app.handle().clone(),
+                    store_for_engine.clone(),
+                );
+                tauri::async_runtime::spawn(reconcile_orphaned_session_browser_files_until_success(
+                    app.handle().clone(),
+                    store_for_engine.clone(),
+                ));
+            }
+            // 原生代码会话的执行根解析需要共享 AcpPool 持有的 SessionAgentStore
+            // （多实例各自读盘，只有这份 clone 与 AcpPool 同一份 Arc）。
+            let (code_session_agents, acp_pool_for_capabilities) =
+                match crate::features::codex_acp::AcpPool::new(handle.clone(), store_for_engine.clone())
+                {
+                    Ok(pool) => {
+                        let agents = pool.agents().clone();
+                        let capability_pool = pool.clone();
+                        // 空闲回收巡检：ACP 会话是活的子进程，空闲超阈值回收
+                        // （回到 lazy spawn 语义，下次使用重新拉起）。
+                        pool.start_idle_reaper();
+                        handle.manage(pool);
+                        eprintln!("[pinvou3-app] Codex ACP pool ready (lazy spawn per session)");
+                        (agents, capability_pool)
+                    }
+                    Err(error) => {
+                        panic!("failed to init Codex ACP pool: {error:#}");
+                    }
+                };
+            startup::mark("engine_pool:start");
+            // Computer Use consent state: a global singleton. The
+            // EngineToolFactory injects it into every per-session
+            // ComputerUseTool, and the Tauri commands
+            // (app::commands::computer_use) reach the same instance through
+            // the .manage()'d State. settings.json's computer_use.enabled is
+            // the single source of truth for the toggle; it is replayed into
+            // the AtomicBool at startup (the computer_use_set_enabled command
+            // owns the later persist-to-disk → flip-flag flow). The virtual
+            // display preference rides the same replay (same persist → flip
+            // command shape), followed by the cheap availability probe so
+            // the first status read answers "ready"/"unavailable" instead of
+            // the unprobed placeholder.
+            let computer_use_shared =
+                std::sync::Arc::new(features::computer_use::ComputerUseShared::new());
+            // Replay the persisted toggle through the same platform gate the
+            // set_enabled command enforces: on an OS without a backend a
+            // stale `enabled: true` in settings.json must not flip the
+            // in-memory flag (it would keep the tool model-visible while
+            // every call dies at the capability check).
+            let computer_use_prefs = crate::platform::prefs::UserPrefs::load().computer_use;
+            computer_use_shared.set_enabled(
+                computer_use_prefs.enabled && features::computer_use::backend_supported(),
+            );
+            computer_use_shared.set_display_pref(computer_use_prefs.prefer_virtual_display);
+            // (set_display_pref already refreshed the availability snapshot —
+            // no second probe here.)
+            // Main-thread dispatch channel for the platform layer: the macOS
+            // virtual display creation hops onto the main run loop through
+            // it (linux/windows call sites ignore the helper). Stored once
+            // at setup; dispatching before this point answers false and the
+            // callers fall back explicitly.
+            features::computer_use::set_main_thread_app_handle(app.handle().clone());
+            // Crash-orphan sweep for the virtual display stacks (linux
+            // pidfiles; a no-op elsewhere). Once, at setup — never per
+            // session.
+            features::computer_use::sweep_virtual_display_orphans();
+            app.manage(computer_use_shared.clone());
+            let tool_factory: crate::features::assistant::engine_pool::EngineToolFactory = {
+                let computer_use_shared = computer_use_shared.clone();
+                std::sync::Arc::new(move |app, session_id| {
+                    let mut tools: Vec<
+                        std::sync::Arc<dyn deepseek_tui::tools::spec::ToolSpec>,
+                    > = vec![
+                        std::sync::Arc::new(knowledge::KbSearchTool::new(
+                            app.clone(),
+                            session_id.to_string(),
+                        )),
+                        std::sync::Arc::new(knowledge::KbOpenSourceTool::new(
+                            app.clone(),
+                            session_id.to_string(),
+                        )),
+                    ];
+                    // ComputerUseTool is constructed unconditionally: the
+                    // settings toggle governs visibility through the
+                    // disallowed list in tool_policy below, not through
+                    // construction. This keeps both toggle directions
+                    // immediate on already-running engines — a tool instance
+                    // held by an engine spawned while disabled becomes
+                    // reachable on the next turn after enabling, with no
+                    // engine rebuild needed. Defense in depth while
+                    // disabled: the schema hides the tool (disallow list)
+                    // and the consent guard rejects every call.
+                    tools.push(std::sync::Arc::new(
+                        features::computer_use::ComputerUseTool::new(
+                            app.clone(),
+                            session_id.to_string(),
+                            computer_use_shared.clone(),
+                        ),
+                    ));
+                    tools
+                })
+            };
+            let tool_policy: crate::features::assistant::engine_pool::ToolPolicy = {
+                let computer_use_shared = computer_use_shared.clone();
+                std::sync::Arc::new(move |app| {
+                    let mut tools = crate::features::marketplace::unavailable_tool_names();
+                    // 语义与单一真相源见 KnowledgeService::kb_tools_usable:
+                    // 只看有没有内容,不看模型在位状态(可见性随模型波动会让
+                    // 自愈重载路径不可达)。
+                    let kb_usable = knowledge::KnowledgeService::kb_tools_usable(
+                        app.try_state::<knowledge::KnowledgeService>()
+                            .map(|service| service.has_indexed_content())
+                            .unwrap_or(false),
+                        app.try_state::<RemoteKnowledgeService>()
+                            .map(|service| service.has_connections())
+                            .unwrap_or(false),
+                    );
+                    if !kb_usable {
+                        tools.push("kb_search".to_string());
+                        tools.push("kb_open_source".to_string());
+                    }
+                    // Dynamic visibility for computer_use: the guard hook
+                    // appends the tool to the disallow list while the master
+                    // switch is off (single source of truth in guard.rs, unit
+                    // tested there). The disallowed list is the only
+                    // toggle→engine channel; this closure re-evaluates
+                    // whenever refresh_disallowed_tools runs.
+                    // computer_use_set_enabled flips the flag and refreshes
+                    // immediately (see app/commands/computer_use.rs), so both
+                    // toggle directions take effect on every live engine on
+                    // the next turn — construction is unconditional on the
+                    // factory side. Other refresh triggers (connector /
+                    // marketplace / knowledge changes) recompute against the
+                    // same current flag state.
+                    computer_use_shared.add_to_disallow_list_when_disabled(&mut tools);
+                    // Base automation tools are dead in app sessions: the
+                    // foundation `automation`/`send_later` tools are registered
+                    // in the engine's tool catalog but their AutomationManager
+                    // is never attached here, so every call fails with
+                    // "AutomationManager is not attached". Leaving them visible
+                    // only invites the model to retry the dead path instead of
+                    // the working app-automations MCP tool. (`tasks`/`github`
+                    // stay untouched — out of scope.)
+                    tools.push("automation".to_string());
+                    tools.push("send_later".to_string());
+                    tools
+                })
+            };
+            match EnginePool::new_with_dependencies(
+                handle.clone(),
+                store_for_engine.clone(),
+                tool_factory,
+                tool_policy,
+            ) {
+                Ok(mut pool) => {
+                    // 两个根：执行根（engine cwd/shell）对绑了项目目录的原生代码会话
+                    // 解析到项目目录；账本根（附件/审计/产物）恒为会话私有目录。
+                    // 解析实现统一下沉在 SessionStore::session_roots，bridge 与
+                    // SessionStore 注入同一份 resolver 闭包，两侧结果一致。
+                    // When the resolver misses a native code session's project
+                    // binding, fall back to plain chat sessions' user
+                    // working-directory bindings (the per-session sidecar
+                    // `workspace-binding.json` inside the session-private
+                    // directory) — the dual-root semantics, AGENTS.md injection,
+                    // and prompt environment section treat both kinds of bound
+                    // sessions alike.
+                    let execution_root_resolver: crate::features::sessions::ExecutionRootResolver =
+                        std::sync::Arc::new({
+                            let agents = code_session_agents.clone();
+                            let store = store_for_engine.clone();
+                            move |session_id: &str| {
+                                agents
+                                    .code_project_workspace(session_id)
+                                    .or_else(|| store.session_workspace_binding(session_id))
+                            }
+                        });
+                    pool.bridge
+                        .set_execution_root_resolver(execution_root_resolver.clone());
+                    store_for_engine.set_execution_root_resolver(execution_root_resolver);
+                    let code_session_predicate: crate::features::sessions::CodeSessionPredicate =
+                        std::sync::Arc::new({
+                            let agents = code_session_agents.clone();
+                            move |session_id: &str| agents.is_code_session(session_id)
+                        });
+                    pool.bridge
+                        .set_code_session_predicate(code_session_predicate.clone());
+                    // Keychain snapshot (§6) resolution: code/ACP sessions read the session-agents
+                    // record, purely bound sessions read the workspace-binding sidecar; neither
+                    // side = single root (the base normalizes by cwd).
+                    pool.bridge.set_workspace_roots_resolver(std::sync::Arc::new({
+                        let agents = code_session_agents.clone();
+                        let store = store_for_engine.clone();
+                        let projects = projects_for_roots_resolver.clone();
+                        move |session_id: &str| {
+                            compose_workspace_roots(&agents, &store, &projects, session_id)
+                        }
+                    }));
+                    pool.bridge
+                        .set_external_acp_session_predicate(std::sync::Arc::new({
+                            let acp_pool = acp_pool_for_capabilities.clone();
+                            move |session_id: &str| acp_pool.is_acp(session_id)
+                        }));
+                    // sessions feature 自己的 code 判定（mode 默认值解析 + 仅 code
+                    // 持久化），与 bridge 共用同一份 SessionAgentStore 闭包。
+                    store_for_engine.set_code_session_predicate(code_session_predicate.clone());
+                    // SessionStore::delete and deep deletion paths without
+                    // an app handle (retention policy/scheduled cleanup)
+                    // clear process-level per-session keys uniformly via
+                    // the purge hook, matching the delete_session command's
+                    // cleanup (dependency inversion, see SessionPurgedHook —
+                    // sessions must not depend on assistant in reverse).
+                    // MonitorState is managed late in setup while the hook
+                    // only runs at deletion time, so try_state finds it in
+                    // place; if unmanaged (very early deletions) the item is
+                    // skipped.
+                    let app_for_purge_hook = handle.clone();
+                    let agents_index_for_purge_hook = code_session_agents.clone();
+                    store_for_engine
+                        .register_session_purged_hook(std::sync::Arc::new(move |session_id: &str| {
+                            // Drop the codex_acp agents-index entry as well —
+                            // see `remove_agents_index_entry`.
+                            crate::remove_agents_index_entry(
+                                &agents_index_for_purge_hook,
+                                session_id,
+                            );
+                            crate::features::assistant::timing::clear_session(session_id);
+                            crate::features::assistant::pending_user_input::clear_session(
+                                session_id,
+                            );
+                            crate::features::memory::discard_turn_capture(session_id);
+                            // The computer-use audit trail is per-session
+                            // metadata about what the agent did on the user's
+                            // screen. Nothing else ever removed it, so a
+                            // deleted session kept its behavioural record on
+                            // disk indefinitely.
+                            crate::features::computer_use::remove_session_audit(session_id);
+                            // Self-metrics accumulate per session key
+                            // (inflight entries are inserted on TurnStarted
+                            // and only cleared on TurnComplete/abort); clear
+                            // the key on deletion.
+                            if let Some(metrics) = app_for_purge_hook
+                                .try_state::<crate::features::monitor::MonitorState>()
+                                .map(|state| state.self_metrics())
+                            {
+                                metrics.drop_session(session_id);
+                            }
+                        }));
+                    // 远程端正式支持代码会话之前，先过滤原生代码会话事件（与 Engine
+                    // bridge 共用同一份 SessionAgentStore 判定）。
+                    remote_control_manager.set_code_session_predicate(code_session_predicate);
+                    let scheduled_state = tauri::async_runtime::block_on(
+                        scheduled_tasks::ScheduledTaskState::boot_runtime(
+                            &pool.bridge,
+                            pool.clone(),
+                            store_for_engine.clone(),
+                            &handle,
+                        ),
+                    );
+                    match scheduled_state {
+                        Ok(state) => {
+                            handle.manage(state);
+                            eprintln!("[pinvou3-app] scheduled tasks runtime ready");
+                        }
+                        Err(e) => {
+                            eprintln!("[pinvou3-app] scheduled tasks runtime init failed: {e:#}");
+                        }
+                    }
+                    handle.manage(pool.clone());
+                    // 空闲回收巡检：engine 常驻但不再无限常驻，空闲超阈值回收
+                    // （回到 lazy spawn 语义，下次发消息重建 + 注水历史）。
+                    pool.start_idle_reaper();
+                    eprintln!("[pinvou3-app] engine pool ready (lazy spawn per session)");
+                    // Cross-session messaging delivery watcher
+                    // (features::messaging): drains the spool backlog written
+                    // by the session-reader MCP server
+                    // (send_message_to_session), then polls. The watcher
+                    // consults the session-messaging feature switch every
+                    // poll (switch off pauses delivery) and gates
+                    // ACP/code-session targets through the shared AcpPool.
+                    // The app lifetime is the watcher lifetime.
+                    features::messaging::spawn_delivery_watcher(
+                        pool.clone(),
+                        acp_pool_for_capabilities.clone(),
+                        store_for_engine.clone(),
+                    );
+                    // Session-creation request watcher
+                    // (features::session_creation): drains the spool written
+                    // by the session-reader MCP server (create_session),
+                    // creating each requested session through the store's
+                    // own pipeline (never stealing focus) and emitting
+                    // session:list_changed. Same app-lifetime form.
+                    features::session_creation::spawn_session_creation_watcher(
+                        pool.clone(),
+                        store_for_engine.clone(),
+                        projects_store.clone(),
+                        handle.clone(),
+                    );
+                    match remote_control_manager.resume() {
+                        Ok(true) => eprintln!("[pinvou3-app] persistent Web access resumed"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!("[pinvou3-app] persistent Web access resume failed: {error}")
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[pinvou3-app] failed to init engine pool: {e:#}");
+                }
+            }
+            startup::mark("engine_pool:done");
+
+            // 技能/工具开关 scope 治理(已收敛为 disabled_bundles.json):启动时
+            //   1. Read disabled_bundles.json once — the legacy two-file
+            //      migration (disabled_connectors.json / disabled_skills.json →
+            //      a single disabled set keyed by package id × SessionMode) and
+            //      the fresh-vs-upgrade verdict freeze already happened at the
+            //      top of the setup hook (must precede bridge boot's
+            //      first-startup writes; see the disabled_bundles_migration
+            //      marks); this is an idempotent re-read.
+            // (Retiring the process-global DISABLED_SKILLS already landed on
+            // main; an empty composite dir → the whole `## Skills` block is
+            // not rendered, closing the path-leak surface.)
+            // 组合目录的物化在 engine spawn 时按会话进行(build_engine_config 注入
+            // skills_dir 指向 ~/.pinvou3/sessions/<sid>/skills/)。
+            startup::mark("disabled_skills:start");
+            // Fully locked on purpose: a try-locked hot read cannot persist the
+            // freeze/recovery verdicts, so this re-read is the second chance to
+            // persist them if the hoisted read degraded under peer contention
+            // (the unbounded flock wait is the documented fail-stop boot
+            // tradeoff). A persist failure on this read is mirrored by the
+            // shared helper onto the timeline: the hoisted read's success does
+            // not cover a failure developing in between, and this mirror is
+            // the only durable channel that can name it.
+            crate::features::marketplace::scope::load_disabled_bundles_startup_mirrored();
+            startup::mark("disabled_skills:done");
+
+            // Monitor 按需采样：state 只持有 session_uptime，sample 由前端调
+            // get_monitor_snapshot 时触发（监控页面 1s interval，离开页面停）。
+            let monitor_state = MonitorState::new();
+            app.handle().manage(monitor_state);
+            app.handle()
+                .manage(notifications::NotificationState::default());
+            app.handle()
+                .manage(pet_window::PetNavigationState::default());
+            app.handle().manage(pet_window::PetReplyState::default());
+            app.handle().manage(selected_pet::SelectedPetStore::load());
+
+            // CLI 连接器连接编排状态(按连接器 id 存长驻子进程 PID + 取消标志),
+            // 飞书 / 企微共用,供 *_connect_begin / *_cancel 用。
+            app.handle().manage(connector_cli::ConnectorConn::default());
+
+            // File watcher: 监听 ~/.pinvou3/sessions/ 树,新文件 emit artifact:disk
+            file_watcher::spawn(app.handle().clone(), bridge::paths::sessions_root());
+            startup::mark("file_watcher:spawned");
+
+            // 本地知识底座 L0:全系统元数据索引(秒搜+去重)。这里只 manage,**不自动扫**——
+            // 扫描改懒触发:由前端进入文件管理页时增量扫(不进页=零扫描),不常驻 watcher/周期
+            // 重扫。文件管理是低频功能,不该长期占资源。
+            // embedding 模型**不再随 deb 打包**(deb 瘦 ~559MB):改按需下载到
+            // ~/.pinvou3/knowledge/models/bge-m3。setup 只打开数据库并以 embedder=None 注册服务；
+            // React 首帧后再调用 kb_model_load_after_first_frame，通过 spawn_blocking 后台加载。
+            // 模型没装/加载失败时维持完全门控，不阻断启动；下载完成仍可热加载。
+            // 语音识别引擎随平台安装包打包,容错同 bge-m3 的资源布局,
+            // 注入给 voice_asr 作为 ~/.pinvou3/asr/ 之外的回退查找目录。
+            if let Some(asr_res) = app.path().resource_dir().ok().and_then(|res| {
+                [
+                    res.join("runtime").join("asr"),
+                    res.join("resources").join("runtime").join("asr"),
+                ]
+                .into_iter()
+                .find(|d| d.join(features::voice::engine_binary_name()).exists())
+            }) {
+                features::voice::set_bundled_engine_dir(asr_res);
+            }
+
+            startup::mark("knowledge_service:start");
+            match knowledge::KnowledgeService::new(&knowledge::default_db_path()) {
+                Ok(svc) => {
+                    app.handle().manage(svc);
+                    eprintln!("[pinvou3-app] knowledge service ready");
+                    startup::mark("knowledge_service:done");
+                }
+                Err(e) => mark_knowledge_service_failed(&e),
+            }
+
+            match RemoteKnowledgeService::load(RemoteKnowledgeService::default_path()) {
+                Ok(service) => {
+                    app.handle().manage(service);
+                    eprintln!("[pinvou3-app] remote knowledge service ready");
+                }
+                Err(error) => {
+                    eprintln!("[pinvou3-app] remote knowledge service init failed: {error}")
+                }
+            }
+            // 桌宠:settings.json 里 pet.enabled 为真时随主窗口一起拉起。
+            pet_window::spawn_if_enabled(app.handle());
+
+            // On Windows, Alt+Space is intercepted by the system menu first and
+            // the WebView keydown is unreliable. Translate it into a frontend
+            // event at the native layer, keeping the WebView shortcut as the
+            // fallback path.
+            crate::features::voice_shortcut::install(app.handle().clone());
+            // Startup replay: settings.json's voice_shortcut_enabled is the
+            // authoritative persistence of the switch (frontend localStorage is
+            // only a mirror); sync it into the native-layer AtomicBool right
+            // after the hook is installed. One shared load serves both this
+            // and the global-shortcut replay below.
+            let prefs = crate::platform::prefs::UserPrefs::load();
+            crate::features::system_tray::install(app.handle(), prefs.language);
+            crate::features::voice_shortcut::set_enabled(prefs.voice_shortcut_enabled);
+
+            // System-wide bring-to-front shortcut: same replay shape. A parse
+            // failure or register conflict (another app owns the combination)
+            // logs and continues — startup must never fail over the shortcut.
+            crate::features::global_shortcut::install(app.handle().clone());
+            crate::features::global_shortcut::apply_saved_settings(
+                prefs.global_shortcut_enabled,
+                &prefs.global_shortcut_accelerator,
+            );
+
+            startup::mark("setup:done");
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            crate::features::system_tray::on_window_event(window, event);
+            if let tauri::WindowEvent::Destroyed = event {
+                // When a recording window is closed outright, the frontend has
+                // no chance to deregister; leaving it registered would keep the
+                // native shortcut routing Alt gestures into a destroyed window
+                // (a global swallow-keys black hole).
+                crate::features::voice_shortcut::forget_recording_window(window.label());
+                // Main window destroyed → close the pet window too, otherwise
+                // the app never exits while only the pet window remains.
+                if window.label() == "main" {
+                    pet_window::close_with_main(window.app_handle());
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::chat::chat,
+            commands::chat::steer_chat,
+            commands::chat::withdraw_steer,
+            commands::checkpoints::list_checkpoints,
+            commands::checkpoints::checkpoint_diff,
+            commands::checkpoints::rewind_to_turn,
+            commands::checkpoints::rewind_undo_state,
+            commands::checkpoints::undo_last_rewind,
+            commands::assistant_response::export_assistant_response,
+            commands::assistant_response::open_assistant_share_target,
+            commands::browser::browser_stop,
+            commands::browser::browser_status,
+            commands::browser::browser_prepare,
+            commands::browser::browser_hand_back_to_agent,
+            commands::browser::browser_show_native_surface,
+            commands::browser::browser_hide_native_surface,
+            commands::browser::browser_begin_surface_generation,
+            commands::browser::browser_navigate,
+            commands::browser::browser_back,
+            commands::browser::browser_forward,
+            commands::browser::browser_reload,
+            commands::browser::browser_list_tabs,
+            commands::browser::browser_create_tab,
+            commands::browser::browser_close_tab,
+            commands::browser::browser_activate_tab,
+            commands::startup::report_frontend_startup,
+            commands::diagnostics::record_authority_sync_diagnostics,
+            commands::startup::reveal_startup_window,
+            commands::computer_use::computer_use_get_status,
+            commands::computer_use::computer_use_grant,
+            commands::computer_use::computer_use_revoke,
+            commands::computer_use::computer_use_stop,
+            commands::computer_use::computer_use_deny,
+            commands::computer_use::computer_use_confirm,
+            commands::computer_use::computer_use_set_enabled,
+            commands::computer_use::computer_use_set_virtual_display_preference,
+            commands::computer_use::computer_use_request_permissions,
+            commands::computer_use::computer_use_permission_status,
+            commands::connectors::refresh_connector_auth_gates,
+            commands::connectors::feishu_ensure_cli,
+            commands::connectors::feishu_connect_begin,
+            commands::connectors::feishu_cancel,
+            commands::connectors::feishu_logout,
+            commands::connectors::feishu_apply_skills,
+            commands::connectors::feishu_skills_state,
+            commands::connectors::wecom_ensure_cli,
+            commands::connectors::wecom_connect_begin,
+            commands::connectors::wecom_cancel,
+            commands::connectors::wecom_logout,
+            commands::connectors::wecom_apply_skills,
+            commands::connectors::wecom_skills_state,
+            commands::connectors::dingtalk_ensure_cli,
+            commands::connectors::dingtalk_connect_begin,
+            commands::connectors::dingtalk_cancel,
+            commands::connectors::dingtalk_logout,
+            commands::connectors::dingtalk_apply_skills,
+            commands::connectors::dingtalk_skills_state,
+            commands::connectors::tmeet_ensure_cli,
+            commands::connectors::tmeet_connect_begin,
+            commands::connectors::tmeet_cancel,
+            commands::connectors::tmeet_logout,
+            commands::connectors::tmeet_apply_skills,
+            commands::connectors::tmeet_skills_state,
+            commands::connectors::ima_connect,
+            commands::connectors::ima_logout,
+            commands::settings::get_settings,
+            commands::runtime::get_platform_capabilities,
+            commands::settings::submit_feedback,
+            commands::settings::get_effective_model_config,
+            commands::settings::update_settings,
+            commands::settings::update_search_settings,
+            commands::settings::save_search_settings_and_restart,
+            commands::monitor::get_monitor_snapshot,
+            commands::monitor::get_backend_status,
+            commands::monitor::discover_local_vllm,
+            commands::settings::list_models,
+            commands::settings::reveal_model_api_key,
+            commands::settings::probe_local_server_kind,
+            commands::settings::save_model,
+            commands::settings::delete_model,
+            commands::settings::set_active_model,
+            commands::settings::set_session_model,
+            commands::settings::get_session_model_id,
+            commands::settings::get_image_input_capability,
+            commands::codex::list_acp_agents,
+            commands::codex::get_acp_agent_status,
+            commands::codex::install_acp_agent,
+            commands::codex::login_acp_agent,
+            commands::codex::switch_acp_agent_account,
+            commands::codex::open_acp_agent_login_url,
+            commands::codex::submit_acp_agent_login_code,
+            commands::codex::get_codex_acp_session_info,
+            commands::codex::set_codex_acp_model,
+            commands::codex::set_codex_acp_mode,
+            commands::codex::set_codex_acp_config_option,
+            commands::codex::codex_acp_prompt,
+            commands::codex::cancel_codex_acp,
+            commands::codex::get_codex_acp_timeline,
+            commands::codex::get_codex_acp_pending_permissions,
+            commands::codex::respond_codex_acp_permission,
+            commands::codex::get_codex_acp_pending_elicitations,
+            commands::codex::respond_codex_acp_elicitation,
+            commands::acp_providers::list_acp_providers,
+            commands::acp_providers::save_acp_provider,
+            commands::acp_providers::delete_acp_provider,
+            commands::acp_providers::switch_acp_provider,
+            commands::acp_providers::switch_acp_provider_official,
+            commands::acp_providers::uninstall_acp_agent,
+            commands::acp_providers::cancel_acp_agent_install,
+            commands::acp_providers::logout_acp_agent,
+            commands::acp_providers::get_acp_provider_key,
+            commands::acp_providers::export_acp_providers,
+            commands::acp_providers::import_acp_providers,
+            commands::acp_providers::probe_acp_agent_models,
+            commands::acp_providers::set_codex_acp_session_provider,
+            commands::codex::list_codex_acp_sessions,
+            commands::codex::create_codex_acp_session,
+            commands::codex::list_codex_workspace,
+            commands::codex::search_codex_workspace,
+            commands::codex::preview_codex_workspace_file,
+            commands::codex::open_codex_workspace_resource,
+            commands::codex::get_codex_workspace_changes,
+            commands::codex::get_codex_workspace_diff,
+            commands::codex::list_codex_workspace_branches,
+            commands::codex::checkout_codex_workspace_branch,
+            commands::codex::open_codex_workspace_file,
+            commands::codex::reveal_codex_workspace_file,
+            commands::codex::open_code_reader,
+            commands::codex::take_code_reader_pending,
+            commands::settings::test_model_connection,
+            commands::settings::probe_endpoint_models,
+            commands::settings::test_image_input_capability,
+            commands::voice::transcribe_voice_audio,
+            commands::voice::postprocess_voice_text,
+            commands::voice::reset_microphone_permission,
+            commands::voice::voice_asr_status,
+            commands::voice::install_voice_asr,
+            commands::voice::cancel_voice_asr,
+            commands::voice::set_voice_shortcut_enabled,
+            commands::voice::set_voice_shortcut_recording,
+            commands::global_shortcut::set_global_shortcut_config,
+            commands::projects::list_projects,
+            commands::projects::create_project,
+            commands::projects::update_project,
+            commands::projects::delete_project,
+            commands::projects::move_session_to_project,
+            commands::projects::ensure_folder_projects,
+            commands::projects::projects_set_never_materialize,
+            commands::projects::align_session_to_project,
+            commands::projects::rebind_workspace_root,
+            commands::sessions::list_sessions,
+            commands::sessions::create_session,
+            commands::sessions::fork_session,
+            commands::sessions::get_session_workspace_binding,
+            commands::sessions::load_session,
+            commands::sessions::delete_session,
+            commands::sessions::rename_session,
+            commands::sessions::export_session,
+            commands::sessions::import_session_archive,
+            commands::sessions::set_session_pinned,
+            commands::sessions::list_archived_sessions,
+            commands::sessions::set_session_archived,
+            commands::sessions::get_or_create_aux_session,
+            commands::sessions::reset_aux_session,
+            commands::timeline::get_session_timeline,
+            commands::timeline::get_session_stats,
+            commands::scheduled::list_scheduled_tasks,
+            commands::scheduled::read_scheduled_task,
+            commands::scheduled::list_scheduled_task_runs,
+            commands::scheduled::list_scheduled_runs,
+            commands::scheduled::create_scheduled_task,
+            commands::scheduled::update_scheduled_task,
+            commands::scheduled::pause_scheduled_task,
+            commands::scheduled::resume_scheduled_task,
+            commands::scheduled::set_scheduled_task_pinned,
+            commands::scheduled::delete_scheduled_task,
+            commands::scheduled::run_scheduled_task_now,
+            commands::scheduled::mark_scheduled_run_viewed,
+            commands::scheduled::scheduled_task_chat_prompt,
+            commands::sessions::save_session_artifacts,
+            commands::sessions::save_session_pinvou_scene_events,
+            commands::sessions::get_session_pinvou_scene_events,
+            commands::sessions::save_session_steered_messages,
+            commands::sessions::get_session_steered_messages,
+            commands::sessions::list_workspace_files,
+            commands::runtime::cancel_generation,
+            commands::runtime::list_shell_tasks,
+            commands::runtime::cancel_shell_task,
+            commands::remote_control::web_access_enable,
+            commands::remote_control::web_access_disable,
+            commands::remote_control::web_access_status,
+            commands::remote_control::web_access_rotate,
+            commands::remote_control::web_access_revoke_host_workspace,
+            commands::remote_control::web_access_bridge_ready,
+            commands::remote_control::web_access_rpc_begin,
+            commands::remote_control::web_access_rpc_respond,
+            commands::remote_control::web_access_publish_event,
+            commands::remote_control::web_access_list_host_files,
+            commands::remote_control::web_access_list_sessions,
+            commands::remote_control::web_access_list_archived_sessions,
+            commands::remote_control::web_access_create_session,
+            commands::remote_control::web_access_create_session_and_chat,
+            commands::remote_control::web_access_cancel_session_download,
+            commands::remote_control::web_access_load_session_chunk,
+            commands::remote_control::web_access_ingest_file,
+            commands::remote_control::web_access_upload_attachment_chunk,
+            commands::remote_control::web_access_abort_attachment_upload,
+            commands::remote_control::web_access_discard_attachment,
+            commands::remote_control::web_access_read_conversation_attachment_chunk,
+            commands::remote_control::web_access_chat,
+            commands::remote_control::web_access_create_codex_acp_session,
+            commands::remote_control::web_access_list_codex_workspace,
+            commands::remote_control::web_access_search_codex_workspace,
+            commands::remote_control::web_access_preview_codex_workspace_file,
+            commands::remote_control::web_access_get_codex_workspace_changes,
+            commands::remote_control::web_access_get_codex_workspace_diff,
+            commands::remote_control::web_access_cancel_codex_acp,
+            commands::remote_control::web_access_codex_acp_prompt,
+            commands::remote_control::web_access_get_codex_acp_timeline,
+            commands::remote_control::web_access_get_codex_acp_session_info,
+            commands::remote_control::web_access_set_codex_acp_model,
+            commands::remote_control::web_access_set_codex_acp_mode,
+            commands::remote_control::web_access_set_codex_acp_config_option,
+            commands::remote_control::web_access_get_codex_acp_pending_permissions,
+            commands::remote_control::web_access_respond_codex_acp_permission,
+            commands::remote_control::web_access_get_codex_acp_pending_elicitations,
+            commands::remote_control::web_access_respond_codex_acp_elicitation,
+            commands::remote_control::web_access_list_codex_acp_sessions,
+            commands::remote_control::web_access_list_acp_agents,
+            commands::remote_control::web_access_get_acp_agent_status,
+            commands::remote_control::web_access_transcribe_voice_audio,
+            commands::remote_control::web_access_read_artifact_chunk,
+            commands::remote_control::web_access_update_settings,
+            commands::remote_control::web_access_artifact_info,
+            commands::remote_control::web_access_read_artifact_text,
+            commands::remote_control::web_access_write_artifact_text,
+            commands::remote_control::web_access_read_artifact_image_b64,
+            commands::remote_control::web_access_read_artifact_thumbnail,
+            commands::remote_control::web_access_render_artifact_visual,
+            commands::connectors::enable_marketplace_packages,
+            commands::connectors::set_disabled_connectors,
+            commands::connectors::get_disabled_connectors,
+            commands::connectors::set_bundle_visibility,
+            commands::connectors::get_bundle_visibility,
+            commands::connectors::set_project_skills_enabled,
+            commands::connectors::get_project_skills_enabled,
+            commands::memory::update_memory_profile,
+            commands::memory::get_memory_overview,
+            commands::memory::organize_memory,
+            commands::memory::get_memory_organize_history,
+            commands::memory::confirm_pending_memory,
+            commands::memory::ignore_pending_memory,
+            commands::memory::never_pending_memory,
+            commands::memory::delete_memory_preference,
+            commands::memory::update_memory_preference,
+            commands::memory::update_work_context_memory,
+            commands::memory::delete_work_context_memory,
+            commands::memory::update_timed_memory,
+            commands::memory::delete_timed_memory,
+            commands::memory::edit_last_turn,
+            commands::artifacts::read_artifact_text,
+            commands::artifacts::write_artifact_text,
+            commands::artifacts::list_deliverable_index,
+            commands::artifacts::list_deliverable_index_v2,
+            commands::artifacts::artifact_info,
+            commands::artifacts::render_artifact_visual,
+            commands::artifacts::read_artifact_image_b64,
+            commands::artifacts::read_artifact_thumbnail,
+            commands::artifacts::open_in_system,
+            commands::artifacts::open_containing_folder,
+            commands::artifacts::reveal_session_folder,
+            commands::artifacts::open_scheduled_task_folder,
+            commands::artifacts::open_artifact_window,
+            commands::pet::begin_detach_drag,
+            commands::pet::set_pet_enabled,
+            commands::pet::set_pet_scale,
+            commands::pet::set_pet_activity_visible,
+            commands::pet::save_pet_position,
+            commands::pet::save_pet_vertical_alignment,
+            commands::pet::open_main_from_pet,
+            commands::pet::take_pet_navigation,
+            commands::pet::queue_pet_reply,
+            commands::pet::take_pet_reply,
+            commands::pet::get_selected_pet,
+            commands::pet::set_selected_pet,
+            commands::artifacts::open_external_url,
+            commands::artifacts::open_user_external_url,
+            commands::files::ingest_file,
+            commands::files::ingest_draft_file_chunk,
+            commands::files::cancel_draft_file_upload,
+            commands::files::adopt_draft_attachment,
+            commands::files::discard_dropped_attachment,
+            commands::files::resolve_conversation_attachment,
+            commands::files::open_conversation_attachment,
+            commands::files::reveal_conversation_attachment,
+            commands::files::save_paste_image,
+            commands::files::paste_clipboard_image,
+            commands::interaction::compact_now,
+            commands::interaction::get_mode_state,
+            commands::interaction::get_code_permission_prefs,
+            commands::interaction::confirm_code_yolo,
+            commands::interaction::get_mode_defaults,
+            commands::interaction::set_mode_default,
+            commands::interaction::set_plan_mode_next,
+            commands::interaction::exit_plan_to_yolo,
+            commands::interaction::set_multi_agent_mode,
+            commands::interaction::accept_plan,
+            commands::interaction::discard_plan,
+            // 多智能体执行记录投影。
+            commands::multiagent::list_subagent_transcripts,
+            commands::multiagent::read_subagent_transcript,
+            commands::interaction::submit_user_input,
+            commands::interaction::cancel_user_input,
+            commands::interaction::get_pending_user_inputs,
+            commands::interaction::summon_pinvou,
+            commands::personas::save_session_pinvou_reviews,
+            commands::personas::get_session_pinvou_reviews,
+            commands::interaction::get_super_permission_status,
+            commands::interaction::set_super_permission,
+            commands::personas::list_personas,
+            commands::personas::read_persona_body,
+            commands::personas::equip_persona,
+            commands::personas::unequip_persona,
+            commands::personas::get_active_persona,
+            commands::personas::create_persona,
+            commands::personas::update_persona,
+            commands::personas::delete_persona,
+            commands::personas::save_session_persona_events,
+            commands::personas::get_session_persona_events,
+            commands::updater::get_app_version,
+            commands::updater::check_for_update,
+            commands::updater::download_update,
+            commands::updater::install_update,
+            commands::updater::restart_app,
+            commands::updater::cancel_download,
+            commands::updater::report_pending_update_result,
+            commands::dependencies::check_dependencies,
+            commands::dependencies::install_dependencies,
+            commands::marketplace::list_marketplace_tools,
+            commands::marketplace::install_marketplace_tool,
+            commands::marketplace::get_marketplace_tool_auth_status,
+            commands::marketplace::start_marketplace_tool_oauth_login,
+            commands::marketplace::cancel_marketplace_tool_oauth_login,
+            commands::marketplace::uninstall_marketplace_tool,
+            commands::builtin::list_builtin_features,
+            commands::builtin::set_builtin_feature_enabled,
+            commands::artifacts::detect_obsidian,
+            commands::knowledge::kb_start_scan,
+            commands::knowledge::kb_scan_status,
+            commands::knowledge::kb_search,
+            commands::knowledge::kb_stats,
+            commands::knowledge::kb_type_counts,
+            commands::knowledge::kb_collection_list,
+            commands::knowledge::kb_collection_create,
+            commands::knowledge::kb_collection_update,
+            commands::knowledge::kb_collection_delete,
+            commands::knowledge::kb_collection_add_sources,
+            commands::knowledge::kb_index_status,
+            commands::knowledge::kb_index_cancel,
+            commands::knowledge::kb_index_failed_files,
+            commands::knowledge::kb_index_resume,
+            commands::knowledge::kb_index_retry_file,
+            commands::knowledge::kb_documents,
+            commands::knowledge::kb_remove_document,
+            commands::knowledge::kb_embed_info,
+            commands::knowledge::kb_model_status,
+            commands::knowledge::kb_model_cancel,
+            commands::knowledge::kb_model_load_after_first_frame,
+            commands::knowledge::kb_model_download,
+            commands::knowledge::session_mount_collection,
+            commands::knowledge::session_add_mounted_collection,
+            commands::knowledge::session_set_mounted_collection_enabled,
+            commands::knowledge::session_remove_mounted_collection,
+            commands::knowledge::session_unmount_collection,
+            commands::knowledge::session_mounted_collection,
+            commands::knowledge::session_mounted_collections,
+            commands::knowledge::session_mounted_collections_snapshot,
+            commands::remote_knowledge::remote_kb_connections,
+            commands::remote_knowledge::remote_kb_request_join,
+            commands::remote_knowledge::remote_kb_probe_private_endpoint,
+            commands::remote_knowledge::remote_kb_request_join_confirmed,
+            commands::remote_knowledge::remote_kb_connection_identity,
+            commands::remote_knowledge::remote_kb_pending_joins,
+            commands::remote_knowledge::remote_kb_refresh_join,
+            commands::remote_knowledge::remote_kb_cancel_join,
+            commands::remote_knowledge::remote_kb_create_share,
+            commands::remote_knowledge::remote_kb_shares,
+            commands::remote_knowledge::remote_kb_stop_share,
+            commands::remote_knowledge::remote_kb_join_requests,
+            commands::remote_knowledge::remote_kb_approve_join_request,
+            commands::remote_knowledge::remote_kb_reject_join_request,
+            commands::remote_knowledge::remote_kb_model_status,
+            commands::remote_knowledge::remote_kb_download_model,
+            commands::remote_knowledge::remote_kb_devices,
+            commands::remote_knowledge::remote_kb_update_device,
+            commands::remote_knowledge::remote_kb_update_collection,
+            commands::remote_knowledge::remote_kb_remove_device,
+            commands::remote_knowledge::remote_kb_trashed_collections,
+            commands::remote_knowledge::remote_kb_trashed_documents,
+            commands::remote_knowledge::remote_kb_permanently_delete_collection,
+            commands::remote_knowledge::remote_kb_permanently_delete_document,
+            commands::shared_knowledge_host::shared_kb_host_status,
+            commands::shared_knowledge_host::shared_kb_host_lan_endpoints,
+            commands::shared_knowledge_host::shared_kb_discover_nearby,
+            commands::shared_knowledge_host::shared_kb_host_install,
+            commands::shared_knowledge_host::shared_kb_host_upgrade,
+            commands::shared_knowledge_host::shared_kb_host_reconnect,
+            commands::shared_knowledge_host::shared_kb_host_set_owner_device,
+            commands::shared_knowledge_host::shared_kb_host_remove,
+            commands::shared_knowledge_host::shared_kb_host_backup,
+            commands::shared_knowledge_host::shared_kb_host_restore,
+            commands::remote_knowledge::remote_kb_remove_connection,
+            commands::remote_knowledge::remote_kb_collections,
+            commands::remote_knowledge::remote_kb_create_collection,
+            commands::remote_knowledge::remote_kb_delete_collection,
+            commands::remote_knowledge::remote_kb_restore_collection,
+            commands::remote_knowledge::remote_kb_documents,
+            commands::remote_knowledge::remote_kb_document_statuses,
+            commands::remote_knowledge::remote_kb_discover_folder_files,
+            commands::remote_knowledge::remote_kb_upload_files,
+            commands::remote_knowledge::remote_kb_replace_document,
+            commands::remote_knowledge::remote_kb_delete_document,
+            commands::remote_knowledge::remote_kb_restore_document,
+            commands::remote_knowledge::remote_kb_download_document,
+            commands::remote_knowledge::remote_kb_search,
+            commands::remote_knowledge::session_mounted_remote_collections,
+            commands::remote_knowledge::session_add_mounted_remote_collection,
+            commands::remote_knowledge::session_set_mounted_remote_collection_enabled,
+            commands::remote_knowledge::session_remove_mounted_remote_collection,
+            commands::marketplace::list_marketplace_skills,
+            commands::marketplace::install_marketplace_skill,
+            commands::marketplace::update_marketplace_skill,
+            commands::marketplace::update_bundle_display_meta,
+            commands::marketplace::import_plugin_package_cmd,
+            commands::marketplace::import_plugin_package_bytes_cmd,
+            commands::marketplace::import_skill_md_bytes,
+            commands::marketplace::uninstall_marketplace_skill,
+            commands::marketplace::bundle_readiness,
+            commands::marketplace::export_plugin_spec,
+            commands::marketplace::list_recycled_plugins,
+            commands::marketplace::restore_recycled_plugin,
+            commands::marketplace::purge_recycled_plugin,
+            commands::marketplace::export_recycled_plugin,
+            commands::marketplace::export_installed_plugin,
+        ]);
+
+    startup::mark("tauri:builder_configured");
+    startup::mark("tauri:context:start");
+    let context = build_tauri_context();
+    startup::mark("tauri:context:done");
+    // Keep the historical marker so old and new startup runs remain comparable.
+    startup::mark("tauri:run_enter");
+    startup::mark("tauri:build:start");
+    // Tauri template idiom: a builder.build failure means the window/event loop
+    // cannot be built and the process has not entered a user session; there is
+    // no degradation path — keep expect to fail fast.
+    #[allow(clippy::expect_used)]
+    let app = builder
+        .build(context)
+        .expect("error while building tauri application");
+    startup::mark("tauri:build:done");
+    startup::mark("tauri:event_loop:run_enter");
+    let mut resumed_reported = false;
+    app.run(move |app, event| match event {
+        tauri::RunEvent::Ready => startup::mark("tauri:event_loop:ready"),
+        tauri::RunEvent::Exit => {
+            startup::mark("tauri:event_loop:exit");
+            features::system_tray::on_exit();
+            // On main-process exit, refresh browser URL restore manifests, destroy
+            // in-app native WebViews, and clean runtime targets/endpoints. Preserve
+            // restore manifests; there is no external Chrome process.
+            if let Some(browser) = app.try_state::<features::browser::BrowserManager>() {
+                browser.shutdown_on_exit();
+            }
+            // Exit semantics preserve the latest restore manifest. Do not asynchronously
+            // call ordinary stop() here: if shutdown_on_exit skips explicit close because
+            // of lock contention, a late stop could acquire the lock and delete restore
+            // state with user-stop semantics. Process exit destroys remaining WebViews,
+            // and shutdown_on_exit always removes coordination files.
+            // 退出收割:同步执行——Exit 后进程即将结束,这是最后的清理窗口。
+            // 重启(app.restart())跳过本事件,调用点在 restart 前主动调同一辅助函数。
+            startup::mark("exit:cleanup:start");
+            tauri::async_runtime::block_on(harvest_child_processes(app));
+            startup::mark("exit:cleanup:done");
+        }
+        tauri::RunEvent::Resumed if !resumed_reported => {
+            resumed_reported = true;
+            startup::mark("tauri:event_loop:first_resumed");
+        }
+        _ => {}
+    });
+    startup::mark("process:exit");
+}
+
+#[cfg(test)]
+mod startup_order_contract {
+    /// Order pin (review #455 non-blocking item 3; three rounds in, switched
+    /// to a source-position assertion): the disabled_bundles migration read
+    /// (which freezes the fresh-vs-upgrade verdict) must run, in all three
+    /// hosts' startup hooks, ahead of the first first-startup write
+    /// (SessionStore boot creating the sessions/ dir entries; bridge boot
+    /// backfilling the default settings.json). Statement order cannot be
+    /// observed from inside the module, and assertions over a self-built mark
+    /// trace prove nothing (reordering the real setup hook would not fail
+    /// them), so this reads the three host sources directly via
+    /// `include_str!` and pins the **textual position** of the migration-read
+    /// call site ahead of the boot call site.
+    fn assert_migration_read_precedes(source: &str, earlier: &str, later: &str, file: &str) {
+        let pos_earlier = source
+            .find(earlier)
+            .unwrap_or_else(|| panic!("{file} is missing the migration-read call site: {earlier}"));
+        let pos_later = source.find(later).unwrap_or_else(|| {
+            panic!("{file} is missing the first-boot self-write call site: {later}")
+        });
+        assert!(
+            pos_earlier < pos_later,
+            "{file}: the migration read ({earlier}) must precede the first-boot self-write ({later})"
+        );
+    }
+
+    #[test]
+    fn disabled_bundles_migration_read_precedes_first_boot_writes() {
+        // GUI host: the migration read at the top of the setup hook precedes
+        // the SessionStore boot. The needle pins the hoist call itself — the
+        // shared mirrored startup read — (fragment-concatenated to prevent a
+        // self-match — this test lives in the same lib.rs as the production
+        // call site, and include_str! scans the test module too, so a full
+        // needle appearing verbatim in the test would degenerate into a
+        // self-match). The old leg pinning the startup
+        // marks on both sides only preserved the mark sandwich: deleting or
+        // moving the hoist call between the two marks still passed (review
+        // #455 R5-S1). The later needle pins the
+        // `SessionStore::boot_for_process_startup` call itself rather than
+        // the adjacent startup-mark proxy (review #455 R8 nit). `find` takes
+        // the first occurrence: the guarded regression is "hoist deleted or
+        // reordered" (the needle's first occurrence lands after the boot;
+        // deletion fails the test outright, and it is not a self-match);
+        // deleting the boot call itself is **not** guarded — the same-named
+        // call in the panic fallback branch still hits the needle (round-10
+        // nit wording made accurate).
+        assert_migration_read_precedes(
+            include_str!("lib.rs"),
+            &[
+                "crate::features::marketplace::scope::load_disabled_bundles_startup_",
+                "mirrored()",
+            ]
+            .concat(),
+            &["SessionStore::", "boot_for_process_startup()"].concat(),
+            "lib.rs",
+        );
+        // Windowless hosts (agentic/headless): same-order freeze ahead of the
+        // SessionStore boot.
+        assert_migration_read_precedes(
+            include_str!("features/assistant/product_runtime/headless_bridge.rs"),
+            &[
+                "marketplace::scope::load_disabled_bundles_startup_",
+                "mirrored()",
+            ]
+            .concat(),
+            "SessionStore::boot()",
+            "headless_bridge.rs",
+        );
+        // dump_system_prompt tool: same-order freeze ahead of bridge.boot()
+        // (ensure_dirs / default settings.json first-startup writes).
+        assert_migration_read_precedes(
+            include_str!("bin/dump_system_prompt.rs"),
+            "load_disabled_bundles_startup()",
+            "Pinvou3Bridge::boot()",
+            "dump_system_prompt.rs",
+        );
+    }
+
+    /// The freeze-persist failure mirror is the only durable channel naming
+    /// the failure before the log plugin attaches (the windowless host
+    /// attaches none at all). lib.rs must keep the mirrored startup read at
+    /// BOTH startup sites (the hoisted freeze and the second-chance
+    /// re-read); headless keeps one. Needle assembled from fragments so this
+    /// test module's own source (scanned together with lib.rs) cannot
+    /// self-match.
+    #[test]
+    fn freeze_persist_failures_mirror_onto_the_startup_timeline_in_every_host() {
+        let mirrored_read = ["load_disabled_bundles_startup_", "mirrored()"].concat();
+        let gui_mirrors = include_str!("lib.rs").matches(&mirrored_read).count();
+        assert!(
+            gui_mirrors >= 2,
+            "lib.rs must keep the mirrored startup read at BOTH startup sites (the hoisted freeze and the second-chance re-read): found {gui_mirrors}"
+        );
+        let headless_mirrors =
+            include_str!("features/assistant/product_runtime/headless_bridge.rs")
+                .matches(&mirrored_read)
+                .count();
+        assert_eq!(
+            headless_mirrors, 1,
+            "headless_bridge.rs must keep its mirrored startup read (this host attaches no log plugin)"
+        );
+        // The console bin mirrors via eprintln (the
+        // startup timeline is pub(crate) and this host has no window at all);
+        // deleting that mirror passed every leg — pin it. The wording lives
+        // once in scope's FREEZE_PERSIST_FAILURE_NOTICE (every host mirror
+        // shares it), so pin both halves: the const keeps the message text,
+        // and the bin still references the const from its eprintln.
+        let mirror_needle = [
+            "CRITICAL: the fresh-vs-",
+            "upgraded verdict could not be persisted",
+        ]
+        .concat();
+        let const_carries_text = include_str!("features/marketplace/scope.rs")
+            .matches(&mirror_needle)
+            .count();
+        assert!(
+            const_carries_text >= 1,
+            "scope.rs must keep the freeze-persist failure notice wording (every host mirror shares it)"
+        );
+        let bin_mirrors = include_str!("bin/dump_system_prompt.rs")
+            .matches("FREEZE_PERSIST_FAILURE_NOTICE")
+            .count();
+        assert!(
+            bin_mirrors >= 1,
+            "dump_system_prompt.rs must keep its freeze-persist failure eprintln mirror (this host has neither window nor log plugin)"
+        );
+    }
+
+    /// Wiring pin for the ghost-session fix's root-cause leg: the purge
+    /// hook's agents-index leg must capture the store derived from
+    /// `AcpPool::new` (`pool.agents().clone()`), never a second
+    /// `SessionAgentStore` instance over the same file — a second instance
+    /// would rewrite `session-agents.json` from its own memory on every
+    /// purge, clobbering concurrent binds. Textual pin like the legs above
+    /// (needles fragment-concatenated against self-match, `find` takes the
+    /// first = production occurrence): deleting the capture, swapping it
+    /// for an independent `SessionAgentStore::load_or_empty`, or swapping
+    /// the `pool.agents()` binding itself for an independent instance all
+    /// fail here.
+    #[test]
+    fn purge_hook_captures_the_pool_agents_store() {
+        let source = include_str!("lib.rs");
+        let capture = source
+            .find(
+                &[
+                    "let agents_index_for_purge_hook = code_session_",
+                    "agents.clone();",
+                ]
+                .concat(),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "lib.rs is missing the purge-hook agents-index capture from code_session_agents"
+                )
+            });
+        let agents_binding = source
+            .find(&["let agents = pool.", "agents().clone();"].concat())
+            .unwrap_or_else(|| {
+                panic!("lib.rs is missing the pool agents binding for the purge hook")
+            });
+        let pool_binding = source
+            .find(&["let (code_session_", "agents, acp_pool_for_capabilities)"].concat())
+            .unwrap_or_else(|| panic!("lib.rs is missing the AcpPool agents binding"));
+        assert!(
+            agents_binding < capture,
+            "the purge hook's store must be cloned from the AcpPool's agents store, not an independent instance"
+        );
+        assert!(
+            pool_binding < capture,
+            "the purge hook must capture the store derived from AcpPool::new (pool.agents()), not an independent instance"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_allowlist_contract {
+    use std::sync::Arc;
+
+    use crate::features::assistant::tool_policy::{
+        PINVOU3_ALLOWED_TOOLS, PINVOU3_ALWAYS_LOADED_TOOLS, is_pinvou3_allowed,
+    };
+    use async_trait::async_trait;
+    use deepseek_tui::tools::spec::{ToolCapability, ToolError, ToolResult, ToolSpec};
+    use deepseek_tui::tools::{ToolContext, ToolRegistryBuilder};
+    use serde_json::{Value, json};
+
+    /// Host and MCP tools enter the foundation through `ToolSpec`, rather than
+    /// through the native builder. This probe keeps the test on the same
+    /// `model_visible()` -> API-catalog boundary used by a real turn.
+    struct RegistryProbeTool {
+        name: &'static str,
+        model_visible: bool,
+    }
+
+    #[async_trait]
+    impl ToolSpec for RegistryProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "allowlist registry probe"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![ToolCapability::ReadOnly]
+        }
+
+        fn model_visible(&self) -> bool {
+            self.model_visible
+        }
+
+        async fn execute(
+            &self,
+            _input: Value,
+            _context: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult::success("unused registry probe"))
+        }
+    }
+
+    /// Pinvou 只允许产品需要的 canonical 工具家族；动态 MCP 工具限制在标准命名空间。
+    #[test]
+    fn pinvou3_allowlist_uses_canonical_families_and_dynamic_mcp_namespace() {
+        for core in [
+            "bash",
+            "read",
+            "write",
+            "edit",
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "Git",
+            "Web",
+            "terminal/run",
+            "terminal/send",
+            "terminal/wait",
+            "terminal/cancel",
+            "terminal/reset",
+            "agent",
+            "load_skill",
+            "todo_write",
+            "tool_search",
+            "request_user_input",
+            // The base spillover footer and subagent worker records teach
+            // these two by name (retrieve_tool_result auto-activation,
+            // HANDLE_READ_ACTIVATION_HINT); excluding them recreates the
+            // phantom the allowlist exists to prevent.
+            "retrieve_tool_result",
+            "handle_read",
+            "kb_search",
+            "kb_open_source",
+            "mcp_weather_get_weather",
+            // Tools named by the base registry-first policy: the instruction
+            // says "call these first", so the allowlist must admit them
+            // (capability is governed by the allowlist, not by deleting
+            // descriptions).
+            "registry_sync",
+            "start_registry_mcp_server",
+            // The ima connector skill teaches a direct call to this native
+            // tool; without an exact rule the `mcp_*` prefix never admits it.
+            "ima_openapi",
+        ] {
+            assert!(is_pinvou3_allowed(core), "核心工具 {core} 应在白名单");
+        }
+
+        for excluded in [
+            // Snapshot-based turn rollback is dead with `snapshots_enabled`
+            // false (app-side code_checkpoints owns rewind); admitting it
+            // would offer a permanently failing Required-approval tool.
+            "revert_turn",
+            // Taught by the base `agent` description as an alternative to
+            // `type=test` (the `Run` tool with action="verifiers");
+            // deliberately excluded, with the residual probe disclosed in
+            // tool_policy.rs.
+            "Run",
+            "tasks",
+            "automation",
+            "github",
+            "rlm",
+            // work_update 是 v0.9.5 隐藏的 replay 别名，模型目录里只有 canonical
+            // `todo_write`；别名写进白名单是死条目，且会让进度工具整体不可见。
+            "work_update",
+            "checklist_write",
+            "update_plan",
+            // The File action family no longer has a canonical lowercase
+            // counterpart and must not be admitted into new catalogs.
+            "File",
+            // Exact terminal names prevent future execution primitives from
+            // being admitted merely by sharing a prefix.
+            "terminal/future-capability",
+        ] {
+            assert!(
+                !is_pinvou3_allowed(excluded),
+                "非 Pinvou 工具家族 {excluded} 不应进入白名单"
+            );
+        }
+
+        // Always-loading a name the allowlist strips is dead configuration
+        // (the per-turn retain wins), so every entry must resolve through the
+        // real matcher; a typo here must fail instead of silently deferring.
+        for always_loaded in PINVOU3_ALWAYS_LOADED_TOOLS {
+            assert!(
+                is_pinvou3_allowed(always_loaded),
+                "always-loaded tool {always_loaded} has no matching allowlist rule"
+            );
+        }
+        // Membership guard: the static instructions and the registry-first
+        // policy name these tools directly, so each must stay in the
+        // always-loaded list. The live-catalog regression iterates this same
+        // constant, so dropping an entry here would silence that check and
+        // re-create the first-turn-absent phantom with a green suite.
+        for load_bearing in [
+            "load_skill",
+            "file_search",
+            "registry_sync",
+            "start_registry_mcp_server",
+            // The computer-use instruction section (computer_use::
+            // instruction_block, rendered while the master switch is on)
+            // names the tool directly, so it must ship non-deferred.
+            crate::features::computer_use::TOOL_NAME,
+        ] {
+            assert!(
+                PINVOU3_ALWAYS_LOADED_TOOLS.contains(&load_bearing),
+                "always-loaded list dropped {load_bearing}: static text names it, so it must ship non-deferred on the first turn"
+            );
+        }
+        // `is_pinvou3_allowed` is deliberately case-insensitive, so the
+        // legacy `Bash` spelling remains executable when replaying an old
+        // transcript. The source catalog still teaches only canonical `bash`.
+        assert!(!PINVOU3_ALLOWED_TOOLS.contains(&"Bash"));
+        assert!(!PINVOU3_ALLOWED_TOOLS.contains(&"File"));
+        assert!(PINVOU3_ALLOWED_TOOLS.contains(&"mcp_*"));
+    }
+
+    /// The native ima tool's name is spelled independently in the engine
+    /// registration, the allowlist, and the marketplace deny table; a rename
+    /// that updates the allowlist but not the deny table fails open silently
+    /// (a stale deny of a nonexistent name) while every list-only test stays
+    /// green. Pin all three to the tool's actual registered name.
+    #[test]
+    fn native_ima_tool_name_is_pinned_across_allowlist_and_deny_table() {
+        let registered = crate::features::connectors::ima::ImaOpenApiTool::new()
+            .name()
+            .to_string();
+        assert_eq!(registered, "ima_openapi");
+        assert!(
+            is_pinvou3_allowed(&registered),
+            "native tool {registered} must keep an exact allowlist rule (the mcp_ prefix never admits it)"
+        );
+        assert!(
+            crate::features::marketplace::NATIVE_PACKAGE_TOOLS
+                .iter()
+                .any(|(tool, _)| *tool == registered),
+            "native tool {registered} must keep its marketplace ownership mapping"
+        );
+    }
+
+    /// Conditional host tools and dynamically discovered MCP tools do not
+    /// appear in every session. Register representative tools through the
+    /// v0.9.12 registry and verify the allowlist sees exactly its
+    /// model-visible API catalog, including the dynamic MCP prefix.
+    #[test]
+    fn conditional_allowlist_rules_match_model_visible_registry_entries() {
+        let visible_names = [
+            "image_analyze",
+            "kb_search",
+            "kb_open_source",
+            "mcp_weather_get_weather",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+        ];
+        let mut builder = ToolRegistryBuilder::new();
+        for name in visible_names {
+            builder = builder.with_tool(Arc::new(RegistryProbeTool {
+                name,
+                model_visible: true,
+            }));
+        }
+        builder = builder.with_tool(Arc::new(RegistryProbeTool {
+            name: "mcp_hidden_replay_alias",
+            model_visible: false,
+        }));
+        let registry = builder.build(ToolContext::new(std::env::temp_dir()));
+        let model_catalog = registry.to_api_tools();
+        let model_names = model_catalog
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            model_names,
+            visible_names.into_iter().collect(),
+            "the probe must exercise the foundation's model-visible registry projection"
+        );
+        assert!(
+            model_names.iter().all(|name| is_pinvou3_allowed(name)),
+            "a conditional host/MCP registry entry has no matching Pinvou allowlist rule: {model_names:?}"
+        );
+        assert!(!model_names.contains("mcp_hidden_replay_alias"));
+    }
+}
+
+#[cfg(test)]
+mod navigation_policy_tests {
+    use super::{MainNavigationVerdict, decide_main_navigation};
+
+    fn allow_origin(verdict: MainNavigationVerdict) -> Option<String> {
+        match verdict {
+            MainNavigationVerdict::Allow { initial_origin } => initial_origin,
+            MainNavigationVerdict::Block { .. } => panic!("expected Allow, got Block"),
+        }
+    }
+
+    fn block_detail(verdict: MainNavigationVerdict) -> Option<String> {
+        match verdict {
+            MainNavigationVerdict::Block { detail } => detail,
+            MainNavigationVerdict::Allow { .. } => panic!("expected Block, got Allow"),
+        }
+    }
+
+    const MAIN_ORIGIN: &str = "tauri://localhost:-";
+
+    #[test]
+    fn embedded_srcdoc_navigation_is_allowed_after_main_origin() {
+        // Regression: `iframe[srcdoc]` (the HTML artifact preview carrier)
+        // surfaces as an about:srcdoc navigation of the host webview on
+        // engines that forward subframe navigations (WKWebView, WebKitGTK).
+        // PR #116 unblocked it on Linux only; on macOS the guard denied it
+        // and the preview stayed a black placeholder forever.
+        for allowed in ["about:blank", "about:srcdoc"] {
+            let url = tauri::Url::parse(allowed).unwrap();
+            let verdict = decide_main_navigation(&url, Some(MAIN_ORIGIN));
+            assert!(
+                allow_origin(verdict).is_none(),
+                "embedded documents must not overwrite the main origin: {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_documents_must_not_become_the_initial_main_origin() {
+        for allowed in ["about:blank", "about:srcdoc"] {
+            let url = tauri::Url::parse(allowed).unwrap();
+            let verdict = decide_main_navigation(&url, None);
+            assert!(
+                block_detail(verdict).is_none(),
+                "pre-baseline embedded documents are denied silently: {allowed}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_main_frame_navigation_records_baseline_origin() {
+        let url = tauri::Url::parse("tauri://localhost/").unwrap();
+        let recorded = allow_origin(decide_main_navigation(&url, None))
+            .expect("first navigation must establish the baseline");
+        assert_eq!(recorded, MAIN_ORIGIN);
+    }
+
+    #[test]
+    fn same_origin_navigation_is_allowed_without_re_recording_baseline() {
+        let url = tauri::Url::parse("tauri://localhost/index.html").unwrap();
+        assert!(allow_origin(decide_main_navigation(&url, Some(MAIN_ORIGIN))).is_none());
+    }
+
+    #[test]
+    fn external_origins_still_blocked_after_baseline() {
+        for blocked in [
+            "https://example.com/",
+            "file:///etc/passwd",
+            "data:text/html,hello",
+        ] {
+            let url = tauri::Url::parse(blocked).unwrap();
+            let detail = block_detail(decide_main_navigation(&url, Some(MAIN_ORIGIN)))
+                .unwrap_or_else(|| panic!("external origin must stay blocked: {blocked}"));
+            assert!(
+                detail.contains("scheme="),
+                "block detail carries the startup diagnostic: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn about_variants_do_not_match_the_embedded_allowlist() {
+        // Exact-string allowlist: query-bearing or unrelated about: URLs fall
+        // through to the origin baseline and are denied there.
+        let url = tauri::Url::parse("about:blank?next=https://example.com").unwrap();
+        assert!(block_detail(decide_main_navigation(&url, Some(MAIN_ORIGIN))).is_some());
+        let url = tauri::Url::parse("about:config").unwrap();
+        assert!(block_detail(decide_main_navigation(&url, Some(MAIN_ORIGIN))).is_some());
+    }
+}
+
+#[cfg(test)]
+mod session_browser_cleanup_retry_tests {
+    use super::{
+        SESSION_BROWSER_CLEANUP_INITIAL_RETRY, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY,
+        SESSION_BROWSER_CLEANUP_MAX_RETRY, SessionBrowserCleanupQueue,
+        next_session_browser_cleanup_retry, session_browser_cleanup_failure_kind,
+    };
+
+    #[test]
+    fn cleanup_failure_diagnostics_use_non_sensitive_categories() {
+        assert_eq!(
+            session_browser_cleanup_failure_kind("browser manager is unavailable"),
+            "browser-manager-unavailable"
+        );
+        assert_eq!(
+            session_browser_cleanup_failure_kind(
+                "browser cleanup attempt timed out after 10 seconds"
+            ),
+            "timeout"
+        );
+        let category = session_browser_cleanup_failure_kind(
+            "failed to delete session private-session-id from C:\\private\\path",
+        );
+        assert_eq!(category, "cleanup-error");
+        assert!(!category.contains("private-session-id"));
+        assert!(!category.contains("private\\path"));
+    }
+
+    #[test]
+    fn pending_queue_coalesces_repeated_ids_before_worker_take() {
+        let queue = SessionBrowserCleanupQueue::default();
+
+        for _ in 0..10_000 {
+            queue.enqueue("session-a");
+        }
+        queue.enqueue("session-b");
+
+        assert_eq!(queue.pending_len(), 2);
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut claimed = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+        claimed.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|claim| claim.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["session-a", "session-b"]
+        );
+        assert_eq!(queue.pending_len(), 0);
+        assert_eq!(queue.in_flight_len(), 2);
+        for claim in claimed {
+            queue.complete_attempt(claim, true, now);
+        }
+        assert_eq!(queue.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn unique_pending_ids_are_concurrency_bounded_without_loss() {
+        let queue = SessionBrowserCleanupQueue::default();
+        let expected = (0..10_000)
+            .map(|index| format!("session-{index}"))
+            .collect::<std::collections::HashSet<_>>();
+        for session_id in &expected {
+            queue.enqueue(session_id);
+        }
+
+        let mut observed = std::collections::HashSet::new();
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while queue.in_flight_len() > 0 || queue.pending_len() > 0 {
+            let batch = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+            assert!(batch.len() <= SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+            assert!(queue.in_flight_len() <= SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+            for claim in batch {
+                assert!(observed.insert(claim.session_id.clone()));
+                queue.complete_attempt(claim, true, now);
+            }
+        }
+
+        assert_eq!(observed, expected);
+        assert_eq!(queue.pending_len(), 0);
+        assert_eq!(queue.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn repeated_events_are_coalesced_and_success_releases_cleanup_bookkeeping() {
+        let queue = SessionBrowserCleanupQueue::default();
+        queue.enqueue("session-a");
+        queue.enqueue("session-b");
+        let now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut first = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+        let session_a = first
+            .iter()
+            .position(|claim| claim.session_id == "session-a")
+            .map(|index| first.swap_remove(index))
+            .expect("session A claim");
+        let session_b = first.pop().expect("session B claim");
+
+        queue.enqueue("session-a");
+        queue.enqueue("session-a");
+        queue.complete_attempt(session_a, true, now);
+        queue.complete_attempt(session_b, true, now);
+
+        let rerun = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+        assert_eq!(rerun.len(), 1);
+        assert_eq!(rerun[0].session_id, "session-a");
+        queue.complete_attempt(rerun.into_iter().next().unwrap(), true, now);
+        assert_eq!(queue.pending_len(), 0);
+        assert_eq!(queue.in_flight_len(), 0);
+
+        queue.enqueue("session-a");
+        assert_eq!(queue.claim_ready_up_to(now, 1).len(), 1);
+    }
+
+    #[test]
+    fn persistent_failures_do_not_starve_a_later_unique_cleanup() {
+        let queue = SessionBrowserCleanupQueue::default();
+        let failure_ids = (0..SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY)
+            .map(|index| format!("failure-{index}"))
+            .collect::<std::collections::HashSet<_>>();
+        for index in 0..SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY {
+            queue.enqueue(&format!("failure-{index}"));
+        }
+        queue.enqueue("eventual-success");
+        let mut now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+
+        let first = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+        assert_eq!(first.len(), SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+        assert!(
+            first
+                .iter()
+                .all(|claim| failure_ids.contains(&claim.session_id))
+        );
+        for claim in first {
+            queue.complete_attempt(claim, false, now);
+        }
+
+        let success = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+        assert_eq!(success.len(), 1);
+        assert_eq!(success[0].session_id, "eventual-success");
+        queue.complete_attempt(success.into_iter().next().unwrap(), true, now);
+
+        for _ in 0..3 {
+            now += SESSION_BROWSER_CLEANUP_MAX_RETRY;
+            let retry = queue.claim_ready_up_to(now, SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+            assert_eq!(retry.len(), SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+            assert!(
+                retry
+                    .iter()
+                    .all(|claim| failure_ids.contains(&claim.session_id))
+            );
+            for claim in retry {
+                queue.complete_attempt(claim, false, now);
+            }
+        }
+        assert_eq!(queue.in_flight_len(), 0);
+        assert_eq!(queue.pending_len(), SESSION_BROWSER_CLEANUP_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn cleanup_retry_uses_exponential_backoff_with_a_fixed_cap() {
+        let mut delay = SESSION_BROWSER_CLEANUP_INITIAL_RETRY;
+        for expected_millis in [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] {
+            delay = next_session_browser_cleanup_retry(delay);
+            assert_eq!(delay.as_millis(), expected_millis);
+        }
+        assert_eq!(
+            next_session_browser_cleanup_retry(SESSION_BROWSER_CLEANUP_MAX_RETRY),
+            SESSION_BROWSER_CLEANUP_MAX_RETRY
+        );
+    }
+}
+
+#[cfg(test)]
+mod release_env_defaults_guard {
+    /// PR #210 守卫：release/boot 不得重新注入 DEEPSEEK_MAX_OUTPUT_TOKENS。
+    /// 该 env 会被底座 effective_max_output_tokens() 优先读取，一旦回归会重新把
+    /// 所有模型（含云端）输出上限钉死 24576——正是本 PR 移除的根因。此守卫在
+    /// CHANGES_REQUESTED 后新增：clean env 云端落底座 64K 兜底的前提，就是
+    /// release 安装包启动路径（.deb 双击等）不再注入该变量。
+    ///
+    /// 两层检查（评审修正 2026-08-11）：
+    /// 1. 常量表本身不含这两个 key（防常量里重新出现）；
+    /// 2. 走**实际注入路径** `ensure_release_env`（run() 启动路径的 release env
+    ///    注入函数，无写盘副作用）后断言进程 env 仍无这两个 key——即使未来有人在
+    ///    注入函数里绕过常量表直接 set_var，这里也能抓到。
+    ///
+    /// 第三轮评审修正 2026-08-11：本测试此前直接删进程级 env 且不还原，未借 crate
+    /// 级唯一 ENV_LOCK（会与 bridge.rs 等 env 写测试并发竞态），也不还原
+    /// ensure_release_env 写入的 RELEASE_ENV_DEFAULTS / PATH / 平台 UI env（串行 CI
+    /// 下造成后续测试顺序依赖）。现改为：先取 ENV_LOCK 再全量快照 env，退出（含
+    /// panic）时按快照完整还原。bridge boot 侧的 env 注入源头由 bridge.rs
+    /// `forkguard_boot_env_must_not_pin_global_output_cap` 单独守卫（boot 不直接
+    /// 进单测：会 mutate PINVOU3_HOME 写盘 + 全量解包 bundle，见
+    /// `engine_config_workspace_follows_bridge_field` 注释）。
+    ///
+    /// 进程 env 全量快照：ensure_release_env 会 set RELEASE_ENV_DEFAULTS、重写 PATH、
+    /// Linux 上还会 set GDK_BACKEND 等 UI env——只有全量快照才能完整还原，且不随
+    /// 各常量表增删漂移。
+    ///
+    /// 第四轮评审修正（2026-08-12）：此前用 `String` + `std::env::vars()`——`vars()`
+    /// 对任何非 UTF-8 的合法环境变量值（POSIX 允许任意字节）会直接 panic，且 Drop 中
+    /// 的二次枚举同样 panic；测试断言失败展开 panic 期间再 panic 会中止整个测试进程。
+    /// 现改用 `OsString` + `vars_os()`，非 UTF-8 环境变量也能完整快照/还原。
+    struct EnvSnapshot(std::collections::HashMap<std::ffi::OsString, Option<std::ffi::OsString>>);
+
+    impl EnvSnapshot {
+        fn take() -> Self {
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in std::env::vars_os() {
+                map.insert(k, Some(v));
+            }
+            // 显式记录"当前不存在"的 key，还原时统一按快照恢复原状（set / remove）。
+            for key in ["DEEPSEEK_MAX_OUTPUT_TOKENS", "PINVOU3_MAX_OUTPUT_TOKENS"] {
+                map.entry(std::ffi::OsString::from(key)).or_insert(None);
+            }
+            Self(map)
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    // SAFETY: holding platform::paths::tests::ENV_LOCK (see each
+                    // use site); env writes in the test process are serialized.
+                    Some(v) => unsafe { std::env::set_var(k, v) },
+                    // SAFETY: same as above; restore-side removal serialized under ENV_LOCK.
+                    None => unsafe { std::env::remove_var(k) },
+                }
+            }
+            // ensure_release_env 可能 set 了快照中原本不存在的 key（PATH 分支、Linux
+            // UI env 等）——全部移除，回到快照状态，杜绝后续测试的顺序依赖。
+            let keep: std::collections::HashSet<&std::ffi::OsString> = self.0.keys().collect();
+            let stale: Vec<std::ffi::OsString> = std::env::vars_os()
+                .map(|(k, _)| k)
+                .filter(|k| !keep.contains(k))
+                .collect();
+            for k in stale {
+                // SAFETY: same as above; cleanup-side removal under ENV_LOCK serialization.
+                unsafe { std::env::remove_var(&k) };
+            }
+        }
+    }
+
+    #[test]
+    fn release_env_defaults_must_not_pin_global_output_cap() {
+        // crate 级唯一 env 锁：与所有 env 写测试串行（同 bridge.rs locked_env 约定），
+        // 避免与 DEEPSEEK_* / PINVOU3_HOME 写测试并发竞态。
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _snapshot = EnvSnapshot::take();
+
+        // 第一层：常量表
+        assert!(
+            !super::RELEASE_ENV_DEFAULTS
+                .iter()
+                .any(|(k, _)| *k == "DEEPSEEK_MAX_OUTPUT_TOKENS"),
+            "RELEASE_ENV_DEFAULTS 不得包含 DEEPSEEK_MAX_OUTPUT_TOKENS（PR #210 移除全局注入）"
+        );
+        assert!(
+            !super::RELEASE_ENV_DEFAULTS
+                .iter()
+                .any(|(k, _)| *k == "PINVOU3_MAX_OUTPUT_TOKENS"),
+            "RELEASE_ENV_DEFAULTS 不得包含 PINVOU3_MAX_OUTPUT_TOKENS（品悟侧上限仅经 prefs/route 携带）"
+        );
+
+        // 第二层：实际注入路径（ensure_release_env 是 run() 启动路径的 release env
+        // 注入函数）。先清掉外部可能残留的 env，确保断言的是注入函数自身的行为。
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line of this test); env writes serialized.
+        unsafe { std::env::remove_var("DEEPSEEK_MAX_OUTPUT_TOKENS") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::remove_var("PINVOU3_MAX_OUTPUT_TOKENS") };
+        super::ensure_release_env();
+        assert!(
+            std::env::var_os("DEEPSEEK_MAX_OUTPUT_TOKENS").is_none(),
+            "ensure_release_env must not re-inject DEEPSEEK_MAX_OUTPUT_TOKENS (would re-pin cloud caps)"
+        );
+        assert!(
+            std::env::var_os("PINVOU3_MAX_OUTPUT_TOKENS").is_none(),
+            "ensure_release_env must not re-inject PINVOU3_MAX_OUTPUT_TOKENS (the Pinvou cap travels only via prefs/route)"
+        );
+        // 退出时 EnvSnapshot::drop 按快照完整还原（含 PATH / UI env / 常量表变量）。
+    }
+
+    /// PATH assembly order guard: lock-pinned versioned CLI asset dirs must
+    /// precede the legacy `connectors/<platform>/bin/` dir. A stale old-version
+    /// binary left in the legacy dir must not shadow the upgraded runtime
+    /// (observed: a leftover wecom-cli 0.1.9 kept running after the upgrade to
+    /// 1.2.1); the legacy dir itself must stay on PATH — connectors whose
+    /// pinned version is not installed resolve through it by name.
+    #[test]
+    fn release_env_path_orders_versioned_cli_dirs_before_legacy_bin() {
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _snapshot = EnvSnapshot::take();
+
+        // The PATH branch only runs when var_os("PATH") exists; set a sentinel
+        // first so the assertions cover exactly what ensure_release_env
+        // assembled. PINVOU3_HOME is repointed at a nonexistent test path —
+        // directory existence plays no part in PATH assembly.
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line); env writes serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", "/tmp/pinvou3-path-order-test") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+        super::ensure_release_env();
+
+        let path = std::env::var_os("PATH").expect("ensure_release_env must rewrite PATH");
+        let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+        // 软跳过仅限真正不支持的架构；受支持平台上 wrapper 回归会在此硬断言
+        // 失败（契约见 platform::test_support 同名 helper）。
+        let Some(legacy) =
+            crate::platform::test_support::managed_connector_bin_dir_or_assert_unsupported()
+        else {
+            return;
+        };
+        let legacy_idx = dirs
+            .iter()
+            .position(|d| d == &legacy)
+            .expect("legacy bin dir must stay on PATH for not-yet-migrated binaries");
+        let pins = crate::platform::connector_lock::all_artifact_pins();
+        assert!(
+            !pins.is_empty(),
+            "test platform lock must pin at least one CLI artifact"
+        );
+        for (name, pin) in &pins {
+            let versioned = crate::platform::paths::assets_cli_dir(&name, &pin.version);
+            let idx = dirs
+                .iter()
+                .position(|d| d == &versioned)
+                .unwrap_or_else(|| panic!("versioned {name} asset dir must be on PATH"));
+            assert!(
+                idx < legacy_idx,
+                "versioned {name} dir must precede the legacy bin dir (stale legacy binaries must not shadow the pinned runtime)"
+            );
+        }
+        // EnvSnapshot::drop restores the full snapshot on exit (PATH / PINVOU3_HOME included).
+    }
+
+    /// PATH assembly must honor both npm prefix spellings: npm reads
+    /// NPM_CONFIG_PREFIX and npm_config_prefix alike, and a lowercase-only
+    /// setup (the shape commit 132cd4be9 fixed for the posix vendor-CLI scan
+    /// in platform/os/posix.rs) must still get its `<prefix>/bin` onto the
+    /// child-process PATH — a shim npm lands there must stay resolvable by
+    /// name for every PATH-based consumer this env serves.
+    #[test]
+    fn release_env_path_reads_lowercase_npm_config_prefix() {
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _snapshot = EnvSnapshot::take();
+
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-npm-prefix-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create prefix bin dir");
+        // The PATH branch only runs when var_os("PATH") exists; set a sentinel
+        // and set ONLY the lowercase spelling (uppercase removed) so the
+        // assertion covers exactly the two-spelling read.
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line); env writes serialized.
+        unsafe { std::env::set_var("PATH", "/usr/bin:/bin") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::remove_var("NPM_CONFIG_PREFIX") };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::set_var("npm_config_prefix", &root) };
+        super::ensure_release_env();
+
+        let path = std::env::var_os("PATH").expect("ensure_release_env must rewrite PATH");
+        let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path).collect();
+        assert!(
+            dirs.contains(&bin_dir),
+            "lowercase-only npm_config_prefix must still put <prefix>/bin on the child PATH (dirs: {dirs:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        // EnvSnapshot::drop restores the full snapshot on exit (both npm
+        // prefix spellings included).
+    }
+
+    /// `startup_process_env` is the sole injection funnel for
+    /// `PINVOU3_SESSION_ARTIFACTS` (bridge boot runs in the multi-threaded
+    /// phase and must not write the process env; see the dual assertion in
+    /// bridge.rs `forkguard_boot_env_must_not_pin_global_output_cap`).
+    /// This test locks the positive behavior: the single-threaded startup
+    /// function must write the session artifacts dir into the process env for
+    /// MCP stdio subprocesses such as PPT / official-document tools to
+    /// inherit.
+    #[test]
+    fn startup_process_env_writes_session_artifacts() {
+        let _lock = crate::platform::paths::tests::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _snapshot = EnvSnapshot::take();
+
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-startup-env-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        std::fs::create_dir_all(&root).expect("create isolated PINVOU3_HOME");
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line of this test); env writes serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &root) };
+        // SAFETY: same as above; ENV_LOCK serialization.
+        unsafe { std::env::remove_var("PINVOU3_SESSION_ARTIFACTS") };
+
+        super::startup_process_env();
+
+        let expected = crate::platform::paths::default_session_artifacts_dir();
+        assert_eq!(
+            std::env::var("PINVOU3_SESSION_ARTIFACTS").as_deref(),
+            Ok(expected.to_str().expect("isolated home path must be UTF-8")),
+            "startup_process_env must inject PINVOU3_SESSION_ARTIFACTS"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(test)]
+    mod workspace_roots_resolver_tests {
+        use crate::compose_workspace_roots;
+
+        #[test]
+        fn workspace_roots_resolver_prefers_the_agents_record() {
+            // Round-13 M4: the composition priority is the feature's delivery
+            // contract — an agents record (code/ACP) is authoritative, the plain
+            // binding sidecar is the fallback, both empty = single-root. As an
+            // inline closure this went unpinned (deleting the agents branch kept
+            // every test green); composed through compose_workspace_roots the
+            // conflicting fixture goes red. Hermetic under ENV_LOCK + PINVOU3_HOME.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-roots-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let w = std::env::temp_dir().join("pinvou3-compose-roots-w");
+            let _ = std::fs::remove_dir_all(&w);
+            std::fs::create_dir_all(&w).unwrap();
+
+            // Both stores populated with DIFFERENT non-empty sets: the agents
+            // record wins and the plain sidecar must not leak through. The
+            // bind requires a live session record, so create it first (the id
+            // is what both stores key on).
+            let s_both = sessions
+                .create_new("s-both".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_both,
+                    w.clone(),
+                    vec![w.clone(), w.join("plain-extra")],
+                )
+                .expect("bind plain sidecar");
+            agents
+                .set_acp_workspace(
+                    &s_both,
+                    crate::features::codex_acp::AgentBackend::CodexAcp,
+                    crate::features::codex_acp::CodexWorkspaceKind::Project,
+                    Some(w.clone()),
+                    vec![w.clone(), w.join("agents-extra")],
+                )
+                .expect("seed agents record");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s_both);
+            assert!(
+                composed.iter().any(|root| root.ends_with("agents-extra")),
+                "{composed:?}"
+            );
+            assert!(
+                !composed.iter().any(|root| root.ends_with("plain-extra")),
+                "{composed:?}"
+            );
+
+            // An agents record with an EMPTY set falls back to the plain sidecar.
+            let s_conv = sessions
+                .create_new("s-conv".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            agents
+                .set_acp_workspace(
+                    &s_conv,
+                    crate::features::codex_acp::AgentBackend::CodexAcp,
+                    crate::features::codex_acp::CodexWorkspaceKind::Project,
+                    Some(w.clone()),
+                    Vec::new(),
+                )
+                .expect("seed empty agents record");
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_conv,
+                    w.clone(),
+                    vec![w.clone(), w.join("plain-only")],
+                )
+                .expect("bind plain sidecar for the fallback leg");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s_conv);
+            assert!(
+                composed.iter().any(|root| root.ends_with("plain-only")),
+                "the empty agents record must fall back to the sidecar: {composed:?}"
+            );
+
+            // Both empty = single-root (empty vector).
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, "s-none");
+            assert!(composed.is_empty());
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&w);
+        }
+
+        #[test]
+        fn workspace_roots_delivery_rechecks_soft_kept_spellings() {
+            // Round-19 minor 6: a soft-kept (nonexistent at intake) root is
+            // stored lexically; if it later materializes as a symlink to `/`
+            // or to the primary's ancestor, the per-turn canonicalizing
+            // enforcement would grant the wide target. compose_workspace_roots
+            // re-checks the two hard invariants on the canonical form of every
+            // resolvable additional root and DROPS the widening ones
+            // (fail-safe narrowing); a benign materialized root and an
+            // still-missing spelling stay delivered. Hermetic like the
+            // sibling test: ENV_LOCK + PINVOU3_HOME + own temp dirs.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir().join(format!(
+                "pinvou3-compose-recheck-home-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base = std::env::temp_dir()
+                .join(format!("pinvou3-compose-recheck-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Pin the fixture to the canonical base (projects-tests D2
+            // convention, round-21 M5): on macOS the raw /var spelling of
+            // temp_dir never prefix-matches the /private/var canonical
+            // form the re-check compares against, so the widening links
+            // would be delivered and the drop assertions panic.
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let w = base.join("ws");
+            std::fs::create_dir_all(&w).unwrap();
+
+            let s = sessions
+                .create_new("s-recheck".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            let benign = w.join("materialized");
+            std::fs::create_dir_all(&benign).unwrap();
+            let still_missing = w.join("still-missing");
+
+            #[cfg(unix)]
+            let root_link = {
+                let link = base.join("root-link");
+                std::os::unix::fs::symlink("/", &link).expect("symlink to /");
+                link
+            };
+            #[cfg(unix)]
+            let ancestor_link = {
+                let link = base.join("ancestor-link");
+                std::os::unix::fs::symlink(&base, &link).expect("symlink to the primary's parent");
+                link
+            };
+
+            // The `mut` lives inside the unix arm only: with the extend
+            // cfg'd out on Windows a plain `let mut` would trip
+            // `-D unused-mut` on the all-targets leg (the round-19 BLOCKER
+            // class — platform-conditional code must stay clean on both
+            // targets).
+            #[cfg(unix)]
+            let roots = {
+                let mut all = vec![w.clone(), benign.clone(), still_missing.clone()];
+                all.extend([root_link.clone(), ancestor_link.clone()]);
+                all
+            };
+            #[cfg(not(unix))]
+            let roots = vec![w.clone(), benign.clone(), still_missing.clone()];
+            sessions
+                .bind_session_workspace_with_roots(&s, w.clone(), roots)
+                .expect("bind sidecar");
+
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert!(
+                composed.contains(&benign),
+                "a benign materialized root stays delivered: {composed:?}"
+            );
+            assert!(
+                composed.contains(&still_missing),
+                "an unverifiable spelling keeps the soft-keep semantics: {composed:?}"
+            );
+            #[cfg(unix)]
+            {
+                assert!(
+                    !composed.contains(&root_link),
+                    "a symlink resolving to the filesystem root must be dropped at delivery: {composed:?}"
+                );
+                assert!(
+                    !composed.contains(&ancestor_link),
+                    "a symlink resolving to the primary's ancestor must be dropped at delivery: {composed:?}"
+                );
+            }
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn compose_caps_a_hand_edited_over_limit_snapshot() {
+            // Round-32 minor 12: the compose cap (round-31 minor 10) — a
+            // hand-edited 70-root sidecar displays/delivers at most the
+            // foundation ceiling (primary + 64); deleting the truncate
+            // reds this.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-cap-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base =
+                std::env::temp_dir().join(format!("pinvou3-compose-cap-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let w = base.join("ws");
+            std::fs::create_dir_all(&w).unwrap();
+            let s = sessions
+                .create_new("s-cap".to_string(), None, w.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            let mut roots = vec![w.clone()];
+            for index in 0..69 {
+                roots.push(w.join(format!("extra-{index}")));
+            }
+            sessions
+                .bind_session_workspace_with_roots(&s, w.clone(), roots)
+                .expect("bind sidecar");
+
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed.len(),
+                codewhale_core::MAX_WORKSPACE_ROOTS + 1,
+                "primary + 64 = the foundation ceiling: {composed:?}"
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[test]
+        fn compose_delivers_a_project_backed_ancestor_root() {
+            // Round-21 M1: align persists `[cwd, ancestor]` when the owning
+            // project registers an ancestor of the session's cwd (§9.7, pin
+            // `align_persists_a_project_ancestor_root_by_design`; the
+            // delivery-side pin is
+            // `compose_delivers_a_project_backed_ancestor_root` below). The
+            // delivery re-check must exempt an ancestor whose canonical form
+            // matches one of the owning project's registered roots (tier-②
+            // covers the nested cwd); an unbacked ancestor — no project, or
+            // the project no longer registers the root — still drops
+            // (fail-safe narrowing, the pre-M1 behavior). Hermetic like the
+            // sibling tests: ENV_LOCK + PINVOU3_HOME + own temp dirs.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir().join(format!(
+                "pinvou3-compose-backed-home-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base = std::env::temp_dir()
+                .join(format!("pinvou3-compose-backed-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            // Canonical fixture base (projects-tests D2 convention): the
+            // tier-② fold-key prefix match and the exemption comparison both
+            // run on canonical spellings.
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let nested = base.join("nested");
+            std::fs::create_dir_all(&nested).unwrap();
+
+            projects
+                .create_project("backed".to_string(), vec![base.clone()])
+                .expect("create backing project");
+
+            let s = sessions
+                .create_new("s-backed".to_string(), None, nested.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "a project-backed ancestor root stays delivered (align shape, §9.7): {composed:?}"
+            );
+
+            // The same keychain against a store with no project keeps the
+            // fail-safe drop — the exemption needs the backing authority.
+            let projects_empty = crate::features::projects::ProjectStore::from_paths(
+                home.join("projects-empty.json"),
+            );
+            let s_unbacked = sessions
+                .create_new("s-unbacked".to_string(), None, nested.clone())
+                .expect("create unbacked session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_unbacked,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            let composed =
+                compose_workspace_roots(&agents, &sessions, &projects_empty, &s_unbacked);
+            assert_eq!(
+                composed,
+                vec![nested.clone()],
+                "an unbacked ancestor root is still dropped at delivery: {composed:?}"
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[test]
+        fn compose_keeps_an_explicitly_granted_ancestor_across_project_mutations() {
+            // Round-40 (zhuowp P2): align persists [cwd A/sub, ancestor A]
+            // with the ancestor's provenance recorded. Removing A from the
+            // project, deleting the project, or moving the session out
+            // makes resolve_session_project return no backing root — the
+            // delivery used to drop A although the snapshot and the
+            // directories were unchanged, contradicting blueprint §6/§9.5
+            // and the remove-folder UI promise. The grant's authority is
+            // its recorded provenance, not mutable project state.
+            let _lock = crate::platform::paths::tests::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev_home = std::env::var("PINVOU3_HOME").ok();
+            let home = std::env::temp_dir()
+                .join(format!("pinvou3-compose-prov-home-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+            unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+
+            let sessions = crate::features::sessions::SessionStore::boot_with_scheduled_root(
+                home.join("scheduled"),
+            )
+            .expect("boot plain store");
+            let agents = crate::features::codex_acp::SessionAgentStore::for_test(
+                home.join("session-agents.json"),
+            );
+            let projects =
+                crate::features::projects::ProjectStore::from_paths(home.join("projects.json"));
+            let base =
+                std::env::temp_dir().join(format!("pinvou3-compose-prov-w-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            let base = base.canonicalize().expect("canonicalize fixture base");
+            let nested = base.join("sub");
+            std::fs::create_dir_all(&nested).unwrap();
+
+            let project = projects
+                .create_project("granted".to_string(), vec![base.clone()])
+                .expect("create backing project");
+
+            // The align shape: keychain [nested, base] with the ancestor's
+            // provenance recorded (what
+            // set_session_workspace_roots_with_explicit_ancestors persists).
+            let s = sessions
+                .create_new("s-granted".to_string(), None, nested.clone())
+                .expect("create session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s,
+                    vec![nested.clone(), base.clone()],
+                    vec![base.clone()],
+                )
+                .expect("record provenance");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "the granted ancestor delivers while the project backs it: {composed:?}"
+            );
+
+            // Mutation 1: the project no longer registers the root.
+            projects
+                .update_project(&project.id, Some("granted".to_string()), Some(vec![]))
+                .expect("remove the root from the project");
+            let composed = compose_workspace_roots(&agents, &sessions, &projects, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "removing the folder from the project keeps the granted ancestor delivered                  (the snapshot promised it; the directories are unchanged): {composed:?}"
+            );
+
+            // Mutation 2: the project is gone entirely.
+            let projects_after_delete = crate::features::projects::ProjectStore::from_paths(
+                home.join("projects-after-delete.json"),
+            );
+            let composed = compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s);
+            assert_eq!(
+                composed,
+                vec![nested.clone(), base.clone()],
+                "deleting the project keeps the granted ancestor delivered: {composed:?}"
+            );
+
+            // Mutation 3 (the control): WITHOUT provenance the same
+            // mutation still drops — the exemption is the recorded grant,
+            // not the spelling's shape.
+            let s_plain = sessions
+                .create_new("s-plain".to_string(), None, nested.clone())
+                .expect("create control session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_plain,
+                    nested.clone(),
+                    vec![nested.clone(), base.clone()],
+                )
+                .expect("bind control sidecar");
+            let composed =
+                compose_workspace_roots(&agents, &sessions, &projects_after_delete, &s_plain);
+            assert_eq!(
+                composed,
+                vec![nested.clone()],
+                "an ancestor with NO recorded provenance still drops without backing: {composed:?}"
+            );
+
+            // Symlink widening is still rejected (Unix leg — the fixture
+            // needs a symlink): see the cfg(unix) helper below.
+            #[cfg(unix)]
+            symlink_widened_provenance_still_drops(
+                &sessions,
+                &agents,
+                &projects_after_delete,
+                &base,
+                &nested,
+                &home,
+            );
+
+            // SAFETY: ENV_LOCK held for the whole test; restoring the caller's
+            // environment.
+            unsafe {
+                match prev_home {
+                    Some(home) => std::env::set_var("PINVOU3_HOME", home),
+                    None => std::env::remove_var("PINVOU3_HOME"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// Round-40 (zhuowp P2) control, Unix leg: a provenance spelling
+        /// whose CANONICAL form becomes an ancestor of the primary (the
+        /// link target contains the workspace) matches neither the
+        /// recorded provenance key nor a project backing, and drops.
+        #[cfg(unix)]
+        fn symlink_widened_provenance_still_drops(
+            sessions: &crate::features::sessions::SessionStore,
+            agents: &crate::features::codex_acp::SessionAgentStore,
+            projects: &crate::features::projects::ProjectStore,
+            base: &std::path::Path,
+            nested: &std::path::Path,
+            home: &std::path::Path,
+        ) {
+            let ancestor_target = base.parent().expect("fixture base parent");
+            let redirect = home.join("redirect");
+            std::os::unix::fs::symlink(ancestor_target, &redirect).expect("widening symlink");
+            let s_widened = sessions
+                .create_new("s-widened".to_string(), None, nested.to_path_buf())
+                .expect("create widened session")
+                .metadata
+                .id;
+            sessions
+                .bind_session_workspace_with_roots(
+                    &s_widened,
+                    nested.to_path_buf(),
+                    vec![nested.to_path_buf(), redirect.clone()],
+                )
+                .expect("bind widened sidecar");
+            sessions
+                .set_session_workspace_roots_with_explicit_ancestors(
+                    &s_widened,
+                    vec![nested.to_path_buf(), redirect.clone()],
+                    vec![redirect.clone()],
+                )
+                .expect("record widened provenance");
+            let composed = compose_workspace_roots(agents, sessions, projects, &s_widened);
+            assert_eq!(
+                composed,
+                vec![nested.to_path_buf()],
+                "a provenance spelling that canonicalizes to a widening target still drops: {composed:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod knowledge_service_failure_tests {
+    /// A failed knowledge init must leave an `:error` line carrying the cause
+    /// on the real `startup.log` — the failure previously reached stderr only
+    /// (lost on windowed Windows builds) — and must not be bookkept as
+    /// `knowledge_service:done`, which is reserved for a successful init.
+    /// Swapping the stage name back to a success-looking or retry-promising
+    /// one, dropping the cause, or re-sharing `:done` across both arms turns
+    /// this red.
+    #[test]
+    fn failed_knowledge_init_marks_the_timeline_with_the_cause() {
+        use crate::platform::paths::tests::{ENV_LOCK, EnvVarGuard, unique_suffix};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Restores the host's PINVOU3_HOME (present or absent) on drop, panic paths included.
+        let _env = EnvVarGuard::capture(&["PINVOU3_HOME"]);
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-kb-fail-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create isolated PINVOU3_HOME");
+        // SAFETY: holding platform::paths::tests::ENV_LOCK (first line of this test); env writes serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &root) };
+        // Re-init re-points the sink at this test's own log (see `init` docs).
+        crate::platform::startup::init();
+
+        super::mark_knowledge_service_failed(&anyhow::anyhow!("store too new: schema 9 > 4"));
+
+        let log = std::fs::read_to_string(root.join("logs").join("startup.log"))
+            .expect("the failure mark must be persisted");
+        assert!(log.contains("knowledge_service:error"), "{log}");
+        assert!(log.contains("store too new: schema 9 > 4"), "{log}");
+        assert!(
+            !log.contains("knowledge_service:done"),
+            "a failed init must not be bookkept as finished: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod session_purge_agents_index_tests {
+    use crate::features::codex_acp::{CodexWorkspaceKind, SessionAgentStore};
+
+    /// The composition root's purge hook must remove the purged session's
+    /// entry from the codex_acp agents index: retention evictions and
+    /// scheduled cleanups cannot reach that codex_acp-owned index, and a
+    /// stale entry outlives its owner and feeds the boot-time sidecar
+    /// backfill — resurrecting ghost `sessions/<id>/` directories on every
+    /// startup. The removal must be id-scoped (unrelated entries survive)
+    /// and must drop the authoritative sidecar with the index record.
+    #[test]
+    fn purge_removes_index_entry_and_keeps_others() {
+        crate::platform::test_support::with_temp_home("pinvou3-purge-agents-index", || {
+            // Index inside the hermetic home; the sidecar root derives as
+            // <home>/sessions, matching the production layout.
+            let home = crate::platform::paths::pinvou3_home();
+            let store = SessionAgentStore::for_test(home.join("session-agents.json"));
+            store
+                .bind_code_native_session(
+                    "sess-purged",
+                    CodexWorkspaceKind::Project,
+                    Some(home.clone()),
+                    Vec::new(),
+                )
+                .expect("bind purged");
+            store
+                .bind_code_native_session(
+                    "sess-survivor",
+                    CodexWorkspaceKind::Project,
+                    Some(home.clone()),
+                    Vec::new(),
+                )
+                .expect("bind survivor");
+
+            super::remove_agents_index_entry(&store, "sess-purged");
+
+            assert!(
+                !store.is_code_session("sess-purged"),
+                "the purged id's in-memory entry must be gone"
+            );
+            assert!(
+                store.is_code_session("sess-survivor"),
+                "unrelated entries must survive the purge leg"
+            );
+            let on_disk = std::fs::read_to_string(home.join("session-agents.json"))
+                .expect("the index must persist after the purge leg");
+            assert!(
+                !on_disk.contains("sess-purged"),
+                "the purged id must not survive on disk: {on_disk}"
+            );
+            assert!(
+                on_disk.contains("sess-survivor"),
+                "the survivor must remain on disk: {on_disk}"
+            );
+            assert!(
+                !home.join("sessions").join("sess-purged").exists(),
+                "the authoritative sidecar (and its directory) must be removed with the index entry",
+            );
+        });
+    }
+
+    /// The purge leg is best-effort like its siblings: an id without an index
+    /// entry (user deletes already removed it, or the session never had one)
+    /// must be a no-op, never an error that could abort an eviction.
+    #[test]
+    fn purge_tolerates_missing_index_entry() {
+        crate::platform::test_support::with_temp_home("pinvou3-purge-agents-index-missing", || {
+            let home = crate::platform::paths::pinvou3_home();
+            let store = SessionAgentStore::for_test(home.join("session-agents.json"));
+            super::remove_agents_index_entry(&store, "never-bound");
+            assert!(
+                !store.is_code_session("never-bound"),
+                "nothing to remove, nothing to resurrect"
+            );
+        });
+    }
+}

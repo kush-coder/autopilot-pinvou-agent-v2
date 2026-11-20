@@ -1,0 +1,464 @@
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+
+const { APP_ROOT } = require("./platform-config.js");
+const { npmInstallInvocation } = require("./npm-invocation.js");
+
+const BRIDGE_PACKAGE_ROOT = path.join(APP_ROOT, "scripts", "codex-bridge-runtime");
+const PACKAGE_JSON_PATH = path.join(BRIDGE_PACKAGE_ROOT, "package.json");
+const LOCKFILE_PATH = path.join(BRIDGE_PACKAGE_ROOT, "package-lock.json");
+const WINDOWS_RUNTIME_ROOT = path.join(
+  APP_ROOT,
+  "src-tauri",
+  "target",
+  "windows-runtime",
+);
+const WINDOWS_BRIDGE_ROOT = path.join(WINDOWS_RUNTIME_ROOT, "codex-bridge");
+const WINDOWS_BRIDGE_CONFIG_PATH = path.join(
+  WINDOWS_RUNTIME_ROOT,
+  "codex-bridge.tauri.conf.json",
+);
+const BRIDGE_ENTRYPOINT = path.join(
+  "acp",
+  "node_modules",
+  "@agentclientprotocol",
+  "codex-acp",
+  "dist",
+  "index.js",
+);
+const BRIDGE_PACKAGE_JSON = path.join(
+  "acp",
+  "node_modules",
+  "@agentclientprotocol",
+  "codex-acp",
+  "package.json",
+);
+const CLAUDE_BRIDGE_ENTRYPOINT = path.join(
+  "acp",
+  "node_modules",
+  "@agentclientprotocol",
+  "claude-agent-acp",
+  "dist",
+  "index.js",
+);
+const CLAUDE_BRIDGE_PACKAGE_JSON = path.join(
+  "acp",
+  "node_modules",
+  "@agentclientprotocol",
+  "claude-agent-acp",
+  "package.json",
+);
+const MARKER_NAME = "manifest.json";
+const PREPARE_FORMAT_VERSION = 4;
+const MINIMUM_NODE_MAJOR = 20;
+// Spawn sites inside @agentclientprotocol/codex-acp dist/index.js (verbatim,
+// minified output). Since 2.x the win32 branch goes through cross-spawn with an
+// args array and no shell string; the bundled fallback spreads
+// appServerStartupArgs. Both must stay unique single occurrences in the bundle
+// (the patch throws when an anchor is missing, duplicated, or half-applied);
+// hideWindowsChildProcesses rewrites exactly these two (the POSIX ternary
+// branch never runs on win32, mirroring the 1.x patch scope).
+const CODEX_PATH_SPAWN =
+  "(0, import_cross_spawn.default)(codexPath, appServerStartupArgs, { env: spawnEnv })";
+const HIDDEN_CODEX_PATH_SPAWN =
+  "(0, import_cross_spawn.default)(codexPath, appServerStartupArgs, { env: spawnEnv, windowsHide: true })";
+const BUNDLED_CODEX_SPAWN =
+  "spawn(process.execPath, [bundledCodexPath, ...appServerStartupArgs], { env: spawnEnv })";
+const HIDDEN_BUNDLED_CODEX_SPAWN =
+  "spawn(process.execPath, [bundledCodexPath, ...appServerStartupArgs], { env: spawnEnv, windowsHide: true })";
+const WINDOWS_NPM_CI_ARGS = [
+  "ci",
+  "--prefer-offline",
+  "--no-audit",
+  "--no-fund",
+  "--omit=dev",
+  "--include=optional",
+  "--os=win32",
+  "--cpu=x64",
+];
+
+function fileSha256(filePath) {
+  return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+}
+
+function expectedCodexAcpVersion() {
+  const packageJson = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, "utf8"));
+  return packageJson.dependencies["@agentclientprotocol/codex-acp"];
+}
+
+function expectedClaudeAcpVersion() {
+  const packageJson = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, "utf8"));
+  return packageJson.dependencies["@agentclientprotocol/claude-agent-acp"];
+}
+
+function expectedMarker({ architecture = process.arch } = {}) {
+  return {
+    schema_version: PREPARE_FORMAT_VERSION,
+    platform: "win32",
+    arch: architecture,
+    package_json_sha256: fileSha256(PACKAGE_JSON_PATH),
+    lockfile_sha256: fileSha256(LOCKFILE_PATH),
+  };
+}
+
+function countOccurrences(haystack, needle) {
+  return haystack.split(needle).length - 1;
+}
+
+function hideWindowsChildProcesses(entrypointPath) {
+  let source = fs.readFileSync(entrypointPath, "utf8");
+  const replacements = [
+    [CODEX_PATH_SPAWN, HIDDEN_CODEX_PATH_SPAWN],
+    [BUNDLED_CODEX_SPAWN, HIDDEN_BUNDLED_CODEX_SPAWN],
+  ];
+
+  for (const [visibleSpawn, hiddenSpawn] of replacements) {
+    if (source.includes(hiddenSpawn)) {
+      if (source.includes(visibleSpawn)) {
+        throw new Error(
+          "Windows ACP Bridge 子进程入口补丁只应用了一半，无法安全继续",
+        );
+      }
+      continue;
+    }
+    if (countOccurrences(source, visibleSpawn) !== 1) {
+      throw new Error(
+        "Windows ACP Bridge 子进程入口已变化，无法安全应用隐藏控制台补丁",
+      );
+    }
+    // eslint-disable-next-line unicorn/no-unsafe-string-replacement -- replacement value is a controlled literal
+    source = source.replace(visibleSpawn, hiddenSpawn);
+  }
+  fs.writeFileSync(entrypointPath, source);
+}
+
+function windowsChildProcessesHidden(entrypointPath) {
+  try {
+    const source = fs.readFileSync(entrypointPath, "utf8");
+    return (
+      source.includes(HIDDEN_CODEX_PATH_SPAWN) &&
+      source.includes(HIDDEN_BUNDLED_CODEX_SPAWN) &&
+      !source.includes(CODEX_PATH_SPAWN) &&
+      !source.includes(BUNDLED_CODEX_SPAWN)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function nonemptyFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function packageDirectories(root, scope, prefix) {
+  const scopeRoot = path.join(root, "acp", "node_modules", scope);
+  try {
+    return fs
+      .readdirSync(scopeRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix))
+      .map((entry) => path.join(scopeRoot, entry.name));
+  } catch {
+    return [];
+  }
+}
+
+function pruneWindowsPlatformPackages(root) {
+  for (const packageRoot of packageDirectories(root, "@openai", "codex-")) {
+    fs.rmSync(packageRoot, { recursive: true, force: true });
+  }
+  // Claude Code 走系统安装（与 Codex/Kimi 一致），适配器通过
+  // CLAUDE_CODE_EXECUTABLE / PATH 中的 claude 启动，不随包携带 claude.exe
+  //（单个原生二进制约 140MB）。
+  for (const packageRoot of packageDirectories(
+    root,
+    "@anthropic-ai",
+    "claude-agent-sdk-",
+  )) {
+    fs.rmSync(packageRoot, { recursive: true, force: true });
+  }
+}
+
+function platformPackagesValid(root) {
+  const codexPackages = packageDirectories(root, "@openai", "codex-");
+  const claudePackages = packageDirectories(
+    root,
+    "@anthropic-ai",
+    "claude-agent-sdk-",
+  );
+  return codexPackages.length === 0 && claudePackages.length === 0;
+}
+
+function windowsBridgeOverlay() {
+  return {
+    bundle: {
+      resources: {
+        "target/windows-runtime/codex-bridge/": "runtime/codex-bridge",
+      },
+    },
+  };
+}
+
+function writeWindowsBridgeOverlay() {
+  fs.mkdirSync(path.dirname(WINDOWS_BRIDGE_CONFIG_PATH), { recursive: true });
+  fs.writeFileSync(
+    WINDOWS_BRIDGE_CONFIG_PATH,
+    `${JSON.stringify(windowsBridgeOverlay(), null, 2)}\n`,
+  );
+}
+
+function isPrepared(expected = expectedMarker(), outputRoot = WINDOWS_BRIDGE_ROOT) {
+  try {
+    const actual = JSON.parse(
+      fs.readFileSync(path.join(outputRoot, MARKER_NAME), "utf8"),
+    );
+    const packageJson = JSON.parse(
+      fs.readFileSync(path.join(outputRoot, BRIDGE_PACKAGE_JSON), "utf8"),
+    );
+    const claudePackageJson = JSON.parse(
+      fs.readFileSync(path.join(outputRoot, CLAUDE_BRIDGE_PACKAGE_JSON), "utf8"),
+    );
+    return (
+      JSON.stringify(actual) === JSON.stringify(expected) &&
+      packageJson.version === expectedCodexAcpVersion() &&
+      claudePackageJson.version === expectedClaudeAcpVersion() &&
+      nonemptyFile(path.join(outputRoot, BRIDGE_ENTRYPOINT)) &&
+      nonemptyFile(path.join(outputRoot, CLAUDE_BRIDGE_ENTRYPOINT)) &&
+      platformPackagesValid(outputRoot) &&
+      windowsChildProcessesHidden(path.join(outputRoot, BRIDGE_ENTRYPOINT))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function checkedSpawn(spawn, command, args, options, label) {
+  // Build-time script that runs on a trusted build machine. The command comes
+  // from process.execPath, Windows runtime descriptor paths already confined
+  // to src-tauri by resolveDescriptorPath, or, for Windows npm installs, the
+  // npm-provided npm_execpath (executed via node) and the OS-provided ComSpec
+  // interpreter, with character-whitelisted npm arguments. No user-controlled
+  // input reaches it.
+  // codeql[js/shell-command-injection-from-environment] build-time script on a trusted build machine; the only environment-derived values are npm- and OS-provided build-tool paths.
+  const result = spawn(command, args, options);
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`${label}失败，退出码：${result.status ?? "unknown"}`);
+  }
+  return result;
+}
+
+function validateNodeRuntime(nodeExecutable, { environment, spawn } = {}) {
+  if (!nonemptyFile(nodeExecutable)) {
+    throw new Error(`Codex Bridge 缺少可用 Node：${nodeExecutable}`);
+  }
+  const result = checkedSpawn(
+    spawn,
+    nodeExecutable,
+    ["--version"],
+    { env: environment, encoding: "utf8" },
+    "验证 Codex Bridge Node",
+  );
+  const version = String(result.stdout || "").trim();
+  const major = /^v(\d+)\./u.exec(version)?.[1];
+  if (!major || Number(major) < MINIMUM_NODE_MAJOR) {
+    throw new Error(
+      `Codex Bridge Node 版本不受支持：${version || "unknown"}，需要 Node ${MINIMUM_NODE_MAJOR}+`,
+    );
+  }
+  return version;
+}
+
+function prepareWindowsCodexBridge({
+  platform = process.platform,
+  architecture = process.arch,
+  environment = process.env,
+  nodeExecutable = process.execPath,
+  npmExecPath,
+  spawn = spawnSync,
+} = {}) {
+  if (platform !== "win32") return false;
+  if (architecture !== "x64") {
+    throw new Error(`Windows Codex ACP Bridge 暂不支持 ${architecture} 架构`);
+  }
+
+  const expected = expectedMarker({ architecture });
+  if (isPrepared(expected)) {
+    writeWindowsBridgeOverlay();
+    console.log(`[codex-bridge] 复用 Windows/${architecture} Bridge`);
+    return false;
+  }
+
+  const stagingRoot = path.join(
+    WINDOWS_RUNTIME_ROOT,
+    `.codex-bridge.tmp-${process.pid}-${Date.now()}`,
+  );
+  const bridgeRoot = path.join(stagingRoot, "codex-bridge");
+  const acpRoot = path.join(bridgeRoot, "acp");
+  fs.rmSync(stagingRoot, { recursive: true, force: true });
+  fs.mkdirSync(acpRoot, { recursive: true });
+
+  try {
+    const nodeVersion = validateNodeRuntime(nodeExecutable, { environment, spawn });
+    const installEnvironment = npmExecPath
+      ? { ...environment, npm_execpath: npmExecPath }
+      : environment;
+    if (npmExecPath && !nonemptyFile(npmExecPath)) {
+      throw new Error(`Codex Bridge 缺少可用 npm CLI：${npmExecPath}`);
+    }
+
+    for (const fileName of ["package.json", "package-lock.json"]) {
+      fs.copyFileSync(
+        path.join(BRIDGE_PACKAGE_ROOT, fileName),
+        path.join(acpRoot, fileName),
+      );
+    }
+
+    const invocation = npmInstallInvocation({
+      platform,
+      environment: installEnvironment,
+      nodeExecutable,
+      npmArgs: WINDOWS_NPM_CI_ARGS,
+    });
+    console.log(`[codex-bridge] 使用现有 ${nodeVersion} 从锁文件准备 Windows ACP Bridge`);
+    checkedSpawn(
+      spawn,
+      invocation.command,
+      invocation.args,
+      {
+        cwd: acpRoot,
+        env: installEnvironment,
+        stdio: "inherit",
+      },
+      "安装 Windows ACP Bridge",
+    );
+
+    pruneWindowsPlatformPackages(bridgeRoot);
+    hideWindowsChildProcesses(path.join(bridgeRoot, BRIDGE_ENTRYPOINT));
+    fs.rmSync(path.join(acpRoot, "package.json"), { force: true });
+    fs.rmSync(path.join(acpRoot, "package-lock.json"), { force: true });
+    fs.writeFileSync(
+      path.join(bridgeRoot, MARKER_NAME),
+      `${JSON.stringify(expected, null, 2)}\n`,
+    );
+    if (!isPrepared(expected, bridgeRoot)) {
+      throw new Error("Windows ACP Bridge 准备后校验失败");
+    }
+
+    fs.rmSync(WINDOWS_BRIDGE_ROOT, { recursive: true, force: true });
+    fs.renameSync(bridgeRoot, WINDOWS_BRIDGE_ROOT);
+    writeWindowsBridgeOverlay();
+    console.log(`[codex-bridge] Windows ACP Bridge ready: ${WINDOWS_BRIDGE_ROOT}`);
+    return true;
+  } finally {
+    fs.rmSync(stagingRoot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Prepare the Linux/macOS Codex ACP Bridge.
+ *
+ * `targetArch` is the architecture being packaged by a cross build (Node
+ * notation: `"arm64"` / `"x64"`). Without it the host architecture is used,
+ * exactly as before.
+ *
+ * Unlike SenseVoice, the bridge can be prepared for another architecture: it
+ * compiles nothing, it only downloads, verifies and unpacks the official Node
+ * tarball. The one obstacle is that `npm ci` must run on a Node that executes
+ * on the host, so the script downloads both (see its comments).
+ * @param {{platform?: string, spawn?: Function, targetArch?: string, env?: object}} options Options.
+ * @returns {boolean} Whether this platform needs the step.
+ */
+function prepareCodexBridge({
+  platform = process.platform,
+  spawn = spawnSync,
+  targetArch = null,
+  env = process.env,
+} = {}) {
+  if (platform !== "linux" && platform !== "darwin") return false;
+  const script = path.join(APP_ROOT, "scripts", "prepare-codex-bridge-runtime.sh");
+  // Node arch notation -> the machine segment of a Rust target triple (the
+  // `--target` notation). This is not `uname -m`: macOS reports arm64 while
+  // the triple says aarch64 (aarch64-apple-darwin). The script accepts both
+  // words (`Darwin-aarch64|Darwin-arm64`, like the Linux entry), so no second
+  // per-OS table is kept here; tests/tauri_effective_config.test.js pins the
+  // mapping.
+  //
+  // This map must cover every arch that `TARGET_MACHINE_ARCHITECTURES` in
+  // build.js can produce. A missing entry raises no error: machine becomes
+  // undefined, the variable is not injected, and the script falls back to
+  // `uname -m`, packaging a host-architecture Node - the silent wrong package
+  // this path exists to prevent. The same test file holds that subset check.
+  const machine = { arm64: "aarch64", loong64: "loongarch64", x64: "x86_64" }[targetArch];
+  // Always pass a copy: inject the machine when there is one, otherwise drop
+  // any PINVOU3_BRIDGE_TARGET_ARCH left in the caller's environment. The
+  // variable is a legitimate manual switch when the script is run directly,
+  // but through this path an empty machine means there is no cross target; a
+  // leftover value would prepare another architecture's Node while the
+  // overlay still follows process.arch.
+  const childEnv = { ...env };
+  if (machine) childEnv.PINVOU3_BRIDGE_TARGET_ARCH = machine;
+  else delete childEnv.PINVOU3_BRIDGE_TARGET_ARCH;
+  const result = spawn(script, [], {
+    cwd: APP_ROOT,
+    stdio: "inherit",
+    env: childEnv,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `准备 Codex ACP Bridge 失败，退出码：${result.status ?? "unknown"}`,
+    );
+  }
+  return true;
+}
+
+function preparePlatformCodexBridge(options = {}) {
+  const platform = options.platform ?? process.platform;
+  if (platform === "linux" || platform === "darwin") {
+    return prepareCodexBridge({ ...options, platform });
+  }
+  if (platform === "win32") {
+    return prepareWindowsCodexBridge({ ...options, platform });
+  }
+  return false;
+}
+
+function main() {
+  preparePlatformCodexBridge();
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`[codex-bridge] ${error.message}`);
+    process.exitCode = 1;
+  }
+}
+
+module.exports = {
+  BRIDGE_ENTRYPOINT,
+  BRIDGE_PACKAGE_ROOT,
+  CLAUDE_BRIDGE_ENTRYPOINT,
+  LOCKFILE_PATH,
+  MINIMUM_NODE_MAJOR,
+  WINDOWS_BRIDGE_ROOT,
+  WINDOWS_BRIDGE_CONFIG_PATH,
+  WINDOWS_NPM_CI_ARGS,
+  expectedMarker,
+  hideWindowsChildProcesses,
+  isPrepared,
+  main,
+  prepareCodexBridge,
+  preparePlatformCodexBridge,
+  prepareWindowsCodexBridge,
+  validateNodeRuntime,
+  windowsBridgeOverlay,
+};

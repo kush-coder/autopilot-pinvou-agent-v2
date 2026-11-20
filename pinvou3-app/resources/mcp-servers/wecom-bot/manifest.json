@@ -1,0 +1,28 @@
+{
+  "id": "wecom-bot",
+  "name": "企微群机器人",
+  "description": "通过企业微信官方群机器人 webhook 向绑定的群推送文本、Markdown、图文、图片与文件消息",
+  "version": "1.0.0",
+  "icon": "message-circle",
+  "category": "即时沟通",
+  "mcp_tools": [
+    "mcp_wecom-bot_send_text",
+    "mcp_wecom-bot_send_markdown",
+    "mcp_wecom-bot_send_news",
+    "mcp_wecom-bot_send_image",
+    "mcp_wecom-bot_send_file"
+  ],
+  "command": "python",
+  "args": ["server.py"],
+  "secret_env": [
+    {
+      "key": "WECOM_BOT_KEY",
+      "provider": "wecom-bot",
+      "required": true
+    }
+  ],
+  "config_fields": [
+    { "key": "WECOM_BOT_KEY", "label": "群机器人 Webhook Key", "required": true, "target": "env", "secret": true }
+  ],
+  "pip_dependencies": []
+}

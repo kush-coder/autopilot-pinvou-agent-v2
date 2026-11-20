@@ -1,0 +1,1305 @@
+use super::prelude::*;
+use crate::features::voice::contract::{
+    normalize_voice_postprocess_mode, sanitize_voice_postprocess_output,
+    truncate_voice_postprocess_input, voice_postprocess_max_tokens, voice_postprocess_prompt,
+    voice_postprocess_retry_prompt, voice_postprocess_timeout, voice_postprocess_user_content,
+};
+use anyhow::{Context, Result as AnyResult, anyhow};
+use base64::Engine as _;
+use reqwest::Client;
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceTranscriptionRequest {
+    /// Standard padded-base64-encoded WAV produced by the WebView recorder.
+    /// Replaces the old `audio_bytes: Vec<u8>` JSON number array — 60s of
+    /// 16kHz/16-bit mono is about 1.92MB, and per-element deserialization of
+    /// that means 1.92M JSON values and ~25MB peak memory; base64 is just one
+    /// string decode.
+    pub audio_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoiceTranscriptionResponse {
+    pub text: String,
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoicePostprocessRequest {
+    pub text: String,
+    pub mode: String,
+    pub session_id: Option<String>,
+    pub draft_text: Option<String>,
+    /// Raw ASR transcript (before rule-based correction). When present and
+    /// different from `text`, it is sent along in the prompt so the model can
+    /// undo deterministic rule mis-corrections against the original (e.g.
+    /// "表哥" → "表格").
+    pub raw_text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoicePostprocessResponse {
+    pub text: String,
+    pub mode: String,
+    pub source: String,
+    /// The model output was truncated by max_tokens (finish_reason=length);
+    /// the frontend falls back on this and skips write-back. The serde default
+    /// keeps older caller constructions compatible.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoiceCommandError {
+    pub category: String,
+    pub stage: String,
+    /// Stable machine-decidable error code: the frontend maps it to trilingual
+    /// copy. The text in `message` is kept only as the raw log/diagnostic
+    /// string and is no longer passed through to en/ja user interfaces.
+    pub code: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub(crate) async fn set_voice_shortcut_enabled(enabled: bool) -> Result<(), String> {
+    // Round-54 audit A5: sync commands run on the main thread, and the
+    // settings transaction below holds the cross-process settings.json.lock
+    // across keychain I/O — a CLI `models` command parked at a keychain
+    // prompt would freeze the whole UI. The async conversion is transparent
+    // to the frontend invoke; the transaction joins on a blocking worker
+    // like the settings family (persist-first order unchanged: the hook
+    // flip below only runs after a successful persist).
+    // Persist first, then flip the in-memory hook (same order as
+    // save_model/set_active_model): if the settings write fails, the native
+    // hook must not disagree with what settings.json still says, or the
+    // next launch would silently revert the user's choice. The frontend
+    // localStorage is only a mirror; the authoritative state lives on the
+    // Rust side (replayed into the AtomicBool at startup by lib.rs), so
+    // repeated invokes from multi-window mounts are idempotent and clearing
+    // WebView storage cannot lose the setting.
+    super::settings::join_blocking("set_voice_shortcut_enabled", move || {
+        crate::platform::prefs::UserPrefs::update_transaction(|prefs| {
+            prefs.voice_shortcut_enabled = enabled;
+            Ok(())
+        })
+    })
+    .await?;
+    // Round-2 review m3 disclosure: the await between the persist and the
+    // hook flip means two racing opposite invokes can transiently leave
+    // settings.json and the native hook disagreeing until the next invoke
+    // or restart (lib.rs replays settings into the hook at startup) — the
+    // accepted shape of the already-async settings family; invokes are
+    // user-paced and idempotent.
+    crate::features::voice_shortcut::set_enabled(enabled);
+    Ok(())
+}
+
+/// Cross-window recording mutual exclusion: the frontend atomically claims
+/// the recording ownership (its own window label bound to an operation token)
+/// before opening the microphone, and releases it when recording ends/fails;
+/// the native shortcut hook uses the current owner to pick the trigger target
+/// window (see voice_shortcut::set_recording_owner). A window may only
+/// register its own label, so a broken or compromised renderer cannot pin an
+/// arbitrary window as the recording window and hijack the global Alt gesture.
+/// The returned bool tells whether the claim/release landed; a failed claim
+/// fails the recording start before any microphone is opened.
+///
+/// The handle is injected as a `Webview`, not a `WebviewWindow`: the main
+/// window hosts browser-tab child WebViews (agent-browser-*), and Tauri's
+/// single-WebView `WebviewWindow` injection fails once any tab exists.
+#[tauri::command]
+pub(crate) fn set_voice_shortcut_recording(
+    webview: tauri::Webview,
+    label: Option<String>,
+    token: String,
+) -> Result<bool, String> {
+    if let Some(label) = &label {
+        if label != webview.label() {
+            return Err("voice shortcut recording label must match the calling window".to_string());
+        }
+    }
+    crate::features::voice_shortcut::set_recording_owner(webview.label(), &token, label.is_some())
+}
+
+impl VoiceCommandError {
+    pub(crate) fn new(code: &str, category: &str, stage: &str, message: impl Into<String>) -> Self {
+        Self {
+            category: category.to_string(),
+            stage: stage.to_string(),
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+fn local_asr_command_name() -> String {
+    crate::features::voice::asr_tool_path()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn local_asr_model_name() -> String {
+    std::env::var("PINVOU3_ASR_MODEL")
+        .or_else(|_| std::env::var("PINVOU3_DEEPSPEECH2_MODEL"))
+        .unwrap_or_else(|_| "sensevoice-q8".to_string())
+}
+
+fn local_asr_language() -> String {
+    std::env::var("PINVOU3_ASR_LANG")
+        .or_else(|_| std::env::var("PINVOU3_DEEPSPEECH2_LANG"))
+        .unwrap_or_else(|_| "zh".to_string())
+}
+
+fn local_asr_timeout() -> std::time::Duration {
+    let secs = std::env::var("PINVOU3_ASR_TIMEOUT_SECS")
+        .or_else(|_| std::env::var("PINVOU3_DEEPSPEECH2_TIMEOUT_SECS"))
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(60);
+    std::time::Duration::from_secs(secs)
+}
+
+fn has_explicit_asr_cli_fallback() -> bool {
+    // 变量清单唯一实现在 `platform::asr_tool_path_from_env`（经
+    // `features::voice::has_asr_cli_override` 暴露）：GUI 兜底门禁与平台
+    // 探测读同一组变量，新增/移除变量名时不会漏改这一侧（RT27 F27-1）。
+    crate::features::voice::has_asr_cli_override()
+}
+
+pub(super) fn apply_local_asr_model_env(
+    command: &mut std::process::Command,
+    model_path: Option<std::path::PathBuf>,
+) {
+    if let Some(path) = model_path.filter(|path| path.is_file()) {
+        command.env("PINVOU3_SENSEVOICE_MODEL", path);
+    }
+}
+
+struct LocalAsrOutput {
+    text: String,
+    /// Recognition backend source (system_speech /
+    /// pinvou-webview-sensevoice-local / local_cli), passed through to
+    /// VoiceTranscriptionResponse.source so the frontend/triage can tell them
+    /// apart.
+    source: String,
+}
+
+pub(super) fn parse_local_asr_text(stdout: &str, stderr: &str) -> Option<String> {
+    crate::features::voice::parse_asr_transcript(stdout, stderr)
+}
+
+fn run_local_asr_cli(wav_path: &std::path::Path) -> Result<LocalAsrOutput, VoiceCommandError> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let executable = local_asr_command_name();
+    let model = local_asr_model_name();
+    let language = local_asr_language();
+    let timeout = local_asr_timeout();
+
+    let mut command = std::process::Command::new(&executable);
+    apply_local_asr_model_env(
+        &mut command,
+        Some(crate::features::voice::voice_asr::model_path()),
+    );
+    command
+        .arg("asr")
+        .arg("--model")
+        .arg(&model)
+        .arg("--lang")
+        .arg(&language)
+        .arg("--input")
+        .arg(wav_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::platform::process::hide_std_console(&mut command);
+
+    let mut child = command.spawn().map_err(|e| {
+        let (code, message) = if e.kind() == std::io::ErrorKind::NotFound {
+            (
+                "asr_engine_missing",
+                crate::features::voice::asr_missing_message().to_string(),
+            )
+        } else {
+            // The io error detail goes to the log; the user-visible copy stays
+            // generic, consistent with the macOS lane's copy style.
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_transcribe] local ASR spawn failed: {e}"
+            );
+            (
+                "asr_engine_start_failed",
+                "Local speech recognition engine failed to start; check the recognition component installation and retry".to_string(),
+            )
+        };
+        VoiceCommandError::new(code, "recognition_failed", "transcribing", message)
+    })?;
+
+    // stdout/stderr must be drained concurrently with the wait polling: if the
+    // pipes are not read while polling, model-loading logs fill the OS pipe
+    // buffer (~64KB) and the child blocks forever on write, leaving the
+    // polling side to wait for the timeout and misreport. The two drain
+    // threads keep the child writable at all times; on the timeout path the
+    // kill closes the pipes, the threads exit right away, and join cannot
+    // hang.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_drain = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_drain = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let started = std::time::Instant::now();
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    break Err(VoiceCommandError::new(
+                        "asr_timeout",
+                        "recognition_failed",
+                        "transcribing",
+                        format!(
+                            "Local speech recognition timed out ({} s); confirm the recognition model and runtime are available",
+                            timeout.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                log::warn!(
+                    target: "pinvou.voice",
+                    "[voice_transcribe] local ASR wait failed: {e}"
+                );
+                break Err(VoiceCommandError::new(
+                    "asr_runtime_error",
+                    "recognition_failed",
+                    "transcribing",
+                    "Local speech recognition failed unexpectedly; please retry",
+                ));
+            }
+        }
+    };
+    // All three paths wrap up the same way: on timeout/wait failure too, kill
+    // + wait before joining; calling kill/wait on an already-exited child is a
+    // harmless no-op.
+    let _ = child.kill();
+    let _ = child.wait();
+    let stdout = stdout_drain.join().unwrap_or_default();
+    let stderr = stderr_drain.join().unwrap_or_default();
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(error) => return Err(error),
+    };
+
+    if !status.success() {
+        let exit_code = status.code();
+        // Privacy: stdout/stderr may contain recognized speech fragments, so
+        // the log records only lengths and the exit code; the user-visible
+        // copy stays generic, consistent with the macOS lane's copy style.
+        log::warn!(
+            target: "pinvou.voice",
+            "[voice_transcribe] local ASR failed exit={:?} stdout_len={} stderr_len={}",
+            exit_code,
+            stdout.len(),
+            stderr.len()
+        );
+        // Exit code 6 = the CLI's "no speech recognized" convention (the
+        // frontend's emptyResultLike check also classifies by exit 6); return
+        // the empty_result category at the source so the frontend no longer
+        // has to guess from English error text.
+        if exit_code == Some(6) {
+            return Err(VoiceCommandError::new(
+                "asr_no_speech",
+                "empty_result",
+                "transcribing",
+                "No speech content recognized; move closer to the microphone and retry",
+            ));
+        }
+        return Err(VoiceCommandError::new(
+            "asr_cli_failed",
+            "recognition_failed",
+            "transcribing",
+            "Local speech recognition failed; please retry",
+        ));
+    }
+
+    let text = parse_local_asr_text(&stdout, &stderr).ok_or_else(|| {
+        // As above: the failure log carries no raw process output, only lengths.
+        log::warn!(
+            target: "pinvou.voice",
+            "[voice_transcribe] local ASR returned no usable text: stdout_len={} stderr_len={}",
+            stdout.len(),
+            stderr.len()
+        );
+        VoiceCommandError::new(
+            "asr_parse_failed",
+            "empty_result",
+            "transcribing",
+            "Local speech recognition returned no usable text; please retry",
+        )
+    })?;
+
+    Ok(LocalAsrOutput {
+        text,
+        source: "local_cli".to_string(),
+    })
+}
+
+/// Transcribe a short one-shot voice capture from the desktop WebView using
+/// local SenseVoice/FunASR ASR.
+#[tauri::command]
+pub async fn transcribe_voice_audio(
+    request: VoiceTranscriptionRequest,
+) -> Result<VoiceTranscriptionResponse, VoiceCommandError> {
+    // Length pre-check before decoding: a normal 60s recording is ~1.9MiB of
+    // WAV (≈2.6MB base64), so 4MiB already leaves ample headroom; without a
+    // cap a misbehaving renderer could create memory pressure via unbounded
+    // base64 decoding.
+    const MAX_TRANSCRIBE_AUDIO_BYTES: usize = 4 * 1024 * 1024;
+    let max_base64_chars = (MAX_TRANSCRIBE_AUDIO_BYTES / 3 + 1) * 4;
+    if request.audio_base64.len() > max_base64_chars {
+        return Err(VoiceCommandError::new(
+            "recording_too_long",
+            "recording_failed",
+            "recording",
+            "Voice recording too long; shorten it and retry",
+        ));
+    }
+    let audio_bytes = base64::engine::general_purpose::STANDARD
+        .decode(request.audio_base64.trim())
+        .map_err(|error| {
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_transcribe] audio base64 decode failed: {error}"
+            );
+            VoiceCommandError::new(
+                "audio_invalid",
+                "recording_failed",
+                "recording",
+                "Invalid voice audio data; please record again",
+            )
+        })?;
+    transcribe_voice_audio_bytes(audio_bytes).await
+}
+
+/// Decoded WAV bytes go through the unified recognition path. Remote control
+/// (`web_access_transcribe_voice_audio`) brings its own validation and
+/// decoding and reuses this function directly.
+pub(crate) async fn transcribe_voice_audio_bytes(
+    audio_bytes: Vec<u8>,
+) -> Result<VoiceTranscriptionResponse, VoiceCommandError> {
+    if audio_bytes.len() < 44 {
+        return Err(VoiceCommandError::new(
+            "audio_empty",
+            "recording_failed",
+            "recording",
+            "Recording is empty or corrupted; please record again",
+        ));
+    }
+
+    let asr_output = tokio::task::spawn_blocking(move || {
+        let wav_file = crate::features::voice::VoiceTempWav::create().map_err(|e| {
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_transcribe] create temp wav failed: {e}"
+            );
+            VoiceCommandError::new(
+                "temp_file_unavailable",
+                "recording_failed",
+                "recording",
+                "Could not create temporary audio file; please retry",
+            )
+        })?;
+        let wav_path = wav_file.write_and_close(&audio_bytes).map_err(|e| {
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_transcribe] write temp wav failed: {e}"
+            );
+            VoiceCommandError::new(
+                "temp_file_write_failed",
+                "recording_failed",
+                "recording",
+                "Failed to write temporary audio file; please retry",
+            )
+        })?;
+        // Recognition path branching (platform-neutral):
+        //   macOS         → system Speech framework (no model download, no
+        //                    ffmpeg, usable on first run)
+        //   Linux/Windows → bundled SenseVoice (otherwise fall back to the CLI)
+        // Platform selection is encapsulated in
+        // `features::voice::recognize_native` (a platform/ adapter); this site
+        // only dispatches on the return value and contains no cfg(target_os).
+        let result = {
+            // The recognition language follows the UI language preference
+            // (decided by the system locale on first launch): this avoids a
+            // UI/model language mismatch, e.g. a Chinese UI parsing Chinese
+            // audio as English.
+            let locale_tag = crate::platform::prefs::UserPrefs::load()
+                .language
+                .speech_recognition_locale();
+            let native = crate::features::voice::recognize_native(&wav_path, locale_tag);
+            match native {
+                Some(Ok(text)) => Ok(LocalAsrOutput {
+                    text,
+                    source: crate::features::voice::native_recognition_source().to_string(),
+                }),
+                Some(Err(e)) => {
+                    if has_explicit_asr_cli_fallback() {
+                        run_local_asr_cli(&wav_path)
+                    } else {
+                        Err(VoiceCommandError::new(
+                            "asr_engine_error",
+                            "recognition_failed",
+                            "transcribing",
+                            e,
+                        ))
+                    }
+                }
+                None => run_local_asr_cli(&wav_path),
+            }
+        };
+        result
+    })
+    .await
+    .map_err(|e| {
+        log::warn!(
+            target: "pinvou.voice",
+            "[voice_transcribe] recognition task join failed: {e}"
+        );
+        VoiceCommandError::new(
+            "asr_join_failed",
+            "recognition_failed",
+            "transcribing",
+            "Local speech recognition task failed unexpectedly; please retry",
+        )
+    })??;
+
+    Ok(VoiceTranscriptionResponse {
+        text: asr_output.text,
+        source: asr_output.source,
+    })
+}
+
+/// Frontend-facing error summary: a reqwest error's Display carries the full
+/// URL (possibly an intranet address or embedded credentials), and a
+/// status-with-body error carries the endpoint's response body; passing
+/// either through rawMessage would land it in frontend diagnostics persisted
+/// to localStorage. Keep only the error class and HTTP status here; the full
+/// error chain goes to the local log only.
+fn summarize_voice_postprocess_error(error: &anyhow::Error) -> String {
+    for cause in error.chain() {
+        if let Some(status_error) =
+            cause.downcast_ref::<crate::core::model_endpoint::StatusWithBodyError>()
+        {
+            return format!("model endpoint http {}", status_error.status());
+        }
+        let Some(request_error) = cause.downcast_ref::<reqwest::Error>() else {
+            continue;
+        };
+        if let Some(status) = request_error.status() {
+            return format!("model endpoint http {status}");
+        }
+        if request_error.is_timeout() {
+            return "model endpoint timeout".to_string();
+        }
+        if request_error.is_connect() {
+            return "model endpoint connect failed".to_string();
+        }
+        return "model endpoint request failed".to_string();
+    }
+    // Non-HTTP errors (missing model/credential configuration etc.): the
+    // outermost context is already a short human-written sentence and carries
+    // no URL, so it is safe to pass through.
+    error.to_string()
+}
+
+fn voice_postprocess_changed(mode: &str, text: &str, draft_text: Option<&str>) -> bool {
+    if mode != "edit" {
+        return true;
+    }
+    let draft = draft_text.unwrap_or("").trim();
+    if draft.is_empty() {
+        return true;
+    }
+    text.trim() != draft
+}
+
+/// voice 域的推理控制薄壳：dialect 判定与请求体写入统一委托
+/// `core::reasoning_dialect`（与 memory 同一实现；review 自 2026-11-06 起改走
+/// 永不关闭的 features/review::apply_review_thinking_controls，不再经本模块。
+/// 本域的 preset 分发保留 memory 同款的 model-name 回退，见下方函数注释）。
+fn apply_voice_reasoning_controls(
+    body: &mut Value,
+    preset: crate::platform::prefs::ModelPreset,
+    provider: &str,
+    base_url: &str,
+    model: &str,
+) {
+    crate::core::reasoning_dialect::apply_reasoning_dialect_controls(
+        body,
+        voice_reasoning_dialect(preset, provider, base_url, model),
+    );
+}
+
+fn voice_reasoning_dialect(
+    preset: crate::platform::prefs::ModelPreset,
+    provider: &str,
+    base_url: &str,
+    model: &str,
+) -> crate::core::reasoning_dialect::ReasoningDialect {
+    use crate::core::reasoning_dialect::ReasoningDialect;
+    if provider == "vllm"
+        || provider == "tachyon"
+        || preset == crate::platform::prefs::ModelPreset::LocalVllm
+    {
+        return ReasoningDialect::VllmChatTemplate;
+    }
+    if provider == "deepseek" || preset == crate::platform::prefs::ModelPreset::Deepseek {
+        return ReasoningDialect::ThinkingDisabled;
+    }
+
+    match preset {
+        crate::platform::prefs::ModelPreset::Kimi => {
+            if crate::core::reasoning_dialect::kimi_supports_disabled_thinking(model) {
+                ReasoningDialect::ThinkingDisabled
+            } else {
+                ReasoningDialect::None
+            }
+        }
+        crate::platform::prefs::ModelPreset::Qwen => ReasoningDialect::QwenEnableThinking,
+        crate::platform::prefs::ModelPreset::Doubao
+        | crate::platform::prefs::ModelPreset::Glm
+        | crate::platform::prefs::ModelPreset::Mimo => ReasoningDialect::ThinkingDisabled,
+        crate::platform::prefs::ModelPreset::Minimax => ReasoningDialect::Minimax,
+        crate::platform::prefs::ModelPreset::OpenaiCompatible
+        | crate::platform::prefs::ModelPreset::LocalVllm
+        | crate::platform::prefs::ModelPreset::Deepseek
+        | crate::platform::prefs::ModelPreset::Openai
+        // Custom Responses endpoints only switch the main-session engine
+        // route; the aux calls this wrapper serves (voice output etc.) stay
+        // single-shot Chat Completions (no tool calls; the gpt-6 family
+        // works plain-text on the Chat protocol), so resolution falls back
+        // to URL/model-name sniffing.
+        | crate::platform::prefs::ModelPreset::OpenaiResponses
+        | crate::platform::prefs::ModelPreset::Anthropic
+        | crate::platform::prefs::ModelPreset::Gemini
+        | crate::platform::prefs::ModelPreset::Xai => {
+            // Mirror the memory-review lane: when URL sniffing cannot identify
+            // the vendor, fall back to model-name matching so custom
+            // OpenAI-compatible endpoints fronting qwen/deepseek models still
+            // disable thinking output — the voice output sanitizer only strips
+            // a single leading `<think>` block, so reasoning leaked after the
+            // first block or mid-text would still land verbatim in the
+            // user's input box.
+            let d =
+                crate::core::reasoning_dialect::reasoning_dialect_from_base_url(base_url, model);
+            if matches!(d, ReasoningDialect::None) {
+                let lower = model.to_ascii_lowercase();
+                if lower.contains("qwen") {
+                    return ReasoningDialect::QwenEnableThinking;
+                }
+                if lower.contains("deepseek") {
+                    return ReasoningDialect::ThinkingDisabled;
+                }
+            }
+            d
+        }
+    }
+}
+
+fn voice_chat_message_text(value: &Value) -> String {
+    let Some(message) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+    else {
+        return String::new();
+    };
+    if let Some(content) = message.get("content").and_then(Value::as_str) {
+        return content.to_string();
+    }
+    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        return parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .or_else(|| part.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    String::new()
+}
+
+async fn voice_postprocess_bridge(
+    session_id: Option<&str>,
+    pool: &EnginePool,
+    store: &SessionStore,
+) -> AnyResult<crate::features::assistant::platform::bridge::Pinvou3Bridge> {
+    if let Some(sid) = session_id.filter(|sid| !sid.trim().is_empty()) {
+        // The error chain reaches the local log and the frontend diagnostics
+        // verbatim (summarize_voice_postprocess_error), so keep the session
+        // id out of it.
+        crate::features::sessions::validate_session_id(sid)
+            .map_err(|_| anyhow!("session id is invalid"))?;
+        store
+            .load(sid)
+            .map_err(|_| anyhow!("session snapshot is unavailable"))?;
+        return pool
+            .fresh_bridge_for(sid)
+            .await
+            .context("prepare session model for voice postprocess");
+    }
+    // No session yet (an unsent draft): prepare the default model through the
+    // same runtime path as chat instead of borrowing whichever session the
+    // backend last marked active, which may bind a different model.
+    pool.fresh_bridge_for_draft()
+        .await
+        .context("draft default model unavailable")
+}
+
+/// Returns (sanitized text, whether truncated by max_tokens). Truncation
+/// detection: OpenAI-compatible endpoints report
+/// choices[0].finish_reason == "length"; Anthropic endpoints report
+/// stop_reason == "max_tokens", surfaced by post_anthropic_messages.
+async fn call_voice_postprocess_model(
+    bridge: &crate::features::assistant::platform::bridge::Pinvou3Bridge,
+    mode: &str,
+    raw_text: &str,
+    asr_raw_text: Option<&str>,
+    draft_text: Option<&str>,
+    retry: bool,
+    attempt: u8,
+    model_name: &str,
+    timeout: Duration,
+) -> AnyResult<(String, bool)> {
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("build voice postprocess client")?;
+    let base_url = bridge.base_url();
+    log::info!(
+        target: "pinvou.voice",
+        "[voice_postprocess] request attempt={} mode={} provider={} model={} timeout_ms={} draft_present={}",
+        attempt,
+        mode,
+        bridge.provider(),
+        model_name,
+        timeout.as_millis(),
+        draft_text.map(|text| !text.trim().is_empty()).unwrap_or(false)
+    );
+    let system = if retry {
+        voice_postprocess_retry_prompt(mode)
+    } else {
+        voice_postprocess_prompt(mode)
+    };
+    let user = voice_postprocess_user_content(raw_text, asr_raw_text, draft_text);
+    let preset = bridge
+        .effective_model_owned()
+        .map(|model| model.preset)
+        .unwrap_or_else(|| bridge.prefs.advanced.model_preset.unwrap_or_default());
+
+    if preset == crate::platform::prefs::ModelPreset::Anthropic {
+        let completion = crate::core::model_endpoint::post_anthropic_messages(
+            &client,
+            &base_url,
+            &bridge.api_key(),
+            model_name,
+            system,
+            &user,
+            voice_postprocess_max_tokens(mode, retry),
+            bridge.opencode_conversation_key("voice-postprocess"),
+        )
+        .await?;
+        let truncated = completion.stop_reason.as_deref() == Some("max_tokens");
+        return Ok((
+            sanitize_voice_postprocess_output(&completion.text),
+            truncated,
+        ));
+    }
+
+    let max_tokens = voice_postprocess_max_tokens(mode, retry);
+    let mut body = voice_postprocess_request_body(model_name, &system, &user, max_tokens);
+    apply_voice_reasoning_controls(&mut body, preset, &bridge.provider(), &base_url, model_name);
+    let mut request = crate::core::model_endpoint::with_opencode_session_header(
+        client.post(format!(
+            "{}/chat/completions",
+            base_url.trim_end_matches('/')
+        )),
+        &base_url,
+        bridge.opencode_conversation_key("voice-postprocess"),
+    );
+    // A keyless-declared endpoint receives no Authorization header at all —
+    // an empty `Bearer ` would contradict the toggle's "no credentials are
+    // sent" contract (keyed records keep the bearer; undeclared empty-key
+    // records keep the historical empty-bearer shape).
+    if !bridge.effective_model_declares_no_auth() {
+        request = request.bearer_auth(bridge.api_key());
+    }
+    let resp = request
+        .json(&body)
+        .send()
+        .await
+        .context("post voice postprocess chat/completions")?;
+    let resp = crate::core::model_endpoint::error_for_status_with_body(
+        resp,
+        "voice postprocess chat/completions status",
+    )
+    .await?;
+    let value: Value = resp
+        .json()
+        .await
+        .context("parse voice postprocess response json")?;
+    let content = voice_chat_message_text(&value);
+    let truncated = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        == Some("length");
+    Ok((sanitize_voice_postprocess_output(&content), truncated))
+}
+
+/// One-shot Chat Completions body for voice postprocess. Field set mirrors the
+/// main-session engine wire (`model`/`messages`/`max_tokens`/`stream`, and —
+/// pinned by foundation tests — **no `temperature`**): a hard-coded 0 400s on
+/// gateways that pin sampling server-side (Kimi Coding Plan, live-probed
+/// 2026-09-30: "invalid temperature: only 1 is allowed for this model"). No
+/// `response_format`: postprocess returns prose, not JSON. Single source so
+/// the wire-drift budget stays testable.
+fn voice_postprocess_request_body(model: &str, system: &str, user: &str, max_tokens: u32) -> Value {
+    json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "max_tokens": max_tokens,
+        "stream": false
+    })
+}
+
+/// At most one in-flight postprocess request at a time: this command calls a
+/// paid model endpoint with the user's key, and without a concurrency gate a
+/// broken or compromised renderer could burn quota with high-frequency calls.
+/// The frontend is serial anyway, so the normal path never hits the gate (the
+/// conflicting caller falls back to the rule-corrected text).
+static VOICE_POSTPROCESS_INFLIGHT: AtomicBool = AtomicBool::new(false);
+
+struct VoicePostprocessSlot;
+
+impl Drop for VoicePostprocessSlot {
+    fn drop(&mut self) {
+        VOICE_POSTPROCESS_INFLIGHT.store(false, Ordering::Relaxed);
+    }
+}
+
+#[tauri::command]
+pub async fn postprocess_voice_text(
+    request: VoicePostprocessRequest,
+    pool: State<'_, EnginePool>,
+    store: State<'_, SessionStore>,
+) -> Result<VoicePostprocessResponse, String> {
+    let started_at = Instant::now();
+    if VOICE_POSTPROCESS_INFLIGHT
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        log::warn!(
+            target: "pinvou.voice",
+            "[voice_postprocess] busy_conflict elapsed_ms={}",
+            started_at.elapsed().as_millis()
+        );
+        return Err("voice postprocess busy".to_string());
+    }
+    let _slot = VoicePostprocessSlot;
+    // Truncate before the model: neither the ASR text nor the input-box draft
+    // should reach the LLM unbounded.
+    let raw_text = truncate_voice_postprocess_input(request.text.trim());
+    let mode = normalize_voice_postprocess_mode(&request.mode);
+    let asr_raw_text = request
+        .raw_text
+        .as_deref()
+        .map(|text| truncate_voice_postprocess_input(text.trim()));
+    let draft_text = request
+        .draft_text
+        .as_deref()
+        .map(|text| truncate_voice_postprocess_input(text.trim()));
+    let draft_len = draft_text
+        .as_deref()
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    if raw_text.is_empty() {
+        log::info!(
+            target: "pinvou.voice",
+            "[voice_postprocess] skipped_empty mode={} elapsed_ms={}",
+            mode,
+            started_at.elapsed().as_millis()
+        );
+        return Ok(VoicePostprocessResponse {
+            text: String::new(),
+            mode: mode.to_string(),
+            source: "empty".to_string(),
+            truncated: false,
+        });
+    }
+    let bridge = match voice_postprocess_bridge(request.session_id.as_deref(), &pool, &store).await
+    {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_postprocess] prepare_failed mode={} raw_len={} draft_len={} elapsed_ms={} error={:#}",
+                mode,
+                raw_text.chars().count(),
+                draft_len,
+                started_at.elapsed().as_millis(),
+                error
+            );
+            return Err(format!(
+                "prepare voice postprocess model: {}",
+                summarize_voice_postprocess_error(&error)
+            ));
+        }
+    };
+    // EnginePool already resolved the served model while preparing this bridge
+    // (resolve_served_model keeps a configured name the server lists). Keep
+    // that effective choice for both attempts: probing /v1/models again and
+    // taking its first entry would replace the user's model B with an
+    // unrelated model A on multi-model servers (LM Studio / Ollama).
+    let model_name = bridge.model();
+    // The frontend times the whole invoke against the same
+    // voice_postprocess_timeout budget; both Rust attempts share that budget,
+    // each taking only the remaining headroom, so the total latency does not
+    // double from each attempt spending the full budget.
+    let budget = voice_postprocess_timeout(mode, &raw_text);
+    if started_at.elapsed() >= budget {
+        // Symmetric with the retry guard below: bridge preparation and
+        // model resolution can consume the whole budget, and handing a zero
+        // timeout to the first request would guarantee an instant timeout
+        // failure.
+        log::warn!(
+            target: "pinvou.voice",
+            "[voice_postprocess] budget_exhausted_before_first_request mode={} elapsed_ms={}",
+            mode,
+            started_at.elapsed().as_millis()
+        );
+        return Err(
+            "voice postprocess failed: timeout budget exhausted before first request".to_string(),
+        );
+    }
+    let (text, truncated) = match call_voice_postprocess_model(
+        &bridge,
+        mode,
+        &raw_text,
+        asr_raw_text.as_deref(),
+        draft_text.as_deref(),
+        false,
+        1,
+        &model_name,
+        budget.saturating_sub(started_at.elapsed()),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_postprocess] failed mode={} raw_len={} draft_len={} elapsed_ms={} error={:#}",
+                mode,
+                raw_text.chars().count(),
+                draft_len,
+                started_at.elapsed().as_millis(),
+                error
+            );
+            return Err(format!(
+                "voice postprocess failed: {}",
+                summarize_voice_postprocess_error(&error)
+            ));
+        }
+    };
+    let needs_retry = text.trim().is_empty()
+        || truncated
+        || !voice_postprocess_changed(mode, &text, draft_text.as_deref());
+    let (text, truncated) = if needs_retry {
+        let retry_reason = if text.trim().is_empty() {
+            "retry_empty_output"
+        } else if truncated {
+            "retry_truncated_output"
+        } else {
+            "retry_unchanged_output"
+        };
+        log::warn!(
+            target: "pinvou.voice",
+            "[voice_postprocess] {} mode={} raw_len={} draft_len={} elapsed_ms={}",
+            retry_reason,
+            mode,
+            raw_text.chars().count(),
+            draft_len,
+            started_at.elapsed().as_millis()
+        );
+        let remaining = budget.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            log::warn!(
+                target: "pinvou.voice",
+                "[voice_postprocess] retry_budget_exhausted mode={} elapsed_ms={}",
+                mode,
+                started_at.elapsed().as_millis()
+            );
+            return Err(
+                "voice postprocess failed: timeout budget exhausted before retry".to_string(),
+            );
+        }
+        match call_voice_postprocess_model(
+            &bridge,
+            mode,
+            &raw_text,
+            asr_raw_text.as_deref(),
+            draft_text.as_deref(),
+            true,
+            2,
+            &model_name,
+            remaining,
+        )
+        .await
+        {
+            Ok((text, truncated)) if !text.trim().is_empty() => (text, truncated),
+            Ok(_) => {
+                log::warn!(
+                    target: "pinvou.voice",
+                    "[voice_postprocess] empty_output mode={} raw_len={} draft_len={} elapsed_ms={}",
+                    mode,
+                    raw_text.chars().count(),
+                    draft_len,
+                    started_at.elapsed().as_millis()
+                );
+                // The prompts define an empty output as the correct answer for
+                // pure filler/noise input, so this is a success, not an error:
+                // the frontend validator accepts an empty candidate exactly
+                // when the raw/corrected text is filler-only (and discards it),
+                // falling back to the rule-corrected text otherwise. Returning
+                // an Err here would make the frontend write the filler back
+                // into the input box.
+                (String::new(), false)
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "pinvou.voice",
+                    "[voice_postprocess] failed mode={} raw_len={} draft_len={} elapsed_ms={} error={:#}",
+                    mode,
+                    raw_text.chars().count(),
+                    draft_len,
+                    started_at.elapsed().as_millis(),
+                    error
+                );
+                return Err(format!(
+                    "voice postprocess failed: {}",
+                    summarize_voice_postprocess_error(&error)
+                ));
+            }
+        }
+    } else {
+        (text, truncated)
+    };
+    let changed = voice_postprocess_changed(mode, &text, draft_text.as_deref());
+    log::info!(
+        target: "pinvou.voice",
+        "[voice_postprocess] completed mode={} raw_len={} draft_len={} output_len={} changed={} truncated={} elapsed_ms={}",
+        mode,
+        raw_text.chars().count(),
+        draft_len,
+        text.chars().count(),
+        changed,
+        truncated,
+        started_at.elapsed().as_millis()
+    );
+    Ok(VoicePostprocessResponse {
+        text,
+        mode: mode.to_string(),
+        source: "llm".to_string(),
+        truncated,
+    })
+}
+
+use crate::features::voice::voice_asr as voice_asr_domain;
+use voice_asr_domain::*;
+
+/// 麦克风权限重置命令：feature 侧为裸 fn（原 microphone_permission 转发壳已扁平化），
+/// 不适用 domain 模块的 passthrough 宏，直接薄转发。
+/// The handle is injected as a `Webview`, not a `WebviewWindow`: the main
+/// window hosts browser-tab child WebViews (agent-browser-*), and Tauri's
+/// single-WebView `WebviewWindow` injection fails once any tab exists.
+#[tauri::command]
+pub async fn reset_microphone_permission(webview: tauri::Webview) -> Result<bool, String> {
+    crate::features::voice::reset_microphone_permission(webview).await
+}
+async_command_passthrough!(voice_asr_domain, voice_asr_status() -> VoiceAsrStatus);
+async_command_passthrough!(
+    voice_asr_domain,
+    install_voice_asr(app: AppHandle) -> Result<VoiceAsrStatus, String>
+);
+sync_command_passthrough!(voice_asr_domain, cancel_voice_asr());
+
+#[cfg(test)]
+mod voice_postprocess_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_asr_cli_fallback_evaluates_the_shared_override() {
+        // Executing pin for the shape pins in
+        // tests/macos_phase2_contract.test.js: a regression like
+        // `fn has_explicit_asr_cli_fallback() -> bool { false }` keeps
+        // every source-shape regex green (the doc comment still mentions
+        // has_asr_cli_override), so the gate's behavior is pinned here
+        // against the real env table.
+        let (_lock, _env) = crate::platform::test_support::locked_env(&[
+            "PINVOU3_ASR_CMD",
+            "PINVOU3_DEEPSPEECH2_CMD",
+            "PADDLESPEECH_BIN",
+        ]);
+        // SAFETY: ENV_LOCK held by locked_env above; env writes are
+        // serialized against the other env-writing tests.
+        unsafe {
+            std::env::remove_var("PINVOU3_ASR_CMD");
+            std::env::remove_var("PINVOU3_DEEPSPEECH2_CMD");
+            std::env::remove_var("PADDLESPEECH_BIN");
+        }
+        assert!(
+            !has_explicit_asr_cli_fallback(),
+            "no override configured: the CLI fallback gate must stay closed"
+        );
+        // SAFETY: ENV_LOCK held.
+        unsafe { std::env::set_var("PINVOU3_ASR_CMD", "  ") };
+        assert!(
+            !has_explicit_asr_cli_fallback(),
+            "a blank override must not count as configured"
+        );
+        // SAFETY: ENV_LOCK held.
+        unsafe { std::env::set_var("PINVOU3_ASR_CMD", "/usr/bin/pinvou-asr") };
+        assert!(
+            has_explicit_asr_cli_fallback(),
+            "a non-empty override must open the CLI fallback gate"
+        );
+    }
+
+    #[test]
+    fn summarize_reduces_status_with_body_error_to_class_and_status() {
+        // error_for_status_with_body errors carry the endpoint's response
+        // body; the frontend-facing summary must keep only the class and
+        // status (same contract as the reqwest-error branch below), because
+        // the raw string is persisted to localStorage diagnostics.
+        // Mirrors the production chain exactly: the status error reaches
+        // this summarizer unwrapped, so the fallthrough would surface the
+        // endpoint body verbatim.
+        let error = anyhow::Error::new(crate::core::model_endpoint::StatusWithBodyError::new(
+            "voice postprocess chat/completions status",
+            reqwest::StatusCode::BAD_REQUEST,
+            Some("invalid temperature: only 1 is allowed for this model".to_string()),
+        ));
+        let summary = summarize_voice_postprocess_error(&error);
+        assert_eq!(summary, "model endpoint http 400 Bad Request");
+        assert!(
+            !summary.contains("temperature"),
+            "endpoint body must not reach the frontend-facing string: {summary}"
+        );
+    }
+
+    #[test]
+    fn summarize_passes_non_http_errors_through() {
+        let error = anyhow::Error::msg("model not configured");
+        assert_eq!(
+            summarize_voice_postprocess_error(&error),
+            "model not configured"
+        );
+    }
+
+    /// Pin the call site, not just the builder: the builder pin above goes
+    /// red when `voice_postprocess_request_body` itself changes, but a
+    /// re-inlined body inside `call_voice_postprocess_model` would bypass it
+    /// silently. The request region must build through the shared builder
+    /// and must not carry a sampling parameter.
+    #[test]
+    fn call_voice_postprocess_model_builds_body_through_builder() {
+        let source = include_str!("voice.rs");
+        let start = source
+            .find("async fn call_voice_postprocess_model")
+            .expect("call_voice_postprocess_model definition present");
+        let region = &source[start
+            ..source[start..]
+                .find("fn voice_postprocess_request_body")
+                .expect("voice_postprocess_request_body definition present")
+                + start];
+        assert!(
+            region.contains("voice_postprocess_request_body("),
+            "call_voice_postprocess_model must build its body via \
+             voice_postprocess_request_body"
+        );
+        assert!(
+            !region.contains("\"temperature\""),
+            "the postprocess request region must not re-inline a temperature \
+             field"
+        );
+    }
+
+    #[test]
+    fn voice_postprocess_body_mirrors_engine_wire_no_temperature() {
+        let body = voice_postprocess_request_body("k3", "sys prompt", "user content", 512);
+        assert!(
+            body.get("temperature").is_none(),
+            "aux voice body must mirror the engine wire (no temperature): a \
+             hard-coded 0 400s on sampling-pinned gateways — Kimi Coding Plan \
+             live 2026-09-30: only 1 is allowed for this model"
+        );
+        assert_eq!(body["model"], "k3");
+        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["stream"], false);
+        assert!(
+            body.get("response_format").is_none(),
+            "postprocess returns prose; no json mode"
+        );
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "sys prompt");
+        assert_eq!(body["messages"][1]["role"], "user");
+        assert_eq!(body["messages"][1]["content"], "user content");
+    }
+
+    #[test]
+    fn sanitize_strips_one_wrapping_quote_pair_only() {
+        assert_eq!(
+            sanitize_voice_postprocess_output("\"你好世界\""),
+            "你好世界"
+        );
+        assert_eq!(sanitize_voice_postprocess_output("'你好'"), "你好");
+        // Content quotes must survive: dictated quotations and quoted code.
+        assert_eq!(
+            sanitize_voice_postprocess_output("'await' 关键字"),
+            "'await' 关键字"
+        );
+        assert_eq!(
+            sanitize_voice_postprocess_output("以引号结尾\""),
+            "以引号结尾\""
+        );
+        // A lone quote is ambiguous output; keep it rather than emitting empty.
+        assert_eq!(sanitize_voice_postprocess_output("\""), "\"");
+        assert_eq!(sanitize_voice_postprocess_output("'"), "'");
+        // A bare quote pair wraps an empty answer and still unwraps to empty.
+        assert_eq!(sanitize_voice_postprocess_output("\"\""), "");
+        assert_eq!(sanitize_voice_postprocess_output("''"), "");
+        assert_eq!(sanitize_voice_postprocess_output("\u{feff}文本"), "文本");
+    }
+
+    #[test]
+    fn sanitize_strips_one_wrapping_markdown_fence() {
+        assert_eq!(
+            sanitize_voice_postprocess_output("```text\n内容\n```"),
+            "内容"
+        );
+        assert_eq!(sanitize_voice_postprocess_output("普通文本"), "普通文本");
+    }
+
+    #[test]
+    fn sanitize_strips_leading_thinking_block_as_output_side_fallback() {
+        // Paired leading think block: reasoning text must not reach the input box.
+        assert_eq!(
+            sanitize_voice_postprocess_output("<think>推理过程……</think>结构化结果"),
+            "结构化结果"
+        );
+        // Whitespace before the block is tolerated.
+        assert_eq!(
+            sanitize_voice_postprocess_output("\n  <think>r</think>答案"),
+            "答案"
+        );
+        // A BOM before the block must not defeat the strip: U+FEFF is not
+        // White_Space, and the sanitize pipeline strips BOM only after this
+        // step, so the block would otherwise leak verbatim into the input box.
+        assert_eq!(
+            sanitize_voice_postprocess_output("\u{feff}<think>r</think>答案"),
+            "答案"
+        );
+        // Whitespace and BOM interleaved before the block.
+        assert_eq!(
+            sanitize_voice_postprocess_output(" \u{feff}\n<think>r</think>答案"),
+            "答案"
+        );
+        // BOM right after the closing tag is also trimmed.
+        assert_eq!(
+            sanitize_voice_postprocess_output("<think>r</think>\u{feff}答案"),
+            "答案"
+        );
+        // Unclosed leading block (truncation) falls through the empty-output contract.
+        assert_eq!(sanitize_voice_postprocess_output("<think>被截断的推理"), "");
+        // No think block: byte-identical passthrough.
+        assert_eq!(sanitize_voice_postprocess_output("普通文本"), "普通文本");
+        // A bare <think> in the middle is literal content, not a block.
+        assert_eq!(
+            sanitize_voice_postprocess_output("先说<think>再写"),
+            "先说<think>再写"
+        );
+    }
+
+    #[test]
+    fn voice_reasoning_dialect_falls_back_to_model_name() {
+        use crate::platform::prefs::ModelPreset;
+        assert_eq!(
+            voice_reasoning_dialect(
+                ModelPreset::OpenaiCompatible,
+                "openai",
+                "https://example.com/v1",
+                "qwen2.5-72b-instruct"
+            ),
+            crate::core::reasoning_dialect::ReasoningDialect::QwenEnableThinking
+        );
+        assert_eq!(
+            voice_reasoning_dialect(
+                ModelPreset::OpenaiCompatible,
+                "openai",
+                "https://example.com/v1",
+                "deepseek-chat"
+            ),
+            crate::core::reasoning_dialect::ReasoningDialect::ThinkingDisabled
+        );
+        // Unknown URL and unknown model name: no dialect, as before.
+        assert_eq!(
+            voice_reasoning_dialect(
+                ModelPreset::OpenaiCompatible,
+                "openai",
+                "https://example.com/v1",
+                "meta-llama-3"
+            ),
+            crate::core::reasoning_dialect::ReasoningDialect::None
+        );
+        // The custom Responses preset rides the same URL-sniff fallback:
+        // voice postprocess stays single-shot Chat (no tools), so the
+        // dialect follows the endpoint/model, not the preset (the compiler
+        // only pins arm exhaustiveness — this pins the semantics).
+        assert_eq!(
+            voice_reasoning_dialect(
+                ModelPreset::OpenaiResponses,
+                "openai",
+                "https://example.com/v1",
+                "qwen2.5-72b-instruct"
+            ),
+            crate::core::reasoning_dialect::ReasoningDialect::QwenEnableThinking
+        );
+    }
+}

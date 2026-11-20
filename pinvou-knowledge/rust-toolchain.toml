@@ -1,0 +1,8 @@
+# Float on `stable`, matching pinvou3-app/src-tauri/rust-toolchain.toml
+# and CodeWhale/rust-toolchain.toml: one floating rustc across the repo.
+# The MSRV floor stays in Cargo.toml (rust-version = 1.90), which still
+# pins the oldest supported compiler. clippy / rustfmt back the lint
+# gates.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

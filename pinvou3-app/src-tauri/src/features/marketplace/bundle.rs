@@ -1,0 +1,1692 @@
+//! 能力包统一模型 — 步骤 1/2：schema + 注册表 + kind 推导 + 就绪态（只读，不改安装/门禁/投影）。
+//!
+//! 设计依据：`docs/capability-governance.md` §3（能力包线）+ 实施修复方案（V1-V7）。
+//! 一切外部能力统一建模为包：
+//!
+//! ```text
+//! Bundle = { id, name, kind, credentials: [ { key, target: env|credential|bearer,
+//!            required } ], ... }
+//! ```
+//!
+//! 包内组成（mcp_servers / skills / cli）只在注册期用于 kind 推导与 companion
+//! 认领；`BundleInfo` 对前端只携带展示与门控所需的功能事实。
+//! - 包是唯一真相源；`mcp.json`、会话 skills 组合目录降级为投影（后续步骤实施）
+//! - 包类型不做存储标签，`bundle_kind` 由内容现算（可信代码推导，防自报标签提权）
+//! - 一个包 = 一个开关；包内技能可见性唯一跟随所属包
+//! - **installed 与 ready 分离**：installed 是存储态（装没装，二态）；ready 是派生态
+//!   （不进存储，查询时现算）——CLI 包按授权存在与否、凭据型按 credentials 必填项
+//!   是否齐（查系统凭据）、本地免凭据包恒 ready。UI 统一消费 (installed, ready) 二元组。
+//!
+//! 注册表汇总四类源：MCP manifest（`bundles/<id>/mcp/manifest.json`）、
+//! 预置技能（编译内嵌）、CLI 连接器（内置常量表）、已上传技能
+//! （`bundles/<id>/skills/`，来源（`BundleSource::Upload`）与内容指纹记录在
+//! bundles.json——`.installed-from` 标记已退役）。
+
+use serde::{Deserialize, Serialize};
+
+use super::MarketplaceManager;
+use super::skill_marketplace::SkillMarketplaceManager;
+use super::store;
+
+// 内置 CLI 连接器清单（修复方案 V2：ima 无 CLI 二进制，移出 CLI 包，归凭据型技能包）。
+// 条目 = (id, 展示名, CLI 二进制名, 配套技能目录, 功能描述)。本表是「连接器 → CLI 二进制 /
+// 配套技能」的单一真相源：能力包注册（下方 list_bundles）、companion 联动排除
+// （MarketplaceManager::companion_skills）、execpolicy 硬拦截（engine_pool ruleset）
+// 与技能解包门控（runtime_bundle apply_*_skills）全部从这里取数。
+// 功能描述是功能事实（§3.1 下沉侧），取自前端 tsToolsData 既有文案；label/icon/
+// color/welcomeQueries 等 i18n 展示资产仍留前端 overlay。
+// 四张配套技能目录表已下沉 `crate::platform::connector_skills` 作为单一真相源
+// （与 runtime_bundle 解包门控共用，见该模块头注释）；此处 pub(crate) re-export
+// 保持 BUILTIN_CLI_BUNDLES 与既有 `bundle::<NAME>_SKILL_DIRS` 引用不变。
+pub(crate) use crate::platform::connector_skills::{
+    DINGTALK_SKILL_DIRS, LARK_SKILL_DIRS, TMEET_SKILL_DIRS, WECOM_SKILL_DIRS,
+};
+
+const BUILTIN_CLI_BUNDLES: &[(&str, &str, &str, &[&str], &str)] = &[
+    (
+        "feishu",
+        "飞书（Lark）",
+        "lark-cli",
+        &LARK_SKILL_DIRS,
+        "接入飞书官方 CLI + 官方域技能（MIT）：让 AI 以你本人身份读写云文档、查改日历、操作多维表格（Base）、收发消息、管理知识库与任务。点「连接飞书」浏览器一键授权，全程不填 key。数据经飞书云 OpenAPI（可选联网功能，opt-in）。",
+    ),
+    (
+        "wecom",
+        "企业微信",
+        "wecom-cli",
+        &WECOM_SKILL_DIRS,
+        "接入企业微信官方 CLI（@wecom/cli，MIT）+ 官方域技能：让 AI 以你本人身份收发消息、收发邮件、读写文档/智能表格/在线表格/智能文档、管理微盘文件、制作演示文稿、创建/查询会议与日程、管理待办、查询通讯录。点「连接」用企业微信 App 扫码授权，全程不填 key。数据经企业微信云（可选联网功能，opt-in）。",
+    ),
+    (
+        "dingtalk",
+        "钉钉",
+        "dws",
+        &DINGTALK_SKILL_DIRS,
+        "接入钉钉官方 DingTalk Workspace CLI（dws，Apache-2.0）+ 官方技能：让 AI 以你本人身份读写钉钉文档、查改日历、操作 AI 表格/在线表格、收发群聊消息、处理待办/审批/日志/邮箱等。点「连接」用钉钉 App 扫码授权，全程不填 key。",
+    ),
+    (
+        "tmeet",
+        "腾讯会议",
+        "tmeet",
+        &TMEET_SKILL_DIRS,
+        "接入腾讯会议官方 CLI（@tencentcloud/tmeet）+ 官方技能：让 AI 以你本人身份创建、查询、修改和取消腾讯会议，查询受邀人、参会报告、录制、转写与智能纪要，并支持会中呼叫成员入会。点「连接」打开腾讯会议授权页扫码登录，全程不填 key。",
+    ),
+];
+
+/// 内置 CLI 连接器 id 列表（scope 默认全禁等门禁逻辑的覆盖来源）。
+pub fn builtin_cli_bundle_ids() -> impl Iterator<Item = &'static str> {
+    BUILTIN_CLI_BUNDLES.iter().map(|(id, ..)| *id)
+}
+
+/// CLI 连接器的配套技能目录名（非 CLI id 返回空切片）。
+pub fn cli_bundle_skill_dirs(id: &str) -> &'static [&'static str] {
+    BUILTIN_CLI_BUNDLES
+        .iter()
+        .find(|(cid, ..)| *cid == id)
+        .map(|(.., dirs, _)| *dirs)
+        .unwrap_or(&[])
+}
+
+/// Whether a CLI connector's companion skill dirs are FULLY materialized on
+/// disk (`bundles/<id>/skills/<dir>/`, the same layout and all-dirs-present
+/// bar as the startup visibility cache). The DenyAll consent gate's
+/// known-bundle decision uses this as ONE HALF of the CLI-connector evidence:
+/// the files can only have been written by an earlier gated show (or carried
+/// over from a pre-locking version, where a connected connector's visible
+/// skills were the recorded status quo), and the gate additionally requires
+/// the surviving sync-ledger trace — the ledger entry is
+/// written by that gate run and cleared only by a consent-strip teardown or a
+/// fail-closed store recovery (whose re-registration is the accepted
+/// over-denial), so
+/// a stripped consent state (whose teardown also withdraws these dirs)
+/// can never keep vouching through them, not even when a
+/// gated show materializing in flight across the teardown re-lands the
+/// dirs. A partially materialized state (an interrupted show) errs toward
+/// "not known" — registration is over-denial, not exposure. Non-CLI ids are
+/// always false.
+///
+/// Case caveat: on case-insensitive filesystems the
+/// EXACT-name check makes a case-variant planted dir count as partial, so
+/// the gate registers (over-denial, fail-closed). A poisoned pre-upgrade
+/// state converges once the variant package is uninstalled — the next gated
+/// show re-extracts under the canonical names.
+///
+/// Exact-name bar: every expected dir must exist UNDER ITS EXACT NAME
+/// (read_dir, not path resolution) with a SKILL.md file inside. Path
+/// resolution would let a case-variant directory planted on a
+/// case-insensitive filesystem (macOS/Windows) vouch for consent it never
+/// received; exact names cannot. The dirs are derived from the id via
+/// [`cli_bundle_skill_dirs`], and the startup visibility cache
+/// (`cached_connector_skills_visible`) calls this same fn, so the two bars
+/// cannot diverge.
+pub(crate) fn cli_connector_skills_materialized(id: &str) -> bool {
+    let dirs = cli_bundle_skill_dirs(id);
+    if dirs.is_empty() {
+        return false;
+    }
+    let skills_dir = crate::platform::paths::bundles_root()
+        .join(id)
+        .join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills_dir) else {
+        return false;
+    };
+    let present: std::collections::HashSet<std::ffi::OsString> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|entry| entry.file_name())
+        .collect();
+    dirs.iter().all(|dir| {
+        present.contains(std::ffi::OsStr::new(*dir))
+            && skills_dir.join(dir).join("SKILL.md").is_file()
+    })
+}
+
+/// CLI 连接器的二进制名（execpolicy 硬拦截按它构造 deny 规则）。
+pub fn cli_bundle_bin(id: &str) -> Option<&'static str> {
+    BUILTIN_CLI_BUNDLES
+        .iter()
+        .find(|(cid, ..)| *cid == id)
+        .map(|(.., bin, _, _)| *bin)
+}
+
+/// 技能目录名 → CLI 连接器 id（内置清单反查；非 CLI companion 返回 None）。
+///
+/// Case-folded like the exact-name bar of every other CLI identity claim: on
+/// case-insensitive filesystems (default macOS/Windows) a case-variant
+/// on-disk directory resolves to the connector's dir regardless of declared
+/// casing, so the reverse claim must fold the same way or
+/// the vocabulary guards and the consent gate would disagree about what
+/// counts as the connector's companion. On Linux this can only over-deny a
+/// hypothetical distinct package whose skill dir differs solely by case —
+/// the import pipeline rejects such names, so the fold converges.
+pub(crate) fn cli_bundle_of_skill(skill_dir: &str) -> Option<&'static str> {
+    BUILTIN_CLI_BUNDLES
+        .iter()
+        .find(|(.., dirs, _)| dirs.iter().any(|d| d.eq_ignore_ascii_case(skill_dir)))
+        .map(|(id, ..)| *id)
+}
+/// Skill dir name → owner pack id (manifest-claim semantics; the lens for
+/// import collision checks and UI display).
+///
+/// **Conditional claim** (matching list_bundles' V5 decision): ima claims
+/// ima-skills (same as list_bundles' skill_claimed preset) → the CLI builtin
+/// manifests → MCP manifest companion_skills (attributed to the MCP pack only
+/// while that MCP pack is currently installed; uninstalled, the skill keeps
+/// its standalone pure-skill-pack form, owner = the skill name itself) →
+/// otherwise its own pack. The migration layer
+/// (`skill_marketplace::legacy_companion_owners`) derives owners under the
+/// same conditional lens; the two sides must not diverge (four review rounds,
+/// M-7).
+///
+/// The gating/materialization side resolves ownership via
+/// [`skill_gating_owner`] (physical-layout fallback included): import
+/// collision checks must stay on manifest-claim semantics — import staging
+/// dirs (`<id>.tmp`) and an existing install's physical nesting would both
+/// make the physical lens misread a self-collision as a cross-pack conflict
+/// (the pitfall the first R17-MAJOR1 fix cut itself on).
+pub(crate) fn skill_owner_package(skill_name: &str) -> String {
+    skill_owner_package_with(&MarketplaceManager::new().available_tools(), skill_name)
+}
+
+/// [`skill_owner_package`] over a pre-walked tool snapshot — the hoisted form
+/// resolution passes use so one `available_tools()` walk (every manifest under
+/// `bundles_root` parsed once) serves the whole id list instead of one walk
+/// per id (review #455 round-23 MINOR 3). Semantics identical to the wrapper.
+pub(crate) fn skill_owner_package_with(tools: &[super::ToolManifest], skill_name: &str) -> String {
+    if skill_name == "ima-skills" {
+        return "ima".to_string();
+    }
+    if let Some(cli) = cli_bundle_of_skill(skill_name) {
+        return cli.to_string();
+    }
+    for tool in tools {
+        // Case-folded like the builtin guards: on case-insensitive filesystems
+        // an on-disk `Session-Reader` directory resolves to the companion
+        // skill regardless of declared casing (review round-5 minor 4).
+        if tool
+            .companion_skills
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(skill_name))
+        {
+            // V5「随包」认领：包本体已装才把技能归属到包（与 list_bundles 的认领
+            // 条件一致）；未装时技能保留独立纯技能包形态（owner = 技能名自身）。
+            // 保证 save 归一与物化排除跟 UI 展示的包形态对齐（二轮评审：scope
+            // save 归一与 V5 条件认领冲突）。
+            if bundle_installed(&tool.id) {
+                return tool.id.clone();
+            }
+            break;
+        }
+    }
+    skill_name.to_string()
+}
+/// Skill dir name → the gating/materialization owner: [`skill_owner_package`]'s
+/// conditional claim plus a **physical-layout fallback** (R17-MAJOR1). A skill
+/// dir physically nested under `bundles/<pkg>/skills/<name>/` belongs to
+/// `<pkg>` whether or not the manifest declares it — session materialization
+/// scans directories and sees only physical layout; if the gate attributed an
+/// undeclared skill to the skill name itself, it would enter every scope with
+/// zero consent and no composer row to turn it off (the record-driven lists
+/// have no such row). The fallback shares materialization's lens: purely
+/// physical (no install-record lookups, staging dirs excluded (round-27 m4) —
+/// the gating side does not distinguish "currently importing" dirs; import
+/// collision checks never route through this function). First match in sorted
+/// order keeps the outcome deterministic when several packs nest the same
+/// name; no hit → the skill is its own pack.
+pub(crate) fn skill_gating_owner(skill_name: &str) -> String {
+    skill_gating_owner_with(&MarketplaceManager::new().available_tools(), skill_name)
+}
+
+/// [`skill_gating_owner`] over a pre-walked tool snapshot (round-23 MINOR 3
+/// hoist; see [`skill_owner_package_with`]).
+pub(crate) fn skill_gating_owner_with(tools: &[super::ToolManifest], skill_name: &str) -> String {
+    let claimed = skill_owner_package_with(tools, skill_name);
+    if claimed != skill_name {
+        return claimed;
+    }
+    // Round-33 minor 4 (review #455): both swallow points below are
+    // consent-load-bearing (a degraded scan silently fails open to the
+    // standalone shape); they are logged loudly, and the full propagation
+    // refactor (a degraded flag mirroring `installed_skill_ids_strict`) is
+    // registered for the next wave — the signature change ripples through
+    // the materialization hot path and does not belong in a merge wave.
+    let rd = match std::fs::read_dir(crate::platform::paths::bundles_root()) {
+        Ok(rd) => rd,
+        Err(e) => {
+            log::warn!(
+                "[bundle] gating-owner fallback cannot read bundles_root; failing open to the standalone owner for '{skill_name}' (consent-critical, refactor registered): {e}"
+            );
+            return skill_name.to_string();
+        }
+    };
+    let mut owners: Vec<String> = rd
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                log::warn!(
+                    "[bundle] gating-owner fallback skipped an unreadable bundles_root entry (consent-critical, refactor registered): {e}"
+                );
+                None
+            }
+        })
+        // Skip import staging (`<id>.tmp`) and
+        // landing backup (`<id>.old`) dirs — the same exclusion the two
+        // lenses this fallback shares with (materialization's
+        // `skill_source_dirs`, the expansion disk leg) already apply; a
+        // crash-residue staging dir could otherwise win the sorted-first
+        // race and render its skills ungated under the suffix owner id.
+        .filter(|pkg| {
+            let name = pkg.file_name().to_string_lossy().into_owned();
+            !name.ends_with(".tmp") && !name.ends_with(".old")
+        })
+        .filter(|pkg| pkg.path().join("skills").join(skill_name).is_dir())
+        .filter_map(|pkg| pkg.file_name().into_string().ok())
+        .collect();
+    owners.sort();
+    if let Some(pkg) = owners.first() {
+        return pkg.clone();
+    }
+    skill_name.to_string()
+}
+
+/// 包是否已安装：BundleStore 记录优先；store 不可读时回退 installed.json——
+/// 与 `list_bundles` 的 V5 认领判定同口径（Phase 2 过渡期 installed.json 仍权威）。
+///
+/// Disclosed residual: the fallback consults the
+/// legacy `installed.json`, which is kept as read-only history after the
+/// one-shot legacy import — a stale id there keeps the V5 owner-claim alive
+/// while the store is unreadable. The claim additionally requires the
+/// owner's manifest to be physically present (the `available_tools` walk),
+/// and every manifest-on-disk state except a user enable also carries the
+/// owner's consent rows, so no exploitable fail-open chain is known; the
+/// direction is still fail-open-leaning compared with every other gate
+/// input. Do not extend this fallback to new callers.
+pub(crate) fn bundle_installed(id: &str) -> bool {
+    match super::store::BundleStore::new().records() {
+        Ok(records) => records.iter().any(|r| r.id == id && r.installed),
+        Err(_) => MarketplaceManager::new()
+            .installed_ids()
+            .iter()
+            .any(|installed| installed == id),
+    }
+}
+
+/// 凭据目标：env（mcp.json 环境变量占位）、credential（系统凭据存储）、bearer（Authorization 头）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialTarget {
+    Env,
+    Credential,
+    Bearer,
+}
+
+/// CredentialTarget → keyring 存储的 target 字符串（env/header/credential）。
+pub fn keyring_target(target: CredentialTarget) -> &'static str {
+    match target {
+        CredentialTarget::Env => "env",
+        CredentialTarget::Bearer => "header",
+        CredentialTarget::Credential => "credential",
+    }
+}
+
+/// 包声明的凭据项（修复方案一：从 config_fields/secret_env/secret_headers 收敛）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialSpec {
+    pub key: String,
+    pub target: CredentialTarget,
+    pub required: bool,
+}
+
+/// 配置弹窗字段的功能事实（修复方案 V4 下沉部分）。
+/// label/placeholder/helpText 属 i18n 展示资产，留前端 overlay 按包 id 索引，不进后端。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigFieldSpec {
+    pub key: String,
+    pub required: bool,
+    pub target: CredentialTarget,
+    pub secret: bool,
+}
+
+/// 包形态（内容现算，不落存储）。优先级定死（修复方案 V2）：
+/// servers+skills both non-empty → Bundle; servers non-empty → Mcp; skills non-empty → Skill.
+/// CLI connectors are not derived from content: they are produced by registering directly in the
+/// registry from the built-in constant table (`BUILTIN_CLI_BUNDLES`).
+/// 注：旧 `Spanner` 变体已删除——脚本可执行能力并入 skill 包，通过 SKILL.md frontmatter
+/// `tools[]` + `runtime` 段声明，由 skill_marketplace::install 后置 hook 注册。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BundleKind {
+    /// CLI 包：cli 非空（飞书/企微/钉钉/腾讯会议等内置连接器）
+    Cli,
+    /// 组合包：mcp_servers 与 skills 均非空（MCP 函数 + 使用引导一体）
+    Bundle,
+    /// 纯 MCP：mcp_servers 非空、skills/cli 空
+    Mcp,
+    /// 纯技能包：仅 skills（市场预置、用户上传；含凭据型技能包如 ima）
+    Skill,
+}
+
+/// 空包错误：mcp_servers/skills/cli 全空（修复方案 V7，schema 层拦截，不默认归 Skill）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidBundle;
+
+/// Ready state (derived state; never stored and not part of serde serialization).
+/// The UI consumes (installed, ready).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    /// 未就绪；reason 给前端提示（如缺凭据的 key 列表）
+    NotReady(&'static str),
+}
+
+/// 能力包清单条目（前端消费；id 沿用现有命名空间：MCP 工具 id / 技能 id / CLI 连接器 id）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleInfo {
+    pub id: String,
+    pub name: String,
+    pub kind: BundleKind,
+    /// 包声明的凭据项（收敛自 config_fields/secret_env/secret_headers）
+    pub credentials: Vec<CredentialSpec>,
+    /// 功能事实（修复方案 V4 下沉；icon/color/todayImg/welcomeQueries/i18n 留前端 overlay）
+    pub description: String,
+    pub version: String,
+    /// 配置弹窗字段功能事实（label/placeholder/helpText 留前端）
+    pub config_fields: Vec<ConfigFieldSpec>,
+    pub installed: bool,
+    /// 用户上传（非预置），前端用默认图标渲染
+    pub user_uploaded: bool,
+    /// `Degraded` 异常态原因（§3.2：登记在、资源缺），从 BundleStore 记录透传，
+    /// 前端据此提示修复动作（按来源重新获取）；None = 资源完整。只是资源完整性
+    /// 标记，不参与 ready 判定（ready 仍为派生态，Readiness 枚举不变）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<String>,
+    /// 预置技能内容落后于嵌入资源（App 升级带入新版或本地被改过）→ 动作下发
+    /// `update`。非预置技能恒 false（上传技能无嵌入对应物）。
+    #[serde(default)]
+    pub update_available: bool,
+    /// 含远程 OAuth server（manifest `servers` 非空）→ 未安装时动作下发
+    /// `connect`（flow=oauth）而非 `install`/`configure`。
+    #[serde(default)]
+    pub oauth: bool,
+    /// 用户自定义展示名/说明覆盖的**原值**（仅 source=Upload 的包；存于
+    /// bundles.json extra，供前端编辑弹窗预填）。name/description 已是应用
+    /// 覆盖后的生效值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_description: Option<String>,
+}
+
+/// Per-package-id install-state read (§3.2 truth-source inversion): takes `(installed, degraded)` from the
+/// BundleStore record snapshot the caller read in bulk once; a missing record = not installed.
+/// `records` being `None` (store read failure) → `None`, and the caller applies its own fallback policy.
+/// `list_bundles` and `MarketplaceManager::list_tools` share this same read, keeping the
+/// readiness card's and the tool card's installed/degraded semantics consistent.
+pub(crate) fn store_state(
+    records: Option<&[store::BundleRecord]>,
+    id: &str,
+) -> Option<(bool, Option<String>)> {
+    records.map(|records| {
+        records
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (r.installed, r.degraded.clone()))
+            .unwrap_or((false, None))
+    })
+}
+
+/// 注册表：从现有源汇总包清单。只读；安装/门禁/投影迁移见后续步骤。
+pub struct BundleRegistry {
+    mcp_manager: MarketplaceManager,
+    skill_manager: SkillMarketplaceManager,
+}
+
+impl Default for BundleRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BundleRegistry {
+    pub fn new() -> Self {
+        Self {
+            mcp_manager: MarketplaceManager::new(),
+            skill_manager: SkillMarketplaceManager::new(),
+        }
+    }
+
+    /// 全部能力包（含未安装）。组合规则：
+    /// - MCP manifest 的 `companion_skills` 声明 → 技能归入该 MCP 包（组合包）
+    /// - 未被任何 MCP 引用的预置技能 → 独立纯技能包
+    /// - 用户上传技能 → 独立纯技能包
+    /// - 内置 CLI 连接器 → CLI 包（修复方案 V2：ima 移出，归凭据型技能包）
+    /// - ima（凭据型）：OpenAPI 凭据 + companion 技能 ima-skills → 纯技能包（凭据型）
+    pub fn list_bundles(&self) -> Vec<BundleInfo> {
+        let mut out: Vec<BundleInfo> = Vec::new();
+        // 已被 MCP/凭据型包认领的技能 id（ima-skills 须在预置扫描前声明，避免先独立成包）
+        let mut skill_claimed: Vec<String> = vec!["ima-skills".to_string()];
+        let installed_mcp_ids = self.mcp_manager.installed_ids();
+
+        // installed 真相源反转（§3.2，Phase 2 第三刀）：bundles.json 是唯一可写
+        // 存储，installed / degraded 从 BundleStore 记录读；无记录 = 未安装。
+        // 过渡期防御：store 读失败（如损坏 JSON）回退旧的文件推导并 log::warn ——
+        // Phase 3 切换后删除回退分支（届时读失败应直接报错）。
+        let store_records = match store::BundleStore::new().records() {
+            Ok(records) => Some(records),
+            Err(e) => {
+                log::warn!("[marketplace] BundleStore 读取失败，installed 回退旧文件推导: {e}");
+                None
+            }
+        };
+        let store_records = store_records.as_deref();
+
+        // 1) MCP 源（含组合包；凭据项从 manifest config_fields/secret_env 收敛）
+        for tool in self.mcp_manager.available_tools() {
+            let (installed, degraded) = store_state(store_records, &tool.id)
+                .unwrap_or_else(|| (installed_mcp_ids.contains(&tool.id), None));
+            // 修复方案 V5：companion 认领是「随包」语义——包本体已装才认领技能；
+            // 存量已单装技能的包未装时，技能保留独立纯技能包形态（不强制认领，
+            // 只影响新装路径），避免用户既有开关/技能消失。
+            let companions: Vec<String> = if installed {
+                tool.companion_skills.clone()
+            } else {
+                Vec::new()
+            };
+            skill_claimed.extend(companions.iter().cloned());
+            let credentials = tool_credentials(&tool);
+            let config_fields = tool_config_fields(&tool);
+            // 上传来源的包：用户自定义展示名/说明（bundles.json extra）覆盖
+            // manifest 的 name/description；空/缺 key 回退 manifest 现状。
+            let upload_record = store_records.and_then(|records| {
+                records
+                    .iter()
+                    .find(|r| r.id == tool.id)
+                    .filter(|r| matches!(r.source, store::BundleSource::Upload(_)))
+            });
+            let (display_name, display_description) = match upload_record {
+                Some(record) => store::apply_display_override(record, None, None),
+                None => (None, None),
+            };
+            out.push(BundleInfo {
+                id: tool.id.clone(),
+                name: display_name.clone().unwrap_or_else(|| tool.name.clone()),
+                kind: if companions.is_empty() {
+                    BundleKind::Mcp
+                } else {
+                    BundleKind::Bundle
+                },
+                credentials,
+                description: display_description
+                    .clone()
+                    .unwrap_or_else(|| tool.description.clone()),
+                version: tool.version.clone(),
+                config_fields,
+                installed,
+                user_uploaded: upload_record.is_some(),
+                degraded,
+                update_available: false,
+                oauth: !tool.servers.is_empty(),
+                display_name,
+                display_description,
+            });
+        }
+
+        // list_skills is one full traversal: the 2)/3) skill-source loops
+        // share a single read and do not walk the fingerprints twice (same
+        // hoist rationale as unavailable_tool_names_for).
+        let skills = self.skill_manager.list_skills();
+        // 2) 预置技能源（未被认领的独立成包）
+        for skill in &skills {
+            if skill.user_uploaded {
+                continue; // 上传技能单独处理
+            }
+            if skill_claimed.contains(&skill.id) {
+                continue;
+            }
+            // id 唯一性：与既有包同名的技能不再独立成包。同名 companion 技能
+            // （pptx 技能 ↔ pptx MCP）由同名 MCP 包全权代表——装后认领并 derive 为
+            // Bundle 携带技能；未装时若再独立成包会产生两个同 id 包，破坏
+            // 「一个包 = 一个开关」前提（前端同名技能装卸本就路由到该 MCP）。
+            if out.iter().any(|b| b.id == skill.id) {
+                continue;
+            }
+            let (installed, degraded) =
+                store_state(store_records, &skill.id).unwrap_or((skill.installed, None));
+            out.push(BundleInfo {
+                id: skill.id.clone(),
+                name: skill.title.clone(),
+                kind: BundleKind::Skill,
+                credentials: Vec::new(),
+                description: skill.description.clone(),
+                version: String::new(),
+                config_fields: Vec::new(),
+                installed,
+                user_uploaded: false,
+                degraded,
+                update_available: skill.update_available,
+                oauth: false,
+                display_name: None,
+                display_description: None,
+            });
+        }
+
+        // 3) 上传技能源（独立纯技能包；后续步骤改走统一安装管线）
+        for skill in &skills {
+            if !skill.user_uploaded {
+                continue;
+            }
+            let (installed, degraded) =
+                store_state(store_records, &skill.id).unwrap_or((true, None));
+            // name/description 已在 list_skills 应用 extra 展示覆盖；覆盖原值透传
+            // 给前端编辑弹窗预填。
+            out.push(BundleInfo {
+                id: skill.id.clone(),
+                name: skill.title.clone(),
+                kind: BundleKind::Skill,
+                credentials: Vec::new(),
+                description: skill.description.clone(),
+                version: String::new(),
+                config_fields: Vec::new(),
+                installed,
+                user_uploaded: true,
+                degraded,
+                update_available: false,
+                oauth: false,
+                display_name: skill.display_name.clone(),
+                display_description: skill.display_description.clone(),
+            });
+        }
+
+        // 4) CLI 连接器源（内置常量表；V2 后不含 ima。元数据已随 Phase 2 第七刀
+        //    下沉：desc 取自常量表、version 取 lock 表钉住版本；i18n 展示资产留
+        //    前端 overlay）。「连接器 → 配套技能」的单一真相源仍是常量表本身
+        //    （`cli_bundle_skill_dirs` / `cli_bundle_of_skill` 取数），不再经
+        //    BundleInfo 透出。
+        for (id, name, bin, _, desc) in BUILTIN_CLI_BUNDLES {
+            let (installed, degraded) = store_state(store_records, id).unwrap_or((false, None));
+            // version 功能事实：lock 表钉住版本（tmeet 走 npm 无 lock 条目 → 空，
+            // 前端 overlay 保留自报版本展示）
+            let version = crate::platform::connector_lock::artifact_pin(bin)
+                .map(|pin| pin.version)
+                .unwrap_or_default();
+            out.push(BundleInfo {
+                id: (*id).to_string(),
+                name: (*name).to_string(),
+                kind: BundleKind::Cli,
+                credentials: Vec::new(),
+                description: (*desc).to_string(),
+                version,
+                config_fields: Vec::new(),
+                installed,
+                user_uploaded: false,
+                degraded,
+                update_available: false,
+                oauth: false,
+                display_name: None,
+                display_description: None,
+            });
+        }
+
+        // 5) 凭据型技能包：ima（OpenAPI 凭据 + companion 技能 ima-skills；V2 归 Skill）。
+        // 登记侧写入的记录 id 是 `ima-skills`（技能包 install 的登记口径），卡 id 是
+        // `ima`——两个 id 任一有记录都算已装，保证「一个包 = 一张卡 = 一个开关」。
+        // 注意区分「store 不可读」与「记录不存在」（再查别名 id）：
+        // 通用 store_state 对缺记录也返回 Some((false, None))，直接 .or_else 会让
+        // ima-skills 兜底永不触发（三轮评审死代码）。
+        let (ima_installed, ima_degraded) = match store_records {
+            Some(records) => ["ima", "ima-skills"]
+                .iter()
+                .find_map(|id| records.iter().find(|r| r.id == *id))
+                .map(|r| (r.installed, r.degraded.clone()))
+                .unwrap_or((false, None)),
+            None => (false, None),
+        };
+        out.push(BundleInfo {
+            id: "ima".to_string(),
+            name: "腾讯 ima".to_string(),
+            kind: BundleKind::Skill,
+            credentials: vec![
+                CredentialSpec {
+                    key: "IMA_CLIENT_ID".to_string(),
+                    target: CredentialTarget::Credential,
+                    required: true,
+                },
+                CredentialSpec {
+                    key: "IMA_API_KEY".to_string(),
+                    target: CredentialTarget::Credential,
+                    required: true,
+                },
+            ],
+            description: "接入腾讯 ima OpenAPI Skill：通过 Pinvou 内置的受控工具调用 ima.qq.com 官方 OpenAPI，支持笔记搜索/读取/创建/追加，以及知识库搜索、浏览、网页导入和内容添加。需要填写你自己的 Client ID 和 API Key，凭据只写入本机系统凭据，不进入对话、环境变量、仓库或 mcp.json。".to_string(),
+            // 预置技能无版本概念（无版本号/无自动更新机制），version 留空，
+            // 前端 overlay 保留自报版本展示
+            version: String::new(),
+            config_fields: vec![
+                ConfigFieldSpec {
+                    key: "IMA_CLIENT_ID".to_string(),
+                    required: true,
+                    target: CredentialTarget::Credential,
+                    secret: true,
+                },
+                ConfigFieldSpec {
+                    key: "IMA_API_KEY".to_string(),
+                    required: true,
+                    target: CredentialTarget::Credential,
+                    secret: true,
+                },
+            ],
+            installed: ima_installed,
+            user_uploaded: false,
+            degraded: ima_degraded,
+            update_available: false,
+            oauth: false,
+            display_name: None,
+            display_description: None,
+        });
+
+        out
+    }
+
+    pub fn bundle(&self, id: &str) -> Option<BundleInfo> {
+        self.list_bundles().into_iter().find(|b| b.id == id)
+    }
+}
+
+/// 纯函数：由内容推导包形态（修复方案 V2 优先级定死 + V7 空包报错）。
+/// Priority: mcp+skills combo → Bundle; mcp non-empty → Mcp; skills non-empty → Skill;
+/// all empty → Err (empty packages are rejected at the schema layer).
+///
+/// Note: the CLI kind is not derived here — CLI connectors are registered by the built-in constant table (`BUILTIN_CLI_BUNDLES`,
+/// produced directly from the table by `BundleRegistry::list_bundles`), not derived from content. The old
+/// `spanners` parameter was removed — script executability is declared via the skill package's SKILL.md frontmatter
+/// `tools[]` 段声明，不影响 kind 推导。
+pub fn derive_bundle_kind(
+    mcp_servers: &[String],
+    skills: &[String],
+) -> Result<BundleKind, InvalidBundle> {
+    if !mcp_servers.is_empty() && !skills.is_empty() {
+        Ok(BundleKind::Bundle)
+    } else if !mcp_servers.is_empty() {
+        Ok(BundleKind::Mcp)
+    } else if !skills.is_empty() {
+        Ok(BundleKind::Skill)
+    } else {
+        Err(InvalidBundle)
+    }
+}
+
+/// config_fields `target` 字符串 → [`CredentialTarget`]（缺省/未知 = env），
+/// 与 `types::ConfigField.target` 的 serde 缺省值（"env"）同口径。
+fn parse_credential_target(target: &str) -> CredentialTarget {
+    match target {
+        "bearer" => CredentialTarget::Bearer,
+        "credential" => CredentialTarget::Credential,
+        _ => CredentialTarget::Env,
+    }
+}
+
+/// 从 MCP ToolManifest 收敛凭据声明（修复方案一）：config_fields → credentials，
+/// secret_env/secret_headers 按 target 映射（env/bearer），required 语义保留。
+fn tool_credentials(tool: &super::ToolManifest) -> Vec<CredentialSpec> {
+    dedup_credential_declarations(tool, |key, target, required, _| CredentialSpec {
+        key,
+        target,
+        required,
+    })
+}
+
+/// 配置弹窗字段功能事实（V4 下沉；label/placeholder/helpText 属 i18n 展示资产留前端）。
+/// Deduplicated under the same policy as tool_credentials: when the same key is declared in both config_fields and
+/// secret_env/secret_headers, only one dialog field is emitted, otherwise the frontend would render duplicate inputs.
+fn tool_config_fields(tool: &super::ToolManifest) -> Vec<ConfigFieldSpec> {
+    dedup_credential_declarations(tool, |key, target, required, secret| ConfigFieldSpec {
+        key,
+        required,
+        target,
+        secret,
+    })
+}
+
+/// Three-source dedup traversal shared by tool_credentials / tool_config_fields (fix plan 1/V4):
+/// projects in declaration order config_fields → secret_env → secret_headers; the same key may be declared
+/// repeatedly across sources (dual use: UI field + placeholder parsing), deduplicated once by `(key, target)`,
+/// first declaration wins. The `secret` flag follows config_fields' explicit declaration (not overridden by the
+/// implicit true of secret_env/secret_headers); the latter two are sensitive declarations themselves, so secret is always true.
+///
+/// Legacy sensitive `manifest.env` keys are deliberately NOT projected here.
+/// On the remote channel they follow an existential "any one resolving key
+/// serves the entry" doctrine (the builder wires only the first), which
+/// cannot map onto this per-key required filter without false
+/// missing_credentials signals — a two-key manifest with one key stored
+/// works fine. A reconcile-disabled legacy-env entry therefore shows no
+/// Configure fix on its card; the startup reconcile note carries the why
+/// and the fix instead.
+fn dedup_credential_declarations<T>(
+    tool: &super::ToolManifest,
+    build: impl Fn(String, CredentialTarget, bool, bool) -> T,
+) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut seen: Vec<(String, CredentialTarget)> = Vec::new();
+    let mut push = |key: String, target: CredentialTarget, required: bool, secret: bool| {
+        if seen.iter().any(|(k, t)| *k == key && *t == target) {
+            return;
+        }
+        seen.push((key.clone(), target));
+        out.push(build(key, target, required, secret));
+    };
+    for f in &tool.config_fields {
+        push(
+            f.key.clone(),
+            parse_credential_target(&f.target),
+            f.required,
+            f.secret,
+        );
+    }
+    for s in &tool.secret_env {
+        push(s.key.clone(), CredentialTarget::Env, s.required, true);
+    }
+    for s in &tool.secret_headers {
+        push(
+            s.source_key.clone(),
+            CredentialTarget::Bearer,
+            s.required,
+            true,
+        );
+    }
+    out
+}
+
+/// The reason copy written into a record's `degraded` field when its
+/// authorization is disconnected. Both writers (the desktop
+/// `features::connectors::connector_cli::bundle_store_on_disconnected` and the
+/// headless `pinvou-cli` mirror in connectors.rs) import THIS constant; the
+/// connectors → marketplace dependency direction matches the standing module
+/// boundary. Publishing the judgment and the copy in the same module shrinks
+/// the drift surface from "two literals drifting independently" to "edit this
+/// one constant".
+///
+/// The judgment matches by prefix, not full equality (see this module's
+/// `degraded_by_disconnect`): the copy is human-facing hint text whose tail
+/// may be reworded at any time, and a full-equality match would let a pure
+/// copy edit silently reclassify "disconnected" back into
+/// "assets mismatch" -- exactly the misdiagnosis this judgment prevents.
+///
+/// Written as a two-half `concat!` split exactly at the classifier prefix:
+/// the first half is byte-for-byte `CLI_DISCONNECTED_DEGRADED_PREFIX`, so
+/// the prefix relationship is structural in the source (the two literals sit
+/// a few lines apart) instead of being policed by a hand-rolled const-fn
+/// byte matcher.
+pub const CLI_DISCONNECTED_DEGRADED_REASON: &str =
+    concat!("已断开授权", "：配套技能已随断开移除，重新连接即可恢复");
+
+/// [`CLI_DISCONNECTED_DEGRADED_REASON`] 的稳定前缀：分类器只认前缀（尾巴的
+/// 提示文案可随时改写），两个写入方都以它开头——重新措辞 const 时分类器
+/// 自动跟随，不会再留一份手抄字面量悄悄漂移。（上方 const 的 `concat!` 第一
+/// 段就是这段字节；改前缀时两处须同改。）
+const CLI_DISCONNECTED_DEGRADED_PREFIX: &str = "已断开授权";
+
+/// `degraded` 原因是否来自「断开授权」而不是资产校验失败。
+fn degraded_by_disconnect(reason: &str) -> bool {
+    reason.starts_with(CLI_DISCONNECTED_DEGRADED_PREFIX)
+}
+
+/// 就绪态判定（派生态，现算不进存储）。
+/// - CLI 包：桌面端由命令层经 `bundle_readiness` 分派到各 status 查询注入授权态
+///   （注册表不直连 CLI 运行时，注入闭包保持依赖方向 app → features）；headless
+///   调用方（pinvou-cli `plugins readiness`）没有命令层，落到下方按 installed
+///   + degraded 的保守回退
+/// - 凭据型：credentials 必填项在系统凭据存储中齐不齐（现算）
+/// - 本地免凭据：恒 Ready
+///
+/// degraded（`store::BundleRecord::installed` 注释的存储二态异常侧：「登记在、
+/// 资源缺」）只在 CLI 臂参与判定，且按来源分两码（见该臂注释）。非 CLI 臂**不**
+/// 读 degraded：那会改变桌面 `bundle_readiness` 的 `_` 臂结论（就绪卡翻成未就绪），
+/// 是一处没有 GUI 侧需求的可见变更；需要这个信号的是 headless 的
+/// `plugins readiness`，它自己按行上的 `degraded` 派生 `assets_missing`
+/// （见 pinvou-cli `plugins.rs`），不必让桌面端跟着改判。
+pub fn readiness_for(bundle: &BundleInfo, credential_has: impl Fn(&str) -> bool) -> Readiness {
+    match bundle.kind {
+        // The desktop command layer overrides this arm with its `*_status`
+        // dispatch; headless callers (pinvou-cli has no command layer) get
+        // the conservative installed-based verdict instead of a panic. That
+        // fallback is strictly weaker than the desktop's live probe: it sees
+        // registry facts only, never the connection state. The headless
+        // surface must disclose that gap itself rather than let a registry
+        // `Ready` pass for a probed one —— see pinvou-cli `plugins.rs`
+        // readiness (`probe: "unavailable_in_cli"`).
+        BundleKind::Cli => {
+            if !bundle.installed {
+                Readiness::NotReady("cli_not_installed")
+            } else if let Some(reason) = bundle.degraded.as_deref() {
+                // CLI 包的 degraded 有两个来源，修复动作正好相反，必须分码：
+                // 1) 断开授权 —— `connector_cli::bundle_store_on_disconnected`
+                //    在**每一次**断开（桌面断开 / `connectors logout`）时置位，
+                //    是常态路径；修复动作 = 重新授权连接（重解包 companion 技能）。
+                // 2) 存量二进制对照 lock 表校验 SHA-256 不匹配 / 无法校验
+                //    （`store::legacy_cli_records` 的 `CliAssetState::Mismatch`），
+                //    只在首启导入时一次性置位；修复动作 = 重新下载二进制。
+                // 一律报 (2) 会把「刚登出」这个最常见的 degraded 诊断成资产损坏，
+                // 把运维引去重下二进制而不是重新授权——与分码的初衷相反。
+                // 两者都不是桌面端实时探测得出的 `not_connected`：那个码只由
+                // 命令层的 status 探测下发，此处不冒名。
+                if degraded_by_disconnect(reason) {
+                    Readiness::NotReady("cli_disconnected")
+                } else {
+                    Readiness::NotReady("cli_assets_mismatch")
+                }
+            } else {
+                Readiness::Ready
+            }
+        }
+        BundleKind::Mcp | BundleKind::Bundle | BundleKind::Skill => {
+            // Local credential-free (no required credentials) is always Ready; with required credentials, check the system credential store.
+            // The Mcp / Bundle / Skill kinds are judged identically (a combo package does not change its
+            // credential verdict by carrying skills) and share the same branch.
+            let missing: Vec<&str> = bundle
+                .credentials
+                .iter()
+                .filter(|c| c.required && !credential_has(&c.key))
+                .map(|c| c.key.as_str())
+                .collect();
+            // degraded 不在此臂参与判定（理由见函数文档）：这是桌面就绪卡直接
+            // 消费的结论，改判它是 GUI 可见变更，而提出诉求的只有 headless 侧。
+            if missing.is_empty() {
+                Readiness::Ready
+            } else {
+                Readiness::NotReady("missing_credentials")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+    use crate::platform::test_support::with_temp_home;
+
+    /// fixture：临时 home 下构造 mcp-servers manifest + 技能目录 + 上传标记。
+    /// `install_gongwen=true` 时把 gongwen 写入 installed.json（V5 认领条件）。
+    /// 布局按包聚合新布局：MCP manifest 落 `bundles/<id>/mcp/`，技能落
+    /// `bundles/<owner>/skills/<name>/`（旧扁平 `bundle/skills/` 已退役）。
+    fn seed_fixture(home: &std::path::Path, install_gongwen: bool) {
+        let write = |rel: &str, content: &str| {
+            let p = home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(content.as_bytes()).unwrap();
+        };
+        // 组合包 gongwen（companion 声明 government-writing）
+        write(
+            "bundles/gongwen/mcp/manifest.json",
+            r#"{"id":"gongwen","name":"公文写作","description":"d","version":"1.0.0","icon":"","category":"office","mcp_tools":[],"command":"","args":[],"companion_skills":["government-writing"]}"#,
+        );
+        // 纯 MCP 包 weather
+        write(
+            "bundles/weather/mcp/manifest.json",
+            r#"{"id":"weather","name":"高德天气","description":"d","version":"1.0.0","icon":"","category":"life","mcp_tools":[],"command":"","args":[]}"#,
+        );
+        // 预置技能（被认领 + 独立），按包聚合新布局落位：
+        // government-writing 属主 = gongwen（companion），visualizer 独立成包。
+        for (owner, name) in [
+            ("gongwen", "government-writing"),
+            ("visualizer", "visualizer"),
+        ] {
+            write(
+                &format!("bundles/{owner}/skills/{name}/SKILL.md"),
+                "---\nname: {name}\n---\n# hi",
+            );
+        }
+        // 上传技能（独立纯技能包）
+        write(
+            "bundles/my-upload/skills/my-upload/SKILL.md",
+            "---\nname: my-upload\n---\n# hi",
+        );
+        // 上传技能的枚举自刀十起是 BundleStore 记录驱动（`.installed-from` 标记已退役）
+        store::BundleStore::new()
+            .upsert(store::BundleRecord::installed_now(
+                "my-upload",
+                store::BundleSource::Upload("pkg.zip".to_string()),
+            ))
+            .unwrap();
+        // 旧布局安装态（V5 认领的回退推导来源；真相源反转后由 store_install 覆盖）
+        if install_gongwen {
+            write("marketplace/installed.json", r#"["gongwen"]"#);
+        }
+    }
+
+    /// 往 BundleStore 写安装记录（真相源反转后 installed 的权威来源，§3.2）。
+    fn store_install(ids: &[&str]) {
+        let store = store::BundleStore::new();
+        for id in ids {
+            store
+                .upsert(store::BundleRecord::installed_now(
+                    *id,
+                    store::BundleSource::Preset,
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn derives_bundle_kind_by_content() {
+        let mcp = |id: &str| id.to_string();
+        // V7：空包报错，不默认归 Skill
+        assert_eq!(derive_bundle_kind(&[], &[]), Err(InvalidBundle));
+        // V2 priority: Bundle > Mcp > Skill (the CLI kind is produced by the built-in constant table,
+        // not derived from content — see the derive_bundle_kind docs)
+        assert_eq!(derive_bundle_kind(&[mcp("a")], &[]), Ok(BundleKind::Mcp));
+        assert_eq!(
+            derive_bundle_kind(&[mcp("a")], &[mcp("s")]),
+            Ok(BundleKind::Bundle)
+        );
+        assert_eq!(derive_bundle_kind(&[], &[mcp("s")]), Ok(BundleKind::Skill));
+    }
+
+    #[test]
+    fn readiness_rules() {
+        let b = |kind: BundleKind, creds: Vec<CredentialSpec>| BundleInfo {
+            id: "x".into(),
+            name: "x".into(),
+            kind,
+            credentials: creds,
+            description: String::new(),
+            version: String::new(),
+            config_fields: vec![],
+            installed: true,
+            user_uploaded: false,
+            degraded: None,
+            update_available: false,
+            oauth: false,
+            display_name: None,
+            display_description: None,
+        };
+        // 本地免凭据 → 恒 Ready
+        assert_eq!(
+            readiness_for(&b(BundleKind::Mcp, vec![]), |_| false),
+            Readiness::Ready
+        );
+        // 必填凭据缺失 → NotReady
+        let creds = vec![CredentialSpec {
+            key: "AMAP_KEY".into(),
+            target: CredentialTarget::Env,
+            required: true,
+        }];
+        assert_eq!(
+            readiness_for(&b(BundleKind::Mcp, creds.clone()), |k| k != "AMAP_KEY"),
+            Readiness::NotReady("missing_credentials")
+        );
+        assert_eq!(
+            readiness_for(&b(BundleKind::Mcp, creds), |k| k == "AMAP_KEY"),
+            Readiness::Ready
+        );
+        // 非必填凭据缺失不影响 ready
+        let opt = vec![CredentialSpec {
+            key: "OPT".into(),
+            target: CredentialTarget::Credential,
+            required: false,
+        }];
+        assert_eq!(
+            readiness_for(&b(BundleKind::Skill, opt.clone()), |_| false),
+            Readiness::Ready
+        );
+        // Headless fallback (pinvou-cli has no command layer to inject the
+        // `*_status` verdict): an installed CLI bundle is Ready, an
+        // uninstalled one reports cli_not_installed instead of panicking.
+        assert_eq!(
+            readiness_for(&b(BundleKind::Cli, vec![]), |_| false),
+            Readiness::Ready
+        );
+        let mut uninstalled_cli = b(BundleKind::Cli, vec![]);
+        uninstalled_cli.installed = false;
+        assert_eq!(
+            readiness_for(&uninstalled_cli, |_| false),
+            Readiness::NotReady("cli_not_installed")
+        );
+        // CLI 记录的 degraded 分两码，因为修复动作相反：断开授权 → 重新连接，
+        // 资产校验失败 → 重下二进制。断开是每次登出都会走的常态路径，一律报
+        // 资产损坏会把运维引错方向（那正是分码前的缺陷）。
+        let mut disconnected_cli = b(BundleKind::Cli, vec![]);
+        disconnected_cli.degraded = Some(CLI_DISCONNECTED_DEGRADED_REASON.into());
+        assert_eq!(
+            readiness_for(&disconnected_cli, |_| false),
+            Readiness::NotReady("cli_disconnected")
+        );
+        let mut degraded_cli = b(BundleKind::Cli, vec![]);
+        degraded_cli.degraded = Some("CLI 二进制 SHA-256 与 lock 表不符，待重新下载".into());
+        assert_eq!(
+            readiness_for(&degraded_cli, |_| false),
+            Readiness::NotReady("cli_assets_mismatch")
+        );
+        for cli in [&disconnected_cli, &degraded_cli] {
+            assert_ne!(
+                readiness_for(cli, |_| false),
+                Readiness::NotReady("not_connected"),
+                "headless 回退不得冒用 not_connected：那个码来自桌面端的实时 status 探测"
+            );
+        }
+        // 非 CLI 臂不读 degraded：这是桌面就绪卡直接消费的结论，改判它属于没有
+        // GUI 侧需求的可见变更。需要这个信号的 headless 侧（pinvou-cli
+        // `plugins readiness`）自行按行上的 degraded 派生 assets_missing，
+        // 对应契约测试 `readiness_derives_assets_missing_for_a_degraded_package`。
+        for kind in [BundleKind::Mcp, BundleKind::Bundle, BundleKind::Skill] {
+            let mut degraded = b(kind, opt.clone());
+            degraded.degraded = Some("resources missing".into());
+            assert_eq!(
+                readiness_for(&degraded, |_| true),
+                Readiness::Ready,
+                "{kind:?} 的 degraded 不得改变桌面就绪卡的结论"
+            );
+        }
+        // 缺必填凭据仍然判 NotReady，degraded 与否都不影响该结论。
+        let mut degraded_and_uncredentialed = b(
+            BundleKind::Mcp,
+            vec![CredentialSpec {
+                key: "AMAP_KEY".into(),
+                target: CredentialTarget::Env,
+                required: true,
+            }],
+        );
+        degraded_and_uncredentialed.degraded = Some("resources missing".into());
+        assert_eq!(
+            readiness_for(&degraded_and_uncredentialed, |_| false),
+            Readiness::NotReady("missing_credentials")
+        );
+    }
+
+    #[test]
+    fn keyring_target_matches_install_storage() {
+        assert_eq!(keyring_target(CredentialTarget::Env), "env");
+        assert_eq!(keyring_target(CredentialTarget::Bearer), "header");
+        assert_eq!(keyring_target(CredentialTarget::Credential), "credential");
+    }
+
+    /// 五轮评审必修 3：wecom 技能表与 `platform::connector_skills` 单一真相源
+    /// 一致（1.1.0 引入 14 名，1.3.4 起新增 wecomcli-pptx 共 15 名）；新名
+    /// 反查命中 wecom 包（DenyAll 默认集 / `skill_owner_package` 归属推导），
+    /// 0.1.9 退役名（msg/schedule）不进表、反查不命中。
+    #[test]
+    fn wecom_skill_dirs_track_platform_truth() {
+        let dirs = cli_bundle_skill_dirs("wecom");
+        assert_eq!(
+            dirs,
+            crate::platform::connector_skills::WECOM_SKILL_DIRS.as_slice(),
+            "marketplace 侧表必须引用 platform 单一真相源"
+        );
+        assert_eq!(dirs.len(), 15);
+        // 新名（0.1.9 旧表里没有的）反查命中
+        for name in [
+            "wecomcli-calendar",
+            "wecomcli-message",
+            "wecomcli-disk",
+            "wecomcli-pptx",
+        ] {
+            assert_eq!(
+                cli_bundle_of_skill(name),
+                Some("wecom"),
+                "{name} 应反查命中"
+            );
+            assert_eq!(skill_owner_package(name), "wecom", "{name} 归属应为 wecom");
+        }
+        // 退役名不再是合法 companion
+        for legacy in crate::platform::connector_skills::WECOM_LEGACY_SKILL_DIRS {
+            assert!(!dirs.contains(&legacy), "{legacy} 不应在现行表");
+            assert_eq!(cli_bundle_of_skill(legacy), None, "{legacy} 反查应不命中");
+        }
+    }
+
+    /// The CLI identity fold must hold for the REVERSE claim too — a
+    /// case-variant skill dir name resolves to the connector so the
+    /// vocabulary guards and the consent gate agree on what counts as its
+    /// companion. Reverting the `eq_ignore_ascii_case` fold in
+    /// `cli_bundle_of_skill` turns this red (the exact-name materialization
+    /// probe does not exercise this function). Empty manifests keep it
+    /// hermetic: the CLI branch precedes manifest claims in
+    /// `skill_owner_package_with`.
+    #[test]
+    fn cli_bundle_of_skill_folds_case_variant_dirs() {
+        for &dir in cli_bundle_skill_dirs("wecom") {
+            let variant = dir.to_ascii_uppercase();
+            if variant == dir {
+                continue;
+            }
+            assert_eq!(
+                cli_bundle_of_skill(&variant),
+                Some("wecom"),
+                "{variant} must fold onto the connector"
+            );
+            assert_eq!(
+                super::skill_owner_package_with(&[], &variant),
+                "wecom",
+                "{variant} owner claim must fold"
+            );
+        }
+    }
+
+    /// R17-MAJOR1 regression: a skill directory physically nested under
+    /// `bundles/<pkg>/skills/<name>/` belongs to `<pkg>` for GATING even when
+    /// **no manifest declares it** (under-declared `companion_skills`, author
+    /// omission, or a bare structural-detection pack). Session materialization
+    /// is directory-scan based and sees the skill; if gating attributed it to
+    /// the skill name itself, it would render into every scope with zero
+    /// consent and no composer row to turn it off. The manifest-claim
+    /// semantics (`skill_owner_package`, import collision checks and UI
+    /// display) deliberately stay claim-only: the import staging dir
+    /// (`<id>.tmp`) and an existing same-pack install would otherwise turn
+    /// self-collisions into false cross-package rejections. Also pins
+    /// determinism when the same name is nested in two packs (sorted first)
+    /// and the negative (no nesting → standalone).
+    #[test]
+    fn under_declared_nested_skill_claims_physical_owner() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let bundles = crate::platform::paths::bundles_root();
+            std::fs::create_dir_all(bundles.join("combo-pack").join("skills").join("stowaway"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("stowaway"),
+                "combo-pack",
+                "a nested-but-undeclared skill must attribute to its physical pack"
+            );
+            assert_eq!(
+                skill_owner_package("stowaway"),
+                "stowaway",
+                "manifest-claim semantics stay claim-only (import/UI lens)"
+            );
+            std::fs::create_dir_all(bundles.join("a-pack").join("skills").join("stowaway"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("stowaway"),
+                "a-pack",
+                "same-name nesting resolves deterministically (sorted first)"
+            );
+            assert_eq!(
+                skill_gating_owner("nowhere"),
+                "nowhere",
+                "a skill with no physical nesting stays standalone"
+            );
+        });
+    }
+
+    /// Round-29 m3 (review #455): the staging exclusion in the physical
+    /// fallback (round-27 m4) is consent-load-bearing — pin it. A
+    /// crash-residue `<id>.tmp`/`<id>.old` dir nesting the skill must never
+    /// win the sorted-first race nor attribute the skill to a suffix-owner
+    /// id; without a real pack the skill stays standalone.
+    #[test]
+    fn staging_residue_never_wins_the_physical_owner_fallback() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let bundles = crate::platform::paths::bundles_root();
+            std::fs::create_dir_all(bundles.join("ghost.tmp").join("skills").join("victim"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "victim",
+                "staging residue must not own the skill (standalone fallback)"
+            );
+            // `ghost.tmp` sorts before `real-pack`, so without the exclusion
+            // the sorted-first race would pick the residue dir.
+            std::fs::create_dir_all(bundles.join("real-pack").join("skills").join("victim"))
+                .unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "real-pack",
+                "the real pack owns the skill; the residue never wins the race"
+            );
+            std::fs::remove_dir_all(bundles.join("real-pack")).unwrap();
+            std::fs::rename(bundles.join("ghost.tmp"), bundles.join("ghost.old")).unwrap();
+            assert_eq!(
+                skill_gating_owner("victim"),
+                "victim",
+                "the landing-backup (.old) arm is excluded too"
+            );
+        });
+    }
+
+    #[test]
+    fn collects_tool_credentials() {
+        let tool = super::super::ToolManifest {
+            id: "t".into(),
+            name: "t".into(),
+            description: String::new(),
+            version: String::new(),
+            icon: String::new(),
+            category: String::new(),
+            mcp_tools: vec![],
+            command: String::new(),
+            args: vec![],
+            env: Default::default(),
+            secret_env: vec![super::super::SecretEnv {
+                key: "SEC".into(),
+                provider: String::new(),
+                required: true,
+            }],
+            secret_headers: vec![],
+            validate_on_install: false,
+            config_fields: vec![super::super::ConfigField {
+                key: "KEY".into(),
+                label: String::new(),
+                required: true,
+                target: "env".into(),
+                secret: false,
+            }],
+            pip_dependencies: vec![],
+            python_dependencies: None,
+            servers: vec![],
+            companion_skills: vec![],
+            builtin: false,
+            visibility: String::new(),
+            security_level: String::new(),
+            data_access: vec![],
+            tool_features: Default::default(),
+        };
+        let creds = tool_credentials(&tool);
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0].key, "KEY");
+        assert_eq!(creds[0].target, CredentialTarget::Env);
+        assert!(creds[0].required);
+        assert_eq!(creds[1].key, "SEC");
+    }
+
+    /// 回归：同一 key 在 config_fields 与 secret_env/secret_headers 重复声明时
+    /// （如 weather/iwencai 的 AMAP_KEY/IWENCAI_API_KEY），弹窗字段与凭据声明
+    /// 按 (key,target) 去重一次——否则前端配置弹窗渲染两个一模一样的输入框。
+    #[test]
+    fn dedupes_duplicate_key_declarations() {
+        let tool = super::super::ToolManifest {
+            id: "t".into(),
+            name: "t".into(),
+            description: String::new(),
+            version: String::new(),
+            icon: String::new(),
+            category: String::new(),
+            mcp_tools: vec![],
+            command: String::new(),
+            args: vec![],
+            env: Default::default(),
+            secret_env: vec![
+                super::super::SecretEnv {
+                    key: "KEY".into(), // 与 config_fields 同 key 同 target → 去重
+                    provider: String::new(),
+                    required: true,
+                },
+                super::super::SecretEnv {
+                    key: "EXTRA".into(), // 仅 secret_env 声明 → 保留
+                    provider: String::new(),
+                    required: false,
+                },
+            ],
+            secret_headers: vec![super::super::SecretHeader {
+                source_key: "TOKEN".into(), // 与 config_fields(bearer) 同 key 同 target → 去重
+                header: "Authorization".into(),
+                scheme: "Bearer".into(),
+                provider: String::new(),
+                required: true,
+            }],
+            validate_on_install: false,
+            config_fields: vec![
+                super::super::ConfigField {
+                    key: "KEY".into(),
+                    label: String::new(),
+                    required: true,
+                    target: "env".into(),
+                    secret: false,
+                },
+                super::super::ConfigField {
+                    key: "TOKEN".into(),
+                    label: String::new(),
+                    required: true,
+                    target: "bearer".into(),
+                    secret: true,
+                },
+            ],
+            pip_dependencies: vec![],
+            python_dependencies: None,
+            servers: vec![],
+            companion_skills: vec![],
+            builtin: false,
+            visibility: String::new(),
+            security_level: String::new(),
+            data_access: vec![],
+            tool_features: Default::default(),
+        };
+        let fields = tool_config_fields(&tool);
+        let creds = tool_credentials(&tool);
+        let field_keys: Vec<&str> = fields.iter().map(|f| f.key.as_str()).collect();
+        let cred_keys: Vec<&str> = creds.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(
+            field_keys,
+            ["KEY", "TOKEN", "EXTRA"],
+            "弹窗字段应按 (key,target) 去重"
+        );
+        assert_eq!(field_keys, cred_keys, "配置字段与凭据声明应同口径");
+        // config_fields 声明优先：secret 标志取 config_fields 的值（不被 secret_env 的 true 覆盖）
+        assert!(
+            !fields[0].secret,
+            "KEY 的 secret 应以 config_fields 声明为准"
+        );
+        assert_eq!(fields[1].target, CredentialTarget::Bearer);
+    }
+
+    #[test]
+    fn registry_lists_all_source_kinds() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let home = std::env::var("PINVOU3_HOME").unwrap();
+            seed_fixture(std::path::Path::new(&home), true);
+            // 真相源反转后 installed 以 BundleStore 为准（V5 认领条件同源）
+            store_install(&["gongwen"]);
+            let reg = BundleRegistry::new();
+            let bundles = reg.list_bundles();
+            // 四类源都存在
+            assert!(
+                bundles.iter().any(|b| b.kind == BundleKind::Mcp),
+                "应含纯 MCP 包"
+            );
+            assert!(
+                bundles.iter().any(|b| b.kind == BundleKind::Bundle),
+                "应含组合包"
+            );
+            assert!(
+                bundles.iter().any(|b| b.kind == BundleKind::Skill),
+                "应含纯技能包"
+            );
+            assert!(
+                bundles.iter().any(|b| b.kind == BundleKind::Cli),
+                "应含 CLI 包"
+            );
+            // gongwen 已装 → 组合包（companion 技能随包认领；BundleInfo 不再透出
+            // skills 列表，认领语义由 kind = Bundle 表达）
+            let gongwen = bundles
+                .iter()
+                .find(|b| b.id == "gongwen")
+                .expect("gongwen 应存在");
+            assert_eq!(gongwen.kind, BundleKind::Bundle, "gongwen 已装应为组合包");
+            assert!(gongwen.installed);
+            // government-writing 不应再以独立技能包出现（已被认领）
+            assert!(
+                !bundles
+                    .iter()
+                    .any(|b| b.id == "government-writing" && b.kind == BundleKind::Skill),
+                "被认领技能不得独立成包"
+            );
+            // 上传技能 = 独立纯技能包 + user_uploaded
+            let upload = bundles
+                .iter()
+                .find(|b| b.id == "my-upload")
+                .expect("上传技能包应存在");
+            assert_eq!(upload.kind, BundleKind::Skill);
+            assert!(upload.user_uploaded);
+            // CLI 包 id 覆盖内置清单（V2：ima 不在 CLI 包）
+            for (id, ..) in BUILTIN_CLI_BUNDLES {
+                assert!(
+                    bundles
+                        .iter()
+                        .any(|b| b.id == *id && b.kind == BundleKind::Cli),
+                    "CLI 包 {id} 应存在"
+                );
+            }
+            // V2：ima 归凭据型技能包（Skill），且携带 ima-skills + 凭据声明
+            let ima = bundles
+                .iter()
+                .find(|b| b.id == "ima")
+                .expect("ima 包应存在");
+            assert_eq!(ima.kind, BundleKind::Skill, "ima 应归 Skill");
+            assert!(
+                ima.credentials
+                    .iter()
+                    .any(|c| c.key == "IMA_API_KEY" && c.required),
+                "ima 应声明必填凭据"
+            );
+            // ima-skills 不得再独立成包（被 ima 认领）
+            assert!(
+                !bundles.iter().any(|b| b.id == "ima-skills"),
+                "ima-skills 不得独立成包"
+            );
+            // wecom 卡的配套技能表以 platform::connector_skills 单一真相源为准
+            //（`wecom_skill_dirs_track_platform_truth` 钉住 15 名/退役名口径）。
+            // id 唯一（一个包 = 一个开关的前提）
+            let mut ids: Vec<&str> = bundles.iter().map(|b| b.id.as_str()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), bundles.len(), "包 id 必须唯一");
+        });
+    }
+
+    /// 上传 MCP/组合包的展示覆盖：extra display_name/description 覆盖
+    /// manifest name/description，display_* 原样透出（对话框回填用），
+    /// user_uploaded 翻转（edit_display 动作门禁），清 key 后回退 manifest 值；
+    /// 预置 MCP 包不受 extra 影响。
+    #[test]
+    fn registry_applies_display_overrides_for_uploaded_mcp_bundles() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let home = std::env::var("PINVOU3_HOME").unwrap();
+            seed_fixture(std::path::Path::new(&home), true);
+            // weather 改为 Upload 记录并写覆盖（seed 里是磁盘 manifest 无记录；
+            // gongwen 保持无记录 = 预置对照）
+            let store = store::BundleStore::new();
+            store
+                .upsert(store::BundleRecord::installed_now(
+                    "weather",
+                    store::BundleSource::Upload("weather-pkg.zip".to_string()),
+                ))
+                .unwrap();
+            store
+                .set_display_meta("weather", Some("我的天气"), Some("我的天气说明"))
+                .unwrap();
+            // 预置包塞入手工 extra 覆盖（越权数据）：展示层必须忽略
+            store
+                .upsert(store::BundleRecord::installed_now(
+                    "gongwen",
+                    store::BundleSource::Preset,
+                ))
+                .unwrap();
+            {
+                let mut rec = store.get("gongwen").unwrap().unwrap();
+                rec.extra.insert(
+                    store::EXTRA_DISPLAY_NAME.to_string(),
+                    serde_json::Value::String("越权名".to_string()),
+                );
+                store.upsert_preserving(rec).unwrap();
+            }
+
+            let reg = BundleRegistry::new();
+            let bundles = reg.list_bundles();
+            let weather = bundles
+                .iter()
+                .find(|b| b.id == "weather")
+                .expect("weather 应存在");
+            assert_eq!(weather.kind, BundleKind::Mcp);
+            assert!(weather.user_uploaded, "上传 MCP 包应 user_uploaded");
+            assert_eq!(weather.name, "我的天气");
+            assert_eq!(weather.description, "我的天气说明");
+            assert_eq!(weather.display_name.as_deref(), Some("我的天气"));
+            assert_eq!(weather.display_description.as_deref(), Some("我的天气说明"));
+            // 预置包：越权 extra 不生效
+            let gongwen = bundles
+                .iter()
+                .find(|b| b.id == "gongwen")
+                .expect("gongwen 应存在");
+            assert!(!gongwen.user_uploaded);
+            assert_eq!(gongwen.name, "公文写作", "预置包不得应用 extra 覆盖");
+
+            // 清 key → 回退 manifest 值
+            store
+                .set_display_meta("weather", Some(""), Some(""))
+                .unwrap();
+            let bundles = reg.list_bundles();
+            let weather = bundles.iter().find(|b| b.id == "weather").unwrap();
+            assert_eq!(weather.name, "高德天气", "清覆盖应回退 manifest 名");
+            assert_eq!(weather.description, "d");
+            assert_eq!(weather.display_name, None);
+        });
+    }
+
+    /// V5：包本体未装时 companion 技能保留独立纯技能包形态（存量单装兼容）。
+    #[test]
+    fn uninstalled_bundle_keeps_companion_skill_independent() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let home = std::env::var("PINVOU3_HOME").unwrap();
+            seed_fixture(std::path::Path::new(&home), false);
+            // 存量单装：installed 以 BundleStore 记录为准
+            store_install(&["government-writing"]);
+            let reg = BundleRegistry::new();
+            let bundles = reg.list_bundles();
+            // gongwen 未装 → 纯 MCP 包（不认领；kind = Mcp 即技能未被认领）
+            let gongwen = bundles
+                .iter()
+                .find(|b| b.id == "gongwen")
+                .expect("gongwen 应存在");
+            assert_eq!(gongwen.kind, BundleKind::Mcp, "gongwen 未装应为纯 MCP 包");
+            assert!(!gongwen.installed);
+            // government-writing 保留独立技能包（存量单装可继续开关）
+            let skill = bundles
+                .iter()
+                .find(|b| b.id == "government-writing")
+                .expect("government-writing 应独立成包");
+            assert_eq!(skill.kind, BundleKind::Skill);
+            assert!(skill.installed, "存量单装技能保持已装态");
+        });
+    }
+
+    /// pptx 组合包化 × V5：companion 技能与 MCP 同名（pptx↔pptx）时——
+    /// 未装 MCP：纯 MCP 包，同名技能**不**独立成包（否则两个包同 id，破坏唯一性）；
+    /// 已装 MCP：认领同名技能，derive 为 Bundle 携带技能。
+    #[test]
+    fn pptx_same_id_companion_claim_follows_install_state() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let home = std::env::var("PINVOU3_HOME").unwrap();
+            let home = std::path::Path::new(&home).to_path_buf();
+            seed_fixture(&home, false);
+            let write = |rel: &str, content: &str| {
+                let p = home.join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, content).unwrap();
+            };
+            // pptx MCP（manifest 声明同名 companion 技能）+ 预置 pptx 技能
+            write(
+                "bundle/mcp-servers/pptx/manifest.json",
+                r#"{"id":"pptx","name":"PPT 生成","description":"d","version":"1.0.0","icon":"","category":"office","mcp_tools":[],"command":"","args":[],"companion_skills":["pptx"]}"#,
+            );
+            write("bundle/skills/pptx/SKILL.md", "---\nname: pptx\n---\n# hi");
+            write(
+                "bundle/skills/pptx/.installed-from",
+                "pinvou3-marketplace:pptx",
+            );
+
+            // 未装：纯 MCP 包；同名技能不独立成包（包 id 唯一）
+            let bundles = BundleRegistry::new().list_bundles();
+            let pptx: Vec<_> = bundles.iter().filter(|b| b.id == "pptx").collect();
+            assert_eq!(pptx.len(), 1, "同名技能不得再独立成包（包 id 唯一）");
+            assert_eq!(pptx[0].kind, BundleKind::Mcp, "未装应为纯 MCP 包");
+            assert!(!pptx[0].installed);
+
+            // 装后：认领同名技能 → 组合包（installed 真相源 = BundleStore）
+            store_install(&["pptx"]);
+            let bundles = BundleRegistry::new().list_bundles();
+            let pptx: Vec<_> = bundles.iter().filter(|b| b.id == "pptx").collect();
+            assert_eq!(pptx.len(), 1);
+            assert_eq!(
+                pptx[0].kind,
+                BundleKind::Bundle,
+                "装后应为组合包（携带同名 companion 技能）"
+            );
+            assert!(pptx[0].installed);
+        });
+    }
+
+    /// installed 真相源反转（§3.2）：BundleStore 是唯一权威 —— 装了→true、
+    /// 卸载→false、degraded 透传；store 读失败（损坏 JSON）回退旧文件推导。
+    #[test]
+    fn installed_reads_bundle_store_with_legacy_fallback() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let home = std::env::var("PINVOU3_HOME").unwrap();
+            seed_fixture(std::path::Path::new(&home), true); // installed.json 含 gongwen
+
+            // 1) store 无记录 → 未安装（即使 installed.json 说装了：store 是真相源）
+            let gongwen = BundleRegistry::new().bundle("gongwen").unwrap();
+            assert!(!gongwen.installed, "store 无记录应为未安装");
+
+            // 2) store 登记 → 已安装；degraded 透传给前端
+            let store = store::BundleStore::new();
+            let mut record =
+                store::BundleRecord::installed_now("gongwen", store::BundleSource::Preset);
+            record.degraded = Some("资源缺失".to_string());
+            store.upsert(record).unwrap();
+            let gongwen = BundleRegistry::new().bundle("gongwen").unwrap();
+            assert!(gongwen.installed, "store 登记应为已安装");
+            assert_eq!(gongwen.degraded.as_deref(), Some("资源缺失"));
+
+            // 3) store 删记录 → 未安装
+            store.remove("gongwen").unwrap();
+            assert!(!BundleRegistry::new().bundle("gongwen").unwrap().installed);
+
+            // 4) store 损坏 → 回退旧文件推导（installed.json 含 gongwen → 已安装）
+            std::fs::write(store.file_path(), "corrupt{{{").unwrap();
+            let gongwen = BundleRegistry::new().bundle("gongwen").unwrap();
+            assert!(gongwen.installed, "store 读失败应回退 installed.json 推导");
+            assert_eq!(gongwen.degraded, None, "回退推导无 degraded 信息");
+        });
+    }
+
+    /// Phase 2 第七刀：CLI/ima 元数据下沉——desc/version 是功能事实而非结构
+    /// 占位；version 与 lock 表钉住版本一致。
+    #[test]
+    fn cli_and_ima_bundles_carry_functional_metadata() {
+        with_temp_home("pinvou3-bundle-test", || {
+            let bundles = BundleRegistry::new().list_bundles();
+            for (id, _, bin, _, desc) in BUILTIN_CLI_BUNDLES {
+                let b = bundles.iter().find(|b| b.id == *id).expect("CLI 包应存在");
+                assert_eq!(b.description, *desc, "{id} desc 应取自常量表");
+                assert!(!b.description.is_empty());
+                match crate::platform::connector_lock::artifact_pin(bin) {
+                    Some(pin) => assert_eq!(
+                        b.version, pin.version,
+                        "{id} version 应与 lock 表钉住版本一致"
+                    ),
+                    // tmeet（npm，无 lock 条目）/不支持的平台 → version 留空
+                    None => assert!(b.version.is_empty(), "{id} 无 lock 条目 version 应空"),
+                }
+            }
+            let ima = bundles
+                .iter()
+                .find(|b| b.id == "ima")
+                .expect("ima 包应存在");
+            assert!(!ima.description.is_empty(), "ima desc 应下沉");
+            assert!(ima.version.is_empty(), "ima 无版本概念（overlay 保留展示）");
+            // config_fields 与 credentials 同 key 同源（弹窗功能事实 ↔ 凭据声明）
+            let cfg_keys: Vec<&str> = ima.config_fields.iter().map(|f| f.key.as_str()).collect();
+            let cred_keys: Vec<&str> = ima.credentials.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(cfg_keys, cred_keys, "ima 配置字段与凭据声明应同口径");
+        });
+    }
+
+    /// 回归（三轮评审）：store 仅含 `ima-skills` 记录（技能包 install 的登记口径）时，
+    /// ima 卡必须 installed=true —— 此前通用 store_state 对缺记录返回 Some((false,None))，
+    /// `.or_else(|| store_state("ima-skills"))` 永不触发（死代码），ima 卡恒未安装。
+    #[test]
+    fn ima_card_installed_from_ima_skills_record() {
+        with_temp_home("pinvou3-bundle-test", || {
+            // 无记录 → 未安装
+            assert!(
+                !BundleRegistry::new().bundle("ima").unwrap().installed,
+                "无记录时 ima 应为未安装"
+            );
+            // 仅 ima-skills 记录 → ima 卡已安装
+            store_install(&["ima-skills"]);
+            let ima = BundleRegistry::new().bundle("ima").unwrap();
+            assert!(
+                ima.installed,
+                "store 仅含 ima-skills 记录时 ima 卡应为已安装"
+            );
+            // ima 记录优先于 ima-skills 记录（含 degraded 透传）
+            let store = store::BundleStore::new();
+            let mut record = store::BundleRecord::installed_now("ima", store::BundleSource::Preset);
+            record.installed = false;
+            record.degraded = Some("资源缺失".to_string());
+            store.upsert(record).unwrap();
+            let ima = BundleRegistry::new().bundle("ima").unwrap();
+            assert!(!ima.installed, "ima 记录存在时以其为准");
+            assert_eq!(ima.degraded.as_deref(), Some("资源缺失"));
+        });
+    }
+}

@@ -1,0 +1,64 @@
+// Shared placement/close plumbing for the sidebar rows' portal "more" menus
+// (RecentItem, ProjectGroupHeader). Owns the open flag, the fixed-position
+// style, the toggle/context-menu openers and the close-on
+// (pointerdown | Escape | resize | scroll) effect, so each row component only
+// renders its own menu items. The "click the button to open, the same click's
+// document pointerdown already closed it" toggle quirk is inherited from the
+// pre-extraction implementation on purpose — fixing it belongs to a dedicated
+// interaction PR, not to a refactor.
+import { useEffect, useState } from 'react';
+
+const MENU_WIDTH = 176;
+
+export function usePortalMenu({ height = 184 } = {}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuStyle, setMenuStyle] = useState(null);
+
+  const closeMenu = () => setMenuOpen(false);
+  const placeMenu = (target) => {
+    const rect = target.getBoundingClientRect();
+    const left = Math.max(8, Math.min(rect.right - MENU_WIDTH, window.innerWidth - MENU_WIDTH - 8));
+    const top = rect.bottom + 6 + height > window.innerHeight
+      ? Math.max(8, rect.top - height - 6)
+      : Math.max(8, rect.bottom + 6);
+    // minWidth keeps the nominal footprint for short zh/en labels; the box is
+    // allowed to grow with longer localized items (ja entries exceed 176px and
+    // were glyph-clipped by the fixed width) up to a viewport-safe cap, since
+    // the consumer menus are overflow-hidden.
+    setMenuStyle({ left, top, minWidth: MENU_WIDTH, maxWidth: Math.max(MENU_WIDTH, window.innerWidth - left - 8) });
+  };
+  const toggleMenu = (e) => {
+    e.stopPropagation();
+    placeMenu(e.currentTarget);
+    setMenuOpen(v => !v);
+  };
+  const openMenuAt = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    placeMenu(e.currentTarget);
+    setMenuOpen(true);
+  };
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = () => setMenuOpen(false);
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      }
+    };
+    document.addEventListener('pointerdown', close);
+    window.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    return () => {
+      document.removeEventListener('pointerdown', close);
+      window.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('resize', close);
+      window.removeEventListener('scroll', close, true);
+    };
+  }, [menuOpen]);
+
+  return { menuOpen, menuStyle, closeMenu, toggleMenu, openMenuAt };
+}

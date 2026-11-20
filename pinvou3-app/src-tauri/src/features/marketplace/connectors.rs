@@ -1,0 +1,1661 @@
+//! Connector(连接器)的注册/注销:把工具写进 `mcp.json`(`servers` 表)或从中移除,
+//! 以及装 Python 依赖等"让 connector 跑起来"的前置准备。
+//!
+//! `add_to_mcp_json` writes entries through two inline branches depending on whether the manifest has a remote server:
+//! remote (url/headers/oauth) goes through `build_remote_server_entry`, local
+//! (command/args/env) through `build_local_server_entry` — both serializations are reused by the
+//! startup reconciliation, so installs and self-healing write entries of the same shape.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use crate::platform::filesystem::read_private_data_file;
+use crate::platform::paths;
+
+use super::MarketplaceManager;
+use super::bundle;
+use super::file_lock;
+use super::python_dependencies;
+use super::secrets::{
+    SecretResolveError, is_sensitive_key_name, mcp_secret_env_var, mcp_secret_missing_error,
+    set_remote_secret_header,
+};
+use super::types::ToolManifest;
+
+/// Runs `f` holding the mcp.json cross-process file lock (in-process mutex +
+/// OS lock on `mcp.lock`, `file_lock.rs`, #521): add/remove are bare
+/// read-modify-writes, and concurrent install/uninstall across the GUI and
+/// headless hosts (sharing one `~/.pinvou3`) used to interleave and silently
+/// drop each other's writes (四轮评审 M-8, cross-process half #515). A write
+/// that cannot establish serialization returns `Err` and must be retried by
+/// the caller's transaction — never run unsynchronized.
+pub(crate) fn with_mcp_json_lock<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce() -> Result<R, String>,
+{
+    file_lock::with_file_lock(&paths::mcp_config_path(), f)
+}
+
+#[cfg(test)]
+static NEXT_PIP_INSTALL_RESULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(super) fn set_next_pip_install_result_for_test(result: u8) {
+    NEXT_PIP_INSTALL_RESULT.store(result, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn take_pending_pip_install_result_for_test() -> u8 {
+    NEXT_PIP_INSTALL_RESULT.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Tsinghua TUNA pip mirror: used only in the fallback round after the default
+/// index round has fully failed, via a per-invocation `-i` flag; never touches
+/// the user's pip config.
+const PIP_CN_MIRROR_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
+
+/// Index rounds for a pip install: the default-index round runs first
+/// (respecting the user's own pip.conf/corporate index), then the Tsinghua
+/// TUNA fallback round — the order is deliberate, see
+/// `pip_mirror_round_runs_after_default_round`.
+fn pip_index_rounds() -> [(&'static str, &'static [&'static str]); 2] {
+    [
+        ("default index", &[]),
+        ("Tsinghua TUNA mirror", &["-i", PIP_CN_MIRROR_INDEX]),
+    ]
+}
+
+/// 把 JSON 值以 pretty 形式写盘(迁移与 connector 注册共用)。
+/// 写前创建父目录：全新 PINVOU3_HOME 下 `bundle/` 尚不存在，直接写会 ENOENT。
+/// tmp + rename 原子落盘（经 `super::write_atomic_file` →
+/// `platform::filesystem::atomic_write_private`，与 store.rs 同一做法）——
+/// 安装中途崩溃不得留下半写的 mcp.json（幽灵 server，四轮评审 M-8）。
+pub(crate) fn write_json_pretty(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
+    super::write_atomic_file(path, json.as_bytes())
+}
+
+fn default_mcp_json() -> serde_json::Value {
+    serde_json::json!({"servers": {}})
+}
+
+/// Load mcp.json for any read-modify-write that must never reset a file it
+/// cannot read (reconcile restores, rebuilt entries, and the UI install /
+/// uninstall writers all go through here). A file that exists but cannot be
+/// parsed is backed up (`mcp.json.corrupt.<ts>`, mirroring the corrupt
+/// `installed.json` handling) and reported as an error. Resetting would
+/// destroy custom entries and preserved user fields, re-creating the exact
+/// parse-failure drift the startup reconcile exists to heal. The same
+/// guarantee holds across the whole boot: `run_mcp_startup_maintenance` keeps
+/// every later writer (the builtin upsert included) off a file reported by
+/// [`mcp_json_unparseable`], so the live file stays byte-identical until the
+/// user fixes or removes it.
+pub(super) fn load_mcp_json_for_reconcile() -> Result<(PathBuf, serde_json::Value), String> {
+    let mcp_path = paths::mcp_config_path();
+    if !mcp_path.is_file() {
+        return Ok((mcp_path, default_mcp_json()));
+    }
+    let content = read_private_data_file(&mcp_path).map_err(|e| format!("读取 mcp.json: {e}"))?;
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(mut mcp) => {
+            // A parseable file that merely LACKS the servers map (a hand
+            // trim, a partial external write) is healed in memory instead of
+            // failing every tool's reconcile with "mcp.json 格式错误" on
+            // every boot: inserting the empty map destroys nothing, and the
+            // healed shape persists with the pass's first real write. A
+            // `servers` key PRESENT but not an object keeps the refusal —
+            // that shape may hold data no writer here can interpret.
+            if mcp.get("servers").is_none() {
+                let object = mcp
+                    .as_object_mut()
+                    .ok_or("mcp.json 格式错误：root is not a JSON object")?;
+                object.insert(
+                    "servers".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+            }
+            Ok((mcp_path, mcp))
+        }
+        Err(error) => {
+            super::backup_corrupt_json_file(&mcp_path, "mcp.json.corrupt", &content);
+            Err(format!(
+                "mcp.json is unparseable; the original file was backed up next to it \
+                 (mcp.json.corrupt.<unix-time>) and left untouched — fix or remove it and \
+                 retry: {error}"
+            ))
+        }
+    }
+}
+
+/// Whether mcp.json exists on disk but cannot currently be parsed (or read).
+/// The startup maintenance keeps every writer off such a file — in
+/// particular the builtin repair loader reads through `unwrap_or_default`, so a
+/// permission failure would reset the file to an empty skeleton. Sessions
+/// degrade to an empty MCP pool instead (engine `load_config` failure → empty
+/// pool), so preserving the file never blocks a session; the recovery path is
+/// the backup plus the timeline note.
+/// try 锁读取（#521）：锁被占用/不可用时退化为不落盘的解锁快照——探测本身
+/// 永远只读，竞态下与既有解锁读同口径，bounded，绝不阻塞在 peer 临界区上。
+pub(crate) fn mcp_json_unparseable() -> bool {
+    let mcp_path = paths::mcp_config_path();
+    file_lock::try_file_lock_for_read(&mcp_path, || {
+        if !mcp_path.is_file() {
+            return Ok(false);
+        }
+        // An unreadable file is treated like an unparseable one: the builtin
+        // repair loader reads through `unwrap_or_default`, so a permission
+        // failure would reset the file to an empty skeleton.
+        // Hardened read — family rationale on `open_private_data_file_within`.
+        Ok(read_private_data_file(&mcp_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .is_none())
+    })
+    .unwrap_or(false)
+}
+
+impl<S: crate::platform::credential_store::CredentialStore> MarketplaceManager<S> {
+    /// 装 `manifest.pip_dependencies` 里的 Python 依赖（跨平台）。
+    /// 用 `python -m pip install`（保证装进跑 MCP server 的同一个 python，不裸 `pip`）。
+    /// ① 先预检依赖是否已可用（系统已装/此前装过）→ 命中即跳过，不跑 pip；
+    /// ② 否则按序兜底：`--user` → `--user --break-system-packages`（PEP 668）→ `--break-system-packages`，任一成功即 Ok。
+    /// 零依赖工具（pip_dependencies 为空）直接返回 Ok，不影响 weather/obsidian 等。
+    pub(super) fn pip_install_deps(&self, manifest: &ToolManifest) -> Result<(), String> {
+        if manifest.pip_dependencies.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        match NEXT_PIP_INSTALL_RESULT.swap(0, std::sync::atomic::Ordering::SeqCst) {
+            1 => return Err("test-injected pip dependency failure".to_string()),
+            2 => return Ok(()),
+            _ => {}
+        }
+        // The bundled Windows interpreter is not an implicit dependency source. Every non-empty
+        // dependency set must have a verified platform wheel lock; silently accepting ambient or
+        // preinstalled packages would make the manifest incomplete and non-reproducible.
+        if crate::platform::capabilities::is_windows() {
+            return Err(format!(
+                "tool '{}' is missing the Windows Python dependency lock required for a safe install",
+                manifest.id
+            ));
+        }
+        let python_cmd = "python3";
+        let deps = &manifest.pip_dependencies;
+
+        // ① 预检:依赖已可用就直接 Ok,不跑 pip。用 importlib.metadata 按 PyPI 包名查
+        //    (python-pptx 等),全部命中即满足。修「明明已装(系统包/此前装过)却仍判失败」。
+        let satisfied = std::process::Command::new(python_cmd)
+            .arg("-c")
+            .arg("import importlib.metadata as m, sys; [m.version(p) for p in sys.argv[1:]]")
+            .args(deps)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if satisfied {
+            return Ok(());
+        }
+
+        // ② pip 安装,按序兜底,任一成功即 Ok:
+        //    --user(常规)→ --user --break-system-packages(PEP 668:现代 Debian/Ubuntu 拦 --user,
+        //    装进 ~/.local 用户目录、不动系统/发行版包)→ --break-system-packages(某些环境 --user 不可用)。
+        //    After the whole default-index round fails, rerun the same ladder
+        //    via the Tsinghua TUNA mirror (only appending the -i flag, never
+        //    touching the user's pip config): CN networks often cannot reach
+        //    the official source at pypi.org. The default index going first is
+        //    deliberate — it respects the user's own pip.conf/corporate index;
+        //    the mirror is only the last fallback.
+        let run = |extra: &[&str], index_args: &[&str]| -> std::io::Result<std::process::Output> {
+            let mut cmd = std::process::Command::new(python_cmd);
+            cmd.args([
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+            ]);
+            cmd.args(extra);
+            cmd.args(index_args);
+            cmd.args(deps);
+            cmd.output()
+        };
+        let attempts: [&[&str]; 3] = [
+            &["--user"],
+            &["--user", "--break-system-packages"],
+            &["--break-system-packages"],
+        ];
+        // The default-index round runs first (no -i, so the user's pip.conf /
+        // corporate index keeps priority); only after the whole round fails do
+        // we rerun once via Tsinghua TUNA (rounds defined in pip_index_rounds).
+        // The pip subprocess has no overall timeout: worst-case time doubles
+        // with the round count, same accounting as native_installer's
+        // multi-candidate fallback. Each round's own last error goes into the
+        // final error: keeping only the last round would hide the default-index
+        // root cause that triggered the mirror retry (same convention as the
+        // first-error causal chain in tmeet/npm).
+        let mut round_errors: Vec<String> = Vec::new();
+        for (round_label, index_args) in pip_index_rounds() {
+            let mut last_err = String::new();
+            for extra in attempts {
+                match run(extra, index_args) {
+                    Ok(o) if o.status.success() => return Ok(()),
+                    Ok(o) => {
+                        last_err = String::from_utf8_lossy(&o.stderr)
+                            .trim()
+                            .lines()
+                            .last()
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "cannot run {python_cmd} (make sure Python is installed and on PATH): {e}"
+                        ));
+                    }
+                }
+            }
+            round_errors.push(format!("{round_label}: {last_err}"));
+        }
+        Err(format!(
+            "pip dependency install failed: {} (tried --user and \
+             --break-system-packages, then retried via the Tsinghua TUNA mirror; \
+             check network reachability and that python3 ships pip)",
+            round_errors.join("; ")
+        ))
+    }
+
+    /// 把 manifest 注册进 `mcp.json`(`servers` 表)。
+    ///
+    /// Depending on whether the manifest has a remote server, entries go through two inline branches:
+    /// - Remote tool path: iterate `manifest.servers[]`, writing url/headers/oauth/
+    ///   env_headers/bearer. Secrets are never written in plaintext, only as `${ENV}` placeholders + process env vars
+    ///   (the base does not expand header literals), via `build_remote_server_entry`.
+    /// - Local tool path: command/args/env. Python tools use the bundled python (Windows) or
+    ///   system python3; sensitive fields go through `${ENV}` placeholders, non-sensitive fields are written verbatim, via
+    ///   `build_local_server_entry`。
+    pub(super) fn add_to_mcp_json(
+        &self,
+        manifest: &ToolManifest,
+        user_config: &HashMap<String, String>,
+        server_dir: &std::path::Path,
+        python_environment: Option<&python_dependencies::InstalledPythonEnvironment>,
+    ) -> Result<(), String> {
+        with_mcp_json_lock(|| {
+            // An unparseable mcp.json is backed up and refused, never reset: an
+            // install that silently reset the file would destroy the custom
+            // entries and preserved user fields the startup reconcile exists to
+            // heal. The transaction in `install_inner` rolls the install back, so
+            // the user fixes or removes the file and retries.
+            let (mcp_path, mut mcp) = load_mcp_json_for_reconcile()?;
+
+            let servers = mcp
+                .get_mut("servers")
+                .and_then(|s| s.as_object_mut())
+                .ok_or("mcp.json 格式错误")?;
+
+            if !manifest.servers.is_empty() {
+                for server in &manifest.servers {
+                    let entry =
+                        self.build_remote_server_entry(manifest, server, user_config, false)?;
+                    servers.insert(server.name.clone(), entry);
+                }
+            } else {
+                let entry = self.build_local_server_entry(
+                    manifest,
+                    user_config,
+                    server_dir,
+                    python_environment,
+                    false,
+                )?;
+                servers.insert(manifest.id.clone(), entry);
+            }
+
+            write_json_pretty(&mcp_path, &mcp)
+        })
+    }
+
+    /// Shared arm of the mcp.json entry builders for one secret placeholder.
+    /// `Ok(Some(placeholder))` — wire it; `Ok(None)` — the credential is
+    /// absent and `degrade_unresolved_secrets` allows skipping the wiring
+    /// (startup reconcile) or the channel is optional (`required == false` —
+    /// the same doctrine the config-field arms apply: an optional key's
+    /// absence is a legitimate outcome the config dialog explicitly invites);
+    /// `Err` — a required secret is missing (install mode) or the credential
+    /// store itself failed (both modes) — the caller refuses the build so a
+    /// transiently locked keyring is never baked into a permanently unwired
+    /// entry. The one tolerated store error is
+    /// [`SecretResolveError::UndeterminableMiss`] for an optional channel
+    /// (absence cannot be proven on a keyring-less host, so an install must
+    /// not block on it). Collapses the per-site 4-arm match over
+    /// `try_resolve_secret_placeholder`, which carries the
+    /// error-classification doctrine.
+    fn resolve_entry_secret(
+        &self,
+        tool_id: &str,
+        target: &str,
+        key: &str,
+        user_config: &HashMap<String, String>,
+        legacy_env: &HashMap<String, String>,
+        required: bool,
+        degrade_unresolved_secrets: bool,
+    ) -> Result<Option<String>, String> {
+        match self.try_resolve_secret_placeholder(tool_id, target, key, user_config, legacy_env) {
+            Ok(Some(placeholder)) => Ok(Some(placeholder)),
+            Ok(None) if degrade_unresolved_secrets || !required => Ok(None),
+            Ok(None) => Err(mcp_secret_missing_error(tool_id, key)),
+            Err(SecretResolveError::UndeterminableMiss(_)) if !required => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Build the fresh-install mcp.json entry for one remote server (url/headers/oauth).
+    /// Shared by the install writer (`add_to_mcp_json` remote branch) and the
+    /// startup reconciliation
+    /// (`reconcile_remote_mcp_entries`), which reuses the exact same serialization as a UI
+    /// install instead of maintaining a second writer. One deliberate addition over
+    /// the pre-extraction install writer: the `field.secret` bearer fallback below
+    /// also re-derives wiring from the credential store when `user_config` omits
+    /// the field — startup restores have no user input at all, and a re-install
+    /// over a previously configured tool keeps its credential instead of coming
+    /// back unwired (behavior disclosed in the PR description).
+    ///
+    /// `degrade_unresolved_secrets` marks the startup-reconciliation caller: startup
+    /// has no user input this run, so a secret whose credential-store entry no longer
+    /// resolves (never entered, or the keyring entry was removed) leaves its wiring
+    /// unwritten instead of failing the whole entry — the auth failure then surfaces
+    /// through the engine's boot receipt instead of blocking the restore. Installs
+    /// keep the fail-loud contract so the user is asked for the key; in both modes
+    /// a credential-store read failure propagates instead of degrading, so a
+    /// transiently locked keyring never gets baked into a permanently unwired
+    /// entry (at install it fails the install; at startup it skips the tool and
+    /// the next startup retries).
+    fn build_remote_server_entry(
+        &self,
+        manifest: &ToolManifest,
+        server: &super::types::RemoteServer,
+        user_config: &HashMap<String, String>,
+        degrade_unresolved_secrets: bool,
+    ) -> Result<serde_json::Value, String> {
+        let mut headers = serde_json::Map::new();
+        let mut env_headers = serde_json::Map::new();
+        let mut bearer_token_env_var = None;
+
+        // 1. config_fields 中 target="bearer" 的字段（用户填入）。
+        //    同一 source_key 已由 secret_headers 声明 Authorization 时跳过:两个通道
+        //    都写 Authorization,scheme 分歧时(bearer 前缀 vs 原始值)会同时落
+        //    bearer_token_env_var 与 env_headers,产生自相矛盾的条目。secret_headers
+        //    是权威声明;此处仍先 resolve_secret_placeholder,保证用户当次输入落库。
+        let secret_header_auth_keys: std::collections::HashSet<&str> = manifest
+            .secret_headers
+            .iter()
+            .filter(|s| s.header.eq_ignore_ascii_case("authorization"))
+            .map(|s| s.source_key.as_str())
+            .collect();
+        for field in &manifest.config_fields {
+            if field.target == "bearer" {
+                // 空串/纯空白输入 = "未提供"，与 try_resolve_secret_placeholder
+                // 的过滤同一语义：弹窗里输入后清空的字段必须走下面的 omitted
+                // 分支（从 store 重推导 / 容忍缺席），而不是被当成"用户给了一个
+                // 凭据"在解析失败时 fail-loud 卡死整个安装。
+                if let Some(val) = user_config.get(&field.key).filter(|v| !v.trim().is_empty()) {
+                    if field.secret {
+                        self.resolve_secret_placeholder(
+                            &manifest.id,
+                            bundle::keyring_target(bundle::CredentialTarget::Bearer),
+                            &field.key,
+                            user_config,
+                            &manifest.env,
+                        )?;
+                        if secret_header_auth_keys.contains(field.key.as_str()) {
+                            continue;
+                        }
+                        set_remote_secret_header(
+                            &mut env_headers,
+                            &mut bearer_token_env_var,
+                            "Authorization",
+                            "Bearer",
+                            &field.key,
+                        )?;
+                    } else {
+                        headers.insert(
+                            "Authorization".to_string(),
+                            serde_json::Value::String(format!("Bearer {}", val)),
+                        );
+                    }
+                } else if field.secret {
+                    // `user_config` omitted this secret bearer field: re-derive the
+                    // wiring from the credential store. This serves the startup
+                    // restore (which has no user input at all) and also a re-install
+                    // over a previously configured tool, whose credential would
+                    // otherwise be dropped. A genuinely absent credential leaves the
+                    // field unwritten on the startup reconcile, which degrades by
+                    // design (the gap scan then disables the entry and the restore
+                    // note discloses it) — while a REQUIRED key refuses the install
+                    // loud, mirroring `resolve_entry_secret`: the import/upload
+                    // path installs with an empty config and no dialog, and silence
+                    // here would land the entry enabled-unwired — the state the
+                    // credential rule exists to prevent. An OPTIONAL key stays
+                    // silent in both modes: its absence is a legitimate outcome the
+                    // config dialog explicitly invites. For a REQUIRED field a
+                    // credential-store
+                    // read failure must not degrade into a permanently unwired entry,
+                    // so it fails the build in every mode and the next startup
+                    // retries the restore. An OPTIONAL field tolerates exactly one
+                    // outcome: [`SecretResolveError::UndeterminableMiss`] — the read
+                    // succeeded but returned nothing while the OS keyring is
+                    // unreachable, so absence cannot be proven (the credential may
+                    // sit in the unreachable keyring) and an install must not block
+                    // on a keyring-less host; nothing is baked into the wiring, the
+                    // same treatment a genuinely absent credential gets. Every other
+                    // error is a real store fault (a failed read or a failed write —
+                    // including under the file fallback): like the required arm it
+                    // fails the build so the next startup retries, instead of baking
+                    // a fault into a permanently unwired entry that later startups
+                    // never repair. The classification comes from
+                    // `try_resolve_secret_placeholder` itself — matching on
+                    // `os_keyring_unreachable` here would tolerate fallback-era
+                    // read/write faults too, not just the miss.
+                    match self.try_resolve_secret_placeholder(
+                        &manifest.id,
+                        bundle::keyring_target(bundle::CredentialTarget::Bearer),
+                        &field.key,
+                        user_config,
+                        &manifest.env,
+                    ) {
+                        Ok(Some(_)) => {
+                            if !secret_header_auth_keys.contains(field.key.as_str()) {
+                                set_remote_secret_header(
+                                    &mut env_headers,
+                                    &mut bearer_token_env_var,
+                                    "Authorization",
+                                    "Bearer",
+                                    &field.key,
+                                )?;
+                            }
+                        }
+                        Ok(None) => {
+                            if !degrade_unresolved_secrets && field.required {
+                                return Err(mcp_secret_missing_error(&manifest.id, &field.key));
+                            }
+                        }
+                        Err(error) if field.required => return Err(error.to_string()),
+                        Err(SecretResolveError::UndeterminableMiss(_)) => {
+                            // Fallback-active miss: the read cannot prove
+                            // absence, not a store fault. Leave the field
+                            // unwired — the one tolerated outcome.
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            }
+        }
+
+        // 2. manifest.secret_headers 声明的敏感 header（不落明文）
+        for secret in &manifest.secret_headers {
+            match self.resolve_entry_secret(
+                &manifest.id,
+                bundle::keyring_target(bundle::CredentialTarget::Bearer),
+                &secret.source_key,
+                user_config,
+                &manifest.env,
+                secret.required,
+                degrade_unresolved_secrets,
+            ) {
+                // The user's current input must still be persisted to the
+                // store; the resolved placeholder value itself is unused here.
+                Ok(Some(_)) => {}
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            }
+            set_remote_secret_header(
+                &mut env_headers,
+                &mut bearer_token_env_var,
+                &secret.header,
+                &secret.scheme,
+                &secret.source_key,
+            )?;
+        }
+
+        // 3. 兼容旧 manifest.env 中以 _API_KEY 结尾的字段。与明文迁移的落盘同形：
+        //    走 `bearer_token_env_var`（env 变量名，请求时经宿主 resolver 解析），
+        //    而不是把 `${...}` 占位符写进 `headers` —— 引擎按原样发送 headers 的
+        //    字面值、不展开占位符（底座 mcp.rs `headers` 字段文档），字面占位符
+        //    是一条永远鉴权失败的接线。
+        if headers.is_empty() && env_headers.is_empty() && bearer_token_env_var.is_none() {
+            // The legacy channel is EXISTENTIAL, matching the oracle that
+            // judges it (entry_secret_keys_without_wiring): the builder wires
+            // the first resolving key and the entry authenticates through it
+            // — so resolution must not depend on `manifest.env`'s HashMap
+            // iteration order. Keys are tried in sorted order; a key that
+            // cannot resolve is skipped (both modes — at startup the gap scan
+            // handles the none-resolved case), a store FAILURE still fails
+            // the build in every mode, and only when NO key resolves does a
+            // direct install refuse loud, naming every missing key sorted.
+            let mut missing: Vec<String> = Vec::new();
+            let mut legacy_keys: Vec<&String> = manifest
+                .env
+                .keys()
+                .filter(|k| is_sensitive_key_name(k))
+                .collect();
+            legacy_keys.sort();
+            for k in legacy_keys {
+                match self.try_resolve_secret_placeholder(
+                    &manifest.id,
+                    bundle::keyring_target(bundle::CredentialTarget::Bearer),
+                    k,
+                    user_config,
+                    &manifest.env,
+                ) {
+                    // The resolved value is persisted to the store/registry
+                    // inside `try_resolve_secret_placeholder`; the entry
+                    // only ever carries the env-var NAME.
+                    Ok(Some(_)) => {
+                        set_remote_secret_header(
+                            &mut env_headers,
+                            &mut bearer_token_env_var,
+                            "Authorization",
+                            "Bearer",
+                            k,
+                        )?;
+                        missing.clear();
+                        break;
+                    }
+                    Ok(None) => missing.push(k.clone()),
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            // The message lists every missing key through the same sentence
+            // mcp_secret_missing_error uses for one key. Startup (degrade)
+            // falls through instead: the unwired declarative entry is what the
+            // restore must land, and the caller's gap scan turns it into the
+            // promised disabled entry with the note — refusing here aborted
+            // the whole restore before any write, on every startup.
+            if !missing.is_empty() && !degrade_unresolved_secrets {
+                return Err(mcp_secret_missing_error(&manifest.id, &missing.join(", ")));
+            }
+        }
+
+        let mut entry = serde_json::json!({ "url": server.url });
+        if !server.scopes.is_empty() {
+            entry["scopes"] = serde_json::to_value(&server.scopes).unwrap_or_default();
+        }
+        if let Some(oauth) = &server.oauth {
+            entry["oauth"] = serde_json::to_value(oauth).unwrap_or_default();
+        }
+        if let Some(resource) = &server.oauth_resource {
+            if !resource.trim().is_empty() {
+                // Same trimmed form `align_remote_entry_fields` writes and
+                // `remote_entry_matches_manifest` compares, so a padded manifest
+                // converges at install time instead of costing a realign write.
+                entry["oauth_resource"] = serde_json::Value::String(resource.trim().to_string());
+            }
+        }
+        if !headers.is_empty() {
+            entry["headers"] = serde_json::Value::Object(headers);
+        }
+        if !env_headers.is_empty() {
+            entry["env_headers"] = serde_json::Value::Object(env_headers);
+        }
+        if let Some(env_var) = bearer_token_env_var {
+            entry["bearer_token_env_var"] = serde_json::Value::String(env_var);
+        }
+        Ok(entry)
+    }
+
+    fn managed_python_runtime_fields(
+        manifest: &ToolManifest,
+        server_dir: &Path,
+        environment: &python_dependencies::InstalledPythonEnvironment,
+    ) -> Result<(String, Vec<String>), String> {
+        if manifest.command != "python" && manifest.command != "python3" {
+            return Err(format!(
+                "tool '{}' declares Python dependencies but does not use a Python command",
+                manifest.id
+            ));
+        }
+        let args = super::mcp_catalog::local_server_args(manifest, server_dir);
+        let Some(server_script) = args.first().cloned() else {
+            return Err(format!(
+                "tool '{}' has no Python server argument",
+                manifest.id
+            ));
+        };
+        if !Path::new(&server_script).is_file() {
+            return Err(format!(
+                "tool '{}' Python server does not exist: {}",
+                manifest.id, server_script
+            ));
+        }
+        let runner = paths::bundle_mcp_python_runner();
+        if !runner.is_file() {
+            return Err("Python MCP dependency runner is missing; restart and retry".to_string());
+        }
+        let mut wrapped_args = vec![
+            "-I".to_string(),
+            "-S".to_string(),
+            "-B".to_string(),
+            runner.to_string_lossy().into_owned(),
+            environment.site_packages.to_string_lossy().into_owned(),
+            server_script,
+        ];
+        wrapped_args.extend(args.into_iter().skip(1));
+        Ok((environment.python_command.clone(), wrapped_args))
+    }
+
+    /// Repair only the managed launcher fields. Existing configuration, secret placeholders,
+    /// enabled state, timeouts, and forward-compatible fields retain their JSON values.
+    pub(super) fn patch_managed_python_runtime(
+        &self,
+        manifest: &ToolManifest,
+        server_dir: &Path,
+        environment: &python_dependencies::InstalledPythonEnvironment,
+    ) -> Result<(), String> {
+        let (command, args) =
+            Self::managed_python_runtime_fields(manifest, server_dir, environment)?;
+        with_mcp_json_lock(|| {
+            let mcp_path = paths::mcp_config_path();
+            // Hardened read — family rationale on `open_private_data_file_within`.
+            let content = read_private_data_file(&mcp_path)
+                .map_err(|error| format!("read mcp.json: {error}"))?;
+            let mut mcp: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|error| format!("parse mcp.json: {error}"))?;
+            let entry = mcp
+                .get_mut("servers")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|servers| servers.get_mut(&manifest.id))
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    format!("mcp.json has no local server entry for '{}'", manifest.id)
+                })?;
+            let command = serde_json::Value::String(command);
+            let args = serde_json::to_value(args).map_err(|error| error.to_string())?;
+            if entry.get("command") == Some(&command) && entry.get("args") == Some(&args) {
+                return Ok(());
+            }
+            entry.insert("command".to_string(), command);
+            entry.insert("args".to_string(), args);
+            write_json_pretty(&mcp_path, &mcp)
+        })
+    }
+
+    /// Build the fresh-install mcp.json entry for one local tool (command/args/env).
+    /// The install writer (`add_to_mcp_json` local branch) and the startup rebuild
+    /// (`write_rebuilt_local_entry`) share this serialization. Extracted so the
+    /// startup rebuild can merge the
+    /// preserved user fields in memory and land them in the same single atomic write
+    /// as a fresh install (`write_rebuilt_local_entry`) instead of a
+    /// rebuild-then-reapply write pair.
+    ///
+    /// `degrade_unresolved_secrets` marks the startup-reconciliation caller: startup
+    /// has no user input, so a secret whose credential-store entry no longer resolves
+    /// is left out of `env` instead of failing the whole entry (the spawn failure
+    /// then surfaces through the engine's boot receipt). Installs keep the fail-loud
+    /// contract so the user is asked for the key.
+    fn build_local_server_entry(
+        &self,
+        manifest: &ToolManifest,
+        user_config: &HashMap<String, String>,
+        server_dir: &std::path::Path,
+        python_environment: Option<&python_dependencies::InstalledPythonEnvironment>,
+        degrade_unresolved_secrets: bool,
+    ) -> Result<serde_json::Value, String> {
+        let (command, args) = if let Some(environment) = python_environment {
+            Self::managed_python_runtime_fields(manifest, server_dir, environment)?
+        } else {
+            (
+                super::mcp_catalog::local_server_command(manifest),
+                super::mcp_catalog::local_server_args(manifest, server_dir),
+            )
+        };
+
+        let mut env = manifest
+            .env
+            .iter()
+            .filter(|(k, _)| !is_sensitive_key_name(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<HashMap<_, _>>();
+        for field in &manifest.config_fields {
+            if field.target == "env" {
+                // 空串/纯空白输入 = "未提供"（弹窗里输入后清空的字段），与
+                // try_resolve_secret_placeholder 的过滤同一语义：必须走下面的
+                // omitted 分支（从 store 重推导 / 容忍缺席），而不是被当成
+                // "用户给了一个凭据"在解析失败时 fail-loud 卡死整个安装——
+                // 远端 bearer 臂的同款防护见 build_remote_server_entry。
+                if let Some(val) = user_config.get(&field.key).filter(|v| !v.trim().is_empty()) {
+                    if field.secret || is_sensitive_key_name(&field.key) {
+                        let placeholder = self.resolve_secret_placeholder(
+                            &manifest.id,
+                            "env",
+                            &field.key,
+                            user_config,
+                            &manifest.env,
+                        )?;
+                        env.insert(field.key.clone(), placeholder);
+                    } else {
+                        env.insert(field.key.clone(), val.clone());
+                    }
+                } else if field.secret || is_sensitive_key_name(&field.key) {
+                    // No user input for a secret config field: re-derive the
+                    // wiring from the credential store in EVERY mode — the
+                    // store fallback also serves a re-install over a
+                    // previously configured tool. Same resolution the
+                    // secret_env and legacy sensitive channels run, with the
+                    // same outcomes: a REQUIRED key absent at install fails
+                    // loud (the import/upload path installs with an empty
+                    // config, and silence here would land the entry
+                    // enabled-unwired — the state the credential rule exists
+                    // to prevent), the startup rebuild degrades so the gap
+                    // scan can disable, and a store FAILURE fails the build
+                    // in every mode so the next startup retries instead of
+                    // silently dropping the wiring. An OPTIONAL key's absence
+                    // is a legitimate outcome in every mode — the config
+                    // dialog explicitly invites leaving it empty — and it
+                    // tolerates exactly one store error
+                    // ([`SecretResolveError::UndeterminableMiss`], the same
+                    // treatment the remote bearer arm gives it); every other
+                    // fault fails the build.
+                    match self.try_resolve_secret_placeholder(
+                        &manifest.id,
+                        "env",
+                        &field.key,
+                        user_config,
+                        &manifest.env,
+                    ) {
+                        Ok(Some(placeholder)) => {
+                            env.insert(field.key.clone(), placeholder);
+                        }
+                        Ok(None) if !field.required => {}
+                        Ok(None) if degrade_unresolved_secrets => {}
+                        Ok(None) => return Err(mcp_secret_missing_error(&manifest.id, &field.key)),
+                        Err(SecretResolveError::UndeterminableMiss(_)) if !field.required => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+            }
+        }
+        for secret in &manifest.secret_env {
+            match self.resolve_entry_secret(
+                &manifest.id,
+                "env",
+                &secret.key,
+                user_config,
+                &manifest.env,
+                secret.required,
+                degrade_unresolved_secrets,
+            ) {
+                Ok(Some(placeholder)) => {
+                    env.insert(secret.key.clone(), placeholder);
+                }
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        for key in manifest.env.keys().filter(|k| is_sensitive_key_name(k)) {
+            if !env.contains_key(key) {
+                match self.resolve_entry_secret(
+                    &manifest.id,
+                    "env",
+                    key,
+                    user_config,
+                    &manifest.env,
+                    true,
+                    degrade_unresolved_secrets,
+                ) {
+                    Ok(Some(placeholder)) => {
+                        env.insert(key.clone(), placeholder);
+                    }
+                    Ok(None) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        let mut entry = serde_json::json!({
+            "command": command,
+            "args": args,
+        });
+        if !env.is_empty() {
+            entry["env"] = serde_json::to_value(&env).unwrap_or_default();
+        }
+        Ok(entry)
+    }
+
+    /// Single-write startup rebuild of a local tool's mcp.json entry: build the
+    /// fresh-install form (empty user config — startup has no user input, so secret
+    /// placeholders resolve from the credential store, degrading per
+    /// `build_local_server_entry` when they no longer resolve), merge the
+    /// caller-supplied preserved user fields (everything except command/args/env)
+    /// in memory, and write once. One atomic write instead of a
+    /// rebuild-then-reapply pair: a crash can never leave the fresh form without
+    /// the preserved fields.
+    ///
+    /// Returns the required-credential keys whose wiring could not be restored
+    /// (empty = fully wired). Under the credential rule the written entry then
+    /// carries `disabled: true` — an entry that cannot authenticate must not be
+    /// enabled (the caller's note names the keys and the reinstall fix). The
+    /// rule wins over a preserved `disabled: false`: a hand re-enable of an
+    /// entry whose credential is gone would recreate the enabled-but-unwired
+    /// state this rule exists to prevent; the note discloses the flip. A
+    /// preserved `disabled: true` is kept: bare `disabled: true` is also the
+    /// engine's valid hand-edit stop (`is_enabled` is `enabled && !disabled`,
+    /// with an omitted `enabled` defaulting to true), the file carries no mark
+    /// separating that user stop from this rule's own earlier auto-disable, and
+    /// a repair is not a user request to re-enable — the caller's note
+    /// discloses the kept flag instead.
+    pub(super) fn write_rebuilt_local_entry(
+        &self,
+        manifest: &ToolManifest,
+        server_dir: &std::path::Path,
+        preserved: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<String>, String> {
+        let mut entry =
+            self.build_local_server_entry(manifest, &HashMap::new(), server_dir, None, true)?;
+        if let Some(object) = entry.as_object_mut() {
+            for (key, value) in preserved {
+                object.insert(key, value);
+            }
+        }
+        // Judge the FINAL entry form (fresh wiring + preserved user fields):
+        // a preserved hand edit can change the judged shape (a hand-added
+        // `url` makes a hybrid the engine launches remotely), so judging the
+        // pre-merge form could disable an entry on channels the final form
+        // does not even use.
+        let missing_secrets = entry_secret_keys_without_wiring(
+            manifest,
+            entry.as_object().unwrap_or(&serde_json::Map::new()),
+        );
+        if !missing_secrets.is_empty() {
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("disabled".to_string(), serde_json::Value::Bool(true));
+            }
+        }
+        with_mcp_json_lock(|| {
+            let (mcp_path, mut mcp) = load_mcp_json_for_reconcile()?;
+            let servers = mcp
+                .get_mut("servers")
+                .and_then(|s| s.as_object_mut())
+                .ok_or("mcp.json 格式错误")?;
+            servers.insert(manifest.id.clone(), entry);
+            write_json_pretty(&mcp_path, &mcp)
+        })?;
+        Ok(missing_secrets)
+    }
+
+    pub(super) fn remove_from_mcp_json(&self, tool_id: &str) -> Result<(), String> {
+        with_mcp_json_lock(|| {
+            let mcp_path = paths::mcp_config_path();
+            if !mcp_path.is_file() {
+                return Ok(());
+            }
+            // An unparseable mcp.json is backed up and refused, never reset. This
+            // writer is reachable at boot from the retired-tool cleanup and the
+            // Python-repair downgrade, and from the UI uninstall: a reset there
+            // would destroy the file before (cleanup) or despite (downgrade,
+            // uninstall) the reconcile's backup — the callers' transactions roll
+            // back instead, and the cleanup simply retries on a later boot.
+            let (mcp_path, mut mcp) = load_mcp_json_for_reconcile()?;
+
+            if let Some(servers) = mcp.get_mut("servers").and_then(|s| s.as_object_mut()) {
+                // 先尝试加载 manifest 看是否有 servers 字段（远程工具有多条目）
+                if let Some(manifest) = self.load_manifest(tool_id) {
+                    if !manifest.servers.is_empty() {
+                        for server in &manifest.servers {
+                            servers.remove(&server.name);
+                        }
+                    } else {
+                        servers.remove(tool_id);
+                    }
+                } else {
+                    servers.remove(tool_id);
+                }
+            }
+
+            write_json_pretty(&mcp_path, &mcp)
+        })
+    }
+
+    /// Startup reconciliation for the given remote servers of one tool (callers pass
+    /// `&manifest.servers` or a subset with contested keys removed):
+    /// - A missing per-server entry is added with the exact fresh-install serialization
+    ///   (startup has no user input, so secret placeholders resolve from the credential
+    ///   store; a credential that is absent from the store leaves its wiring unwritten
+    ///   rather than failing the restore, while a credential-store read failure fails
+    ///   the restore so the next startup retries — installs keep the fail-loud
+    ///   contract for both cases). Under the credential rule, a restored entry whose
+    ///   required credential did not resolve carries `disabled: true` — an entry that
+    ///   cannot authenticate must not boot enabled, where the only guaranteed outcome
+    ///   is a 401 on first use; the reinstall flow writes a fresh entry (clearing the
+    ///   flag) once the key is re-entered.
+    /// - An existing entry whose manifest-derived shape (url/scopes/oauth_resource)
+    ///   drifted from the current manifest is realigned; credential fields
+    ///   (headers/env_headers/bearer_token_env_var) and forward-compatible fields are
+    ///   preserved because they cannot be re-derived without user input. The `oauth`
+    ///   block is the documented user-set client override, so an existing block is
+    ///   never judged or rewritten — only a missing one is healed from the manifest.
+    ///   The same credential rule migrates a legacy ENABLED entry without its required
+    ///   auth wiring to `disabled: true`; already-disabled entries, OAuth-declared
+    ///   servers, user-set `oauth` blocks, and hand-authored auth wiring the manifest
+    ///   cannot judge (any non-`Authorization` header, or wiring pointing outside the
+    ///   manifest's secret namespace) are exempt.
+    /// - Entries not owned by this manifest are never touched.
+    /// Idempotent: returns Ok(None) without writing when everything already matches.
+    pub(super) fn reconcile_remote_mcp_entries(
+        &self,
+        manifest: &ToolManifest,
+        servers: &[&super::types::RemoteServer],
+    ) -> Result<Option<String>, String> {
+        with_mcp_json_lock(|| {
+            let (mcp_path, mut mcp) = load_mcp_json_for_reconcile()?;
+            let servers_map = mcp
+                .get_mut("servers")
+                .and_then(|s| s.as_object_mut())
+                .ok_or("mcp.json 格式错误")?;
+
+            let mut changed: Vec<String> = Vec::new();
+            for server in servers {
+                if super::ENGINE_OWNED_MCP_SERVER_KEYS.contains(&server.name.as_str()) {
+                    // Unreachable via reconcile_installed_mcp_entries (the caller
+                    // filters these with a timeline note); kept as defense in depth
+                    // so a direct caller can never fight the boot-time builtin upsert.
+                    continue;
+                }
+                let had_entry = servers_map.get(&server.name).is_some();
+                match servers_map
+                    .get_mut(&server.name)
+                    .and_then(|entry| entry.as_object_mut())
+                {
+                    // Present as an object: realign in place when the manifest-derived
+                    // shape drifted. A non-object value takes the restore branch below.
+                    Some(object) => {
+                        if !remote_entry_matches_manifest(object, server) {
+                            align_remote_entry_fields(object, server);
+                            changed.push(format!("realigned remote entry '{}'", server.name));
+                        }
+                        // Credential rule, legacy migration: an enabled entry left
+                        // enabled by an earlier restore or a hand edit without its
+                        // required auth wiring cannot authenticate — it 401s on
+                        // every use. Flip it to `disabled: true` instead of leaving
+                        // a permanently broken enabled entry; the note names the
+                        // missing keys and the fix (reinstall). Already-disabled
+                        // entries are exempt, so a converged file is never rewritten.
+                        if let Some(gaps) = entry_requires_disable(manifest, server, object) {
+                            object.insert("disabled".to_string(), serde_json::Value::Bool(true));
+                            changed.push(format!(
+                                "disabled remote entry '{}' — required credential {} has no \
+                                 auth wiring; reinstall the tool to re-enter it and enable",
+                                server.name,
+                                gaps.join(", ")
+                            ));
+                        }
+                    }
+                    _ => {
+                        let mut entry = self.build_remote_server_entry(
+                            manifest,
+                            server,
+                            &HashMap::new(),
+                            true,
+                        )?;
+                        // Credential rule: an entry whose required credential is
+                        // absent cannot authenticate — restoring it enabled only
+                        // guarantees a 401 on first use. Such an entry is restored
+                        // `disabled: true` instead; the reinstall flow writes a
+                        // fresh entry (clearing the flag) once the user re-enters
+                        // the key. OAuth-declared servers and hand-authored auth
+                        // wiring are exempt: their login covers the entry without
+                        // any key this rule could judge.
+                        let missing_secrets = entry_secret_keys_without_wiring(
+                            manifest,
+                            entry.as_object().unwrap_or(&serde_json::Map::new()),
+                        );
+                        let disabled = !missing_secrets.is_empty()
+                            && !credential_rule_exempt(
+                                manifest,
+                                server,
+                                entry.as_object().unwrap_or(&serde_json::Map::new()),
+                            );
+                        if disabled {
+                            if let Some(object) = entry.as_object_mut() {
+                                object
+                                    .insert("disabled".to_string(), serde_json::Value::Bool(true));
+                            }
+                        }
+                        servers_map.insert(server.name.clone(), entry);
+                        // Say what the restore could not do instead of reporting an
+                        // unqualified success that 401s on first use. A key that
+                        // held a non-object value was PRESENT, not missing — the
+                        // write replaced a malformed shape, and the note must not
+                        // claim otherwise.
+                        let mut note = if had_entry {
+                            format!("replaced malformed remote entry '{}'", server.name)
+                        } else {
+                            format!("restored missing remote entry '{}'", server.name)
+                        };
+                        if !disabled
+                            && manifest
+                                .config_fields
+                                .iter()
+                                .any(|field| field.target == "bearer" && !field.secret)
+                        {
+                            note.push_str(
+                                "; its non-secret bearer key is not stored and could not be \
+                                 re-derived — reinstall the tool to re-enter it",
+                            );
+                        }
+                        if !missing_secrets.is_empty() {
+                            if disabled {
+                                note.push_str(&format!(
+                                    "; no stored credential for {} — an entry without its \
+                                     credential cannot authenticate, so it was restored \
+                                     disabled; reinstall the tool to re-enter it and enable",
+                                    missing_secrets.join(", ")
+                                ));
+                            } else {
+                                note.push_str(&format!(
+                                    "; no stored credential for {} — restored without that auth \
+                                     wiring; reinstall the tool to re-enter it",
+                                    missing_secrets.join(", ")
+                                ));
+                            }
+                        }
+                        changed.push(note);
+                    }
+                }
+            }
+
+            if changed.is_empty() {
+                return Ok(None);
+            }
+            write_json_pretty(&mcp_path, &mcp)?;
+            Ok(Some(changed.join("; ")))
+        })
+    }
+
+    // Preserved user fields are folded into the rebuild itself
+    // (`write_rebuilt_local_entry`): the fresh form and the preserved fields
+    // land in one atomic write, so a crash between phases can never leave the
+    // fresh form without them.
+}
+
+/// Read-only snapshot of the current mcp.json `servers` map for reconciliation
+/// decisions, taken without `with_mcp_json_lock`. It gates *whether* a repair is
+/// attempted and sources the user fields preserved across a rebuilt local
+/// entry; the writes themselves re-read the file under the lock, and every
+/// concurrent marketplace writer is excluded by
+/// MARKETPLACE_TRANSACTION_LOCK (the boot-path writers run sequentially on the
+/// same thread), so the merge cannot clobber a concurrent change to *other*
+/// entries — the rebuilt entry's preserved user fields still come from this
+/// snapshot, so a peer's concurrent edit of that same entry can be overwritten
+/// (same-entry last-writer-wins).
+pub(super) fn read_mcp_servers_snapshot() -> serde_json::Map<String, serde_json::Value> {
+    let mcp_path = paths::mcp_config_path();
+    let parsed: serde_json::Value = if mcp_path.is_file() {
+        read_private_data_file(&mcp_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok())
+            .unwrap_or_else(default_mcp_json)
+    } else {
+        default_mcp_json()
+    };
+    parsed
+        .get("servers")
+        .and_then(|s| s.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// First dead target of a local mcp.json entry: an absolute path (command or arg)
+/// that no longer exists on disk. Bare interpreter names and relative args are
+/// never judged (PATH/cwd resolution is out of scope), and neither are existing
+/// directories, so managed-environment lifecycle stays with the Python repair path.
+pub(super) fn dead_local_entry_target(entry: &serde_json::Value) -> Option<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(command) = entry.get("command").and_then(|v| v.as_str()) {
+        candidates.push(command);
+    }
+    if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
+        candidates.extend(args.iter().filter_map(|v| v.as_str()));
+    }
+    candidates
+        .into_iter()
+        .find(|s| Path::new(s).is_absolute() && !Path::new(s).exists())
+        .map(str::to_string)
+}
+
+/// Required-credential source keys of `manifest` whose env-var NAME appears
+/// in none of an mcp.json entry's auth wiring for the key's own declared
+/// slot: the entry carries none of the manifest's required
+/// store-resolvable wiring (a restore degraded because no stored credential
+/// resolved, or the wiring was never written). This is the oracle for the
+/// credential rule — a non-exempt entry with a gap here carries no wiring
+/// the app can vouch for, so it must not boot enabled — and for the restore
+/// notes that name the missing keys. Only names are reported — never
+/// values. The oracle is static: it sees wiring, not credentials, so an
+/// entry whose wiring remains while the keyring entry behind it was deleted
+/// stays invisible (existing entries are never probed against the store — a
+/// transiently locked keyring must never flip entries), and a required
+/// non-secret bearer field (plaintext, never in the keyring) is out of
+/// scope: the restore note discloses it instead — unless the entry is
+/// itself restored disabled, where the disabled note already carries the
+/// reinstall remedy that re-collects every field (pinned).
+///
+/// Channels are guarded by the entry shape so one function serves both
+/// entry forms: a remote entry (`url`) wires secret_headers / secret bearer
+/// config fields via `bearer_token_env_var` and `env_headers` (the engine's
+/// `env_http_headers` alias included); a local entry (`command`) wires
+/// secret_env / secret-or-sensitive env config fields via `env` values'
+/// exact `${...}` placeholder tokens — the only form the engine's env
+/// expansion resolves, so any other occurrence of the name in a plain value
+/// is inert text.
+///
+/// The REMOTE channel is judged slot-bound: every builder pairs a key's
+/// env-var name with the manifest's DECLARED slot — `bearer_token_env_var`
+/// for an Authorization/Bearer channel ([`set_remote_secret_header`]), the
+/// declared header's own entry in `env_headers` for a custom header — and
+/// the engine resolves each map entry's value under THAT entry's name
+/// (http transport), so a value parked under any other header never
+/// reaches the server as auth. A manifest-namespace name under a foreign
+/// slot (`"X-Sentinel": "PINVOU3_MCP_SECRET_K"` for a Bearer manifest)
+/// therefore does not wire the key — it masks nothing. The scan also mirrors
+/// the builder's same-key precedence: a source_key declared on an
+/// Authorization `secret_headers` entry never receives the bearer slot (dual
+/// Authorization writes with diverging schemes — Bearer prefix vs raw value —
+/// would land a contradictory entry; the `secret_headers` declaration is the
+/// authoritative one), so such a key is judged by that Authorization header
+/// channel instead, and regardless of the header's own `required` flag — the
+/// writer skips the bearer slot for the key in every mode, so the header
+/// channel is the only live wiring it can ever have. Slot values are
+/// compared exactly: the remote resolver looks an env var up by the value
+/// string with no expansion, so a composed `${...}` value names a
+/// different, unresolvable variable. Manifest-authored strings that also
+/// land in the entry (`url`, `scopes`, `oauth` blocks,
+/// `secret_headers[].header` names) are data no writer puts a secret name
+/// into, so a name embedded there cannot mask a credential gap. OPTIONAL
+/// (`required: false`) fields are excluded per channel: their absence is a
+/// legitimate outcome (the qcc shape is OAuth-first), so "no stored
+/// credential" would send an OAuth-only user hunting for a key they never
+/// needed — and under the fallback it would be a claim we cannot verify
+/// either way. An entry carrying BOTH markers (a hand-edited hybrid) is
+/// judged by the remote channel alone: the engine launches the URL
+/// whenever it is set, so the local channel cannot affect that entry's
+/// authentication. An entry carrying neither marker (dead defense — every
+/// production call site materializes its marker before judging) counts
+/// every channel: the conservative direction for a shape this rule cannot
+/// classify.
+///
+/// The LOCAL channel stays value-based on purpose: the builder writes the
+/// manifest key's own `env` slot, but composed manifests legitimately
+/// embed the placeholder token in a plain value the engine expands
+/// (pinned), and a local entry's `env` is never carried across a rebuild,
+/// so no writer-produced shape can park the token under another key.
+fn entry_secret_keys_without_wiring(
+    manifest: &ToolManifest,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    // Null-safe: the engine's typed round-trip materializes `"command": null`
+    // on remote entries and `"url": null` on local entries, so a bare
+    // `is_some` would count both channels for every engine-touched entry.
+    let is_remote = entry
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    let is_local = entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some();
+    // Both markers (hand-edited hybrid): the engine launches the URL
+    // whenever it is set, so only the remote channel can affect that
+    // entry's authentication. Neither marker (dead defense): count every
+    // channel.
+    let counts_remote = is_remote || !(is_remote || is_local);
+    let counts_local = (!is_remote && is_local) || !(is_remote || is_local);
+    let env_header_slots = ["env_headers", "env_http_headers"]
+        .iter()
+        .filter_map(|key| entry.get(*key).and_then(serde_json::Value::as_object))
+        .collect::<Vec<_>>();
+    let bearer_slot = entry
+        .get("bearer_token_env_var")
+        .and_then(serde_json::Value::as_str);
+    let remote_wired_in_bearer = |name: &str| bearer_slot == Some(name);
+    let remote_wired_in_header = |slot_header: &str, name: &str| {
+        env_header_slots.iter().any(|map| {
+            map.iter().any(|(header, value)| {
+                header.eq_ignore_ascii_case(slot_header) && value.as_str() == Some(name)
+            })
+        })
+    };
+    let secret_header_wired = |secret: &super::types::SecretHeader| {
+        let name = mcp_secret_env_var(&secret.source_key);
+        if secret.header.eq_ignore_ascii_case("authorization")
+            && secret.scheme.eq_ignore_ascii_case("bearer")
+        {
+            remote_wired_in_bearer(&name)
+        } else if secret.scheme.trim().is_empty() {
+            remote_wired_in_header(&secret.header, &name)
+        } else {
+            // A scheme the builder refuses can never have produced wiring.
+            false
+        }
+    };
+    let env_slot = entry.get("env").and_then(serde_json::Value::as_object);
+    let local_wired = |slot_key: &str| {
+        let name = mcp_secret_env_var(slot_key);
+        env_slot.is_some_and(|map| {
+            map.values()
+                .filter_map(|value| value.as_str())
+                .any(|value| placeholder_value_contains_secret_name(value, &name))
+        })
+    };
+    let mut keys: Vec<String> = Vec::new();
+    let mut push = |key: &str| {
+        if !keys.iter().any(|k| k == key) {
+            keys.push(key.to_string());
+        }
+    };
+    if counts_remote {
+        for secret in &manifest.secret_headers {
+            if secret.required && !secret_header_wired(secret) {
+                push(&secret.source_key);
+            }
+        }
+        // The writer preempts the bearer slot when the same source_key is
+        // also declared on an Authorization secret_headers entry (the
+        // historical Tencent Docs shape: raw-token auth must not gain a
+        // Bearer prefix) — for such a key the header channel is the only
+        // live wiring, so judge the key by it, required or not. Demanding
+        // the preempted slot here would report a correctly wired entry as
+        // missing its credential and disable it on every startup, while the
+        // install writer keeps emitting the same valid raw header — a
+        // reconfigure could never converge.
+        let secret_header_auth_keys: std::collections::HashSet<&str> = manifest
+            .secret_headers
+            .iter()
+            .filter(|s| s.header.eq_ignore_ascii_case("authorization"))
+            .map(|s| s.source_key.as_str())
+            .collect();
+        for field in &manifest.config_fields {
+            if field.target == "bearer" && field.secret && field.required {
+                let wired = if secret_header_auth_keys.contains(field.key.as_str()) {
+                    manifest.secret_headers.iter().any(|s| {
+                        s.source_key == field.key
+                            && s.header.eq_ignore_ascii_case("authorization")
+                            && secret_header_wired(s)
+                    })
+                } else {
+                    remote_wired_in_bearer(&mcp_secret_env_var(&field.key))
+                };
+                if !wired {
+                    push(&field.key);
+                }
+            }
+        }
+    }
+    if counts_local {
+        for secret in &manifest.secret_env {
+            if secret.required && !local_wired(&secret.key) {
+                push(&secret.key);
+            }
+        }
+        for field in &manifest.config_fields {
+            if field.target == "env"
+                && field.required
+                && (field.secret || is_sensitive_key_name(&field.key))
+                && !local_wired(&field.key)
+            {
+                push(&field.key);
+            }
+        }
+    }
+    // Legacy `manifest.env` sensitive keys, modeled per writer: the local
+    // builder wires every sensitive key into `env`, so each counts on its
+    // own. The remote builder wires them only as an exclusive fallback —
+    // never when any other auth wiring exists — and only the first resolving
+    // key (`break`), as an Authorization/Bearer channel. So a remote entry
+    // is judged as a whole: the channel is skipped entirely when other
+    // wiring exists (the fallback never ran), and served when the
+    // fallback's slot carries any legacy key's name (one wired key
+    // authenticates the entry; the rest were never attempted).
+    let legacy_keys: Vec<&String> = manifest
+        .env
+        .keys()
+        .filter(|k| is_sensitive_key_name(k))
+        .collect();
+    if !legacy_keys.is_empty() {
+        if counts_remote {
+            // Remote: the legacy channel is judged as a whole — the builder's
+            // fallback never ran when other wiring exists, and one wired key
+            // served the entry (the rest were never attempted).
+            if !remote_entry_has_auth_wiring(entry)
+                && !legacy_keys
+                    .iter()
+                    .any(|k| remote_wired_in_bearer(&mcp_secret_env_var(k)))
+            {
+                for key in &legacy_keys {
+                    push(key.as_str());
+                }
+            }
+        } else {
+            // Local: the builder wires every sensitive key, so each counts
+            // on its own.
+            for key in &legacy_keys {
+                if !local_wired(key) {
+                    push(key.as_str());
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Whether a local `env` value wires the secret `name`: only the exact
+/// `${name}` placeholder token does — that is the sole form the engine's env
+/// expansion resolves (composition included, since `x${name}y` expands the
+/// same token), and it is exactly what [`mcp_secret_placeholder`] writes.
+/// Every other occurrence of the name in a plain value — a bare name, a
+/// malformed placeholder — is inert text the engine sends verbatim, so it
+/// must not mask a credential gap.
+fn placeholder_value_contains_secret_name(value: &str, name: &str) -> bool {
+    value.contains(&format!("${{{name}}}"))
+}
+
+/// Whether a remote entry carries any auth wiring the remote builder treats
+/// as superseding its legacy `manifest.env` fallback — the entry-level
+/// mirror of the builder's `headers.is_empty() && env_headers.is_empty() &&
+/// bearer_token_env_var.is_none()` gate (the engine's `env_http_headers`
+/// alias included). A value that is empty or whitespace-only wires nothing —
+/// the host resolver skips empty/whitespace `env_headers` and bearer
+/// env-var names, and a literal `headers` value that is empty or
+/// whitespace authenticates nothing even though the engine sends it — so it
+/// does not count: a hand-mangled dead header must not mask the credential
+/// gap.
+fn remote_entry_has_auth_wiring(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let has_wired_value = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|object| {
+                object
+                    .values()
+                    .any(|v| v.as_str().is_some_and(|name| !name.trim().is_empty()))
+            })
+    };
+    has_wired_value(entry.get("headers"))
+        || has_wired_value(entry.get("env_headers"))
+        || has_wired_value(entry.get("env_http_headers"))
+        || entry
+            .get("bearer_token_env_var")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !name.trim().is_empty())
+}
+
+/// Whether the credential rule's exemptions spare this entry. OAuth-declared
+/// servers are exempt — their login is interactive (the engine drives the
+/// flow on use), so there is no API key whose absence could be proven here;
+/// the same exemption covers a user-set `oauth` block on an entry whose
+/// manifest does not declare it, and it is blanket: an OAuth server that
+/// additionally declares a required secret channel is spared too, at the
+/// cost of leaving that channel's gap to the restore note. Converged
+/// entries are spared — `disabled: true` (the stamp the engine's own toggle
+/// and runtime API also write) and `enabled: false` (doctor-fix's stamp):
+/// the engine's `is_enabled()` refuses both flags, so either way the entry
+/// boots for nobody and flipping it would only overwrite another writer's
+/// state. Hand-authored auth wiring the manifest cannot judge is exempt
+/// (see [`entry_has_hand_auth_wiring`]).
+fn credential_rule_exempt(
+    manifest: &ToolManifest,
+    server: &super::types::RemoteServer,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if server.requires_oauth() {
+        return true;
+    }
+    // Already disabled: the entry is converged, and existing entries are
+    // never probed against the store — so a key that later re-enters the
+    // store out of band (a keychain restore) cannot re-enable the entry
+    // here; only the reinstall writer does. The engine's own disable
+    // stamps earn the same respect: its toggle and runtime API write
+    // `disabled: true` alongside `enabled: false`, and doctor-fix writes
+    // `enabled: false` alone — `is_enabled()` refuses both flags, so
+    // either way the entry boots for nobody and flipping it would only
+    // overwrite another writer's state.
+    if entry.get("disabled").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    if entry.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+        return true;
+    }
+    if entry.get("oauth").is_some_and(|value| !value.is_null()) {
+        return true;
+    }
+    entry_has_hand_auth_wiring(manifest, entry)
+}
+
+/// Whether an entry carries auth wiring this rule cannot judge — wiring a
+/// hand edit added that the manifest does not explain. HTTP header names are
+/// case-insensitive (the writers compare with `eq_ignore_ascii_case`), and
+/// the host resolver serves whatever env-var name a wiring value names
+/// (through `env_headers` or the engine's `env_http_headers` alias — a
+/// config copied from another tool keeps working), so:
+/// - any `headers` member other than `Authorization` is hand auth, and a
+///   non-blank `Authorization` value is exempt too: whether it came from
+///   install-time user input or a hand edit, it is literal auth this rule
+///   cannot judge — the app itself only ever writes `Authorization` there;
+/// - an `env_headers` / `bearer_token_env_var` value naming an env var
+///   outside the manifest's own secret namespace is hand wiring — the
+///   builders only ever write `PINVOU3_MCP_SECRET_*` names derived from the
+///   manifest.
+/// Empty or whitespace-only values wire nothing on every channel, so they
+/// are neither hand auth nor wiring. Such an entry may authenticate through
+/// wiring this static rule cannot see, so it is left enabled instead of
+/// disabled on a gap.
+fn entry_has_hand_auth_wiring(
+    manifest: &ToolManifest,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if let Some(headers) = entry.get("headers").and_then(|v| v.as_object()) {
+        // A blank value wires nothing on every channel (the same doctrine
+        // `remote_entry_has_auth_wiring` applies), so a hand-mangled dead
+        // header neither authenticates the entry nor spares it from the
+        // credential rule.
+        let wired =
+            |value: &serde_json::Value| value.as_str().is_some_and(|v| !v.trim().is_empty());
+        if headers
+            .iter()
+            .any(|(name, value)| !name.eq_ignore_ascii_case("authorization") && wired(value))
+        {
+            return true;
+        }
+        if headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization") && wired(value))
+        {
+            return true;
+        }
+    }
+    let manifest_secret_names: std::collections::HashSet<String> = manifest
+        .secret_headers
+        .iter()
+        .map(|s| mcp_secret_env_var(&s.source_key))
+        .chain(
+            manifest
+                .config_fields
+                .iter()
+                .filter(|f| f.target == "bearer" && f.secret)
+                .map(|f| mcp_secret_env_var(&f.key)),
+        )
+        .chain(
+            manifest
+                .env
+                .keys()
+                .filter(|k| is_sensitive_key_name(k))
+                .map(|k| mcp_secret_env_var(k)),
+        )
+        .collect();
+    let foreign = |name: &str| !name.trim().is_empty() && !manifest_secret_names.contains(name);
+    if ["env_headers", "env_http_headers"].into_iter().any(|key| {
+        entry
+            .get(key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|map| map.values().any(|v| v.as_str().is_some_and(foreign)))
+    }) {
+        return true;
+    }
+    entry
+        .get("bearer_token_env_var")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(foreign)
+}
+
+/// Whether a startup-written/reconciled entry must carry `disabled: true`
+/// under the credential rule: an entry with none of the manifest's required
+/// store-resolvable auth wiring cannot authenticate, so it must not boot
+/// enabled. Returns the gap keys when the disable applies.
+fn entry_requires_disable(
+    manifest: &ToolManifest,
+    server: &super::types::RemoteServer,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> Option<Vec<String>> {
+    if credential_rule_exempt(manifest, server, entry) {
+        return None;
+    }
+    let gaps = entry_secret_keys_without_wiring(manifest, entry);
+    if gaps.is_empty() { None } else { Some(gaps) }
+}
+
+/// Whether an existing remote entry carries the exact manifest-derived fields a fresh
+/// install would write. Credential fields are deliberately not compared: they come from
+/// user input/keyring and may legitimately differ from what an empty startup config
+/// would produce.
+fn remote_entry_matches_manifest(
+    object: &serde_json::Map<String, serde_json::Value>,
+    server: &super::types::RemoteServer,
+) -> bool {
+    if object.get("url").and_then(|v| v.as_str()) != Some(server.url.as_str()) {
+        return false;
+    }
+    let expected_scopes = if server.scopes.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(&server.scopes).unwrap_or_default())
+    };
+    match (expected_scopes.as_ref(), object.get("scopes")) {
+        (None, None) => {}
+        // An empty array is the absent form's alias; a fresh install never writes it.
+        (None, Some(value)) if value.as_array().is_some_and(Vec::is_empty) => {}
+        (None, Some(_)) => return false,
+        (Some(expected), actual) => {
+            if actual != Some(expected) {
+                return false;
+            }
+        }
+    }
+    let expected_oauth: Option<serde_json::Value> = match &server.oauth {
+        Some(oauth) => serde_json::to_value(oauth).ok(),
+        None => None,
+    };
+    // The engine documents `oauth` as the user-set client override for
+    // servers that require a pre-registered public client (instead of
+    // dynamic registration). An existing block therefore belongs to the
+    // user, not the manifest: it is never judged drifted and never
+    // rewritten — only a missing (or null) block is healed from the
+    // manifest (`align_remote_entry_fields`).
+    let user_oauth_override = object.get("oauth").is_some_and(|value| !value.is_null());
+    if !user_oauth_override && expected_oauth.is_some() {
+        return false;
+    }
+    let resource = server
+        .oauth_resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty());
+    match (
+        resource,
+        object.get("oauth_resource").and_then(|v| v.as_str()),
+    ) {
+        (None, None | Some("")) => {}
+        (None, Some(_)) => return false,
+        (Some(expected), actual) => {
+            if actual != Some(expected) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Rewrite only the manifest-derived fields of an existing remote entry; everything
+/// else (headers/env_headers/bearer_token_env_var/timeout/…) is kept as-is. The
+/// one exception to "manifest-derived" is `oauth`: the engine documents it as the
+/// user-set client override for servers requiring a pre-registered public client,
+/// so an existing block is preserved verbatim and only a missing one is healed
+/// from the manifest (matching `remote_entry_matches_manifest`).
+fn align_remote_entry_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    server: &super::types::RemoteServer,
+) {
+    object.insert(
+        "url".to_string(),
+        serde_json::Value::String(server.url.clone()),
+    );
+    if server.scopes.is_empty() {
+        object.remove("scopes");
+    } else if let Ok(scopes) = serde_json::to_value(&server.scopes) {
+        object.insert("scopes".to_string(), scopes);
+    }
+    if object.get("oauth").is_some_and(|value| !value.is_null()) {
+        // User-set client override: preserved verbatim (see
+        // `remote_entry_matches_manifest`).
+    } else {
+        // Absent or an explicit null: write the manifest default, or clear a
+        // null placeholder so the entry converges on the canonical absent form.
+        match &server.oauth {
+            Some(oauth) => {
+                if let Ok(value) = serde_json::to_value(oauth) {
+                    object.insert("oauth".to_string(), value);
+                }
+            }
+            None => {
+                object.remove("oauth");
+            }
+        }
+    }
+    match server
+        .oauth_resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        Some(resource) => {
+            object.insert(
+                "oauth_resource".to_string(),
+                serde_json::Value::String(resource.to_string()),
+            );
+        }
+        None => {
+            object.remove("oauth_resource");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pip_rounds_tests {
+    use super::*;
+
+    /// The default-index round must run first as a whole round (respecting the
+    /// user's pip.conf/corporate index; TUNA is only the last fallback): this
+    /// test fails if the round order is swapped.
+    #[test]
+    fn pip_mirror_round_runs_after_default_round() {
+        let rounds = pip_index_rounds();
+        assert_eq!(rounds.len(), 2);
+        assert_eq!(rounds[0].0, "default index");
+        assert!(
+            rounds[0].1.is_empty(),
+            "default-index round must not carry -i: {:?}",
+            rounds[0].1
+        );
+        assert_eq!(rounds[1].0, "Tsinghua TUNA mirror");
+        assert!(
+            rounds[1].1.contains(&PIP_CN_MIRROR_INDEX),
+            "fallback round must carry the TUNA index: {:?}",
+            rounds[1].1
+        );
+    }
+}

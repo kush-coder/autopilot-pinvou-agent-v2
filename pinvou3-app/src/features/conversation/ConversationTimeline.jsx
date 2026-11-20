@@ -1,0 +1,1369 @@
+import React, { useCallback, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { FileTypeIcon } from '../../components/files/FileTypeIcon.jsx';
+import { StatusDot } from '../../components/StatusDot.jsx';
+import { zhDict } from '../../shared/i18n.js';
+import { renderMarkdown } from '../../shared/markdown-renderer.js';
+import { getSyntaxHighlightVersion, subscribeSyntaxHighlight } from '../../shared/syntax-highlighter.js';
+import { splitAttachmentLine } from '../attachments/attachment-message.js';
+import { useThrottledValue } from './useThrottledValue.js';
+import { useConversationSecondClock } from '../../hooks/useConversationSecondClock.js';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  GitBranch,
+  Sparkles,
+  Terminal,
+  Wrench,
+} from '../../components/icons.jsx';
+import {
+  commandExecutionDetails,
+  collectToolWorkspaceResources,
+  countsAsFailedOperation,
+  elapsedMs,
+  externalMarkdownUrl,
+  fetchToolDetails,
+  isFetchTool,
+  isOperationItemType,
+  isSearchTool,
+  searchToolDetails,
+  terminalStatus,
+  toolWorkspaceResources,
+  workspaceMarkdownResource,
+} from './conversation-model.js';
+import { AssistantMessageActions, AssistantMessageFooter } from './AssistantMessageActions.jsx';
+import {
+  codeBlockCopyLabels,
+  copyCodeBlockFromButton,
+  findCodeCopyButton,
+} from './code-block-copy.js';
+import { commitRichTextFrame } from './rich-text-dom.js';
+import { hasRichTextSelection } from './rich-text-selection.js';
+import { createWeakCache } from '../../shared/weak-cache.js';
+import { assistantResponseAvailable, assistantResponseText } from './message-clipboard.js';
+import {
+  CONVERSATION_VIRTUALIZATION_THRESHOLD,
+  shouldVirtualizeConversationTurns,
+  splitConversationLiveTail,
+} from './conversation-virtualization.js';
+
+// Fallback copy derives from the zh dictionary instead of duplicating its strings here:
+// dictionary tweaks in shared/i18n propagate automatically, and a caller that forgets to
+// pass its own uiConversation now sees real zh strings rather than a hand-copied table.
+// Key-set diff (refactor): every key the timeline reads exists in zhDict().uiConversation,
+// so no literal overlay is needed; the defensive `|| {}` only guards the impossible case
+// of a missing dict section (same style as other `x || {}` fallbacks in the codebase).
+// Round-43 (zhuowp P1 class): the zh dict moved behind the lazy loader —
+// resolve at call time. `elapsed` is a FUNCTION key consumed
+// unconditionally during render, so seed a numeric formatter that covers
+// the pre-load window (the zh table's own formatter overwrites it on
+// load; browser fixtures without ensureLanguage ride this default).
+const conversationFallbackCopy = () => {
+  const zh = zhDict()?.uiConversation;
+  return zh ? { elapsed: (ms) => `${Math.max(0, Math.round(ms / 1000))}s`, ...zh } : { elapsed: (ms) => `${Math.max(0, Math.round(ms / 1000))}s` };
+};
+
+// conversationCopy(copy) merges the fallback copy table with the caller's
+// overrides; it used to run once per component per render, so long transcripts
+// rebuilt that object for every turn on every keystroke/stream chunk. The merged
+// table is immutable and `copy` identities are stable (i18n dict tables), so cache
+// the merge per source table (same WeakMap trick as ChatView's legacyMarkdownCache).
+const cachedConversationCopy = createWeakCache((copy) => ({ ...conversationFallbackCopy(), ...copy }));
+function conversationCopy(copy) {
+  // Non-object keys never enter the WeakMap-backed cache (WeakMap contract).
+  if (!copy) return conversationFallbackCopy();
+  return cachedConversationCopy(copy);
+}
+
+// Streaming markdown throttle window: rerun marked+DOMPurify+hljs on a 200ms budget instead of
+// a full rerun for every streaming delta (O(n²)). When streaming ends, useThrottledValue
+// guarantees a verbatim replay of the final full text.
+const STREAMING_MARKDOWN_THROTTLE_MS = 200;
+
+// Short conversations stay in normal document flow. The virtualizer only pays
+// for itself once history is large enough to create a material DOM and mount
+// cost; the running final turn remains outside the virtual history so streamed
+// height growth never waits for ResizeObserver before reaching the bottom.
+const CONVERSATION_ROW_ESTIMATE_PX = 240;
+const CONVERSATION_ROW_OVERSCAN = 5;
+const DEFAULT_CONVERSATION_ROW_GAP_PX = 16;
+
+// The 1s clock is scoped to the smallest display subtree: the per-second tick used to live on
+// ChatView top-level state, re-rendering the whole transcript every second while busy; now only
+// the component showing elapsed time owns the tick. On mount/activation it first syncs a baseline,
+// then starts the interval (same semantics as the old ChatView/CodexAcpView top-level ticker); no
+// timer is created while inactive, and it is cleaned up on unmount.
+// (Hook body lives in hooks/useConversationSecondClock.js, shared with the artifacts/monitor/
+// scheduled/chat tickers.)
+
+function localizedSemanticLabel(value, copy) {
+  return {
+    同花顺新闻: copy.iwencaiNews,
+    网页搜索: copy.webSearch,
+    搜索: copy.search,
+    文本: copy.textContent,
+    网页内容: copy.webContent,
+    网页: copy.webPage,
+    '执行 Shell 命令': copy.shellCommand,
+    工具: copy.tool,
+  }[value] || value;
+}
+
+export function ConversationMarkdown({ text, className = '', onOpenExternal, onOpenResource, streaming = false, copy }) {
+  const c = conversationCopy(copy);
+  // lazy language registration bumps the version when it completes; the version must stay in the useMemo deps
+  // (syntax-highlighter.js contract), otherwise already-rendered code stays plain text after registration completes.
+  const syntaxVersion = useSyncExternalStore(subscribeSyntaxHighlight, getSyntaxHighlightVersion);
+  // While the message is still streaming, parse the throttled snapshot instead of
+  // every chunk (marked+DOMPurify+hljs over the full growing text is O(n²) per
+  // chunk). The hook flushes the exact final text when `streaming` drops, so the
+  // completed message always renders verbatim.
+  const renderText = useThrottledValue(text, STREAMING_MARKDOWN_THROTTLE_MS, streaming);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- syntaxVersion is a version counter; any change requires recomputing to restore highlighting
+  const html = useMemo(() => renderMarkdown(renderText), [renderText, syntaxVersion]);
+  const containerRef = useRef(null);
+  const copyLabels = useMemo(() => codeBlockCopyLabels(c), [c]);
+  // Reconcile sanitized output before paint. Existing text and copy controls
+  // keep their DOM identity while the current paragraph/code continues growing.
+  useLayoutEffect(() => commitRichTextFrame(containerRef.current, html, {
+    streaming, copyLabels, markdownSource: renderText,
+  }), [html, renderText, copyLabels, streaming]);
+  const openLink = (event) => {
+    const anchor = event.target && event.target.closest && event.target.closest('a[href]');
+    if (!anchor) return;
+    const href = String(anchor.getAttribute('href') || '').trim();
+    if (href.startsWith('#')) return;
+    event.preventDefault();
+    const external = externalMarkdownUrl(href);
+    if (external && onOpenExternal) onOpenExternal(external);
+    else {
+      const resource = workspaceMarkdownResource(href);
+      if (resource && onOpenResource) onOpenResource(resource);
+    }
+  };
+  const onClick = (event) => {
+    const copyButton = findCodeCopyButton(event.target);
+    if (copyButton) {
+      event.preventDefault();
+      copyCodeBlockFromButton(copyButton, { labels: copyLabels });
+      return;
+    }
+    openLink(event);
+  };
+  return (
+    // biome-ignore lint/a11y/useKeyWithClickEvents: link-interception layer; the keyboard path is covered by the rendered <a>'s own focus
+    // biome-ignore lint/a11y/noStaticElementInteractions: static rich-text container; onClick only intercepts links to open them externally
+    <div
+      ref={containerRef}
+      className={`codex-markdown conversation-markdown text-[15px] leading-7 ${className}`}
+      onClick={onClick}
+    />
+  );
+}
+
+export function ConversationStatusBadge({ status, copy }) {
+  const c = conversationCopy(copy);
+  const done = ['Completed', 'completed', 'done', 'end_turn'].includes(status);
+  const failed = ['Failed', 'failed', 'Refused'].includes(status);
+  const interrupted = ['Interrupted', 'interrupted', 'incomplete'].includes(status);
+  // A swarm-off cancellation is an operator-level ending, not the agent's
+  // failure: keep it out of the red bucket so the panel agrees with the
+  // running-agents overlay (agentCard.cancelled). The ledger token is
+  // lowercase; compare case-insensitively like the other consumers.
+  const cancelled = typeof status === 'string' && status.toLowerCase() === 'cancelled';
+  const stopped = interrupted || cancelled || status === 'LimitReached';
+  const label = done
+    ? c.completed
+    : failed
+      ? c.failed
+      : cancelled
+        ? (c.cancelled || c.interrupted)
+        : interrupted
+          ? c.interrupted
+          : status === 'LimitReached'
+            ? c.limitReached
+          : c.processing;
+  return (
+    <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full ${
+      done ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300'
+        : failed ? 'bg-red-500/10 text-red-600 dark:text-red-300'
+          : stopped ? 'bg-amber-500/10 text-amber-600 dark:text-amber-300'
+            : 'bg-blue-500/10 text-blue-600 dark:text-blue-300'
+    }`}>
+      {done
+        ? <CheckCircle2 size={12} />
+        : failed || stopped
+          ? <AlertTriangle size={12} />
+          : <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />}
+      {label}
+    </span>
+  );
+}
+
+// running turn 的等待判定(时间轴行与活动指示器共用同一口径):
+// turn 上的显式标记,或 permissions/elicitations 任一未决,都视为等待用户注意。
+function turnWaitingAttention(turn) {
+  const waitingPermission = turn.waitingPermission
+    || (turn.permissions || []).some(permission => !permission.resolved);
+  const waitingInput = turn.waitingInput
+    || (turn.elicitations || []).some(elicitation => !elicitation.resolved);
+  return { waitingPermission, waitingInput, waitingAttention: waitingPermission || waitingInput };
+}
+
+// Internal-only: the only consumer is LiveConversationActivityIndicator below.
+function ConversationActivityIndicator({
+  turn,
+  now = 0,
+  onRequestAttention,
+  className = '',
+  copy,
+}) {
+  const c = conversationCopy(copy);
+  // elapsedMs falls back to Date.now() when now=0; reading the current time during render only displays elapsed time and does not feed state derivation.
+  // eslint-disable-next-line react-hooks/purity -- elapsed time is a display value that naturally drifts over time; re-rendering is driven by the parent's polling of now
+  const nowMs = now || Date.now();
+  if (!turn || turn.status !== 'running') return null;
+  const { waitingPermission, waitingInput, waitingAttention } = turnWaitingAttention(turn);
+  const label = waitingPermission
+    ? c.waitingPermission
+    : waitingInput
+      ? c.waitingInput
+      : c.processing;
+  const content = (
+    <>
+      {waitingAttention
+        ? <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+        : <span className="w-3 h-3 rounded-full border-2 border-current/20 border-t-current animate-spin" />}
+      <span>{label} · {c.elapsed(elapsedMs(turn.startedAt, null, nowMs))}</span>
+    </>
+  );
+  const sharedClass = `h-6 flex items-center gap-2 px-1 text-[12px] ${
+    waitingAttention
+      ? 'text-amber-600 dark:text-amber-300'
+      : 'text-gray-500 dark:text-gray-400'
+  } ${className}`;
+  if (waitingAttention && onRequestAttention) {
+    return (
+      <button type="button" onClick={onRequestAttention}
+        aria-label={c.goLatest(label)}
+        className={`${sharedClass} hover:text-amber-700 dark:hover:text-amber-200`}>
+        {content}
+      </button>
+    );
+  }
+  return <div role="status" aria-live="polite" className={sharedClass}>{content}</div>;
+}
+
+// Second-clock wrapper for the composer activity indicator: the tick used to live on ChatView
+// top-level state, so while busy the whole ChatView (including all transcript coordination)
+// re-rendered once per second; the indicator is the only place showing elapsed time, and now the
+// tick re-renders just this small subtree. Lives next to ConversationActivityIndicator (and the
+// second clock below) so every host composing the timeline shares the same ticking wrapper.
+/**
+ * @param {object} props - component props
+ * @param {{ status: string } | null} props.turn - active conversation turn, if any
+ * @param {() => void} props.onRequestAttention - scroll-to-bottom request handler
+ * @param {string} props.className - extra class for the indicator
+ * @param {object} props.copy - conversation copy table
+ * @returns {React.ReactElement | null} the ticking activity indicator
+ */
+export function LiveConversationActivityIndicator({ turn, onRequestAttention, className, copy }) {
+  const running = !!turn && turn.status === 'running';
+  const now = useConversationSecondClock(running);
+  return (
+    <ConversationActivityIndicator
+      turn={turn}
+      now={now}
+      onRequestAttention={onRequestAttention}
+      className={className}
+      copy={copy}
+    />
+  );
+}
+
+function TerminalBlock({ label, text }) {
+  if (!text) return null;
+  return (
+    <div className="mt-3 min-w-0 max-w-full">
+      <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">{label}</div>
+      <pre className="max-h-80 max-w-full overflow-auto whitespace-pre rounded-xl bg-[#F4F5F7] dark:bg-black/30 px-3 py-2.5 text-[12px] leading-5 font-mono text-gray-700 dark:text-gray-200">{text}</pre>
+    </div>
+  );
+}
+
+// search/fetch 工具卡片共用的原始输出折叠块:自带展开状态,文案走会话 copy。
+function RawOutputToggle({ rawOutput, copy }) {
+  const c = conversationCopy(copy);
+  const [rawOpen, setRawOpen] = useState(false);
+  if (!rawOutput) return null;
+  return (
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={() => setRawOpen(value => !value)}
+        className="text-[10px] text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+      >
+        {rawOpen ? c.collapseRaw : c.viewRaw}
+      </button>
+      {rawOpen && <TerminalBlock label={c.rawData} text={rawOutput} />}
+    </div>
+  );
+}
+
+function StructuredValue({ label, value }) {
+  if (value == null || value === '' || (Array.isArray(value) && !value.length)) return null;
+  if (typeof value !== 'object') return <TerminalBlock label={label} text={String(value)} />;
+  const entries = Object.entries(value);
+  if (!entries.length) return null;
+  return (
+    <div className="mt-3">
+      <div className="mb-1.5 text-[10px] font-medium uppercase tracking-wider text-gray-400">{label}</div>
+      <div className="rounded-xl border border-black/[0.05] dark:border-white/[0.07] overflow-hidden">
+        {entries.map(([key, entry]) => (
+          <div key={key} className="grid grid-cols-[120px_minmax(0,1fr)] border-b last:border-b-0 border-black/[0.05] dark:border-white/[0.06] text-[11px]">
+            <div className="px-3 py-2 bg-black/[0.025] dark:bg-white/[0.025] text-gray-400 font-mono">{key}</div>
+            <pre className="px-3 py-2 overflow-x-auto whitespace-pre-wrap font-mono text-gray-700 dark:text-gray-200">
+              {typeof entry === 'string' ? entry : JSON.stringify(entry, null, 2)}
+            </pre>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function CompactItemRow({ icon, title, meta, status, open, onToggle, controlsId }) {
+  const tone = status === 'failed'
+    ? 'text-red-500 bg-red-500/10'
+    : status === 'warning'
+      ? 'text-amber-500 bg-amber-500/10'
+    : status === 'running'
+      ? 'text-blue-500 bg-blue-500/10'
+      : 'text-gray-500 bg-black/[0.04] dark:bg-white/[0.06]';
+  return (
+    <button type="button" onClick={onToggle}
+      data-testid="conversation-compact-item-toggle"
+      aria-expanded={controlsId ? Boolean(open) : undefined}
+      aria-controls={controlsId && open ? controlsId : undefined}
+      className="w-full min-w-0 min-h-10 overflow-hidden px-2.5 py-2 flex items-center gap-2.5 text-left rounded-xl hover:bg-black/[0.025] dark:hover:bg-white/[0.035]">
+      <span className={`w-6 h-6 shrink-0 rounded-lg flex items-center justify-center ${tone}`}>{icon}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[12px] font-medium">{title}</span>
+        {meta && <span className="block mt-0.5 text-[10px] text-gray-400">{meta}</span>}
+      </span>
+      {status === 'running' && <StatusDot tone="run" />}
+      <ChevronDown size={13} className={`shrink-0 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+    </button>
+  );
+}
+
+function CommandExecutionItem({ item, now, copy }) {
+  const c = conversationCopy(copy);
+  const details = commandExecutionDetails(item.tool);
+  const state = terminalStatus(item.status, details.exitCode);
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const countHint = details.commandCount > 1 ? ` · ${c.segments(details.commandCount)}` : '';
+  const duration = c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
+  const exitHint = details.exitCode == null ? '' : ` · exit ${details.exitCode}`;
+  const outcome = state === 'running'
+    ? `${c.running} · ${duration}`
+    : state === 'failed'
+      ? `${c.executionFailed}${exitHint}`
+      : `${c.executionFinished}${exitHint} · ${duration}`;
+  return (
+    <div className={`rounded-xl border ${state === 'failed' ? 'border-red-500/20' : 'border-black/[0.05] dark:border-white/[0.07]'} bg-white/45 dark:bg-white/[0.015]`}>
+      <CompactItemRow icon={<Terminal size={13} />} title={localizedSemanticLabel(details.summary, c)}
+        meta={`${outcome}${countHint}`} status={state} open={open} controlsId={detailsId}
+        onToggle={() => setOpen(value => !value)} />
+      {open && (
+        <div id={detailsId} data-testid="conversation-compact-item-content" className="px-3 pb-3 border-t border-black/[0.05] dark:border-white/[0.06]">
+          <TerminalBlock label={c.command} text={details.command} />
+          {details.cwd && (
+            <div className="mt-2 text-[10px] text-gray-400">
+              {c.workingDirectory} <span className="ml-1 font-mono text-gray-600 dark:text-gray-300">{details.cwd}</span>
+            </div>
+          )}
+          <TerminalBlock label={c.output} text={details.output} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SearchToolItem({ item, now, onOpenExternal, copy }) {
+  const c = conversationCopy(copy);
+  const tool = item.tool || {};
+  const details = searchToolDetails(tool);
+  const state = terminalStatus(item.status);
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const duration = c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
+  const query = details.query || tool.title || c.webContent;
+  const toolName = String(tool.name || '').trim() || 'web_search';
+  const queryLabel = query.length > 48 ? `${query.slice(0, 48)}…` : query;
+  const resultLabel = details.count == null
+    ? details.results.length
+      ? c.recognizedResults(details.results.length)
+      : c.returnedResults
+    : c.results(details.count);
+  const sourceLabel = localizedSemanticLabel(details.source, c);
+  const meta = state === 'running'
+    ? `${queryLabel} · ${sourceLabel} · ${c.inProgress} · ${duration}`
+    : state === 'failed'
+      ? `${queryLabel} · ${sourceLabel} · ${c.failed}`
+      : `${queryLabel} · ${sourceLabel} · ${resultLabel}`;
+  return (
+    <div className={`rounded-xl border ${state === 'failed' ? 'border-red-500/20' : 'border-black/[0.05] dark:border-white/[0.07]'} bg-white/45 dark:bg-white/[0.015]`}>
+      <CompactItemRow icon={<Wrench size={13} />} title={toolName}
+        meta={meta} status={state} open={open} controlsId={detailsId}
+        onToggle={() => setOpen(value => !value)} />
+      {open && (
+        <div id={detailsId} data-testid="conversation-compact-item-content" className="px-3 pb-3 border-t border-black/[0.05] dark:border-white/[0.06]">
+          {details.results.length > 0 ? (
+            <div className="mt-2 divide-y divide-black/[0.05] dark:divide-white/[0.06]">
+              {details.results.slice(0, 5).map((result, index) => {
+                let domain = '';
+                try { domain = new URL(result.url).hostname.replace(/^www\./, ''); } catch { /* invalid URL: don't show the domain */ }
+                return (
+                  <button
+                    key={result.url}
+                    type="button"
+                    onClick={() => onOpenExternal && onOpenExternal(result.url)}
+                    disabled={!onOpenExternal}
+                    className="w-full py-2 flex items-start gap-2.5 text-left enabled:hover:text-blue-600 dark:enabled:hover:text-blue-300 disabled:cursor-default"
+                  >
+                    <span className="mt-0.5 w-5 h-5 shrink-0 rounded-md bg-black/[0.035] dark:bg-white/[0.06] text-[10px] text-gray-400 flex items-center justify-center">
+                      {index + 1}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[12px] leading-5 text-gray-700 dark:text-gray-200">{result.title}</span>
+                      {domain && <span className="block mt-0.5 truncate text-[10px] text-gray-400">{domain}</span>}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : state === 'completed' ? (
+            <div className="mt-2 text-[11px] leading-5 text-gray-400">
+              {c.searchCompacted}
+            </div>
+          ) : null}
+          {details.compacted && (
+            <div className="mt-2 text-[10px] text-gray-400">{c.resultSummaryOnly}</div>
+          )}
+          <RawOutputToggle rawOutput={details.rawOutput} copy={c} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FetchToolItem({ item, now, onOpenExternal, copy }) {
+  const c = conversationCopy(copy);
+  const tool = item.tool || {};
+  const details = fetchToolDetails(tool);
+  const state = terminalStatus(item.status);
+  const responseWarning = details.status != null && details.status >= 400;
+  const visualState = responseWarning && state !== 'failed' ? 'warning' : state;
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const duration = c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
+  const toolName = String(tool.name || '').trim() || 'fetch_url';
+  const statusLabel = details.status == null
+    ? state === 'failed'
+      ? c.requestFailed
+      : c.returned
+    : `HTTP ${details.status}`;
+  const targetLabel = localizedSemanticLabel(details.target, c);
+  const contentTypeLabel = localizedSemanticLabel(details.contentTypeLabel, c);
+  const truncatedHint = details.truncated ? ` · ${c.contentTruncated}` : '';
+  const meta = state === 'running'
+    ? `${targetLabel} · ${c.inProgress} · ${duration}`
+    : `${targetLabel} · ${statusLabel} · ${contentTypeLabel}${truncatedHint}`;
+  return (
+    <div className={`rounded-xl border ${
+      state === 'failed'
+        ? 'border-red-500/20'
+        : responseWarning
+          ? 'border-amber-500/25'
+          : 'border-black/[0.05] dark:border-white/[0.07]'
+    } bg-white/45 dark:bg-white/[0.015]`}>
+      <CompactItemRow icon={<Wrench size={13} />} title={toolName}
+        meta={meta} status={visualState} open={open} controlsId={detailsId}
+        onToggle={() => setOpen(value => !value)} />
+      {open && (
+        <div id={detailsId} data-testid="conversation-compact-item-content" className="px-3 pb-3 border-t border-black/[0.05] dark:border-white/[0.06]">
+          {details.url && (
+            <button
+              type="button"
+              onClick={() => onOpenExternal && onOpenExternal(details.url)}
+              disabled={!onOpenExternal}
+              title={details.url}
+              className="mt-2 block max-w-full truncate text-left text-[11px] text-blue-600 dark:text-blue-300 enabled:hover:underline disabled:text-gray-400 disabled:cursor-default"
+            >
+              {details.url}
+            </button>
+          )}
+          {details.preview && (
+            <div className="mt-2">
+              <div className="mb-1 text-[10px] font-medium text-gray-400">{c.contentPreview}</div>
+              <div className="max-h-24 overflow-hidden rounded-lg bg-black/[0.025] dark:bg-white/[0.035] px-3 py-2 text-[11px] leading-5 text-gray-600 dark:text-gray-300">
+                {details.preview}{details.contentLength > details.preview.length ? '…' : ''}
+              </div>
+            </div>
+          )}
+          {details.truncated && (
+            <div className="mt-2 text-[10px] text-gray-400">{c.responseTruncated}</div>
+          )}
+          <RawOutputToggle rawOutput={details.rawOutput} copy={c} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WorkspaceResourceButtons({ resources, onOpenResource }) {
+  if (!resources.length) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5 px-3 pb-2">
+      {resources.map(resource => (
+        <button type="button" key={resource.path} onClick={() => onOpenResource && onOpenResource(resource.path)}
+          disabled={!onOpenResource} title={resource.path}
+          className="max-w-full truncate px-2 py-1 rounded-lg bg-blue-500/[0.08] text-[10px] text-blue-700 dark:text-blue-300 font-mono enabled:hover:bg-blue-500/15 disabled:cursor-default">
+          {resource.name}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function GenericToolItem({ item, now, onOpenResource, copy }) {
+  const c = conversationCopy(copy);
+  const tool = item.tool || {};
+  const state = terminalStatus(item.status);
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const duration = c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
+  const label = item.type === 'file_change' ? c.fileChange : (tool.kind || c.tool);
+  const stateLabel = state === 'running'
+    ? `${c.inProgress} · ${duration}`
+    : state === 'failed'
+      ? c.failed
+      : `${c.executionFinished} · ${duration}`;
+  const resources = toolWorkspaceResources(tool);
+  return (
+    <div className="rounded-xl border border-black/[0.05] dark:border-white/[0.07] bg-white/45 dark:bg-white/[0.015]">
+      <CompactItemRow icon={<Wrench size={13} />} title={localizedSemanticLabel(tool.title || label, c)}
+        meta={`${label} · ${stateLabel}`}
+        status={state} open={open} controlsId={detailsId}
+        onToggle={() => setOpen(value => !value)} />
+      <WorkspaceResourceButtons resources={resources} onOpenResource={onOpenResource} />
+      {open && (
+        <div id={detailsId} data-testid="conversation-compact-item-content" className="px-3 pb-3 border-t border-black/[0.05] dark:border-white/[0.06]">
+          <StructuredValue label={c.arguments} value={tool.rawInput} />
+          <StructuredValue label={c.result} value={tool.rawOutput == null ? tool.content : tool.rawOutput} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolItem({ item, now, renderToolItem, onOpenExternal, onOpenResource, copy }) {
+  const custom = renderToolItem && renderToolItem(item);
+  if (custom !== undefined) return custom;
+  if (item.type === 'command_execution') {
+    return <CommandExecutionItem item={item} now={now} copy={copy} />;
+  }
+  if (isSearchTool(item.tool)) {
+    return <SearchToolItem item={item} now={now} onOpenExternal={onOpenExternal} copy={copy} />;
+  }
+  if (isFetchTool(item.tool)) {
+    return <FetchToolItem item={item} now={now} onOpenExternal={onOpenExternal} copy={copy} />;
+  }
+  return <GenericToolItem item={item} now={now} onOpenResource={onOpenResource} copy={copy} />;
+}
+
+function runningToolLabel(item, copy) {
+  if (!item) return '';
+  if (item.type === 'command_execution' || String(item.tool && item.tool.kind || '').toLowerCase() === 'execute') {
+    return copy.shellCommand;
+  }
+  if (item.type === 'file_change') return copy.fileChange;
+  const name = String(item.tool && item.tool.name || '').trim();
+  return name || copy.tool;
+}
+
+function ToolGroup({ group, now, renderToolItem, onOpenExternal, onOpenResource, copy }) {
+  const c = conversationCopy(copy);
+  const items = group.items || [];
+  // Single pass instead of `.some` + `.filter` + reverse().`find` (three scans
+  // per group per render): `runningItem` ends at the LAST running item, matching
+  // the previous reverse().find.
+  let running = false;
+  let failedCount = 0;
+  let runningItem = null;
+  for (const item of items) {
+    if (terminalStatus(item.status) === 'running') {
+      running = true;
+      runningItem = item;
+    }
+    if (countsAsFailedOperation(item)) failedCount += 1;
+  }
+  const failed = failedCount > 0;
+  const runningLabel = runningToolLabel(runningItem, c);
+  const runningSuffix = runningLabel ? ` · ${runningLabel}` : '';
+  const leadLabel = running ? `${c.executing}${runningSuffix}` : c.executionSteps;
+  const failedSuffix = failedCount ? ` · ${c.failedItems(failedCount)}` : '';
+  const summary = `${leadLabel} · ${c.items(items.length)}${failedSuffix}`;
+  const [open, setOpen] = useState(running);
+  const expanded = running || open;
+  const detailsId = useId();
+  const hasDetails = items.length > 0;
+  const resources = collectToolWorkspaceResources(items);
+  return (
+    <div className="min-w-0 max-w-full">
+      <button type="button" onClick={() => setOpen(value => !value)}
+        data-testid="conversation-tool-group-summary"
+        aria-expanded={hasDetails ? Boolean(expanded) : undefined}
+        aria-controls={hasDetails && expanded ? detailsId : undefined}
+        className="w-full min-w-0 h-9 overflow-hidden px-1 flex items-center gap-2 text-left text-[12px] text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">
+        <StatusDot tone={failed ? 'fail' : running ? 'run' : 'idle'} />
+        <span className="min-w-0 flex-1 truncate">{summary}</span>
+        <ChevronDown size={13} className={`shrink-0 transition-transform ${expanded ? 'rotate-180' : ''}`} />
+      </button>
+      <WorkspaceResourceButtons resources={resources} onOpenResource={onOpenResource} />
+      {expanded && hasDetails && (
+        <div id={detailsId} data-testid="conversation-tool-group-content" className="min-w-0 max-w-full ml-3 pl-3 border-l border-black/[0.06] dark:border-white/[0.08] space-y-1.5 pb-1">
+          {items.map(item => (
+            <ToolItem
+              key={item.id}
+              item={item}
+              now={now}
+              renderToolItem={renderToolItem}
+              onOpenExternal={onOpenExternal}
+              onOpenResource={onOpenResource}
+              copy={c}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReasoningItem({ item, now, copy }) {
+  const c = conversationCopy(copy);
+  const running = item.status === 'in_progress';
+  const [open, setOpen] = useState(false);
+  const detailsId = useId();
+  const hasDetails = Boolean(item.text);
+  const duration = item.startedAt == null
+    ? ''
+    : c.elapsed(elapsedMs(item.startedAt, item.completedAt, now));
+  const statusText = running ? c.thinking : c.thoughtCompleted;
+  return (
+    <div className="min-w-0 max-w-full">
+      <button type="button" onClick={() => setOpen(value => !value)}
+        data-testid="conversation-reasoning-toggle"
+        aria-expanded={hasDetails ? Boolean(open) : undefined}
+        aria-controls={hasDetails && open ? detailsId : undefined}
+        className="w-full h-9 px-1 flex items-center gap-2 text-left text-[12px] text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200">
+        <span className={`w-1.5 h-1.5 rounded-full bg-violet-500 ${running ? 'animate-pulse' : ''}`} />
+        <span>{statusText}{duration ? ` · ${duration}` : ''}</span>
+        <ChevronDown size={13} className={`ml-auto transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && hasDetails && (
+        <div id={detailsId} data-testid="conversation-reasoning-content" className="min-w-0 max-w-full ml-3 pl-3 py-1 border-l border-violet-500/15 text-[12px] leading-6 text-gray-500 dark:text-gray-300 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+          {item.text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PlanBlock({ plan, copy }) {
+  const c = conversationCopy(copy);
+  const entries = plan && plan.entries || [];
+  if (!entries.length) return null;
+  return (
+    <div data-testid="conversation-plan" className="min-w-0 max-w-full rounded-2xl border border-violet-500/15 bg-violet-500/[0.04] p-3.5">
+      <div className="text-[12px] font-semibold text-violet-600 dark:text-violet-300 mb-2">{c.plan}</div>
+      <div className="space-y-2">
+        {entries.map((entry, index) => (
+          <div key={index} className="min-w-0 flex items-start gap-2 text-[13px]">
+            <StatusDot
+              size="md"
+              tone={entry.status === 'completed' ? 'ok' : entry.status === 'in_progress' ? 'run' : 'idle'}
+              className="mt-1.5"
+            />
+            <span className="min-w-0 flex-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{entry.content}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PermissionCard({ permission, pending, onRespond, responding, agentLabel, copy }) {
+  const c = conversationCopy(copy);
+  const request = permission.request || {};
+  const tool = request.toolCall || {};
+  const options = request.options || [];
+  const actionable = !!pending && !permission.resolved;
+  return (
+    <div className="rounded-2xl border border-amber-500/25 bg-amber-500/[0.06] p-4">
+      <div className="flex items-start gap-3">
+        <AlertTriangle size={18} className="text-amber-500 mt-0.5 shrink-0" />
+        <div className="min-w-0 flex-1">
+          <div className="text-[13px] font-semibold">{c.permissionRequest(agentLabel)}</div>
+          <div className="mt-1 min-w-0 max-w-full text-[12px] text-gray-500 dark:text-gray-400 break-words [overflow-wrap:anywhere]">{tool.title || c.protectedOperation}</div>
+          {tool.rawInput && tool.rawInput.command
+            ? <TerminalBlock label={c.command} text={String(tool.rawInput.command)} />
+            : <StructuredValue label={c.operationArguments} value={tool.rawInput} />}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {options.map(option => (
+              <button type="button" key={option.optionId} disabled={!actionable || responding}
+                onClick={() => onRespond(permission.toolCallId, option.optionId)}
+                className={`max-w-full min-w-0 whitespace-normal break-all px-3 py-1.5 rounded-xl text-[12px] leading-5 font-medium transition-colors ${
+                  String(option.kind || '').startsWith('allow')
+                    ? 'bg-blue-600 text-white hover:bg-blue-700'
+                    : 'bg-black/[0.06] dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15'
+                } disabled:opacity-45 disabled:cursor-not-allowed`}>
+                {option.optionId === 'allow_once'
+                  ? c.allowOnce
+                  : option.optionId === 'allow_always'
+                    ? c.allowSession
+                    : option.optionId === 'reject_once'
+                      ? c.reject
+                      : option.name}
+              </button>
+            ))}
+          </div>
+          {!actionable && <div className="mt-2 text-[11px] text-gray-400">{permission.resolved ? c.handled : c.expired}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DefaultItem({
+  item,
+  now,
+  pendingByTool,
+  onRespond,
+  responding,
+  renderToolItem,
+  onOpenExternal,
+  onOpenResource,
+  agentLabel,
+  copy,
+}) {
+  if (item.type === 'reasoning') return <ReasoningItem item={item} now={now} copy={copy} />;
+  if (item.type === 'tool_group') {
+    return (
+      <ToolGroup
+        group={item}
+        now={now}
+        renderToolItem={renderToolItem}
+        onOpenExternal={onOpenExternal}
+        onOpenResource={onOpenResource}
+        copy={copy}
+      />
+    );
+  }
+  if (isOperationItemType(item.type)) {
+    return (
+      <ToolItem
+        item={item}
+        now={now}
+        renderToolItem={renderToolItem}
+        onOpenExternal={onOpenExternal}
+        onOpenResource={onOpenResource}
+        copy={copy}
+      />
+    );
+  }
+  if (item.type === 'plan') return <PlanBlock plan={item.plan} copy={copy} />;
+  if (item.type === 'permission') {
+    return (
+      <PermissionCard
+        permission={item.permission}
+        pending={pendingByTool[item.permission.toolCallId]}
+        onRespond={onRespond}
+        responding={responding}
+        agentLabel={agentLabel}
+        copy={copy}
+      />
+    );
+  }
+  if (item.type === 'agent_message') {
+    const commentary = item.phase === 'commentary';
+    // streaming = the projection's in_progress convention (deepseek/ACP projections agree):
+    // while text can still grow, render through the throttle; when it ends, the full text is replayed verbatim.
+    return commentary
+      ? <ConversationMarkdown text={item.text} onOpenExternal={onOpenExternal} onOpenResource={onOpenResource}
+          streaming={item.status === 'in_progress'} copy={copy}
+          className="text-[13px] leading-6 text-gray-500 dark:text-gray-400" />
+      : <ConversationMarkdown text={item.text} onOpenExternal={onOpenExternal} onOpenResource={onOpenResource}
+          streaming={item.status === 'in_progress'} copy={copy} />;
+  }
+  return null;
+}
+
+// Default props must keep stable identities or React.memo below would see fresh
+// objects/functions on every parent render and never skip work.
+const EMPTY_PENDING_BY_TOOL = Object.freeze({});
+const noopOnRespond = () => {};
+/** @type {{ id: string, status: string }[]} */
+const EMPTY_TURNS = [];
+
+// The timeline projections (deepseek-conversation.js / acp-state.js) rebuild every turn object on
+// each run: the container reference is always fresh, but unchanged turns have identical leaf content
+// (bridge snapshots share unchanged values by reference). So `turn` gets a structural comparison
+// (bridge subscription state only allows JSON values, so no functions/cycles), letting unchanged
+// turns skip re-rendering; the other props (parent-stabilized callbacks, memoized copy/avatar)
+// compare by reference.
+
+/**
+ * Structural equality for JSON-like conversation data (bridge subscription state
+ * admits no functions or cycles, so recursion is safe).
+ * @param {unknown} left - previous value
+ * @param {unknown} right - next value
+ * @returns {boolean} true when both values are structurally equal
+ */
+function isEqualConversationValue(left, right) {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left)) {
+    if (!Array.isArray(right) || left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (!isEqualConversationValue(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false;
+  const leftObject = /** @type {Record<string, unknown>} */ (left);
+  const rightObject = /** @type {Record<string, unknown>} */ (right);
+  const leftKeys = Object.keys(leftObject);
+  const rightKeys = Object.keys(rightObject);
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (let index = 0; index < leftKeys.length; index += 1) {
+    const key = leftKeys[index];
+    // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 floor; Object.hasOwn is unavailable and this call is already the safe form
+    if (!Object.prototype.hasOwnProperty.call(rightObject, key)) return false;
+    if (!isEqualConversationValue(leftObject[key], rightObject[key])) return false;
+  }
+  return true;
+}
+
+// Regenerate re-sends the raw turn text through editLastTurn, which has no
+// attachments surface: a turn carrying an attachment marker line would drop
+// its files and resend the marker as literal body text, and empty text has
+// nothing to re-send. Neither renders a retry control.
+function retryHandlerForTurn(onRetry, turn) {
+  const userText = String(turn.userText || '');
+  const retryable = typeof onRetry === 'function' && !!userText.trim()
+    && splitAttachmentLine(userText).attachments.length === 0;
+  return retryable ? () => onRetry(turn) : undefined;
+}
+
+/**
+ * @param {Record<string, unknown>} prev - previous props
+ * @param {Record<string, unknown>} next - next props
+ * @returns {boolean} true when the turn subtree should skip re-rendering
+ */
+function areConversationTurnPropsEqual(prev, next) {
+  const keys = Object.keys(next);
+  if (keys.length !== Object.keys(prev).length) return false;
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === 'turn') {
+      if (!isEqualConversationValue(prev.turn, next.turn)) return false;
+      continue;
+    }
+    if (!Object.is(prev[key], next[key])) return false;
+  }
+  return true;
+}
+
+// Aux-chat quote chips inside a user bubble (selected-text quoting).
+// Extracted from ConversationTurnView so the aux branch's conditionals do
+// not push the turn renderer over the cognitive-complexity cap.
+function ConversationUserQuotes({ quotes, hasBody }) {
+  if (!Array.isArray(quotes) || quotes.length === 0) return null;
+  return (
+    <div className={`flex flex-col gap-1.5 ${hasBody ? 'mb-2' : ''}`}>
+      {quotes.map((quote, index) => (
+        <div
+          key={`${index}-${String(quote.text || '').slice(0, 24)}`}
+          data-testid="conversation-user-quote"
+          className="rounded-lg border border-black/[0.06] bg-white/70 px-2.5 py-1.5 text-[12px] leading-5 text-gray-500 line-clamp-3 dark:border-white/[0.08] dark:bg-white/[0.05] dark:text-gray-400"
+        >
+          {String(quote.text || '')}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ConversationTurnView({
+  turn,
+  virtualized = false,
+  onRetry,
+  now,
+  pendingByTool = EMPTY_PENDING_BY_TOOL,
+  onRespond = noopOnRespond,
+  responding = false,
+  renderUser,
+  renderItem,
+  renderToolItem,
+  onOpenExternal,
+  onOpenResource,
+  agentLabel = 'Agent',
+  assistantAvatar,
+  forkOrdinal = null,
+  onForkTurn,
+  copy,
+}) {
+  const c = conversationCopy(copy);
+  const running = turn.status === 'running';
+  // The per-second tick is scoped to the running turn itself: the parent may still pass a ticking `now`
+  // (`now || tickNow` precedence keeps an external ticker working); when omitted or 0, an
+  // internal clock drives elapsed time, re-rendering only this one turn subtree per second.
+  const tickNow = useConversationSecondClock(running);
+  const effectiveNow = now || tickNow;
+  const { waitingPermission, waitingInput, waitingAttention } = turnWaitingAttention(turn);
+  const duration = c.elapsed(elapsedMs(turn.startedAt, turn.completedAt, effectiveNow));
+  const showTerminalDuration = Boolean(turn.startedAt && turn.completedAt);
+  const presentation = turn.presentation || turn.items || [];
+  const operationCount = Number(turn.operationCount || 0);
+  const failedOperationCount = Number(turn.failedOperationCount || 0);
+  const turnUsage = turn.usage || null;
+  const usageLabel = turnUsage && ('inputTokens' in turnUsage || 'outputTokens' in turnUsage)
+    ? c.usage(Number(turnUsage.inputTokens || 0).toLocaleString(), Number(turnUsage.outputTokens || 0).toLocaleString())
+    : turnUsage && turnUsage.size
+      ? c.contextUsage(Number(turnUsage.used || 0).toLocaleString(), Number(turnUsage.size || 0).toLocaleString())
+      : '';
+  const userAttachments = Array.isArray(turn.userAttachments) ? turn.userAttachments : [];
+  // Aux-chat quote chips (selected-text quoting): turns projected by the aux panel carry
+  // the staged conversation excerpts in userQuotes with the inline
+  // userselect block already stripped. Main-chat projections never set the
+  // field, so this stays dead code for them.
+  const userQuotes = Array.isArray(turn.userQuotes) ? turn.userQuotes : [];
+  const assistantAvailable = assistantResponseAvailable(turn);
+  // Footer/visibility: a turn with no assistant content must not render an
+  // avatar-only row. Live repro: a steered message sandwiched between two
+  // consecutive injections has no items of its own — the unconditional avatar
+  // column showed a lone pinvou avatar between the two user bubbles. The row
+  // renders only for running turns (activity indicator), turns with items, or
+  // turns carrying a terminal footer (badge/duration/usage/error).
+  const assistantFooterVisible = !running
+    && (assistantAvailable || turn.lifecycleKnown || turn.completedAt || turn.error);
+  // 「从此轮分叉」入口（forkOrdinal 由宿主按 turn 序号换算的稳定原始值；
+  // 命令在 Rust 侧落盘新会话并切过去）。渲染判定独立于 assistantFooterVisible：
+  // footer 可见性还要求生命周期已知/有回复/已完结，而序号表对纯用户轮
+  // （steered 空回复轮、尚未获回复的末轮）照样编号——按钮随 footer 隐藏
+  // 会让这些轮失去本可用的分叉入口（Rust 端照样可分叉）。此类轮以独立的
+  // 分叉行渲染在头像行之外，头像行的「不得只剩头像」口径不受影响。
+  const forkTurnVisible = Boolean(onForkTurn && forkOrdinal != null);
+  const assistantRowVisible = running || presentation.length > 0 || assistantFooterVisible;
+  const retryHandler = retryHandlerForTurn(onRetry, turn);
+  const forkButton = forkTurnVisible && (
+    <button type="button" data-testid="conversation-fork-turn"
+      onClick={() => onForkTurn(turn.id, forkOrdinal)}
+      title={c.forkTurnTip}
+      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-gray-400 hover:text-gray-600 hover:bg-black/5 dark:text-gray-500 dark:hover:text-gray-300 dark:hover:bg-white/10 transition-colors">
+      <GitBranch size={12} />
+      {c.forkTurn}
+    </button>
+  );
+  const userContent = renderUser && turn.userItem
+    ? renderUser(turn.userItem, turn)
+    : (turn.userText || userAttachments.length || userQuotes.length)
+      ? (
+          <div className="flex justify-end">
+            <div className="max-w-[78%] rounded-[20px] rounded-br-md bg-[#E9EEF6] dark:bg-[#2A2B2E] px-4 py-3 text-[14px] leading-6 whitespace-pre-wrap break-words">
+              <ConversationUserQuotes quotes={userQuotes} hasBody={Boolean(turn.userText)} />
+              {turn.userText && <div>{turn.userText}</div>}
+              {userAttachments.length > 0 && (
+                <div className={`flex flex-wrap gap-1.5 ${turn.userText ? 'mt-2' : ''}`}>
+                  {userAttachments.map((attachment, index) => (
+                    <span
+                      key={`${attachment.name || 'attachment'}-${index}`}
+                      className="inline-flex max-w-full items-center gap-1 rounded-lg bg-white/65 dark:bg-white/[0.07] px-2 py-1 text-[11px] leading-4"
+                    >
+                      <FileTypeIcon name={attachment.name} className="h-4 w-4 shrink-0" />
+                      <span className="truncate">{attachment.name || c.attachment}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )
+      : null;
+
+  return (
+    <section
+      className="space-y-4"
+      data-conversation-turn={turn.id}
+      style={virtualized ? undefined : { contentVisibility: 'auto', containIntrinsicSize: 'auto 600px' }}
+    >
+      {userContent}
+      {assistantRowVisible && (
+      <div className="flex items-start gap-3">
+        {assistantAvatar || (
+          <div className="mt-1 w-7 h-7 rounded-xl bg-gradient-to-br from-[#34A853] to-[#168C46] text-white flex items-center justify-center shrink-0 shadow-sm">
+            <Sparkles size={15} />
+          </div>
+        )}
+        <div className="min-w-0 flex-1 space-y-1">
+          {running && (
+            <div className={`h-9 flex items-center gap-2 text-[12px] ${waitingAttention ? 'text-amber-600 dark:text-amber-300' : 'text-gray-500 dark:text-gray-400'}`}>
+              <StatusDot tone={waitingAttention ? 'warn' : 'okPulse'} />
+              {waitingPermission ? c.waitingPermission : waitingInput ? c.waitingInputShort : (turn.activityToolName ? c.callingTool(turn.activityToolName) : c.processingActive)} · {duration}
+            </div>
+          )}
+          {presentation.map((item, index) => {
+            const context = { turn, now: effectiveNow, pendingByTool, onRespond, responding };
+            const custom = renderItem && renderItem(item, context);
+            if (custom !== undefined) {
+              return <React.Fragment key={item.id || `${item.type}-${index}`}>{custom}</React.Fragment>;
+            }
+            return (
+              <DefaultItem
+                key={item.id || `${item.type}-${index}`}
+                item={item}
+                now={effectiveNow}
+                pendingByTool={pendingByTool}
+                onRespond={onRespond}
+                responding={responding}
+                renderToolItem={renderToolItem}
+                onOpenExternal={onOpenExternal}
+                onOpenResource={onOpenResource}
+                agentLabel={agentLabel}
+                copy={c}
+              />
+            );
+          })}
+          {assistantFooterVisible && <AssistantMessageFooter>
+            {assistantAvailable && (
+              <AssistantMessageActions
+                resolveText={() => assistantResponseText(turn)}
+                copy={c}
+                onRetry={retryHandler}
+              />
+            )}
+            {forkButton}
+            {(turn.lifecycleKnown || turn.completedAt || turn.error) && <>
+              <ConversationStatusBadge status={turn.status} copy={c} />
+              {showTerminalDuration && <span className="text-[11px] text-gray-400">{duration}</span>}
+              {operationCount > 0 && (
+                <span className="text-[11px] text-gray-400">
+                  {c.operations(operationCount, failedOperationCount)}
+                </span>
+              )}
+              {usageLabel && <span className="text-[11px] text-gray-400">{usageLabel}</span>}
+              {turn.userError ? (
+                <div className="basis-full mt-2">
+                  {/* Dual theme: light uses a white card with gray text; dark: keeps the dark glass style. */}
+                  <div className="w-fit max-w-[640px] rounded-[22px] bg-white/85 ring-1 ring-black/5 dark:bg-[rgba(38,38,42,0.78)] dark:ring-0 px-4 py-3 text-[13px] shadow-[0_16px_48px_rgba(0,0,0,0.10),inset_0_1px_0_rgba(255,255,255,0.06)] dark:shadow-[0_16px_48px_rgba(0,0,0,0.24),inset_0_1px_0_rgba(255,255,255,0.06)] backdrop-blur-2xl">
+                    <div className="flex items-start gap-3">
+                      <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-red-500/10 text-red-600 dark:bg-[rgba(255,105,97,0.16)] dark:text-[#ff9f9a]">
+                        <AlertTriangle className="h-4 w-4" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="leading-5 font-semibold text-gray-900 dark:text-[rgba(255,255,255,0.94)]">{turn.userError.title}</div>
+                        <div className="mt-1.5 leading-5 text-gray-600 dark:text-[rgba(255,255,255,0.72)]">{turn.userError.message}</div>
+                      </div>
+                    </div>
+                    {turn.userError.technicalDetail && (
+                      <details className="mt-2.5 pl-10 text-[11px] text-gray-400 dark:text-[rgba(255,255,255,0.48)]">
+                        <summary className="inline-flex cursor-pointer select-none rounded-full px-0 py-1 transition-colors hover:text-gray-600 dark:hover:text-[rgba(255,255,255,0.72)]">{c.technicalDetails}</summary>
+                        <pre className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-2xl bg-black/5 dark:bg-black/20 p-2.5 font-mono text-[10.5px] leading-4 text-gray-500 dark:text-[rgba(255,255,255,0.52)]">{turn.userError.technicalDetail}</pre>
+                      </details>
+                    )}
+                  </div>
+                </div>
+              ) : turn.error && <span className="text-[11px] text-red-500">{turn.error}</span>}
+            </>}
+          </AssistantMessageFooter>}
+        </div>
+      </div>
+      )}
+      {/* footer 隐藏但该轮有分叉入口时，独立分叉行渲染在头像行之外：头像行
+          的可见性口径（steered 空回复轮/无助手内容轮不得渲染只剩头像的行）
+          不被打破，而这些轮的分叉入口照常可用。 */}
+      {!assistantFooterVisible && forkTurnVisible && (
+        <div className="!mt-0 flex min-h-8 flex-wrap items-center gap-x-2 gap-y-1 pt-2" data-testid="conversation-fork-row">
+          {forkButton}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// Declare the component separately, then wrap it in memo: prop types are inferred from the
+// component's own parameters, so the comparator's Record<string, unknown> parameter does not
+// pollute the inference in reverse.
+export const ConversationTurn = React.memo(ConversationTurnView, areConversationTurnPropsEqual);
+
+/**
+ * @param {HTMLElement | null} timelineElement - the virtual timeline container
+ * @param {HTMLElement | null} scrollElement - the caller-owned scroll viewport
+ * @returns {number} the timeline's offset from the top of the scroll content
+ */
+function conversationTimelineScrollMargin(timelineElement, scrollElement) {
+  if (!timelineElement || !scrollElement) return 0;
+  const timelineRect = timelineElement.getBoundingClientRect();
+  const scrollRect = scrollElement.getBoundingClientRect();
+  return Math.max(0, timelineRect.top - scrollRect.top + scrollElement.scrollTop);
+}
+
+// `sessionId` only scopes virtual row keys and re-measurement; it is not a
+// ConversationTurn prop. `scrollElementRef` opts a caller into virtualization,
+// `followOutputRef` is the caller's "stick to bottom" flag, and
+// `renderBeforeTurn` renders boundary chrome (e.g. rewind chips) inside the
+// same row as the turn it precedes so measurement stays consistent.
+export function ConversationTimeline({
+  turns = EMPTY_TURNS,
+  sessionId,
+  scrollElementRef,
+  busy = false,
+  turnGapPx = DEFAULT_CONVERSATION_ROW_GAP_PX,
+  followOutputRef,
+  renderBeforeTurn,
+  ...props
+}) {
+  "use no memo";
+  const virtualized = shouldVirtualizeConversationTurns(
+    turns.length,
+    scrollElementRef,
+    CONVERSATION_VIRTUALIZATION_THRESHOLD,
+  );
+  const { historyTurns, liveTurn, liveTurnIndex } = useMemo(
+    () => splitConversationLiveTail(turns, virtualized, busy),
+    [busy, turns, virtualized],
+  );
+  const liveTailElementRef = useRef(null);
+  const measuredLiveTailRef = useRef({ key: '', height: 0 });
+  const timelineRef = useRef(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const conversationKey = sessionId || turns[0]?.id || 'conversation';
+  const getScrollElement = useCallback(
+    () => scrollElementRef?.current || null,
+    [scrollElementRef],
+  );
+  const getItemKey = useCallback(
+    /** @param {number} index - virtual history row index */
+    index => `${conversationKey}:${historyTurns[index]?.id || index}`,
+    [conversationKey, historyTurns],
+  );
+  const estimateRowSize = useCallback(
+    /** @param {number} index - virtual history row index */
+    index => {
+      const measured = measuredLiveTailRef.current;
+      return measured.key === getItemKey(index) ? measured.height : CONVERSATION_ROW_ESTIMATE_PX;
+    },
+    [getItemKey],
+  );
+  // TanStack Virtual owns row memoization and measurement; the "use no memo"
+  // directive above keeps React Compiler from compiling this timeline.
+  // eslint-disable-next-line react-hooks/incompatible-library -- see the note above
+  const virtualizer = useVirtualizer({
+    enabled: virtualized,
+    count: virtualized ? historyTurns.length : 0,
+    getScrollElement,
+    getItemKey,
+    estimateSize: estimateRowSize,
+    overscan: CONVERSATION_ROW_OVERSCAN,
+    scrollMargin,
+    gap: turnGapPx,
+    // Core writes this offset back to the scroll element whenever the
+    // threshold flip attaches it to an already-scrolled viewport (and again
+    // on every re-crossing, because a disabled instance forgets its offset).
+    // The default 0 would teleport a mid-history reader to the top.
+    initialOffset: () => getScrollElement()?.scrollTop ?? 0,
+  });
+
+  // The live tail and its later history row share one React key, so when the
+  // running turn completes React keeps the same DOM element and subtree. Its
+  // last measured height seeds the row estimate to avoid a scroll jump.
+  const liveTailKey = liveTurn ? `${conversationKey}:${liveTurn.id || liveTurnIndex}` : '';
+  useLayoutEffect(() => {
+    if (!virtualized || !liveTailKey) return;
+    const element = liveTailElementRef.current;
+    if (!element) return;
+    const rememberSize = () => {
+      const height = element.getBoundingClientRect().height;
+      if (height > 0) measuredLiveTailRef.current = { key: liveTailKey, height };
+    };
+    rememberSize();
+    const observer = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(rememberSize)
+      : null;
+    observer?.observe(element);
+    return () => observer?.disconnect();
+  }, [liveTailKey, virtualized]);
+
+  useLayoutEffect(() => {
+    if (!virtualized) return;
+    const scrollElement = getScrollElement();
+    const timelineElement = timelineRef.current;
+    if (!scrollElement || !timelineElement) return;
+    const refreshScrollMargin = () => {
+      const nextMargin = conversationTimelineScrollMargin(timelineElement, scrollElement);
+      setScrollMargin(current => Math.abs(current - nextMargin) < 0.5 ? current : nextMargin);
+    };
+    refreshScrollMargin();
+    const viewportObserver = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(refreshScrollMargin)
+      : null;
+    const layoutObserver = typeof ResizeObserver === 'function'
+      ? new ResizeObserver(refreshScrollMargin)
+      : null;
+    viewportObserver?.observe(scrollElement);
+    if (timelineElement.parentElement) layoutObserver?.observe(timelineElement.parentElement);
+    window.addEventListener('resize', refreshScrollMargin);
+    return () => {
+      viewportObserver?.disconnect();
+      layoutObserver?.disconnect();
+      window.removeEventListener('resize', refreshScrollMargin);
+    };
+  }, [getScrollElement, sessionId, virtualized, virtualizer]);
+
+  useLayoutEffect(() => {
+    if (!virtualized) return;
+    const scrollElement = getScrollElement();
+    if (!scrollElement || followOutputRef?.current !== true) return;
+    // A long session initially has estimated rows only. Re-stick during the first two layout
+    // frames while the bottom range mounts and is measured; otherwise the first estimated
+    // scrollHeight can expose the middle of the transcript before the caller's follower runs.
+    let firstFrame = 0;
+    let secondFrame = 0;
+    const stickToBottom = () => {
+      if (followOutputRef?.current !== true || hasRichTextSelection(scrollElement)) return false;
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+      return true;
+    };
+    stickToBottom();
+    firstFrame = window.requestAnimationFrame(() => {
+      if (!stickToBottom()) return;
+      secondFrame = window.requestAnimationFrame(() => {
+        stickToBottom();
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+    };
+  }, [followOutputRef, getScrollElement, historyTurns.length, sessionId, virtualized]);
+
+  // Switching conversations reuses the virtualizer instance while row keys are
+  // sessionId-prefixed, so measured sizes from the previous conversation would
+  // otherwise linger in the size cache for the view's lifetime. Dropping them
+  // per conversation keeps the cache bounded; correctness is unaffected either
+  // way because keys from different sessions never collide.
+  useLayoutEffect(() => {
+    virtualizer.measure();
+  }, [conversationKey, virtualizer]);
+
+  // forkEntries（Map）不随 props 下发到每个 turn：新 Map 身份会让 memo
+  // 比较器全数失配，一次入口表更新即整条时间线重渲。这里把它解出，换算成
+  // 每个 turn 的稳定原始值 forkOrdinal（number|null，Object.is 稳定）。
+  const { forkEntries: forkEntriesProp, ...turnProps } = props;
+  const forkOrdinalFor = (turn) => (forkEntriesProp ? (forkEntriesProp.get(turn.id) ?? null) : null);
+
+  if (!virtualized) {
+    return (
+      <>
+        {turns.map((turn, index) => (
+          <React.Fragment key={turn.id}>
+            {renderBeforeTurn?.(turn, index)}
+            {/* Regenerate targets the newest turn only, so older turns never render a retry control. */}
+            <ConversationTurn
+              turn={turn}
+              {...turnProps}
+              forkOrdinal={forkOrdinalFor(turn)}
+              virtualized={false}
+              onRetry={index === turns.length - 1 ? props.onRetry : undefined}
+            />
+          </React.Fragment>
+        ))}
+      </>
+    );
+  }
+
+  const virtualRows = virtualizer.getVirtualItems();
+  const renderedRows = virtualRows.map(virtualRow => {
+    const turn = historyTurns[virtualRow.index];
+    if (!turn) return null;
+    const beforeTurn = renderBeforeTurn?.(turn, virtualRow.index);
+    return (
+      <div
+        key={virtualRow.key}
+        ref={virtualizer.measureElement}
+        data-index={virtualRow.index}
+        data-conversation-virtual-row=""
+        data-conversation-virtual-start={virtualRow.start}
+        data-conversation-virtual-size={virtualRow.size}
+        className={`absolute left-0 top-0 w-full ${beforeTurn ? 'flex flex-col' : ''}`}
+        style={{
+          gap: beforeTurn ? `${turnGapPx}px` : undefined,
+          transform: `translateY(${virtualRow.start - scrollMargin}px)`,
+        }}
+      >
+        {beforeTurn}
+        <ConversationTurn
+          turn={turn}
+          {...turnProps}
+          forkOrdinal={forkOrdinalFor(turn)}
+          virtualized
+          onRetry={virtualRow.index === turns.length - 1 ? props.onRetry : undefined}
+        />
+      </div>
+    );
+  });
+  if (liveTurn) {
+    renderedRows.push(
+      <div
+        key={liveTailKey}
+        ref={liveTailElementRef}
+        data-conversation-live-tail=""
+        className={renderBeforeTurn ? 'flex flex-col' : ''}
+        style={{
+          gap: renderBeforeTurn ? `${turnGapPx}px` : undefined,
+          marginTop: historyTurns.length ? `${turnGapPx}px` : undefined,
+        }}
+      >
+        {renderBeforeTurn?.(liveTurn, liveTurnIndex)}
+        <ConversationTurn
+          turn={liveTurn}
+          {...turnProps}
+          forkOrdinal={forkOrdinalFor(liveTurn)}
+          virtualized
+          onRetry={liveTurnIndex === turns.length - 1 ? props.onRetry : undefined}
+        />
+      </div>,
+    );
+  }
+  return (
+    <div
+      ref={timelineRef}
+      data-conversation-virtual-timeline=""
+      data-conversation-virtual-row-count={virtualRows.length}
+      data-conversation-scroll-margin={scrollMargin}
+      className="relative w-full"
+      style={{ overflowAnchor: 'none' }}
+    >
+      <div
+        data-conversation-virtual-history=""
+        aria-hidden="true"
+        className="w-full"
+        style={{ height: `${virtualizer.getTotalSize()}px` }}
+      />
+      {renderedRows}
+    </div>
+  );
+}

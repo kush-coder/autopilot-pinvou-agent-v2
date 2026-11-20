@@ -1,0 +1,4846 @@
+import { lazy, startTransition as scheduleViewTransition, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { createRoot } from 'react-dom/client';
+import '../styles/base.css';
+import '../styles/tailwind.css';
+import { Edit2, BarChart2, Settings, Smartphone, Clock, Package, Search, ChevronDown, Menu, MoreHorizontal, Check, Filter, Layers, MessageSquare, XIcon, Globe, BookOpen, Puzzle, PetPawIcon } from '../components/icons.jsx';
+import { NavItem, RecentItem } from '../components/layout/NavigationComponents.jsx';
+import { SidePanelLayoutProvider } from '../components/layout/ResizableSidePanel.jsx';
+import {
+  RightDockHost,
+  RightDockPanel,
+  RightDockProvider,
+} from '../components/layout/RightDock.jsx';
+import { AcpAgentLogo } from '../features/codex/AcpAgentLogo.jsx';
+import { CodexAcpView } from '../features/codex/LazyCodexAcpView.jsx';
+import { PinvouLogo } from '../components/PinvouLogo.jsx';
+const MobileMoreSheet = lazy(() =>
+  import('../components/layout/MobileShell.jsx').then((m) => ({ default: m.MobileMoreSheet })));
+const MobileTabBar = lazy(() =>
+  import('../components/layout/MobileShell.jsx').then((m) => ({ default: m.MobileTabBar })));
+const MobileTopBar = lazy(() =>
+  import('../components/layout/MobileShell.jsx').then((m) => ({ default: m.MobileTopBar })));
+import { bridge, useBridgeState, usePlatformCapability, activeModelIsLocal, shouldShowApiKeyGate } from '../hooks/useBridge.js';
+import { useCompactViewport, useVisualViewportHeight } from '../hooks/useViewport.js';
+import { useSystemDarkMode } from '../hooks/useSystemDarkMode.js';
+import { COLOR_SCHEME_STORAGE_KEY, normalizeColorScheme, readStoredColorScheme, resolveTheme } from '../shared/color-scheme.js';
+import { DEFAULT_CHAT_TITLES, dict, createLatestLanguageGate, ensureLanguage, ensureLanguageWithZhFallback, LANG_TO_TAG, initialSystemLanguage, SEARCH_KEY_PROVIDERS, TAG_TO_LANG, zhDict } from '../shared/i18n.js';
+import { mountWhenLanguageReady } from '../shared/entry-boot.js';
+import { formatSessionDate, localDateKey, formatDateGroupLabel } from '../shared/date-utils.js';
+import { groupSessionsWithProjects, resolveSessionProjectId, needsAddFolderConfirm, WORKSPACE_KIND_BOUND } from '../features/projects/projectGrouping.js';
+import { interpretFolderEnsureOutcomes } from '../features/projects/folderEnsure.js';
+// Startup-budget (round-41 merge with #586): project group header + the
+// mobile chrome split behind lazy — they render per project row / only on
+// compact viewports, well off the critical first paint (#586's mention
+// feature plus this PR pushed the main entry past the 500 kB budget).
+const ProjectGroupHeader = lazy(() =>
+  import('../features/projects/ProjectGroupHeader.jsx').then((m) => ({ default: m.ProjectGroupHeader })));
+const WorkspacePickerDialog = lazy(() =>
+  import('../features/projects/WorkspacePickerDialog.jsx').then(m => ({ default: m.WorkspacePickerDialog })));
+import { computePickerRows, pickerPrimaryRoot, pickerProjectRoots, workspaceNoticeTone } from '../features/projects/workspacePickerState.js';
+import { boundDraftNoticeMode as boundDraftNoticeModeOf } from '../features/chat/bound-draft-mode.js';
+import { removeRootPlan, rootAlreadyPresent, rootConflictsWithExisting, rootPathOf } from '../features/projects/manageFoldersState.js';
+const ManageProjectFoldersDialog = lazy(() =>
+  import('../features/projects/ManageProjectFoldersDialog.jsx').then(m => ({ default: m.ManageProjectFoldersDialog })));
+const SessionWorkspaceDialog = lazy(() =>
+  import('../features/projects/SessionWorkspaceDialog.jsx').then(m => ({ default: m.SessionWorkspaceDialog })));
+import { classifyRebindError, mergeRebindCarryoverIds } from '../features/projects/rebindErrors.js';
+import { runSessionBatch } from '../shared/session-management.js';
+import { filterSessionsByTab, groupSessionsByLocalDate, sessionListComparator } from '../shared/session-list-pipeline.js';
+import { can, isWeb } from '../shared/platform.js';
+import { installGlobalMarkdownRenderer } from '../shared/markdown-renderer.js';
+import { acquireNativeSurfaceTransitionHide } from '../features/browser/native-surface-coordinator.js';
+import {
+  createNativeSurfaceTransitionGate,
+  settleBrowserUiPublicationAfterCommit,
+} from '../features/browser/native-surface-transition.mjs';
+import {
+  awaitBrowserListenerReadiness,
+  createBrowserSessionCommandEchoGuard,
+  createBrowserSessionEpochTracker,
+} from '../features/browser/browser-state-sync.mjs';
+import {
+  activateBrowserPane,
+  beginBrowserOpen,
+  browserOpenStateFor,
+  browserPaneStateFor,
+  closeBrowserPane,
+  removeBrowserPaneState,
+  restoreBrowserPane,
+  selectArtifactsPane,
+  settleBrowserOpen,
+} from '../features/browser/browser-pane-state.mjs';
+import { ViewErrorBoundary } from '../shared/ViewErrorBoundary.jsx';
+import { ChatView } from '../features/chat/ChatView.jsx';
+import { createPinvouModeScopeKey, savePinvouModeState } from '../features/chat/pinvou-mode-state.js';
+import { setStreamFadePreference } from '../features/conversation/stream-fade.js';
+import { WebConnectionStatus } from '../features/web/WebConnectionStatus.jsx';
+import { VoiceShortcutRouter } from '../features/voice-composer/VoiceShortcutRouter.jsx';
+import { createPetActivationGuard } from '../features/pet/activation-guard.js';
+import { SessionAttachmentTitle } from '../features/attachments/SessionAttachmentTitle.jsx';
+import {
+  sessionTitlePlainText,
+  sessionTitlePresentation,
+} from '../features/attachments/attachment-message.js';
+import {
+  invokeTauri,
+  isTauriAvailable,
+  tauriCommands,
+  tauriEvents,
+} from '../platform/tauri/client.js';
+import { listAcpSessions } from '../features/codex/acpClient.js';
+import { revealStartupWindow } from '../platform/tauri/startup-window.js';
+
+// Backend default-chat-title sentinel set. The backend always persists the
+// fixed zh sentinel (store.rs's NEW_CHAT_TITLE) and auto-rename targets only
+// that exact zh match; the trilingual set is a display-layer superset — at
+// render time any sentinel title maps to the current language's "new chat"
+// copy. The sentinels are a cross-language backend contract, not current UI
+// copy: use the static set from shared/i18n.js directly, independent of
+// dictionary load progress (zh-primary users never load the en/ja chunks, so
+// the set cannot be derived from the dict).
+function isDefaultChatTitle(title) {
+  return DEFAULT_CHAT_TITLES.has(title);
+}
+// 定时运行侧栏条目的 leadingIcon(Clock 图标 + 未读角标):scheduledRunItems 与
+// decorateScheduledRunChat 共用同一节点形态,提取成纯函数避免两处拷贝漂移。
+function scheduledRunIcon(run, activeTheme) {
+  return (
+    <span className="relative inline-flex h-5 w-5 items-center justify-center">
+      <Clock size={18} />
+      {run.unread && (
+        <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2"
+          style={{ background: '#0B57D0', borderColor: activeTheme === 'dark' ? '#1E1F20' : '#F0F4F9' }} />
+      )}
+    </span>
+  );
+}
+import { Lanyard } from '../features/personas/persona-shared.jsx';
+import { VIEW_LOADERS, prefetchView } from './view-loaders.js';
+// Low-traffic views are lazy-loaded: VIEW_LOADERS (see view-loaders.js) is the
+// single dynamic-import outlet; React.lazy and the NavItem hover/focus
+// prefetch share the same factory so they hit the same module cache.
+// codex is the exception: it renders through the LazyCodexAcpView wrapper,
+// which imports the same CodexAcpView module (sharing the prefetch cache) and
+// adds an in-place retry boundary for chunk fetch failures.
+// ChatView and Lanyard render at startup and stay statically imported.
+const LazySettingsView = lazy(() => VIEW_LOADERS.settings().then(m => ({ default: m.SettingsView })));
+const LazyToolStoreView = lazy(() => VIEW_LOADERS.toolStore().then(m => ({ default: m.ToolStoreView })));
+const LazyCardPoolView = lazy(() => VIEW_LOADERS.cardpool().then(m => ({ default: m.CardPoolView })));
+const LazyScheduledTasksView = lazy(() => VIEW_LOADERS.scheduled().then(m => ({ default: m.ScheduledTasksView })));
+// The browser pane graph is dead weight at startup until a browser session opens.
+const LazyBrowserView = lazy(() => VIEW_LOADERS.browser().then(m => ({ default: m.BrowserView })));
+const LazyKnowledgeView = lazy(() => VIEW_LOADERS.knowledge().then(m => ({ default: m.KnowledgeView })));
+const LazyMonitorView = lazy(() => VIEW_LOADERS.monitor().then(m => ({ default: m.MonitorView })));
+const LazySearchView = lazy(() => VIEW_LOADERS.search().then(m => ({ default: m.SearchView })));
+const LazySearchOverlay = lazy(() => VIEW_LOADERS.searchOverlay().then(m => ({ default: m.SearchOverlay })));
+const LazyMoveToProjectDialog = lazy(() => VIEW_LOADERS.moveToProjectDialog().then(m => ({ default: m.MoveToProjectDialog })));
+const LazyRebindFolderDialog = lazy(() => VIEW_LOADERS.rebindFolderDialog().then(m => ({ default: m.RebindFolderDialog })));
+const LazyPinvouSummonModal = lazy(() => VIEW_LOADERS.pinvouSummon().then(m => ({ default: m.PinvouSummonModal })));
+const LazyUpdateNoticeButton = lazy(() => VIEW_LOADERS.updateNotice().then(m => ({ default: m.UpdateNoticeButton })));
+const LazySavedPersonaConfirmDialog = lazy(() => VIEW_LOADERS.savedPersonaConfirmDialog().then(m => ({ default: m.SavedPersonaConfirmDialog })));
+const LazyApiKeyGateDialog = lazy(() => VIEW_LOADERS.apiKeyGateDialog().then(m => ({ default: m.ApiKeyGateDialog })));
+const LazyArchiveConfirmDialog = lazy(() => VIEW_LOADERS.archiveConfirmDialog().then(m => ({ default: m.ArchiveConfirmDialog })));
+const LazyArchiveToast = lazy(() => VIEW_LOADERS.archiveConfirmDialog().then(m => ({ default: m.ArchiveToast })));
+const LazyPersonaEditorModal = lazy(() => VIEW_LOADERS.cardpool().then(m => ({ default: m.PersonaEditorModal })));
+const LazyWebAccessModal = lazy(() => VIEW_LOADERS.settings().then(m => ({ default: m.WebAccessModal })));
+const LazyDetachedShell = lazy(() => import('./DetachedShell.jsx').then(m => ({ default: m.DetachedShell })));
+
+// 视图 chunk 加载占位:沿用 DetachedShell 的「…」惯例,不引入新视觉语言。
+function ViewFallback() {
+  return <div className="p-6 text-sm opacity-60" data-testid="lazy-view-fallback">…</div>;
+}
+
+// personas-i18n overlay 的 UI 语言兜底注入:实现收敛在 personas-overlay.js,
+// 与撕离窗(DetachedShell 的 useDetachedBase)共用同一模块。
+import { ensurePersonaI18nOverlay } from './personas-overlay.js';
+import { TitleBar } from './DesktopTitleBar.jsx';
+
+installGlobalMarkdownRenderer(window);
+window.__PINVOU_STARTUP__.mark('app:main_module_body_enter');
+
+let appFirstRenderMarked = false;
+
+const APP_BRIDGE_STATE_DOMAINS = [
+  'platform', 'sessions', 'chat', 'voice', 'knowledge', 'scheduled', 'monitor',
+  'settings', 'models', 'vllm', 'interaction', 'personas',
+  'memory', 'remoteControl', 'updater', 'dependencies', 'projects', 'computerUse',
+];
+
+function emitPetEvent(ev, name, payload) {
+  if (!ev) return Promise.resolve(false);
+  try {
+    if (typeof ev.emit === 'function') {
+      return Promise.resolve(ev.emit(name, payload));
+    }
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  return Promise.resolve(false);
+}
+
+function workspaceDisplayName(path) {
+  const parts = String(path || '').split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || String(path || '');
+}
+
+// Per-item callback cache behind the RecentItem memo: sidebar task items
+// (item) are derived by useMemo and keep stable references while the
+// underlying data is unchanged, so caching the onPickUp / scheduled-run
+// onSelect closures keyed by item keeps RecentItem props shallow-equal
+// across unrelated re-renders (local UI state, pure chat streaming tokens)
+// and skips the row re-render. Every captured handler is a stable useCallback
+// reference, and whenever a dependency (t etc.) changes the item is rebuilt
+// too (the derived memo depends on the same state), so the cache can never
+// hand out a stale closure; old item keys are garbage-collected along with
+// their closures.
+function cachedItemCallback(cache, item, build) {
+  let fn = cache.get(item);
+  if (!fn) {
+    fn = build(item);
+    cache.set(item, fn);
+  }
+  return fn;
+}
+const sidebarPickUpCallbacks = new WeakMap();
+const sidebarScheduledSelectCallbacks = new WeakMap();
+// 拖拽 payload 与 onPickUp/onSelect 同因缓存:内联对象每次渲染都是新引用,
+// 会击穿 RecentItem 的 memo(见 NavigationComponents 内注释)。
+const sidebarDndPayloads = new WeakMap();
+
+// Static icon elements for the sidebar main nav: module-level constants keep
+// the element references stable so the NavItem memo can hit.
+const NAV_ICON_NEW_CHAT = <Edit2 size={18} />;
+const NAV_ICON_SEARCH = <Search size={18} />;
+const NAV_ICON_SCHEDULED = <Clock size={18} />;
+const NAV_ICON_OUTPUTS = <Package size={18} />;
+const NAV_ICON_MONITOR = <BarChart2 size={18} />;
+const NAV_ICON_TOOL_STORE = <Puzzle size={18} />;
+const NAV_ICON_CARD_POOL = <Layers size={18} />;
+const NAV_ICON_KNOWLEDGE = <BookOpen size={18} />;
+const NAV_ICON_CURRENT_CHAT = <MessageSquare size={18} />;
+
+// Hover/focus prefetch callbacks (prefetchView is a module function):
+// constant references for the NavItem memo comparison.
+const NAV_PREFETCH = {
+  scheduled: () => prefetchView('scheduled'),
+  knowledge: () => prefetchView('knowledge'),
+  outputs: () => prefetchView('knowledge'),
+  monitor: () => prefetchView('monitor'),
+  toolStore: () => prefetchView('toolStore'),
+  cardpool: () => prefetchView('cardpool'),
+  browser: () => prefetchView('browser'),
+};
+
+const EMPTY_PICKER_ROWS = [];
+
+    // App root component: aggregates bridge state, routing, and all sidebar/overlay UI. Size and complexity are historical
+    // evolution; splitting requires a dedicated refactor task (involving a hundred-plus closure handlers and test contracts);
+    // only lint fixes here, no behavior change.
+    // eslint-disable-next-line sonarjs/cognitive-complexity -- due to the App root component's size; behavior preservation takes priority, split needs a dedicated refactor
+const App = () => {
+      if (!appFirstRenderMarked) {
+        // One-shot startup marker: module-level boolean set on first render, unrelated to component state (no rerender needed).
+        appFirstRenderMarked = true;
+        window.__PINVOU_STARTUP__.mark('react:app_render_start');
+      }
+      const bs = useBridgeState(APP_BRIDGE_STATE_DOMAINS);
+      // latest-ref mirror: stable useCallbacks (e.g. navigateFromScheduledRun)
+      // read the latest bridge snapshot when the event fires instead of
+      // depending on bs, which would change the callback identity on every
+      // notify and defeat the memo.
+      const bsRef = useRef(bs);
+      bsRef.current = bs;
+      useLayoutEffect(() => {
+        window.__PINVOU_STARTUP__.mark('react:first_commit');
+        window.__PINVOU_STARTUP__.flush();
+        // Linux 的主窗口在配置中隐藏创建。首次 React 提交说明可交互 DOM 已就绪，
+        // 此时再映射 XWayland 窗口，避免冷启动阶段把尚未稳定的输入表面暴露给用户。
+        void revealStartupWindow().then((revealed) => {
+          if (!revealed) return;
+          window.__PINVOU_STARTUP__.mark('react:startup_window_revealed');
+          window.__PINVOU_STARTUP__.flush();
+        });
+      }, []);
+      useEffect(() => {
+        window.__PINVOU_STARTUP__.mark('react:first_effect');
+        window.__PINVOU_STARTUP__.flush();
+        // 连续两个 rAF：第二个回调发生在首次提交已经交给 WebView 绘制之后。此时再启动
+        // 558 MiB embedding 模型的 blocking 后台加载，避免模型 IO/ONNX 初始化阻塞白屏。
+        let secondFrame = 0;
+        const firstFrame = window.requestAnimationFrame(() => {
+          window.__PINVOU_STARTUP__.mark('react:first_animation_frame');
+          secondFrame = window.requestAnimationFrame(() => {
+            window.__PINVOU_STARTUP__.mark('react:first_frame_presented');
+            window.__PINVOU_STARTUP__.flush();
+            if (bridge.available && bridge.knowledge.loadKnowledgeEmbedderAfterFirstFrame) {
+              bridge.knowledge.loadKnowledgeEmbedderAfterFirstFrame();
+            }
+            // 首帧已呈现后空闲预取低频视图 chunk:桌宠/定时快捷方式会不经侧栏直接
+            // 跳视图(如 scheduledTaskAutoOpenId),悬停预取覆盖不到这些入口。
+            if (typeof window.requestIdleCallback === 'function') {
+              window.requestIdleCallback(() => {
+                prefetchView('scheduled');
+                prefetchView('settings');
+                prefetchView('codex');
+              }, { timeout: 4000 });
+            } else {
+              window.setTimeout(() => {
+                prefetchView('scheduled');
+                prefetchView('settings');
+                prefetchView('codex');
+              }, 1500);
+            }
+          });
+        });
+        // 让首帧先交给 WebView 绘制，再异步校验飞书/企微实时鉴权状态。
+        // 后端并行跑两个 CLI；结果只刷新技能目录，不阻塞主界面。
+        const authTimer = window.setTimeout(() => {
+          if (bridge.available && bridge.platform.refreshConnectorAuthGates) {
+            bridge.platform.refreshConnectorAuthGates().catch(error => {
+              console.warn('[startup] connector auth refresh failed', error);
+            });
+          }
+        }, 0);
+        return () => {
+          window.cancelAnimationFrame(firstFrame);
+          if (secondFrame) window.cancelAnimationFrame(secondFrame);
+          window.clearTimeout(authTimer);
+        };
+      }, []);
+      const [activeChat, setActiveChat] = useState(null);
+      const [currentView, setCurrentViewState] = useState('chat');
+      const [sessionSyncEpoch, setSessionSyncEpoch] = useState(0);
+      // Color-scheme preference: `system` follows the OS (fresh-install default,
+      // live tracking), light/dark are explicit picks. activeTheme is the resolved
+      // theme to render; light when the system preference is undeterminable
+      // (see shared/color-scheme.js).
+      const systemDark = useSystemDarkMode();
+      // Seed from the persisted scheme (readStoredColorScheme mirrors the
+      // pre-paint rule: stored light/dark wins, anything else follows the OS)
+      // so the class the index.html pre-paint script applied survives until
+      // real settings arrive: reconciling from plain 'system' first would
+      // strip a correct pre-paint class whenever the stored pick differs from
+      // the OS at boot. Web stores the raw choice in localStorage ('system'
+      // falls through to the default); desktop stores the resolved scheme as
+      // a boot cache.
+      const [colorScheme, setColorScheme] = useState(readStoredColorScheme);
+      const activeTheme = resolveTheme(colorScheme, systemDark);
+      // Browser state is scoped to workspace sessions: switching chats only shows
+      // that chat's WebView2. The login profile remains globally shared by the
+      // backend. Legacy events without a sessionId must fail closed.
+      const [browserSessions, setBrowserSessions] = useState({});
+      const [browserPaneStates, setBrowserPaneStates] = useState({});
+      const [browserOpenStates, setBrowserOpenStates] = useState({});
+      const browserOpenAttemptsRef = useRef({});
+      const browserOpenAttemptSequenceRef = useRef(0);
+      const browserLifecycleListenersReadyRef = useRef(null);
+      const browserLifecycleEventEpochRef = useRef(null);
+      const browserLifecycleStatusRequestEpochRef = useRef(null);
+      if (!browserLifecycleEventEpochRef.current) {
+        browserLifecycleEventEpochRef.current = createBrowserSessionEpochTracker();
+      }
+      if (!browserLifecycleStatusRequestEpochRef.current) {
+        browserLifecycleStatusRequestEpochRef.current = createBrowserSessionEpochTracker();
+      }
+      const [browserResizeActive, setBrowserResizeActive] = useState(false);
+      const [browserOwnershipSlot, setBrowserOwnershipSlot] = useState(null);
+      const [browserDocumentHidden, setBrowserDocumentHidden] = useState(() => (
+        typeof document !== 'undefined' && document.visibilityState === 'hidden'
+      ));
+      const [rightDockState, setRightDockState] = useState({
+        activePanelId: null,
+        occluded: false,
+      });
+      // Child overlays publish through RightDockProvider. Keep their reservation
+      // in App state in the same React batch as the child permit so BrowserView is
+      // suspended in the very commit that first exposes the overlay.
+      const [rightDockOcclusionPublications, setRightDockOcclusionPublications] = useState([]);
+      const browserSurfaceTransitionContextRef = useRef({
+        sessionId: null,
+        hasWorkspace: false,
+        visible: false,
+        compact: false,
+        scheduledRunChat: false,
+      });
+      const browserTransitionPublishingRef = useRef(0);
+      const browserSessionTransitionPendingRef = useRef(0);
+      const browserBridgeSessionTransitionRef = useRef(null);
+      const [browserSessionCommandEchoGuard] = useState(
+        () => createBrowserSessionCommandEchoGuard(),
+      );
+      const [browserUiCommitEpoch, setBrowserUiCommitEpoch] = useState(0);
+      const browserUiCommitSequenceRef = useRef(0);
+      const browserUiCommitWaitersRef = useRef(new Map());
+      const browserUiCommitMountedRef = useRef(true);
+      const requestBrowserUiCommitAck = useCallback(() => {
+        if (!browserUiCommitMountedRef.current) return Promise.resolve(false);
+        const epoch = browserUiCommitSequenceRef.current + 1;
+        browserUiCommitSequenceRef.current = epoch;
+        const committed = new Promise((resolve) => {
+          browserUiCommitWaitersRef.current.set(epoch, resolve);
+        });
+        // This marker is queued after the publication's state mutations. With
+        // no transition-priority update in the guarded path, its layout effect
+        // proves the target React tree has committed before native show resumes.
+        setBrowserUiCommitEpoch(epoch);
+        return committed;
+      }, []);
+      useLayoutEffect(() => {
+        for (const [epoch, resolve] of browserUiCommitWaitersRef.current) {
+          if (epoch > browserUiCommitEpoch) continue;
+          browserUiCommitWaitersRef.current.delete(epoch);
+          resolve(true);
+        }
+      }, [browserUiCommitEpoch]);
+      useEffect(() => {
+        const waiters = browserUiCommitWaitersRef.current;
+        browserUiCommitMountedRef.current = true;
+        return () => {
+          browserUiCommitMountedRef.current = false;
+          for (const resolve of waiters.values()) resolve(false);
+          waiters.clear();
+        };
+      }, []);
+      const browserUiTransitionGateRef = useRef(null);
+      const createBrowserUiTransitionGate = () => (
+        createNativeSurfaceTransitionGate({
+          acquireHide: acquireNativeSurfaceTransitionHide,
+          getContext: () => browserSurfaceTransitionContextRef.current,
+          onError: (error) => {
+            console.error('[browser] native-surface transition failed', error);
+          },
+        })
+      );
+      if (!browserUiTransitionGateRef.current) {
+        browserUiTransitionGateRef.current = createBrowserUiTransitionGate();
+      }
+      useEffect(() => {
+        if (!browserUiTransitionGateRef.current) {
+          browserUiTransitionGateRef.current = createBrowserUiTransitionGate();
+        }
+        const gate = browserUiTransitionGateRef.current;
+        return () => {
+          gate?.dispose();
+          if (browserUiTransitionGateRef.current === gate) {
+            browserUiTransitionGateRef.current = null;
+          }
+        };
+      }, []);
+      const handleRightDockStateChange = useCallback((next) => {
+        setRightDockState((current) => (
+          current.activePanelId === next.activePanelId
+          && current.occluded === next.occluded
+            ? current
+            : {
+                activePanelId: next.activePanelId,
+                occluded: next.occluded,
+              }
+        ));
+      }, []);
+      // Keep the currently published task identity stable while a bridge session
+      // switch is waiting behind the native-surface hide barrier.
+      const browserSessionId = activeChat || (bs && bs.activeSessionId) || null;
+      const platformCapabilities = (bs && bs.platformCapabilities) || {};
+      const browserNativeDisplayAvailable = !!platformCapabilities.browserNativeDisplay;
+      const browserSessionIdRef = useRef(browserSessionId);
+      browserSessionIdRef.current = browserSessionId;
+      const browserPaneState = browserPaneStateFor(browserPaneStates, browserSessionId);
+      const browserOpenState = browserOpenStateFor(browserOpenStates, browserSessionId);
+      const browserPaneOpen = browserPaneState.open;
+      const browserPaneSelected = browserPaneState.browserSelected;
+      const browserDockSelectedPanelId = browserPaneSelected ? 'browser' : 'artifact-preview';
+      const browserDockActivationKey = `${browserSessionId || ''}:${browserPaneState.activation}`;
+      const browserActive = browserNativeDisplayAvailable
+        && !!(browserSessionId && browserSessions[browserSessionId]);
+      const browserPaneAllowed = currentView === 'chat'
+        || (currentView === 'scheduled' && !!(bs && bs.scheduledRunContext));
+      const browserWorkspaceStarting = browserOpenState.status === 'starting';
+      const browserWorkspaceError = browserOpenState.status === 'failed'
+        ? browserOpenState.error
+        : '';
+      const runBrowserUiTransition = useCallback((publish, options) => {
+        const tracksSession = options?.channel === 'session';
+        const tracksCommandEcho = tracksSession
+          && options?.sessionSource !== 'bridge'
+          && Object.keys(options).includes('sessionTarget');
+        const sessionCommandToken = tracksCommandEcho
+          ? browserSessionCommandEchoGuard.begin(
+            options.sessionTarget,
+            bsRef.current?.activeSessionId || null,
+          )
+          : null;
+        if (tracksSession) browserSessionTransitionPendingRef.current += 1;
+        const finishRequest = () => {
+          if (sessionCommandToken) {
+            browserSessionCommandEchoGuard.settle(sessionCommandToken);
+          }
+          if (!tracksSession) return;
+          browserSessionTransitionPendingRef.current -= 1;
+          if (
+            browserSessionTransitionPendingRef.current === 0
+            && options?.reconcileSessionOnSettle !== false
+            && browserUiCommitMountedRef.current
+          ) {
+            setSessionSyncEpoch((epoch) => epoch + 1);
+          }
+        };
+        let result;
+        try {
+          // Session and view channels are primary navigation (switch chat, new
+          // chat, main tab). When the native hide barrier fails after its
+          // retries they may publish without a successful hide ACK only while
+          // retaining a cleanup lease, rather than silently dropping the
+          // action; overlay/dock channels stay
+          // fail-closed so menus never open above a visible native page.
+          const transitionOptions = {
+            ...options,
+            degradeOnHideFailure: options?.degradeOnHideFailure
+              ?? (options?.channel === 'session' || options?.channel === 'view'),
+          };
+          result = browserUiTransitionGateRef.current.run((transition) => {
+            browserTransitionPublishingRef.current += 1;
+            return settleBrowserUiPublicationAfterCommit({
+              publish: async () => {
+                try {
+                  return await publish(transition);
+                } finally {
+                  // Nested updates may share this publication only until the
+                  // callback (including async work) has settled. Once the commit
+                  // marker is queued, later effects need their own hide barrier.
+                  browserTransitionPublishingRef.current -= 1;
+                }
+              },
+              waitForCommit: requestBrowserUiCommitAck,
+            });
+          }, transitionOptions);
+        } catch (error) {
+          finishRequest();
+          throw error;
+        }
+        if (result && typeof result.then === 'function') {
+          return Promise.resolve(result).finally(finishRequest);
+        }
+        finishRequest();
+        return result;
+      }, [browserSessionCommandEchoGuard, requestBrowserUiCommitAck]);
+      const setCurrentView = useCallback((nextView) => {
+        const resolvedView = typeof nextView === 'function'
+          ? nextView(currentViewRef.current)
+          : nextView;
+        // A publication that already owns the native-surface hide lease must be
+        // urgent: the later React-commit marker is only authoritative when the
+        // target tree cannot remain deferred behind it. Normal view switches keep
+        // the main-branch transition priority so lazy chunks stay interruptible.
+        if (browserTransitionPublishingRef.current > 0) {
+          setCurrentViewState(resolvedView);
+          return true;
+        }
+        const context = browserSurfaceTransitionContextRef.current;
+        const keepsDesktopBrowserVisible = !context.compact && (
+          resolvedView === 'chat'
+          || (resolvedView === 'scheduled' && context.scheduledRunChat)
+        );
+        const needsNativeHide = !!context.visible && !keepsDesktopBrowserVisible;
+        if (!needsNativeHide) {
+          browserUiTransitionGateRef.current.invalidate('view');
+          scheduleViewTransition(() => setCurrentViewState(resolvedView));
+          return true;
+        }
+        return runBrowserUiTransition(() => {
+          setCurrentViewState(resolvedView);
+        }, {
+          channel: 'view',
+          hideMode: 'visible',
+        });
+      }, [runBrowserUiTransition]);
+      const publishRightDockOcclusion = useCallback((occlusionId, publish) => (
+        browserUiTransitionGateRef.current.run(({ isCurrent }) => {
+          if (!isCurrent()) return false;
+          const published = publish();
+          if (published === false) return false;
+          setRightDockOcclusionPublications((current) => (
+            current.includes(occlusionId) ? current : [...current, occlusionId]
+          ));
+          return requestBrowserUiCommitAck().then(() => true);
+        }, {
+          channel: `right-dock-occlusion:${occlusionId}`,
+          hideMode: 'visible',
+        })
+      ), [requestBrowserUiCommitAck]);
+      const releaseRightDockOcclusion = useCallback((occlusionId) => {
+        browserUiTransitionGateRef.current.invalidate(`right-dock-occlusion:${occlusionId}`);
+        setRightDockOcclusionPublications((current) => (
+          current.includes(occlusionId)
+            ? current.filter((id) => id !== occlusionId)
+            : current
+        ));
+      }, []);
+      const selectRightDockPanel = useCallback((panelId, sessionId, publishSelection) => {
+        const selectedSessionId = sessionId || browserSessionIdRef.current;
+        if (!selectedSessionId) return false;
+        const publish = ({ isCurrent }) => {
+          const selectionIsCurrent = () => (
+            isCurrent() && browserSessionIdRef.current === selectedSessionId
+          );
+          if (!selectionIsCurrent()) return false;
+          const childPublished = publishSelection?.({
+            isCurrent: selectionIsCurrent,
+            sessionId: selectedSessionId,
+          });
+          if (childPublished === false || !selectionIsCurrent()) return false;
+          setBrowserPaneStates((current) => (
+            panelId === 'browser'
+              ? activateBrowserPane(current, selectedSessionId)
+              : selectArtifactsPane(current, selectedSessionId)
+          ));
+          return true;
+        };
+        const context = browserSurfaceTransitionContextRef.current;
+        return runBrowserUiTransition(publish, {
+          channel: 'right-dock',
+          hideMode: panelId !== 'browser' && context.sessionId === selectedSessionId
+            ? 'visible'
+            : 'none',
+        });
+      }, [runBrowserUiTransition]);
+      const closeBrowserDock = useCallback((sessionId) => {
+        const selectedSessionId = sessionId || browserSessionIdRef.current;
+        if (!selectedSessionId) return;
+        const context = browserSurfaceTransitionContextRef.current;
+        void runBrowserUiTransition(() => {
+          setBrowserPaneStates((current) => closeBrowserPane(current, selectedSessionId));
+        }, {
+          channel: 'right-dock',
+          hideMode: context.sessionId === selectedSessionId ? 'visible' : 'none',
+        });
+      }, [runBrowserUiTransition]);
+      const openBrowserDock = useCallback(async () => {
+        const requestedSessionId = browserSessionId;
+        if (!browserNativeDisplayAvailable || !requestedSessionId || !browserPaneAllowed) return;
+        setBrowserPaneStates((current) => activateBrowserPane(current, requestedSessionId));
+        if (browserActive) return;
+        // Hide the lazy chunk fetch inside the Rust workspace preparation. A
+        // failed prefetch remains non-blocking; React.lazy owns the visible
+        // retry/error boundary when the view actually mounts.
+        prefetchView('browser');
+        const attempt = browserOpenAttemptSequenceRef.current + 1;
+        browserOpenAttemptSequenceRef.current = attempt;
+        browserOpenAttemptsRef.current[requestedSessionId] = attempt;
+        setBrowserOpenStates((current) => (
+          beginBrowserOpen(current, requestedSessionId, attempt)
+        ));
+        try {
+          const prepared = await invokeTauri('browser_prepare', { sessionId: requestedSessionId });
+          if (
+            !browserUiCommitMountedRef.current
+            || browserOpenAttemptsRef.current[requestedSessionId] !== attempt
+          ) return;
+          if (!prepared || prepared.sessionId !== requestedSessionId) {
+            throw new Error('browser_prepare returned an invalid session identity');
+          }
+          setBrowserSessions((current) => ({ ...current, [requestedSessionId]: true }));
+          setBrowserOpenStates((current) => (
+            settleBrowserOpen(current, requestedSessionId, attempt, 'idle')
+          ));
+        } catch (error) {
+          if (
+            !browserUiCommitMountedRef.current
+            || browserOpenAttemptsRef.current[requestedSessionId] !== attempt
+          ) return;
+          setBrowserOpenStates((current) => settleBrowserOpen(
+            current,
+            requestedSessionId,
+            attempt,
+            'failed',
+            typeof error === 'string' ? error : String(error),
+          ));
+        }
+      }, [
+        browserActive,
+        browserNativeDisplayAvailable,
+        browserPaneAllowed,
+        browserSessionId,
+      ]);
+      // Shared browser_status reconciliation: snapshot/advance the per-session
+      // epochs, query the backend, and apply the guarded state updates (drop
+      // the dead session, or mark it live and restore its pane). Callers keep
+      // their own liveness gate (isActive) and error-handling nuance.
+      const reconcileBrowserSessionStatus = useCallback((sessionId, isActive) => {
+        const eventEpoch = browserLifecycleEventEpochRef.current.snapshot(sessionId);
+        const requestEpoch = browserLifecycleStatusRequestEpochRef.current.advance(
+          sessionId,
+        );
+        return invokeTauri('browser_status', { sessionId }).then((st) => {
+          if (
+            (isActive && !isActive())
+            || browserSessionIdRef.current !== sessionId
+            || !browserLifecycleEventEpochRef.current.isCurrent(
+              sessionId,
+              eventEpoch,
+            )
+            || !browserLifecycleStatusRequestEpochRef.current.isCurrent(
+              sessionId,
+              requestEpoch,
+            )
+            || !st
+            || st.sessionId !== sessionId
+          ) return null;
+          if (!st.running && !st.restoreError) {
+            setBrowserSessions((current) => {
+              const next = { ...current };
+              delete next[sessionId];
+              return next;
+            });
+            setBrowserPaneStates((current) => (
+              removeBrowserPaneState(current, sessionId)
+            ));
+            return null;
+          }
+          setBrowserSessions((current) => ({ ...current, [sessionId]: true }));
+          // Expand a restored workspace on first discovery. Preserve any explicit
+          // collapse or artifact selection made for this session in this window.
+          setBrowserPaneStates((current) => restoreBrowserPane(current, sessionId));
+          return st;
+        });
+      }, []);
+      useEffect(() => {
+        if (!browserNativeDisplayAvailable) {
+          browserLifecycleListenersReadyRef.current = null;
+          setBrowserSessions({});
+          setBrowserPaneStates({});
+          setBrowserOpenStates({});
+          browserOpenAttemptsRef.current = {};
+          return;
+        }
+        let disposed = false;
+        let reconciliationTimer = 0;
+        let listenerRegistrationFailed = false;
+        const unlisteners = [];
+        // Register listeners before the fallback status query. Reversing this
+        // order can miss browser:activated between the query and registration;
+        // Rust will not resend it after setting the activated marker.
+        const registerActivated = tauriEvents.listen('browser:activated', (event) => {
+          if (disposed) return;
+          const sessionId = event.payload?.sessionId;
+          if (!sessionId) return;
+          browserLifecycleEventEpochRef.current.advance(sessionId);
+          browserLifecycleStatusRequestEpochRef.current.advance(sessionId);
+          setBrowserSessions((current) => ({ ...current, [sessionId]: true }));
+          setBrowserPaneStates((current) => activateBrowserPane(current, sessionId));
+          const attempt = browserOpenAttemptsRef.current[sessionId] || 0;
+          setBrowserOpenStates((current) => (
+            settleBrowserOpen(current, sessionId, attempt, 'idle')
+          ));
+        }).then(unlisten => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        }).catch((error) => {
+          if (disposed) return;
+          listenerRegistrationFailed = true;
+          console.error('[browser] failed to register browser:activated listener', error);
+        });
+        const registerStopped = tauriEvents.listen('browser:stopped', (event) => {
+          if (disposed) return;
+          const sessionId = event.payload?.sessionId;
+          browserLifecycleEventEpochRef.current.advance(sessionId || null);
+          browserLifecycleStatusRequestEpochRef.current.advance(sessionId || null);
+          if (sessionId) {
+            browserOpenAttemptSequenceRef.current += 1;
+            browserOpenAttemptsRef.current[sessionId] = browserOpenAttemptSequenceRef.current;
+            setBrowserSessions((current) => {
+              const next = { ...current };
+              delete next[sessionId];
+              return next;
+            });
+            setBrowserPaneStates((current) => removeBrowserPaneState(current, sessionId));
+            setBrowserOpenStates((current) => {
+              const next = { ...current };
+              delete next[sessionId];
+              return next;
+            });
+          } else {
+            browserOpenAttemptsRef.current = {};
+            setBrowserSessions({});
+            setBrowserPaneStates({});
+            setBrowserOpenStates({});
+          }
+        }).then(unlisten => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        }).catch((error) => {
+          if (disposed) return;
+          listenerRegistrationFailed = true;
+          console.error('[browser] failed to register browser:stopped listener', error);
+        });
+        const readiness = awaitBrowserListenerReadiness(
+          [registerActivated, registerStopped],
+          {
+            schedule: window.setTimeout.bind(window),
+            cancel: window.clearTimeout.bind(window),
+          },
+        ).then((listenersReady) => {
+          if (disposed || browserLifecycleListenersReadyRef.current !== readiness) return false;
+          if (!listenersReady) {
+            listenerRegistrationFailed = true;
+            console.error('[browser] lifecycle listener registration timed out; enabling reconciliation');
+          }
+          if (listenerRegistrationFailed) {
+            const reconcileCurrentSession = () => {
+              const requestedSessionId = browserSessionIdRef.current;
+              if (!requestedSessionId) return;
+              reconcileBrowserSessionStatus(requestedSessionId, () => !disposed).catch((error) => {
+                console.error('[browser] lifecycle reconciliation failed', error);
+              });
+            };
+            reconcileCurrentSession();
+            reconciliationTimer = window.setInterval(reconcileCurrentSession, 2000);
+          }
+          return true;
+        });
+        // The session hydration effect below awaits this exact promise. Merely
+        // starting listen() first is insufficient because Tauri listener
+        // registration itself is asynchronous.
+        browserLifecycleListenersReadyRef.current = readiness;
+        return () => {
+          disposed = true;
+          if (browserLifecycleListenersReadyRef.current === readiness) {
+            browserLifecycleListenersReadyRef.current = null;
+          }
+          if (reconciliationTimer) window.clearInterval(reconciliationTimer);
+          unlisteners.forEach((unlisten) => {
+            if (unlisten) unlisten();
+          });
+        };
+      }, [browserNativeDisplayAvailable, reconcileBrowserSessionStatus]);
+      useEffect(() => {
+        const syncVisibility = () => setBrowserDocumentHidden(document.visibilityState === 'hidden');
+        const handlePageHide = () => setBrowserDocumentHidden(true);
+        document.addEventListener('visibilitychange', syncVisibility);
+        window.addEventListener('pagehide', handlePageHide);
+        window.addEventListener('pageshow', syncVisibility);
+        return () => {
+          document.removeEventListener('visibilitychange', syncVisibility);
+          window.removeEventListener('pagehide', handlePageHide);
+          window.removeEventListener('pageshow', syncVisibility);
+        };
+      }, []);
+      // Query the session after a WebView reload or chat switch. Restore its entry
+      // when pages exist, but retain other sessions so they recover when revisited.
+      useEffect(() => {
+        if (!browserNativeDisplayAvailable || !browserSessionId) return;
+        let disposed = false;
+        const requestedSessionId = browserSessionId;
+        const readiness = browserLifecycleListenersReadyRef.current;
+        if (!readiness) return () => { disposed = true; };
+        Promise.resolve(readiness).then(() => {
+          if (
+            disposed
+            || browserLifecycleListenersReadyRef.current !== readiness
+            || browserSessionIdRef.current !== requestedSessionId
+          ) return null;
+          return reconcileBrowserSessionStatus(requestedSessionId, () => !disposed);
+        }).catch((error) => {
+          if (!disposed) console.error('[browser] initial lifecycle hydration failed', error);
+        });
+        return () => { disposed = true; };
+      }, [browserNativeDisplayAvailable, browserSessionId, reconcileBrowserSessionStatus]);
+      // Compact layouts keep the fullscreen browser view; desktop uses the chat dock.
+      useEffect(() => {
+        if (!browserActive && currentView === 'browser') {
+          setCurrentView('chat');
+        }
+      }, [browserActive, currentView, setCurrentView]);
+      const codexAcpSupported = usePlatformCapability('acpCodeMode') && (isWeb || !!platformCapabilities.codexAcpSupported);
+      const [codexSessions, setCodexSessions] = useState([]);
+      const [codexDraftEpoch, setCodexDraftEpoch] = useState(0);
+      const [activeCodexId, setActiveCodexId] = useState(() => {
+        try {
+          return localStorage.getItem('pinvou_codex_active_session') || null;
+        } catch {
+          return null;
+        }
+      });
+      const [codexBusyBySession, setCodexBusyBySession] = useState({});
+      // 代码会话等待用户输入（request_user_input 挂起）的会话集合：侧边栏用
+      // 「等待你的选择」橙色点提示，与 running 灰点区分——后台会话提问不再无感知。
+      const [codexWaitingInputBySession, setCodexWaitingInputBySession] = useState({});
+      // 全局事件监听器按 id 判断是否为代码会话（监听器注册一次，不能闭包旧列表）。
+      const codexSessionIdsRef = useRef(new Set());
+      // 进入设置前的页面（openSettingsSection 记录），关闭设置时原路返回。
+      const settingsReturnViewRef = useRef(null);
+      useEffect(() => {
+        codexSessionIdsRef.current = new Set(codexSessions.map(session => session && session.id));
+      }, [codexSessions]);
+      const refreshCodexSessions = useCallback(async () => {
+        if (!codexAcpSupported || !isTauriAvailable()) {
+          setCodexSessions([]);
+          return [];
+        }
+        const sessions = await listAcpSessions();
+        const next = Array.isArray(sessions) ? sessions : [];
+        setCodexSessions(next);
+        return next;
+      }, [codexAcpSupported]);
+      const updateActiveCodexSession = useCallback((id) => {
+        const next = id || null;
+        setActiveCodexId(next);
+        try {
+          if (next) localStorage.setItem('pinvou_codex_active_session', next);
+          else localStorage.removeItem('pinvou_codex_active_session');
+        } catch {
+          // WebView 禁用 storage 时仍允许当前窗口内切换。
+        }
+      }, []);
+      useEffect(() => {
+        if (!codexAcpSupported || !isTauriAvailable()) {
+          // Clear the code-session mirror when bridge capabilities change to avoid stale unreachable sessions;
+          // the synchronous setState guarantees it takes effect in this render pass.
+          setCodexSessions([]);
+          return;
+        }
+        let disposed = false;
+        const unlisteners = [];
+        refreshCodexSessions().catch(error => {
+          if (!disposed) console.warn('[codex] list sessions failed', error);
+        });
+        tauriEvents.listen('acp:event', (message) => {
+          if (disposed) return;
+          const incoming = message && message.payload;
+          const sessionId = incoming && incoming.sessionId;
+          const type = incoming && incoming.event && incoming.event.type;
+          if (!sessionId || !type) return;
+          if (type === 'turn_started') {
+            setCodexBusyBySession(current => ({ ...current, [sessionId]: true }));
+            refreshCodexSessions().catch(() => {});
+          } else if (type === 'turn_completed') {
+            setCodexBusyBySession(current => ({ ...current, [sessionId]: false }));
+            refreshCodexSessions().catch(() => {});
+          }
+        }).then(unlisten => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        }).catch(() => {});
+        tauriEvents.listen('session:deleted', () => {
+          if (!disposed) refreshCodexSessions().catch(() => {});
+        }).then(unlisten => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        }).catch(() => {});
+        // 原生（品悟）代码会话的 turn 走 chat:* 事件：busy 徽标与 ACP 会话同机制，
+        // 只跟踪代码会话列表内的 session，普通聊天会话不影响。
+        ['chat:turn_started', 'chat:done'].forEach(eventName => {
+          tauriEvents.listen(eventName, (message) => {
+            if (disposed) return;
+            const sessionId = message && message.payload && message.payload.session_id;
+            if (!sessionId || !codexSessionIdsRef.current.has(sessionId)) return;
+            setCodexBusyBySession(current => ({ ...current, [sessionId]: eventName === 'chat:turn_started' }));
+            if (eventName === 'chat:done') {
+              setCodexWaitingInputBySession(current => ({ ...current, [sessionId]: false }));
+            }
+            refreshCodexSessions().catch(() => {});
+          }).then(unlisten => {
+            if (disposed) unlisten();
+            else unlisteners.push(unlisten);
+          }).catch(() => {});
+        });
+        // 后台会话提问（request_user_input 挂起）时点亮「等待你的选择」提示，
+        // 收口（提交/取消/超时→tool_end）后熄灭；turn 结束由上面 chat:done 兜底。
+        ['chat:user_input_required', 'chat:tool_end'].forEach(eventName => {
+          tauriEvents.listen(eventName, (message) => {
+            if (disposed) return;
+            const p = message && message.payload || {};
+            const sessionId = p.session_id;
+            if (!sessionId || !codexSessionIdsRef.current.has(sessionId)) return;
+            if (eventName === 'chat:user_input_required') {
+              setCodexWaitingInputBySession(current => ({ ...current, [sessionId]: true }));
+              setCodexBusyBySession(current => ({ ...current, [sessionId]: true }));
+            } else if (p.name === 'request_user_input') {
+              setCodexWaitingInputBySession(current => ({ ...current, [sessionId]: false }));
+              // 只有提问收口才刷新会话列表；普通工具 tool_end 不动列表，避免
+              // 工具密集 turn 下每个 chat:tool_end 都触发一次 IPC + 重渲染。
+              refreshCodexSessions().catch(() => {});
+            }
+          }).then(unlisten => {
+            if (disposed) unlisten();
+            else unlisteners.push(unlisten);
+          }).catch(() => {});
+        });
+        return () => {
+          disposed = true;
+          unlisteners.forEach(unlisten => { unlisten(); });
+        };
+      }, [codexAcpSupported, refreshCodexSessions]);
+      // 供全局事件监听器读取最新视图状态（监听器只注册一次，不能闭包旧值）。
+      // latest-ref render-time mirror: event callbacks (fired post-commit) read the latest value, an officially
+      // sanctioned React escape hatch; writing back via an effect would introduce a brief stale-value window around commit.
+      const activeChatRef = useRef(activeChat);
+      activeChatRef.current = activeChat;
+      const currentViewRef = useRef(currentView);
+      currentViewRef.current = currentView;
+      useEffect(() => {
+        if (!isTauriAvailable()) return;
+        const guard = createPetActivationGuard();
+        let disposed = false;
+        let unlisten = null;
+        tauriEvents.listen('pet:activation_guard', guard.arm).then((fn) => {
+          if (disposed) fn();
+          else unlisten = fn;
+        }).catch(() => {});
+        // 只拦截由上面的桌宠专用事件武装后的一个 click。普通 window.focus、
+        // Alt-Tab、任务栏回焦和其它平台不会触发保护，也就不会丢掉正常首击。
+        window.addEventListener('click', guard.handleClick, true);
+        return () => {
+          disposed = true;
+          if (unlisten) unlisten();
+          window.removeEventListener('click', guard.handleClick, true);
+        };
+      }, []);
+      // 工具商店/卡片用 Tailwind dark: 变体(darkMode:'class'),全局挂 <html>.dark 让其随 app 主题切换
+      useEffect(() => {
+        document.documentElement.classList.toggle('dark', activeTheme === 'dark');
+        // 桌面端把解析后的配色写回 localStorage,作为 index.html 首帧前置
+        // class 脚本的启动缓存(authoritative color_scheme 在 settings.json,
+        // 异步到达;无缓存时深色冷启会闪白)。web 端 handleSetTheme 自己持久化
+        // 用户选择(system/light/dark),这里若覆盖会毁掉「跟随系统」。
+        if (!isWeb) {
+          try { window.localStorage.setItem(COLOR_SCHEME_STORAGE_KEY, activeTheme); } catch { /* storage may be unavailable */ }
+        }
+      }, [activeTheme]);
+      const [language, setLanguage] = useState(() => {
+        const systemLanguage = initialSystemLanguage();
+        if (!isWeb) return systemLanguage;
+        try {
+          const value = window.localStorage.getItem('pinvou.web.language');
+          // 首帧引导(文件尾 ensureLanguage)已保证 localStorage 选中的语言词典就位
+          return value && dict[value] ? value : systemLanguage;
+        } catch { return systemLanguage; }
+      });
+      // 语言切换统一走该门(handleSetLanguage):装载完成乱序时只落地最新选择。
+      const switchToLanguage = useRef(createLatestLanguageGate()).current;
+      // UI 语言为 en/ja 时确保 personas-i18n overlay 已加载(覆盖「系统中文 + 手动切
+      // 英/日 UI」、index.html 快速路径跳过的场景),加载完成 bump 一次让卡名重渲染。
+      const [, setPersonaI18nTick] = useState(0);
+      useEffect(() => {
+        if (language === 'en' || language === 'ja') {
+          ensurePersonaI18nOverlay(() => setPersonaI18nTick(v => v + 1));
+        }
+      }, [language]);
+      const [superPerm, setSuperPerm] = useState(false);
+      // Both desktop-notification switches start from the platform
+      // master-switch default (aligned with Rust NotificationPrefs::default).
+      const defaultDesktopNotificationSwitch = platformCapabilities.taskCompletionNotificationsDefault !== false;
+      const [taskCompletedNotif, setTaskCompletedNotif] = useState(defaultDesktopNotificationSwitch);
+      // inputNeededNotif stores the persisted needs_input intent; the
+      // effective display derives as intent && taskCompletedNotif in
+      // SettingsView — the task-completion switch is the master switch (its
+      // payload carries enabled), so the derivation stays truthful across the
+      // master going off->on in both directions.
+      const [inputNeededNotif, setInputNeededNotif] = useState(defaultDesktopNotificationSwitch);
+      // search 后端配置:provider 默认 bing(对齐 bridge prefs::SearchProvider::default());
+      // bs.settings 加载后 useEffect 同步进来。
+      const [searchProvider, setSearchProvider] = useState('bing');
+      const [enabledSearchProviders, setEnabledSearchProviders] = useState(['bing']);
+      const [searchKeyDrafts, setSearchKeyDrafts] = useState({});
+      const [searchKeyActions, setSearchKeyActions] = useState({});
+      const searchConfigInitRef = useRef(false);
+      const uiPrefsInitRef = useRef(false);
+
+      const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+      const [openSidePanelCount, setOpenSidePanelCount] = useState(0);
+      const restoreSidebarAfterConstraintRef = useRef(false);
+      // 移动壳层只作用于 Web 端紧凑视口：底部 Tab + 顶栏，侧栏只保留抽屉形态。
+      const compactViewport = useCompactViewport();
+      const isCompactShell = isWeb && compactViewport;
+      const browserDockAvailable = !isCompactShell
+        && browserNativeDisplayAvailable;
+      // On narrow windows, an open right panel takes priority over the left sidebar.
+      // This is a temporary layout constraint; restore the user's sidebar choice later.
+      useEffect(() => {
+        if (isCompactShell) return;
+        const fitWorkspace = () => {
+          const constrained = openSidePanelCount > 0 && window.innerWidth < 1320;
+          if (constrained) {
+            setIsSidebarOpen((current) => {
+              if (current) restoreSidebarAfterConstraintRef.current = true;
+              return false;
+            });
+          } else if (restoreSidebarAfterConstraintRef.current) {
+            restoreSidebarAfterConstraintRef.current = false;
+            setIsSidebarOpen(true);
+          }
+        };
+        fitWorkspace();
+        window.addEventListener('resize', fitWorkspace);
+        return () => window.removeEventListener('resize', fitWorkspace);
+      }, [isCompactShell, isSidebarOpen, openSidePanelCount]);
+      // iOS Safari 上 100dvh 不等于真实可见高度（动态工具栏/安全区），用 visualViewport 兜底。
+      const visualViewportHeight = useVisualViewportHeight();
+      // iOS Safari 聚焦输入框时会尝试滚动整个文档。紧凑 Web 壳层本身已经按
+      // visualViewport 缩高，若再允许文档级平移，整个应用会被推到键盘上方，只剩白屏。
+      useEffect(() => {
+        if (!isCompactShell) return;
+
+        const html = document.documentElement;
+        const body = document.body;
+        html.classList.add('compact-web-viewport');
+
+        let frame = 0;
+        let settleTimer = 0;
+        const resetDocumentScroll = () => {
+          window.cancelAnimationFrame(frame);
+          window.clearTimeout(settleTimer);
+          const reset = () => {
+            window.scrollTo(0, 0);
+            html.scrollTop = 0;
+            body.scrollTop = 0;
+          };
+          frame = window.requestAnimationFrame(reset);
+          // Safari 的自动聚焦平移可能晚于 focusin/viewport resize，再收敛一次。
+          settleTimer = window.setTimeout(reset, 120);
+        };
+
+        const viewport = window.visualViewport;
+        document.addEventListener('focusin', resetDocumentScroll);
+        viewport?.addEventListener('resize', resetDocumentScroll);
+        viewport?.addEventListener('scroll', resetDocumentScroll);
+        resetDocumentScroll();
+
+        return () => {
+          html.classList.remove('compact-web-viewport');
+          document.removeEventListener('focusin', resetDocumentScroll);
+          viewport?.removeEventListener('resize', resetDocumentScroll);
+          viewport?.removeEventListener('scroll', resetDocumentScroll);
+          window.cancelAnimationFrame(frame);
+          window.clearTimeout(settleTimer);
+        };
+      }, [isCompactShell]);
+      const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
+      const canDetachWindows = can('detachWindows');
+      const [chatPrefill, setChatPrefill] = useState('');
+      // Append mode for failure-recovery prefills (replaced template prefills keep
+      // whole-draft replacement semantics, re-review #4).
+      const [chatPrefillAppend, setChatPrefillAppend] = useState(false);
+      const [searchOverlayOpen, setSearchOverlayOpen] = useState(false);
+      const composerPrefillSeenRef = useRef(0);
+      const scheduledTaskAutoOpenSeenRef = useRef(null);
+      const [personaEditor, setPersonaEditor] = useState(null); // 聊天里"存入卡牌池"草稿 → App 级编辑器
+      const [savedConfirm, setSavedConfirm] = useState(null); // 存入成功 → iOS 确认窗 {name}
+      const [poolMyOnly, setPoolMyOnly] = useState(false); // 跳卡池时是否直接落「我的卡牌」筛选(从确认窗"去查看"进来=true)
+      const [webAccessOpen, setWebAccessOpen] = useState(false);
+      const [publishedBrowserOverlayIntent, setPublishedBrowserOverlayIntent] = useState('');
+      const [settingsUpdateFocusTick, setSettingsUpdateFocusTick] = useState(0);
+      const [settingsInitialSection, setSettingsInitialSection] = useState('general');
+      // 收纳 toast「前往查看」→ 对话管理页并直接展开「已收纳」面板(一次性信号,SearchView 消费后复位)
+      const [searchShowArchived, setSearchShowArchived] = useState(false);
+      const [petFocusComposerTick, setPetFocusComposerTick] = useState(0);
+      const petSnapshotRef = useRef([]);
+      const petSnapshotSequenceRef = useRef(0);
+      // 上次广播的快照内容指纹。ref 而非 effect 局部变量:effect 依赖
+      // bs.sessionBusy/sessions 引用,多会话并发时每次 notify 都换引用导致
+      // effect 重跑;指纹必须跨重跑保持,才能挡住"内容没变"的重复广播。
+      const petSnapshotFingerprintRef = useRef('');
+
+      // ── 多窗口(撕离/tear-off):长按标签 → 浮起跟手 → 拖到目标屏 → 松手 → 该屏最大化打开 ──
+      // dragAvatar = 被拎起的标签副本(跟随光标的 DOM 元素);null=没在拖。原生只判落点,视觉全在这。
+      const [dragAvatar, setDragAvatar] = useState(null); // {key,label,dx,dy,w,h,x,y}
+      const dragOffsetRef = useRef({ dx: 0, dy: 0 });
+      // Stable useCallback: the per-item onPickUp closure caches of
+      // RecentItem/NavItem (see renderSidebarTaskItem) rely on this reference
+      // staying constant across renders so fresh callbacks per render cannot
+      // defeat the memo.
+      const beginTearOff = useCallback((kind, id, label, info) => {
+        const inv = isTauriAvailable() ? invokeTauri : null;
+        if (!inv || !info) return;
+        inv('begin_detach_drag', { kind, id: id == null ? null : id });
+        dragOffsetRef.current = { dx: info.dx, dy: info.dy };
+        setDragAvatar({
+          key: kind + ':' + (id == null ? '' : id), label: label || kind,
+          w: info.w, h: info.h, x: info.startX - info.dx, y: info.startY - info.dy,
+        });
+        if (window.getSelection) { const s = window.getSelection(); if (s && s.removeAllRanges) s.removeAllRanges(); }
+      }, []);
+      // 拖拽中:光标移动 → 更新 avatar 位置(光标 - 抓取偏移,相对位置锁定);禁选 + 抓手光标。
+      const dragAvatarActive = !!dragAvatar;
+      useEffect(() => {
+        if (!dragAvatarActive) return;
+        const prevUS = document.body.style.userSelect, prevCur = document.body.style.cursor;
+        document.body.style.userSelect = 'none';
+        document.body.style.cursor = 'grabbing';
+        const onMove = (e) => {
+          const o = dragOffsetRef.current;
+          setDragAvatar(a => a ? { ...a, x: e.clientX - o.dx, y: e.clientY - o.dy } : a);
+        };
+        window.addEventListener('pointermove', onMove);
+        return () => {
+          window.removeEventListener('pointermove', onMove);
+          document.body.style.userSelect = prevUS;
+          document.body.style.cursor = prevCur;
+        };
+      }, [dragAvatarActive]);
+      // 原生拖拽结束(松手/取消)→ 收起 avatar。
+      useEffect(() => {
+        if (!isTauriAvailable()) return;
+        // If unmount happens after listen() resolves, unlisten immediately
+        // to avoid a leak (same policy as browser:activated).
+        let disposed = false;
+        let un;
+        tauriEvents.listen('detach:drag-ended', () => setDragAvatar(null)).then(f => {
+          if (disposed) f();
+          else un = f;
+        });
+        return () => { disposed = true; if (un) un(); };
+      }, []);
+
+      // 兜底 zh 是活腿:入口 ensureLanguageWithZhFallback 在首选语言 chunk 装载
+      // 失败时已装载 zh,此处 zhDict() 因此非空(两者都失败才落空表,见该函数注释)。
+      const t = dict[language] || zhDict();
+      // The desk-pet reply consumption loop (mounted once) reads a latest-ref mirror of current-language error copy.
+      const petI18nTextRef = useRef(null);
+      petI18nTextRef.current = t.uiMainApp;
+      // 静态 HTML 的 <title>/<html lang> 与非模块脚本(远程文件选择器、web bootstrap)拿不到语言上下文,
+      // 在此按当前语言同步,并把选择器/bootstrap 错误文案暴露给 platform/web/ 下的脚本。
+      // 桌宠窗口标题由 PetWindow 自行同步(主包不做桌宠检测,见 pet_bootstrap_isolation 测试)。
+      useEffect(() => {
+        const misc = t.uiPlatformMisc;
+        if (!misc) return;
+        document.title = misc.appTitle;
+        if (misc.htmlLang) document.documentElement.lang = misc.htmlLang;
+        window.PinvouHostFilePickerStrings = misc.hostFilePicker;
+        // platform/web/bootstrap.js 的 invoke 拒绝错误文案（web bootstrap 内置中文兜底）。
+        window.PinvouWebClientStrings = misc.webClientErrors;
+      }, [t]);
+      // 有可用新版 → 侧边栏设置图标亮红点（不弹窗不打断）
+      const hasUpdate = !!(bs && bs.updateInfo && bs.updateInfo.available);
+      const updateNoticePreviewEnabled = !bridge.available
+        && !!window.UpdateNoticeLogic?.previewEnabled?.(window.location);
+      const isWebAccessConnected = !!(bs && bs.webAccess && bs.webAccess.web_client_connected);
+      function handleOpenWebAccess() {
+        if (!can('webAccessAdmin')) return;
+        setWebAccessOpen(true);
+      }
+
+      // 冷路径预取:该 modal 唯一入口在聊天「存入卡牌池」,此前 cardpool chunk
+      // 可能从未加载;提前发起 import 避免打开动作撞上 chunk 冷启动/失败。
+      // The reference must stay stable across renders: it is passed through to
+      // the structurally compared memoized ConversationTurn; a fresh identity
+      // on every render would invalidate that memo for the whole timeline
+      // during streaming.
+      const handleOpenPersonaEditor = useCallback((initial) => {
+        prefetchView('cardpool');
+        setPersonaEditor({ initial });
+      }, []);
+
+      // Sync from bridge state
+      // One-shot bootstrap: backfill the search-config draft baseline when bridge settings first arrive, then use draft mode
+      // (saved only on confirm) so the effect never overwrites unsaved local edits with old on-disk values.
+      const initSearchConfigFromSettings = (settings) => {
+        const search = settings.search || {};
+        const credentials = search.credentials || {};
+        const saved = {
+          provider: search.provider || 'bing',
+          apiKey: search.api_key || '',
+          credentials,
+          enabledProviders: Array.isArray(search.enabled_providers) && search.enabled_providers.length
+            ? [...new Set(['bing', ...search.enabled_providers])]
+            : ['bing', search.provider || 'bing'].filter(Boolean),
+        };
+        const drafts = {};
+        const actions = {};
+        SEARCH_KEY_PROVIDERS.forEach(p => {
+          drafts[p] = '';
+          actions[p] = 'keep_existing';
+        });
+        if (saved.apiKey && saved.provider !== 'bing') {
+          drafts[saved.provider] = saved.apiKey;
+          actions[saved.provider] = 'replace';
+        }
+        setSearchProvider(saved.provider);
+        setEnabledSearchProviders(saved.enabledProviders);
+        setSearchKeyDrafts(drafts);
+        setSearchKeyActions(actions);
+        searchConfigInitRef.current = true;
+      };
+      // One-shot bootstrap: restore persisted UI language/theme and notification prefs (desktop); on Web the language uses local storage.
+      const initUiPrefsFromSettings = (settings) => {
+        if (isWeb) {
+          // On web the color-scheme preference lives in localStorage; with no
+          // choice made (first visit / storage disabled) follow the system,
+          // light when undeterminable.
+          let storedScheme = null;
+          try { storedScheme = window.localStorage.getItem(COLOR_SCHEME_STORAGE_KEY); } catch { /* silently degrade when WebView disables storage */ }
+          setColorScheme(normalizeColorScheme(storedScheme));
+        } else {
+          const lang = TAG_TO_LANG[settings.language];
+          // 落盘语言可能尚未装载(en/ja 惰性 chunk);ensure 后再切,失败停在系统语言
+          if (lang && lang !== language) ensureLanguage(lang).then((ok) => { if (ok) setLanguage(lang); }).catch(() => {});
+          // `color_scheme` (light/dark/system) is the authoritative preference;
+          // fresh installs keep `system`. `theme` (genesis/liquid-light/liquid-dark)
+          // is the legacy field: the backend derives color_scheme from it once for
+          // old settings missing the key (prefs.rs), and the frontend no longer
+          // reads `theme`, so the two cannot diverge.
+          setColorScheme(normalizeColorScheme(settings.color_scheme));
+        }
+        const notifications = settings.notifications || {};
+        setTaskCompletedNotif(notifications.task_completed !== false && notifications.enabled !== false);
+        // Backfill only the persisted intent; do not fold enabled into the
+        // input switch: the master switch's effectiveness is derived in the
+        // display layer, and folding enabled here would make a persisted
+        // needs_input unrecoverable after the master goes off->on.
+        setInputNeededNotif(notifications.needs_input !== false);
+        uiPrefsInitRef.current = true;
+      };
+      useEffect(() => {
+        if (!bs) return;
+        // activeChat 始终跟随 bridge(含 null:草稿态清掉近期列表高亮)。仅在物化成
+        // 真实 session(非 null)时才强制切回 chat 视图——草稿态/删会话不该把用户从
+        // monitor/settings 拽走。
+        const nextSessionId = bs.activeSessionId;
+        const bridgeTransition = browserBridgeSessionTransitionRef.current;
+        const bridgeObservation = browserSessionCommandEchoGuard.observe(nextSessionId);
+        const isCommandEcho = bridgeObservation.type === 'command-echo';
+        // Intentional nullish check: an HMR-restored ref may be either null or undefined.
+        let bridgeSessionNeedsSync = !isCommandEcho
+          && bridgeTransition != null
+          && bridgeTransition.sessionId !== nextSessionId;
+        if (!isCommandEcho && bs.activeSessionId !== activeChat) {
+          bridgeSessionNeedsSync = true;
+        }
+        if (bridgeSessionNeedsSync) {
+          const publishSession = ({ isCurrent }) => {
+            if (!isCurrent()) return false;
+            setActiveChat(nextSessionId);
+            const publishedView = currentViewRef.current;
+            if (nextSessionId && publishedView !== 'codex' && publishedView !== 'monitor' && publishedView !== 'settings' && publishedView !== 'search' && publishedView !== 'scheduled' && publishedView !== 'browser') {
+              // A normal bridge session must not inherit code-only sidebar/draft state.
+              setCodeModeOn(false);
+              setCurrentView('chat');
+            }
+            return true;
+          };
+          // Every distinct bridge target must enter the serialized gate even
+          // while an older hide ACK is pending. Issuing the newer ticket makes
+          // the older publication stale, and its independently owned hide lease
+          // keeps the native surface hidden until the latest React commit. A
+          // token (not just the session id) avoids an old B→C→B completion from
+          // clearing the newest B request.
+          if (bridgeTransition?.sessionId !== nextSessionId) {
+            const transitionToken = { sessionId: nextSessionId };
+            browserBridgeSessionTransitionRef.current = transitionToken;
+            const transitionResult = runBrowserUiTransition(publishSession, {
+              channel: 'session',
+              hideMode: 'workspace',
+              serialize: true,
+              sessionSource: 'bridge',
+            });
+            void Promise.resolve(transitionResult).finally(() => {
+              if (browserBridgeSessionTransitionRef.current === transitionToken) {
+                browserBridgeSessionTransitionRef.current = null;
+              }
+            });
+          }
+        }
+        if (bs.superPermEnabled !== superPerm) setSuperPerm(bs.superPermEnabled);
+        if (bs.composerPrefill && bs.composerPrefill.id && bs.composerPrefill.id !== composerPrefillSeenRef.current) {
+          composerPrefillSeenRef.current = bs.composerPrefill.id;
+          setChatPrefill(bs.composerPrefill.text || '');
+          setChatPrefillAppend(!!bs.composerPrefill.append);
+          // A composer prefill lands on the normal chat input: same rule — exit code
+          // mode before materializing the chat view.
+          setCodeModeOn(false);
+          setCurrentView('chat');
+        }
+        if (bs.scheduledTaskAutoOpenId && bs.scheduledTaskAutoOpenId !== scheduledTaskAutoOpenSeenRef.current) {
+          scheduledTaskAutoOpenSeenRef.current = bs.scheduledTaskAutoOpenId;
+          setCurrentView('scheduled');
+        }
+        // UI 语言/主题:启动时从落盘 settings 恢复一次；无语言配置时后端已按系统 locale 补齐。
+        if (!uiPrefsInitRef.current && bs.settings) initUiPrefsFromSettings(bs.settings);
+        // 搜索配置：只在第一次从后端加载初始值，后续走草稿模式（确认后才保存并重启）。
+        if (!searchConfigInitRef.current && bs.settings) initSearchConfigFromSettings(bs.settings);
+        // The effect subscribes to the bridge snapshot bs; one-shot bootstrap/init flags are guarded by internal refs,
+        // and the remaining deps (activeChat/currentView/language, etc.) are render-state reads — including them would
+        // rerun the whole sync logic on every UI change. sessionSyncEpoch intentionally
+        // retriggers reconciliation after the serialized browser session gate settles.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [bs, sessionSyncEpoch]);
+
+      function searchProviderKeyAction(provider) {
+        return searchKeyActions[provider] || 'keep_existing';
+      }
+      function buildSearchSettingsPayload() {
+        const baseSearch = (bs && bs.settings && bs.settings.search) || {};
+        const credentials = { ...baseSearch.credentials };
+        SEARCH_KEY_PROVIDERS.forEach(provider => {
+          const action = searchProviderKeyAction(provider);
+          const draft = searchKeyDrafts[provider] || '';
+          if (action === 'delete' || (action === 'replace' && draft.trim())) {
+            credentials[provider] = {
+              ...credentials[provider],
+              api_key: action === 'replace' ? draft.trim() : '',
+              credential_action: action,
+            };
+          }
+        });
+        return {
+          ...baseSearch,
+          provider: searchProvider,
+          enabled_providers: [...new Set(['bing', ...enabledSearchProviders, searchProvider])],
+          api_key: null,
+          credentials,
+        };
+      }
+      // Scheduled-run status copy (depends on the current language
+      // dictionary); defined before the derived useMemos below so they can
+      // depend on it.
+      const scheduledRunLabel = useCallback((value) => {
+        return (t.uiScheduled.runStatus[value] || value || t.uiScheduled.unknown);
+      }, [t]);
+
+      // Title/date-slot derivation for scheduled run entries: sidebar entries (scheduledRunItems) and chat entry
+      // decoration (decorateScheduledRunChat) share one rule to avoid drift between the two copies.
+      // Without a chat, derive from the run DTO's sessionTitle; with a chat, use the chat title.
+      // Rows are single-line: the status · time string rides the right date
+      // slot instead of a second line (run sessions don't go through the
+      // regular date field — see scheduledRunItems below).
+      const scheduledRunDisplayFields = useCallback((run, chat) => {
+        const rawTitle = chat ? chat.title : (run.sessionTitle || '');
+        const title = (!rawTitle || isDefaultChatTitle(rawTitle))
+          ? (run.taskName || t.scheduledPlans)
+          : rawTitle;
+        return {
+          title,
+          date: `${scheduledRunLabel(run.status)} · ${formatSessionDate(run.scheduledFor || run.createdAt, language)}`,
+        };
+      }, [t, language, scheduledRunLabel]);
+
+      // App re-renders in full on every bridge notify (including local UI
+      // state changes unrelated to the sidebar). Every O(sessions) derivation
+      // below is a useMemo over the real data slices: bridge subscription
+      // snapshots are persistent projections whose unchanged slices keep
+      // their references (pure chat streaming tokens only touch the chat
+      // domain and keep the sessions domain identical), so these memos are
+      // what let the sidebar derivations and the RecentItem memo actually
+      // skip recomputation.
+
+      // Build chat history from sessions
+      const bridgeSessions = bs && bs.sessions;
+      const bridgeSessionBusy = bs && bs.sessionBusy;
+      const chatHistory = useMemo(() => {
+        const sessionBusy = bridgeSessionBusy || {};
+        return bridgeSessions ? bridgeSessions.map(s => {
+          const isPlaceholder = !s.title || isDefaultChatTitle(s.title);
+          const titlePresentation = isPlaceholder
+            ? { text: t.newChat, attachments: [] }
+            : sessionTitlePresentation(s.title, s.title_attachment_names);
+          return {
+            id: s.id,
+            // The backend default title is one of the trilingual sentinels
+            // (see isDefaultChatTitle; the bridge uses it to decide whether to
+            // auto-rename) — map it to the current language at the display layer
+            title: sessionTitlePlainText(titlePresentation),
+            titleContent: titlePresentation.attachments.length
+              ? <SessionAttachmentTitle presentation={titlePresentation} />
+              : null,
+            date: formatSessionDate(s.updated_at || s.created_at, language),
+            updatedAt: s.updated_at || s.created_at || '',
+            pinned: !!s.pinned,
+            pinnedAt: s.pinned_at || '',
+            working: !!sessionBusy[s.id], // concurrent sessions: is this session generating in the background
+            // #445 binding: a bound work session carries workspacePath/Kind;
+            // project grouping follows binding (the same signal as the safety
+            // posture). Unbound sessions leave both values empty and stay in
+            // the date view.
+            workspacePath: s.workspace_binding || '',
+            // §6 keychain snapshot (cwd first): powers the "view workspace"
+            // menu entry's access-scope list. Absent on older hosts → [].
+            workspaceRoots: Array.isArray(s.workspace_roots) ? s.workspace_roots : [],
+            // A standalone 'bound' kind: shares the three-tier grouping with
+            // the code/ACP 'project' kind, but is not a disguised
+            // project-kind (review #452 finding 5).
+            workspaceKind: s.workspace_binding ? WORKSPACE_KIND_BOUND : '',
+            leadingIcon: <PinvouLogo className="h-[18px] w-[18px]" />,
+            testId: 'regular-sidebar-item',
+            menuTestId: 'regular-sidebar-menu',
+          };
+        }) : [];
+      }, [bridgeSessions, bridgeSessionBusy, t, language]);
+      const codexHistory = useMemo(() => codexSessions.map(session => ({
+        id: session.id,
+        title: (!session.title || isDefaultChatTitle(session.title))
+          ? t.newChat
+          : session.title,
+        date: formatSessionDate(session.updated_at || session.created_at, language),
+        updatedAt: session.updated_at || session.created_at || '',
+        workspacePath: session.workspace_path || '',
+        // 行是单行:文件夹归属由「项目」视图的分组组头表达,不再逐项标注。
+        workspaceKind: session.workspace_kind || '',
+        // §6 keychain snapshot for the "view workspace" menu entry (same
+        // cwd-first shape as the chat lane's workspaceRoots).
+        workspaceRoots: Array.isArray(session.workspace_roots) ? session.workspace_roots : [],
+        pinned: !!session.pinned,
+        pinnedAt: session.pinned_at || '',
+        working: !!codexBusyBySession[session.id],
+        waitingInput: !!codexWaitingInputBySession[session.id],
+        taskKind: 'codex',
+        leadingIcon: <AcpAgentLogo agentId={session.agent_id} className="h-[18px] w-[18px]" title={session.agent_name || t.acpAgent} />,
+        testId: 'codex-sidebar-item',
+        menuTestId: 'codex-sidebar-menu',
+        codexSession: session,
+      })), [codexSessions, codexBusyBySession, codexWaitingInputBySession, t, language]);
+      const pinnedChatHistory = useMemo(() => chatHistory
+        .filter(chat => chat.pinned)
+        .sort((a, b) => String(b.pinnedAt || b.updatedAt).localeCompare(String(a.pinnedAt || a.updatedAt))), [chatHistory]);
+      const bridgeScheduledTaskRecentRuns = bs && bs.scheduledTaskRecentRuns;
+      const scheduledRunShortcuts = useMemo(() => (bridgeScheduledTaskRecentRuns && bridgeScheduledTaskRecentRuns.length)
+        ? bridgeScheduledTaskRecentRuns
+        : [], [bridgeScheduledTaskRecentRuns]);
+      const scheduledRunSessionIds = useMemo(() => new Set(
+        scheduledRunShortcuts
+          .map(run => run && run.sessionId)
+          .filter(Boolean)
+      ), [scheduledRunShortcuts]);
+      const scheduledRunBySessionId = useMemo(() => {
+        const byId = Object.create(null);
+        scheduledRunShortcuts.forEach(run => {
+          if (run && run.sessionId) byId[run.sessionId] = run;
+        });
+        return byId;
+      }, [scheduledRunShortcuts]);
+      const regularHistory = useMemo(() => chatHistory
+        .filter(chat => !chat.pinned && !scheduledRunSessionIds.has(chat.id))
+        .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))), [chatHistory, scheduledRunSessionIds]);
+      const scheduledRunItems = useMemo(() => scheduledRunShortcuts
+        .filter(run => run && run.sessionId)
+        .map(run => {
+          // 定时运行会话不进 bs.sessions(list_sessions 隔离 sched-*),标题/置顶
+          // 状态由后端 run DTO 直接携带;右侧 date 槽由 displayFields 提供
+          // 「状态 · 时间」,不再置空。
+          return {
+            id: run.sessionId,
+            ...scheduledRunDisplayFields(run),
+            updatedAt: run.createdAt || run.scheduledFor || '',
+            pinned: !!run.pinned,
+            pinnedAt: run.pinnedAt || '',
+            working: run.status === 'running' || run.status === 'queued',
+            leadingIcon: scheduledRunIcon(run, activeTheme),
+            testId: 'scheduled-run-sidebar-item',
+            menuTestId: 'scheduled-run-sidebar-menu',
+            scheduledRun: run,
+          };
+        }), [scheduledRunShortcuts, scheduledRunDisplayFields, activeTheme]);
+      const scheduledRunHistory = useMemo(() => scheduledRunItems.filter(chat => !chat.pinned), [scheduledRunItems]);
+      const pinnedHistory = useMemo(() => [...pinnedChatHistory, ...scheduledRunItems.filter(chat => chat.pinned)]
+        .sort((a, b) => String(b.pinnedAt || b.updatedAt).localeCompare(String(a.pinnedAt || a.updatedAt))), [pinnedChatHistory, scheduledRunItems]);
+
+      const decorateScheduledRunChat = useCallback((chat, run) => {
+        if (!run) return chat;
+        return Object.assign({}, chat, scheduledRunDisplayFields(run, chat), {
+          leadingIcon: scheduledRunIcon(run, activeTheme),
+          testId: 'scheduled-run-sidebar-item',
+          menuTestId: 'scheduled-run-sidebar-menu',
+          scheduledRun: run,
+        });
+      }, [activeTheme, scheduledRunDisplayFields]);
+
+      const [justInstalledTool, setJustInstalledTool] = useState(null);
+      const [taskListFilter, setTaskListFilter] = useState('all');
+      const [taskListSort, setTaskListSort] = useState('pinned_first');
+      const [taskFilterOpen, setTaskFilterOpen] = useState(false);
+      const taskFilterRef = useRef(null);
+      // 日期组展开状态:未点过的组按默认值走(今天展开、以往折叠),点过后记住用户选择
+      const [dateGroupOpen, setDateGroupOpen] = useState({});
+      // Code-style sidebar: enabled by default in code mode (folder grouping +
+      // collapsed primary nav); the 全部/项目 pill switches style explicitly.
+      // null means the user never picked: standard list outside code mode, code
+      // style inside code mode (the long-standing default). Once picked, the
+      // choice is persisted and applies in every mode.
+      const [sidebarCodeStyle, setSidebarCodeStyle] = useState(() => {
+        try {
+          const stored = localStorage.getItem('pinvou_sidebar_code_style');
+          return stored === 'normal' || stored === 'code' ? stored : null;
+        } catch {
+          return null;
+        }
+      });
+      // The 全部/项目 pill drives both state and the persisted choice in one place.
+      const setSidebarCodeStylePersisted = useCallback((next) => {
+        setSidebarCodeStyle(next);
+        try {
+          localStorage.setItem('pinvou_sidebar_code_style', next);
+        } catch {
+          // When the WebView disables storage, still allow switching for this window.
+        }
+      }, []);
+      // Folder group expand state: all expanded by default; once toggled, remember the choice
+      const [folderGroupOpen, setFolderGroupOpen] = useState({});
+      // Primary-nav collapse is a global manual toggle, shared by every mode: nothing
+      // auto-collapses it and no mode switch resets it; the choice persists per window
+      // like the 全部/项目 style pill above.
+      const [sidebarNavCollapsed, setSidebarNavCollapsed] = useState(() => {
+        try {
+          return localStorage.getItem('pinvou_sidebar_nav_collapsed') === '1';
+        } catch {
+          return false;
+        }
+      });
+      const setSidebarNavCollapsedPersisted = useCallback((next) => {
+        setSidebarNavCollapsed(next);
+        try {
+          localStorage.setItem('pinvou_sidebar_nav_collapsed', next ? '1' : '0');
+        } catch {
+          // When the WebView disables storage, still allow toggling for this window.
+        }
+      }, []);
+      // Code mode is a mode, not a page: after entering, navigating to output/monitor
+      // pages keeps code mode — the sidebar stays code-styled and New chat still creates
+      // code sessions; only explicitly switching back to work, or opening a normal
+      // chat session, exits it.
+      const [codeModeOn, setCodeModeOn] = useState(false);
+      // 任务列表的展示形态由 全部/项目 胶囊决定;未显式选择(null)时普通模式
+      // 默认「全部」标准列表、code 模式默认 code 样式(沿用既有默认)。
+      const sidebarCodeListActive = sidebarCodeStyle === null ? codeModeOn : sidebarCodeStyle === 'code';
+      // code 形态下「代码会话」筛选等同「全部」、「定时任务」恒为空(菜单已隐藏这两项);
+      // 进入 code 形态时若仍挂着这两个筛选,复位为「全部」,避免列表莫名变空。
+      // 用 layout effect 在首帧绘制前完成复位,避免闪现一帧空的「暂无任务」列表。
+      useLayoutEffect(() => {
+        if (sidebarCodeListActive && (taskListFilter === 'code' || taskListFilter === 'scheduled')) {
+          setTaskListFilter('all');
+        }
+      }, [sidebarCodeListActive, taskListFilter]);
+      const [archiveConfirm, setArchiveConfirm] = useState(null);
+      const [archiveToast, setArchiveToast] = useState(false);
+      // settingsToast 接受字符串或 { text, duration, multiline }：默认 pill 按
+      // 3 秒的短文案设计；导入汇总（四计数 + 缺产物补救指引）与导入/导出失败
+      // 详情是长文案，3 秒 + 单行截断会把恢复路径整个吞掉（r7 minor），
+      // 长文案调用方自带 duration；multiline（r8）再放开宽度截断——窄窗口上
+      // 80vw 单行仍会裁掉补救指引的尾部，改为可换行 + 圆角大卡形态。
+      const [settingsToast, setSettingsToast] = useState('');
+      const settingsToastText = (settingsToast && typeof settingsToast === 'object') ? settingsToast.text : settingsToast;
+      const settingsToastDuration = (settingsToast && typeof settingsToast === 'object' && Number.isFinite(settingsToast.duration))
+        ? settingsToast.duration : 3000;
+      const settingsToastMultiline = !!(settingsToast && typeof settingsToast === 'object' && settingsToast.multiline);
+      const [projectOpsBusy, setProjectOpsBusy] = useState(false);
+      const [moveToProjectSession, setMoveToProjectSession] = useState(null);
+      const [moveToPresetProject, setMoveToPresetProject] = useState(null);
+      // 拖拽高亮的唯一所有者:源行 dragend 无条件清除,webview 丢 dragleave
+      // 事件时高亮也不会卡死(评审 #450 finding 5)。
+      const [dropTargetGroupKey, setDropTargetGroupKey] = useState(null);
+      // 稳定入口:RecentItem 的 memo 依赖 prop 引用稳定(NavigationComponents
+      // 内注释),内联箭头会让每个 App 重渲染(每个流式 token 批次)重渲染
+      // 全部 codex 侧栏行;identity 只在门控布尔翻转(项目从无到有/反之)时
+      // 变化。RecentItem 自己传 chat,无需逐行捕获。
+      // movePickerRestoreRef:移动成功的 regroup 会把出发行重新挂到新的分组
+      // 容器下,原标签节点随之销毁,被动还原会因 isConnected 失败跳过——
+      // 成功时按会话键解析新节点,交给 useDialogFocusRestore 的关闭时还原。
+      // menu 打开时一并清陈旧拖拽预置,避免上一次落点残留到本次选择
+      // (finding 7;setState 引用稳定,不影响本回调的 identity)。
+      const movePickerRestoreRef = useRef(null);
+      const openMovePicker = useCallback((target) => {
+        prefetchView('moveToProjectDialog');
+        movePickerRestoreRef.current = null;
+        setMoveToPresetProject(null);
+        setMoveToProjectSession(target);
+      }, []);
+      // 拖拽高亮清除必须引用稳定:行内箭头让每个 App 重渲染(每个流式
+      // token 批次、tear-off 期间每次 pointermove 的 setDragAvatar)都新建
+      // 引用,击穿 RecentItem 的 memo,重渲染全部侧栏行。
+      const clearDropTarget = useCallback(() => setDropTargetGroupKey(null), []);
+      const [rebindDraft, setRebindDraft] = useState(null);
+      // Close-time focus resolver for the rebind dialog (review #463 round-10
+      // T7): filled with a `() => Element | null` targeting the project header
+      // row that opened it, which survives the refresh that removes the badge.
+      const rebindRestoreRef = useRef(null);
+      // Re-entry guard for the folder-picker window (review #463 round-10
+      // minor 7): `rebindDraft` stays null until the picker resolves, so the
+      // existing guard cannot see a second badge click in that window — two
+      // pickers would race, and a successful A-rebind could open B's draft.
+      // Held from pick start to settle (pick, empty pick, failure).
+      const rebindPickingRef = useRef(false);
+      // 桥完成首次状态同步(bs 就绪)后拉一次项目快照;后续变更由
+      // projects:list_changed 事件驱动桥内刷新(bridge/projects.js)。
+      const projectsBootstrapReady = !!bs;
+      useEffect(() => {
+        if (projectsBootstrapReady && bridge.projects) bridge.projects.loadProjects();
+      }, [projectsBootstrapReady]);
+      // Round-36 P2b: surface the never-retried tier-1 assignment failure
+      // (tier-2 adoption applies) — the bridge bumps a timestamp on the
+      // degraded create-channel action; one toast per bump, no copy in the
+      // bridge itself.
+      const assignmentDegradedAt = bs.projectsAssignmentDegradedAt || 0;
+      useEffect(() => {
+        if (assignmentDegradedAt) setSettingsToast(t.uiWorkspacePicker.assignmentDegradedNotice);
+      }, [assignmentDegradedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+      // Set of session ids whose archive export is in flight: the handler
+      // exits early to prevent concurrent duplicate exports, and the sidebar
+      // hides the matching menu item as in-progress feedback.
+      const [exportingSessionIds, setExportingSessionIds] = useState(() => new Set());
+      // latest-ref mirror: the stable export callback reads the in-flight set
+      // here instead of changing identity whenever the set changes.
+      const exportingSessionIdsRef = useRef(exportingSessionIds);
+      exportingSessionIdsRef.current = exportingSessionIds;
+
+      // Expanded sidebar width: drag the right edge to adjust (220~480px), double-click
+      // the handle to reset to default; the choice is persisted.
+      const SIDEBAR_WIDTH_DEFAULT = 280;
+      const SIDEBAR_WIDTH_MIN = 220;
+      const SIDEBAR_WIDTH_MAX = 480;
+      const clampSidebarWidth = (w) => Math.min(SIDEBAR_WIDTH_MAX, Math.max(SIDEBAR_WIDTH_MIN, w));
+      const [sidebarWidth, setSidebarWidth] = useState(() => {
+        try {
+          const saved = Number(localStorage.getItem('pinvou_sidebar_width'));
+          return Number.isFinite(saved) && saved > 0 ? clampSidebarWidth(saved) : SIDEBAR_WIDTH_DEFAULT;
+        } catch {
+          return SIDEBAR_WIDTH_DEFAULT;
+        }
+      });
+      // Disable the width transition while dragging to avoid follow lag; the ref lets
+      // pointerup read the latest width for persistence.
+      const [sidebarResizing, setSidebarResizing] = useState(false);
+      const sidebarWidthRef = useRef(sidebarWidth);
+      const applySidebarWidth = (w) => {
+        sidebarWidthRef.current = w;
+        setSidebarWidth(w);
+      };
+      const beginSidebarResize = useCallback((event) => {
+        // Primary button only, mirroring ResizableSidePanel's splitter: a middle
+        // press falls through to the browser's middle-click autoscroll instead
+        // of starting a resize session.
+        if (event.button != null && event.button !== 0) return;
+        // Cancel the compatibility mousedown: left uncanceled it moves focus to
+        // the strip, blurring the composer mid-IME and letting later arrow keys
+        // run keyboardSidebarResize instead of moving the caret — as
+        // ResizableSidePanel does. Canceling pointerdown does not affect
+        // click/dblclick synthesis, so double-click reset is unaffected.
+        event.preventDefault();
+        const handle = event.currentTarget;
+        const startX = event.clientX;
+        const startWidth = sidebarWidthRef.current;
+        setSidebarResizing(true);
+        const onMove = (moveEvent) => {
+          applySidebarWidth(clampSidebarWidth(startWidth + moveEvent.clientX - startX));
+        };
+        const onUp = () => {
+          setSidebarResizing(false);
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          window.removeEventListener('pointercancel', onUp);
+          try {
+            localStorage.setItem('pinvou_sidebar_width', String(sidebarWidthRef.current));
+          } catch {
+            // When the WebView disables storage, the width applies only this once.
+          }
+        };
+        // Capture the pointer and listen for pointercancel so an interrupted drag
+        // (window blur / touch taken over by a system gesture) still settles; otherwise
+        // resizing sticks at true (transition permanently disabled) and listeners leak.
+        try {
+          handle.setPointerCapture(event.pointerId);
+        } catch {
+          // Fall back to window listeners when an old WebView does not support capture.
+        }
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+        window.addEventListener('pointercancel', onUp);
+      }, []);
+      const resetSidebarWidth = useCallback(() => {
+        applySidebarWidth(SIDEBAR_WIDTH_DEFAULT);
+        try {
+          localStorage.setItem('pinvou_sidebar_width', String(SIDEBAR_WIDTH_DEFAULT));
+        } catch {
+          // Same as above.
+        }
+      }, []);
+      // Keyboard resizing per the WAI-ARIA Window Splitter pattern: arrows move by a
+      // step (Shift widens it), Home/End jump to the bounds. Each adjustment goes through
+      // the same clamping and persistence as the pointer flow.
+      const SIDEBAR_RESIZE_KEY_STEP = 24;
+      const keyboardSidebarResize = useCallback((event) => {
+        const step = SIDEBAR_RESIZE_KEY_STEP * (event.shiftKey ? 4 : 1);
+        let next;
+        if (event.key === 'ArrowLeft') next = sidebarWidthRef.current - step;
+        else if (event.key === 'ArrowRight') next = sidebarWidthRef.current + step;
+        else if (event.key === 'Home') next = SIDEBAR_WIDTH_MIN;
+        else if (event.key === 'End') next = SIDEBAR_WIDTH_MAX;
+        else return;
+        event.preventDefault();
+        applySidebarWidth(clampSidebarWidth(next));
+        try {
+          localStorage.setItem('pinvou_sidebar_width', String(sidebarWidthRef.current));
+        } catch {
+          // Same as pointer resize: applies to this session only when storage is unavailable.
+        }
+      }, []);
+
+      useEffect(() => {
+        if (!taskFilterOpen) return;
+        const closeOnPointerDown = (event) => {
+          if (taskFilterRef.current && !taskFilterRef.current.contains(event.target)) {
+            setTaskFilterOpen(false);
+          }
+        };
+        const closeOnEscape = (event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            setTaskFilterOpen(false);
+          }
+        };
+        document.addEventListener('pointerdown', closeOnPointerDown);
+        window.addEventListener('keydown', closeOnEscape);
+        return () => {
+          document.removeEventListener('pointerdown', closeOnPointerDown);
+          window.removeEventListener('keydown', closeOnEscape);
+        };
+      }, [taskFilterOpen]);
+
+      const sidebarTaskFilterOptions = [
+        { id: 'all', label: t.sidebarTaskFilterAll },
+        { id: 'pinned', label: t.sidebarTaskFilterPinned },
+        // In the project form (capsule set to "Projects") the list is always
+        // code/bound sessions: the "Code sessions" filter is equivalent to
+        // 「全部」、「定时任务」恒为空——两个选项都是死胡同,只在标准形态提供。
+        ...(sidebarCodeListActive ? [] : [
+          { id: 'code', label: t.sidebarTaskFilterCodeSessions },
+          { id: 'scheduled', label: t.sidebarTaskFilterScheduled },
+        ]),
+      ];
+      const sidebarTaskSortOptions = [
+        { id: 'pinned_first', label: t.sidebarTaskSortPinnedFirst },
+        { id: 'recent', label: t.sidebarTaskSortRecent },
+      ];
+      const allSidebarTasks = useMemo(() => [
+        ...pinnedHistory.map((chat) => {
+          const run = chat.scheduledRun || scheduledRunBySessionId[chat.id];
+          const item = decorateScheduledRunChat(chat, run);
+          return { ...item, taskKind: run ? 'scheduled' : 'regular' };
+        }),
+        ...regularHistory.map(chat => ({ ...chat, taskKind: 'regular' })),
+        ...scheduledRunHistory.map(chat => ({ ...chat, taskKind: 'scheduled' })),
+        ...codexHistory,
+      ], [pinnedHistory, regularHistory, scheduledRunHistory, scheduledRunBySessionId, codexHistory, decorateScheduledRunChat]);
+      // latest-ref mirror: handleArchiveSession (a stable useCallback) reads
+      // the latest task list for the session title at call time, instead of
+      // changing the callback identity per render just to read a value.
+      const allSidebarTasksRef = useRef(allSidebarTasks);
+      allSidebarTasksRef.current = allSidebarTasks;
+      const sidebarTaskHistory = useMemo(() => (
+        filterSessionsByTab(allSidebarTasks, taskListFilter).sort(sessionListComparator(taskListSort))
+      ), [allSidebarTasks, taskListFilter, taskListSort]);
+
+      // 任务列表按日期堆叠:今天默认展开、以往默认折叠;组内顺序沿用上面的筛选+排序结果,
+      // 组间按日期倒序,无时间戳的落 'unknown' 组沉底。
+      // 「置顶优先」排序下置顶项提升到所有日期组之上,否则旧会话会埋进默认折叠的以往分组,
+      // 只剩置顶标志、没有置顶效果。
+      const todayDateKey = localDateKey(Date.now());
+      const sidebarPinnedHoisted = useMemo(() => (taskListSort === 'pinned_first'
+        ? sidebarTaskHistory.filter(chat => !!chat.pinned)
+        : []), [taskListSort, sidebarTaskHistory]);
+      const sidebarTaskGroups = useMemo(() => groupSessionsByLocalDate(
+        sidebarTaskHistory.filter(chat => !(sidebarPinnedHoisted.length && chat.pinned)),
+        (chat) => localDateKey(chat.updatedAt || chat.pinnedAt),
+      ), [sidebarTaskHistory, sidebarPinnedHoisted]);
+
+      // Project view (formerly the "Code" form): every session bound to a
+      // real directory — code/ACP sessions and #445 bound work sessions — is
+      // grouped uniformly by the project layer's three tiers; unbound plain
+      // sessions stay in the date view of "All". Grouping follows binding,
+      // the same signal as the safety posture.
+      // Note (aligned with the memo comment above): bridge snapshots are
+      // persistent projections, so these memos skip recomputation when their
+      // slices keep their references; tier-2 grouping remains
+      // O(sessions × projects × roots) (#448 finding 8).
+      const sidebarCodeTasks = useMemo(() => (sidebarCodeListActive
+        ? sidebarTaskHistory.filter(chat => chat.taskKind === 'codex'
+            // The bound-work-session branch is desktop-only, like the projects
+            // slice it feeds: on web the backend degrades workspace_binding to
+            // its last path component, so the value is a leaf name with no
+            // project behind it and two same-named directories would collapse
+            // into one tier-3 bucket (review #464 round-6 finding 8b).
+            || (can('desktopChrome') && chat.taskKind === 'regular' && chat.workspacePath))
+        : []), [sidebarCodeListActive, sidebarTaskHistory]);
+      const sidebarFolderPinned = useMemo(() => (taskListSort === 'pinned_first'
+        ? sidebarCodeTasks.filter(chat => !!chat.pinned)
+        : []), [taskListSort, sidebarCodeTasks]);
+      const sidebarUnpinnedCodeTasks = useMemo(() => sidebarCodeTasks.filter(chat => !(sidebarFolderPinned.length && chat.pinned)), [sidebarCodeTasks, sidebarFolderPinned]);
+      const sidebarProjectsData = bs && bs.projectsList;
+      // Sidebar group-header props per group kind (extracted so the render map
+      // stays readable): the project channel (§9.9) and manage-panel (§4)
+      // entries are desktop-only, gated by the projects bridge domain.
+      // Single source for the ProjectGroupHeader domain props (review #484
+      // MINOR: the mount site used to repeat onRename/onDelete/onRebind
+      // before this spread, and the spread silently shadowed the gated
+      // spellings with un-gated ones). Every bridge-backed entry
+      // is gated here: the projects domain is desktop-only (§9.8), and a
+      // web group must render no dead entries.
+      const unavailableRootsOf = (group) => (group.roots || [])
+        // Only a root explicitly marked available=false is unavailable;
+        // missing availability data (older host, stub) counts as available —
+        // same default as manageFolderRows (review #484 round-6). The keep
+        // predicate must select strictly-false roots: `available !== false`
+        // here would invert the list and pin the unavailable badge on every
+        // healthy folder.
+        .filter(root => !!(root && typeof root === 'object' && root.available === false))
+        .map(root => String(root.path));
+      const projectGroupHeaderProps = (group) => ({
+        // Tag-only projects (no roots left) have no directory to bind: the
+        // "new session" entry must not render for them — the handler would
+        // silently no-op on a missing primary root (review #484 M3).
+        onNewSession: bridge.projects && pickerProjectRoots(group).length > 0 ? () => handleProjectNewSession(group.projectId) : undefined,
+        onManage: bridge.projects ? () => setManageFoldersId(group.projectId) : undefined,
+        onRename: bridge.projects ? (name) => handleRenameProject(group.projectId, name) : undefined,
+        onDelete: bridge.projects ? () => handleDeleteProject(group.projectId) : undefined,
+        unavailableRoots: unavailableRootsOf(group),
+        // Forwards the header element too (review #463 round-10 T7 focus
+        // restore): the rebase merged this helper over main's mount-site
+        // props, and a rootPath-only spelling would silently drop the
+        // focus-restore target.
+        onRebind: bridge.projects ? (rootPath, headerEl) => startRebindWorkspace(rootPath, headerEl) : undefined,
+        onDropSession: bridge.projects ? (sessionId) => handleDropSessionOnProject(sessionId, group.projectId) : undefined,
+      });
+      const folderGroupHeaderProps = (group) => ({
+        title: group.path,
+        // bridge.projects exists on desktop only: no dead entries on web.
+        onConvert: bridge.projects ? (name) => handleConvertFolderToProject(group.path, name) : undefined,
+      });
+      const sidebarGroupHeaderProps = (group) => {
+        if (group.kind === 'project') return projectGroupHeaderProps(group);
+        if (group.kind === 'folder') return folderGroupHeaderProps(group);
+        return {};
+      };
+      // Picker inputs: the projects snapshot plus every directory-bound item
+      // (code/ACP project sessions and #445 bound work sessions).
+      const projectsListEntries = sidebarProjectsData && sidebarProjectsData.projects;
+      const projectsListAssignments = sidebarProjectsData && sidebarProjectsData.assignments;
+      // Hot-view inputs come from the UNFILTERED task pool: deriving from
+      // sidebarCodeTasks (the sidebar-filtered slice) made a warm folder go
+      // cold — or vanish from the picker — whenever the sidebar sat in
+      // another filter/style, which has nothing to do with recency
+      // (review #484 round-3 minor).
+      const boundWorkspaceItems = useMemo(() => [
+        ...allSidebarTasks
+          .filter(s => s.taskKind === 'codex'
+            || (can('desktopChrome') && s.taskKind === 'regular' && s.workspacePath))
+          .map(s => ({ id: s.id, workspaceKind: s.workspaceKind, workspacePath: s.workspacePath, updatedAt: s.updatedAt || '' })),
+        ...codexSessions
+          .filter(s => s && s.workspace_kind === 'project' && s.workspace_path)
+          .map(s => ({ id: s.id, workspaceKind: 'project', workspacePath: String(s.workspace_path), updatedAt: s.updated_at || '' })),
+      ], [allSidebarTasks, codexSessions]);
+      // Dedicated channel for the project row's "new session" (§9.9 project
+      // channel): no picker detour — cwd = the project's remembered primary
+      // root (written by the picker / manage panel), keychain = all of the
+      // project's roots at that moment. The lane follows the current page
+      // (code page → codex draft, anything else → chat draft).
+      const handleProjectNewSession = async (projectId) => {
+        const project = ((sidebarProjectsData && sidebarProjectsData.projects) || [])
+          .find(entry => entry.id === projectId);
+        if (!project) return;
+        const primary = pickerPrimaryRoot(project);
+        if (!primary) return; // tag-only project: no root to bind; the render side already keeps the button away
+        const roots = pickerProjectRoots(project);
+        // Grant-notice parity: this channel grants the project's whole root set
+        // without a picker detour, so the mode-aware notice must still surface
+        // at grant time (§9.4) — but only when the draft actually staged.
+        if (await applyWorkspaceTarget({
+          lane: currentView === 'codex' ? 'codex' : 'chat',
+          path: primary,
+          projectId: project.id,
+          roots,
+        }).catch((error) => { reportPickerApplyFailure(error); return false; })) {
+          setSettingsToast(workspaceGrantNotice(
+            currentView === 'codex' ? activeLaneMode() : chatLaneGrantMode(),
+            roots.length,
+            currentView === 'codex' && (codexLaneDeliveryReported ? codexLaneDeliveryLimited : true),
+          ));
+        }
+      };
+
+      // ── Session workspace viewer (sidebar "more" menu) ──────────────────
+      // Read-only access-scope view: the session's §6 keychain snapshot with
+      // the primary folder marked. Desktop-only: the web lane's session list
+      // redacts host absolute paths, so a scope viewer there would display
+      // misleading redacted data.
+      const [viewWorkspaceChat, setViewWorkspaceChat] = useState(null);
+      const openSessionWorkspaceViewer = useCallback((chat) => setViewWorkspaceChat(chat), []);
+
+      // ── Manage-folders panel (§4) ───────────────────────────────────────
+      // View/add/remove project roots, primary-root memory, rename, and the
+      // exclusion list view/revoke. Removing a root writes explicit move-outs
+      // for its auto members inside the backend's update_project; after
+      // add/remove the bridge reloads projects on its own (event + active
+      // refetch, belt and braces).
+      const [manageFoldersId, setManageFoldersId] = useState(null);
+      const manageFoldersProject = manageFoldersId
+        ? (((sidebarProjectsData && sidebarProjectsData.projects) || [])
+            .find(entry => entry.id === manageFoldersId) || null)
+        : null;
+      const closeManageFolders = () => setManageFoldersId(null);
+      // Add folder: system folder picker → whole-set roots replacement (the
+      // grant notice sits on the panel's "add" entry, the same weight as the
+      // picker, §2). Paths already in the project are skipped with a notice.
+      const handleManageAddFolder = async () => {
+        // Round-35 M4: dedicated single-select picker (title matches the
+        // channel; pickFolders was the KB multi-select that silently kept
+        // picked[0] only).
+        if (!bridge.files || !bridge.files.pickManageFolder || !manageFoldersProject || projectOpsBusy) return;
+        const folder = await bridge.files.pickManageFolder()
+          .catch((error) => { console.warn('pick project folder failed', error); return null; });
+        if (!folder) return;
+        if (rootAlreadyPresent(manageFoldersProject, folder)) {
+          setSettingsToast(t.uiManageFolders.addDuplicate);
+          return;
+        }
+        if (rootConflictsWithExisting(manageFoldersProject, folder)) {
+          setSettingsToast(t.uiManageFolders.addNested);
+          return;
+        }
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.updateProjectRoots(
+            manageFoldersProject.id,
+            [...manageFoldersProject.roots.map(root => rootPathOf(root)), folder],
+          );
+        } catch (error) {
+          console.warn('add project folder failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+      const handleManageRemoveRoot = async (root) => {
+        if (!manageFoldersProject || projectOpsBusy) return;
+        const plan = removeRootPlan(manageFoldersProject, root);
+        if (!plan.removed || plan.needsNewPrimary) return; // primary-root removal is blocked inside the panel
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.updateProjectRoots(manageFoldersProject.id, plan.roots);
+        } catch (error) {
+          console.warn('remove project folder failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+      const handleManageSetPrimary = async (root) => {
+        if (!manageFoldersProject || projectOpsBusy) return;
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.setPrimaryRoot(manageFoldersProject.id, root);
+        } catch (error) {
+          console.warn('set primary root failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+      // Exclusion list (§3): listed = no more auto-materialization
+      // (reversible; projects/sessions untouched); unlisted = revoked.
+      const handleSetNeverMaterialize = async (root, never) => {
+        if (projectOpsBusy) return;
+        setProjectOpsBusy(true);
+        try {
+          await bridge.projects.setNeverMaterialize(root, never);
+          setSettingsToast(t.uiManageFolders.exclusionDone);
+        } catch (error) {
+          console.warn('set never-materialize failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+
+      // ── Unified "choose workspace" picker (single entry, §2/§3/§9.3/§9.4) ──
+      // The picker is mounted by the host below and is pure display: every
+      // consequential action (draft staging, ensure/materialization, codex
+      // workspacePickerRequest) is handled here. The dialog only ever reads
+      // hot-view rows + callbacks and never touches the backend.
+      const [workspacePicker, setWorkspacePicker] = useState(null); // { lane, mode }
+      const [pickerBusy, setPickerBusy] = useState(false);
+      const [pickerExcluded, setPickerExcluded] = useState(null);
+      const [pickerCodexRequest, setPickerCodexRequest] = useState(null);
+      // Round-32 MAJOR 1: the request's only clears used to be dismissal, a
+      // chat-lane stage, and the codex view's consumed-ack — if the lazy
+      // codex view never mounts (navigate away mid-chunk-load), no ack ever
+      // fires and the NEXT codex entry replays the stale pick into a fresh
+      // draft (epoch ref resets to 0 on the unmounted view). Leaving the
+      // codex view clears it: an unconsumed request is only meaningful
+      // inside the view it was staged for.
+      useEffect(() => {
+        if (currentView !== 'codex') setPickerCodexRequest(null);
+      }, [currentView]);
+      // The codex lane's effective mode is reported up by CodexAcpView so
+      // sidebar surfaces opened while the code page is active show the codex
+      // lane's mode-aware copy rather than the chat lane's. The delivery
+      // flag mirrors the §6 stage-gate the same way: a third-party ACP agent
+      // only receives the primary root, so codex-lane grant notices use the
+      // recorded-only copy.
+      const [codexLaneMode, setCodexLaneMode] = useState(null);
+      const [codexLaneDeliveryLimited, setCodexLaneDeliveryLimited] = useState(false);
+      // Round-34 minor 17: the mirror stays false until the lazy CodexAcpView
+      // first mounts and reports, so during the chunk-load window a
+      // third-party agent would get full-access wording. `reported` gates the
+      // wording: un-reported = conservative recorded copy (over-warning, never
+      // over-claiming); the first report flips to the lane's true posture.
+      const [codexLaneDeliveryReported, setCodexLaneDeliveryReported] = useState(false);
+      // Lazy hot view (review #484 round-11 M5): `boundWorkspaceItems`
+      // includes `codexSessions`, identity-replaced at every turn boundary,
+      // so an unconditional memo recomputed the rows twice per turn on the
+      // UI thread with the picker closed. Compute only while the picker is
+      // open; closed re-runs short-circuit to the shared empty array before
+      // any grouping work.
+      const workspacePickerRows = useMemo(() => (
+        workspacePicker
+          ? computePickerRows({
+            projects: projectsListEntries || [],
+            items: boundWorkspaceItems,
+            assignments: projectsListAssignments || {},
+          })
+          : EMPTY_PICKER_ROWS
+      ), [workspacePicker, projectsListEntries, projectsListAssignments, boundWorkspaceItems]);
+      const closeWorkspacePicker = () => { setWorkspacePicker(null); setPickerExcluded(null); };
+      // Dismissal without a staged target (Escape / backdrop / close button):
+      // an unconsumed codex picker request from an earlier interaction must
+      // not survive it — the consuming view's epoch ref resets to 0 on
+      // remount, so any stored request would replay onto the next
+      // CodexAcpView mount (review #484 round-11 m8). Chat-lane stages clear
+      // it too (a chat pick invalidates a lingering codex request); the codex
+      // branch of applyWorkspaceTarget intentionally closes WITHOUT clearing
+      // — the request it just set is the payload the view will consume.
+      const dismissWorkspacePicker = () => { closeWorkspacePicker(); setPickerCodexRequest(null); };
+      // Returns whether the draft actually staged (the codex lane's request
+      // object always lands); callers surface grant notices only on a real
+      // staging. Async: the chat lane may need to enter a fresh draft first.
+      const applyWorkspaceTarget = async ({ lane, path, projectId, roots }) => {
+        // Round-37 M8: the re-entry guard lives HERE, not at the five call
+        // sites — the round-34 gates covered the two picker heads while the
+        // browse tail (apply runs after the finally that clears busy),
+        // onBrowseExcluded, and the sidebar new-session path re-entered with
+        // a stale closure (the exact double-session class). The ref (not the
+        // state) is load-bearing: a state check would still see false in the
+        // same render cycle as the first click.
+        if (applyInFlightRef.current) return false;
+        applyInFlightRef.current = true;
+        try {
+          return await applyWorkspaceTargetInner({ lane, path, projectId, roots });
+        } finally {
+          applyInFlightRef.current = false;
+        }
+      };
+      const applyInFlightRef = useRef(false);
+      const applyWorkspaceTargetInner = async ({ lane, path, projectId, roots }) => {
+        // Default false: a missing bridge surface means nothing was staged, so
+        // callers must not claim the grant happened (review #484 n5).
+        let applied = false;
+        if (lane === 'codex') {
+          // Round-21 M7 (mirror of the chat lane's round-11 M7): a pick made
+          // while a codex SESSION is displayed would land as a dormant
+          // beginDraft staging — the grant notice describes a conversation
+          // that is not on screen, and the binding surfaces only on the next
+          // draft. Clear the active codex session (the same transition the
+          // view itself performs on draft entry) and navigate to the codex
+          // view so the staged draft is what the user sees.
+          updateActiveCodexSession(null);
+          setCodeModeOn(true);
+          setCurrentView('codex');
+          setPickerCodexRequest({ epoch: Date.now(), path: path || null, projectId: projectId || null, roots: roots || [] });
+          applied = true;
+        } else if (bridge.sessions && bridge.sessions.setDraftWorkspace) {
+          // A chat-lane stage invalidates a lingering unconsumed codex
+          // request (review #484 round-11 m8).
+          setPickerCodexRequest(null);
+          // The bridge stages a draft workspace only in draft state — with an
+          // active session the call is a documented silent no-op, so the
+          // project row "+" used to dead-end without any feedback on the most
+          // common path (review #484 round-5 M2). Enter a fresh chat draft
+          // first (the same path as handleNewChat), then stage; the
+          // navigation makes the new draft visible instead of silently
+          // discarding the click. The active-session read must go through the
+          // subscribed snapshot: the public bridge object exposes no
+          // activeSessionId getter, so bridge.activeSessionId is always
+          // undefined and the guard below never fired (review #484 round-8 B1).
+          // Round-11 M7: the navigation is NOT gated on an active session —
+          // with no session active while the user is on monitor/outputs/
+          // settings, staging alone left the binding invisible in bridge
+          // state, silently binding a much later fresh draft to a workspace
+          // picked minutes earlier on another page. The chat page's own
+          // handleNewChat always navigates; this entry now does too.
+          if (bs && bs.activeSessionId && bridge.sessions.createNewSession) {
+            setCodeModeOn(false);
+            await bridge.sessions.createNewSession();
+          }
+          setActiveChat(null);
+          setCurrentView('chat');
+          applied = bridge.sessions.setDraftWorkspace(path || null, { projectId: projectId || null, workspaceRoots: roots || [] }) !== false;
+          // Record the pick in the recents list: the legacy system-dialog
+          // path (pickDraftWorkspace) is unreachable on desktop, so the
+          // single-entry picker is now the only recorder — without this the
+          // chat lane's recents never grow while the codex lane's does
+          // (review #484 round-18 M3). Only a concrete path is recorded; the
+          // temporary no-path pick must not create an entry. Existence-guarded
+          // like every optional bridge surface above (web side has no draft
+          // workspace channel).
+          if (applied && path && bridge.sessions.rememberDraftWorkspaceRecent) {
+            bridge.sessions.rememberDraftWorkspaceRecent(path);
+          }
+        }
+        closeWorkspacePicker();
+        return applied;
+      };
+      const activeLaneMode = () => (currentView === 'codex'
+        ? codexLaneMode
+        : ((bs && bs.modeState && bs.modeState.mode) || null));
+      // Chat-lane grant-notice mode (review #484 round-11 M6): the notice
+      // must describe the posture the draft takes ONCE the pick binds it —
+      // the bridge resolves a bound draft to the code lane's default
+      // (fallback plan), and the composer chip flips to exactly that mode
+      // when the pick lands. The render-scope snapshot still shows the
+      // unbound draft's mode at notice time, so reading it here showed YOLO
+      // "visibility" wording for a conversation that then ran plan (and the
+      // inverse overclaim under work-default=plan/code-default=yolo). The
+      // codex lane keeps the draft agent's own mode (correct since round-9).
+      // round-47 M5: resolver body shared with ChatView (features/chat/
+      // bound-draft-mode.js) — one body, no drift twin.
+      const chatLaneGrantMode = () => boundDraftNoticeModeOf(bridge, bs);
+      // Same-weight grant notice for every entry that grants folder access
+      // without the picker's expansion panel (§9.4). Codex-lane channels for
+      // a third-party ACP agent say "recorded" instead: the §6 stage-gate
+      // delivers only the primary root until the session/new follow-up lands.
+      // Recorded wording is gated on count > 1: a single root is the
+      // cwd/primary and is delivered on the wire, so the recorded copy would
+      // be false at n=1 (review #484 round-9 N3).
+      const workspaceGrantNotice = (mode, count, deliveryLimited = false) => (
+        workspaceNoticeTone(mode) === 'restricted'
+          ? (deliveryLimited && count > 1
+            ? t.uiWorkspacePicker.noticeRestrictedRecorded(count)
+            : t.uiWorkspacePicker.noticeRestricted(count))
+          : (deliveryLimited && count > 1
+            ? t.uiWorkspacePicker.noticeVisibilityRecorded(count)
+            : t.uiWorkspacePicker.noticeVisibility(count)));
+      const pickerLane = () => (workspacePicker ? workspacePicker.lane : 'chat');
+      // Project channel (§9.3): cwd = the picked root, keychain = the project's
+      // full root set at that moment; the backend writes last_primary_root
+      // inside create_session.
+      // The picker closes inside applyWorkspaceTarget, so a rejected create
+      // would otherwise be console-only: closed picker, nothing staged, no
+      // toast — on the most common entry path (row click). Surfaced with the
+      // shared project-operations failure copy (review #484 round-10 m5).
+      const reportPickerApplyFailure = (error) => {
+        console.warn('workspace target failed', error);
+        setSettingsToast(t.uiProjects.opFailed);
+      };
+      // Round-34 minor 15: re-entry guard — during the chat lane's
+      // createNewSession await a second click re-entered applyWorkspaceTarget
+      // with the stale closure (double session). Since round-37 M8 the
+      // authoritative guard is the in-flight ref INSIDE applyWorkspaceTarget
+      // (all five apply sites); these pickerBusy checks now only disable the
+      // dialog's click surface for the two picker heads.
+      const handlePickerSelectProject = (project, root) => {
+        if (pickerBusy) return;
+        setPickerBusy(true);
+        applyWorkspaceTarget({ lane: pickerLane(), path: root, projectId: project.id, roots: pickerProjectRoots(project) })
+          .catch(reportPickerApplyFailure)
+          .finally(() => setPickerBusy(false));
+      };
+      const handlePickerTemporary = () => {
+        if (pickerBusy) return;
+        setPickerBusy(true);
+        applyWorkspaceTarget({ lane: pickerLane(), path: null, projectId: null, roots: [] })
+          .catch(reportPickerApplyFailure)
+          .finally(() => setPickerBusy(false));
+      };
+      // Browse channel (§9.9 folder channel): system folder picker → ensure
+      // (anchor reuse / materialize; the exclusion list skips) → start at the
+      // picked folder with cwd = F, roots = [F], projectId = the anchored
+      // project's id. The assignment is required: without it, tier-2 nested
+      // grouping adopts the session into a broader project whose root covers
+      // F (e.g. a Desktop-rooted project), but the user picked F itself —
+      // the decision is "group only on an exact primary-root match, else
+      // materialize a new project and belong to it".
+      const handlePickerBrowse = async () => {
+        if (!bridge.files || !bridge.files.pickWorkspaceFolder || pickerBusy) return;
+        // Capture the lane synchronously: the system folder dialog can outlive
+        // the picker (closed meanwhile), and reading pickerLane() after the
+        // await would mistarget the chat lane (review #484 m1).
+        const lane = pickerLane();
+        // Round-35 M4: dedicated single-select picker (same rationale as the
+        // manage channel above).
+        const folder = await bridge.files.pickWorkspaceFolder()
+          .catch((error) => { console.warn('pick workspace folder failed', error); return null; });
+        if (!folder) return;
+        let materialized = false;
+        // Only an ensure that actually ran may interpret "no outcome" as the
+        // exclusion list; a missing bridge entry proves nothing about the
+        // folder (review #484 round-6: the panel's copy asserts the list, so
+        // it must not render on an unverified claim). An IPC-level rejection
+        // is neither an outcome nor an exclusion either — the folder's
+        // exclusion status stays unverified.
+        let ensured = false;
+        let errored = false;
+        let ensuredProjectId = null;
+        if (bridge.projects && bridge.projects.ensureFolderProjects) {
+          ensured = true;
+          setPickerBusy(true);
+          try {
+            const outcomes = await bridge.projects.ensureFolderProjects([folder]);
+            const interpreted = interpretFolderEnsureOutcomes(outcomes);
+            materialized = interpreted.materialized;
+            // The picked folder now owns an anchored project (created or
+            // reused): the conversation must be assigned to THAT project, or
+            // tier-2 nested grouping adopts it into a broader project whose
+            // root covers the folder (e.g. a Desktop-rooted project) — the
+            // user picked the subfolder, not its ancestor (review decision:
+            // group only on an exact primary-root match, else materialize).
+            ensuredProjectId = interpreted.projectId;
+            // A failed root is NOT the exclusion list: it gets the failure
+            // toast and stops here — the excluded-folder panel is only for
+            // the "skipped without an outcome" case (review #484 MINOR).
+            if (!materialized && interpreted.failed) {
+              setSettingsToast(t.uiProjects.opFailed);
+              return;
+            }
+          } catch (error) {
+            // Log and start the plain folder conversation — browse promises a
+            // conversation at the picked folder, and the failed-outcome branch
+            // above is the stop surface for a real backend refusal.
+            console.warn('ensure folder project failed', error);
+            errored = true;
+          } finally {
+            setPickerBusy(false);
+          }
+        }
+        if (!materialized && ensured && !errored) {
+          // Exclusion list (§3): the backend skipped it → no outcome; the
+          // picker says so honestly and still allows starting as a plain
+          // folder (no projectId).
+          setPickerExcluded(folder);
+          return;
+        }
+        applyWorkspaceTarget({ lane, path: folder, projectId: ensuredProjectId, roots: [folder] })
+          .catch(reportPickerApplyFailure);
+      };
+
+      const sidebarFolderGroups = useMemo(() => (sidebarCodeListActive
+        ? groupSessionsWithProjects(
+            sidebarUnpinnedCodeTasks,
+            sidebarProjectsData ? sidebarProjectsData.projects : [],
+            sidebarProjectsData ? sidebarProjectsData.assignments : {},
+          )
+        : []), [sidebarCodeListActive, sidebarUnpinnedCodeTasks, sidebarProjectsData]);
+      // 置顶提升会把成员从组 rows 里摘走,但组头计数(含删除确认)要按提升前
+      // 的全量成员算,否则成员全置顶的组确认删除时显示 (0)(评审 finding 24)。
+      // 置顶项通常很少,单独对它们跑一遍分组拿到每组被摘走的数量即可。
+      const sidebarGroupPinnedCounts = useMemo(() => {
+        if (!sidebarCodeListActive || sidebarFolderPinned.length === 0) return {};
+        const counts = {};
+        groupSessionsWithProjects(
+          sidebarFolderPinned,
+          sidebarProjectsData ? sidebarProjectsData.projects : [],
+          sidebarProjectsData ? sidebarProjectsData.assignments : {},
+        ).forEach((group) => { counts[group.key] = group.rows.length; });
+        return counts;
+      }, [sidebarCodeListActive, sidebarFolderPinned, sidebarProjectsData]);
+
+      // latest-ref mirror: the pet-snapshot broadcast effect only subscribes to bs.sessions/sessionBusy/language,
+      // while snapshot contents (id/title/working) are read via refs to reduce effect resubscription.
+      petSnapshotRef.current = useMemo(() => chatHistory.map(chat => ({
+        id: chat.id,
+        title: chat.title,
+        working: chat.working,
+      })), [chatHistory]);
+      const petSessions = bs && bs.sessions;
+      const petSessionBusy = bs && bs.sessionBusy;
+      useEffect(() => {
+        const ev = isTauriAvailable() ? tauriEvents : null;
+        if (!ev) return;
+        let disposed = false;
+        let unlisten = null;
+        // 内容指纹:多会话并发时 sessionBusy/sessions 每次 notify 都换新引用,
+        // effect 重跑导致快照风暴,桌宠窗口被高频快照淹没。只有会话集合
+        // (id/title/working)真实变化才广播,同一内容的重跑直接跳过。
+        const fingerprint = () => JSON.stringify(
+          (petSnapshotRef.current || []).map(s => [s.id, s.title, !!s.working]),
+        );
+        const broadcast = (force = false) => {
+          if (typeof ev.emit !== 'function') return Promise.resolve();
+          const next = fingerprint();
+          if (!force && next === petSnapshotFingerprintRef.current) {
+            return Promise.resolve(false);
+          }
+          petSnapshotFingerprintRef.current = next;
+          return ev.emit('pet:activity_snapshot', {
+            sequence: ++petSnapshotSequenceRef.current,
+            sessions: petSnapshotRef.current,
+          }).catch(() => {});
+        };
+        broadcast();
+        // 桌宠窗口冷启动/重连时的主动请求必须无条件应答,不能用指纹挡掉。
+        ev.listen('pet:request_snapshot', () => broadcast(true)).then((fn) => {
+          if (disposed) fn();
+          else unlisten = fn;
+        }).catch(() => {});
+        return () => {
+          disposed = true;
+          if (unlisten) unlisten();
+        };
+      }, [petSessions, petSessionBusy, language]);
+
+      const closeMobileSidebar = useCallback(() => {
+        if (!isWeb || typeof window === 'undefined') return;
+        if (window.matchMedia && window.matchMedia('(max-width: 639px)').matches) {
+          setIsSidebarOpen(false);
+        }
+      }, []);
+
+      // Stable useCallback: the sidebar NavItem memo depends on this callback
+      // identity. bs is read through a latest-ref — a click sees the most
+      // recently rendered snapshot, matching closure-capture semantics.
+      const navigateFromScheduledRun = useCallback(async (nextView, beforeNavigate) => {
+        NAV_PREFETCH[nextView]?.();
+        const bs = bsRef.current;
+        const context = browserSurfaceTransitionContextRef.current;
+        const keepsDesktopBrowserVisible = !context.compact && (
+          nextView === 'chat'
+          || (nextView === 'scheduled' && context.scheduledRunChat)
+        );
+        return runBrowserUiTransition(async ({ isCurrent }) => {
+          if (bs && bs.scheduledRunContext && bridge.available && bridge.scheduled.exitScheduledRunChat) {
+            const exited = await bridge.scheduled.exitScheduledRunChat();
+            if (!exited || !isCurrent()) return false;
+          }
+          if (beforeNavigate) beforeNavigate();
+          if (nextView === 'chat') setCodeModeOn(false);
+          setCurrentView(nextView);
+          // exitScheduledRunChat may have moved activeSessionId (return
+          // session or draft); read the latest ref after the await rather
+          // than the pre-await snapshot.
+          const bsAfterExit = bsRef.current;
+          if (bsAfterExit && bsAfterExit.scheduledRunContext) setActiveChat(bsAfterExit.activeSessionId || null);
+          closeMobileSidebar();
+          return true;
+        }, {
+          channel: 'view',
+          hideMode: bs && bs.scheduledRunContext
+            ? 'workspace'
+            : keepsDesktopBrowserVisible ? 'none' : 'visible',
+        });
+      }, [closeMobileSidebar, runBrowserUiTransition, setCurrentView]);
+
+      function openSettingsSection(section = 'general') {
+        // 记录进入设置前的页面（代码页齿轮等深链入口），关闭设置时原路返回，
+        // 而不是一律回工作页。
+        if (currentView !== 'settings') settingsReturnViewRef.current = currentView;
+        setSettingsInitialSection(section);
+        return navigateFromScheduledRun('settings');
+      }
+
+      // Stable useCallbacks: the LazySearchView/RecentItem memos depend on
+      // these callback identities; rebuilding them per render would defeat
+      // the memo (the dependencies are the real semantic dependencies).
+      const handleOpenScheduledRunShortcut = useCallback(async (run) => {
+        if (!run || !run.sessionId) return;
+        // A scheduled-run session is a normal chat: both the fallback and the
+        // successful-open branches land on the scheduled view, so each branch
+        // exits code mode right before navigating. Clearing once at the entry
+        // would also clear it when the open fails, leaving an active code
+        // session behind the standard sidebar and New chat creating plain drafts.
+        return runBrowserUiTransition(async ({ isCurrent }) => {
+          if (!bridge.available || !bridge.scheduled.openScheduledRunChat) {
+            setCodeModeOn(false);
+            setCurrentView('scheduled');
+            closeMobileSidebar();
+            return true;
+          }
+          const task = {
+            id: run.automationId,
+            name: run.taskName || t.scheduledPlans,
+            model: run.taskModel || null,
+          };
+          const opened = await bridge.scheduled.openScheduledRunChat(run, task);
+          if (!opened || !isCurrent()) return false;
+          setCodeModeOn(false);
+          setActiveChat(run.sessionId);
+          setCurrentView('scheduled');
+          return true;
+        }, {
+          channel: 'session',
+          hideMode: 'workspace',
+          serialize: true,
+          sessionTarget: run.sessionId,
+        });
+      }, [t, closeMobileSidebar, runBrowserUiTransition, setCurrentView]);
+
+      // Stable useCallback: the sidebar "new chat" NavItem memo depends on
+      // this identity.
+      const handleNewChat = useCallback((installedToolId, forceMode) => {
+        // 类型守卫:installedToolId 必须是字符串 toolId。侧边栏按钮 onClick={() => handleNewChat()}
+        // 本不传参,但若哪天有调用点写成 onClick={handleNewChat},React 会把事件对象当首参塞进来——
+        // 那是 truthy 的 SyntheticEvent,会被当成 toolId 置进 welcomeToolId → ToolWelcomeCard 查不到
+        // 工具渲染 null → 欢迎语整块空白。守卫挡住这条暗坑。
+        const toolIntentId = typeof installedToolId === 'string' && installedToolId
+          ? installedToolId
+          : null;
+        // Follow code mode rather than the current page: in code mode, even on
+        // output/monitor tool pages, New chat still creates a code session draft;
+        // forceMode serves call sites that must land on a normal chat, such as AI card
+        // creation.
+        // Calls carrying a tool intent (tool store "new chat with this tool") must also
+        // land on a normal chat: the tool welcome card is only consumed by ChatView, so a
+        // codex draft would silently drop the intent and leak it into the next session.
+        const hasToolIntent = !!toolIntentId;
+        const wantCode = forceMode
+          ? forceMode === 'code'
+          : !hasToolIntent && codeModeOn;
+        return runBrowserUiTransition(async ({ isCurrent }) => {
+          if (!isCurrent()) return false;
+          if (wantCode && codexAcpSupported) {
+            setCodeModeOn(true);
+            updateActiveCodexSession(null);
+            setCodexDraftEpoch(value => value + 1);
+            setCurrentView('codex');
+          } else {
+            // Every landing here is a normal chat (tool intent, forceMode='chat',
+            // code mode off, or codex unsupported on this host). createNewSession
+            // nulls activeSessionId, so the bridge sync guard cannot heal a stale
+            // codeModeOn afterwards — clear it here.
+            setCodeModeOn(false);
+            if (bridge.available) await bridge.sessions.createNewSession();
+            if (!isCurrent()) return false;
+            if (toolIntentId) setJustInstalledTool(toolIntentId);
+            setActiveChat(null);
+            setCurrentView('chat');
+          }
+          closeMobileSidebar();
+          return true;
+        }, {
+          channel: 'session',
+          hideMode: 'workspace',
+          serialize: true,
+          sessionTarget: null,
+        });
+      }, [codeModeOn, codexAcpSupported, closeMobileSidebar, runBrowserUiTransition, updateActiveCodexSession, setCurrentView]);
+
+      function handleSwitchHomeMode(mode) {
+        if (mode === 'code' && codexAcpSupported) {
+          setCodeModeOn(true);
+          updateActiveCodexSession(null);
+          setCodexDraftEpoch(value => value + 1);
+          setCurrentView('codex');
+        } else if (mode === 'work') {
+          setCodeModeOn(false);
+          // Only the draft state (no active session) starts a new session:
+          // when switching back from the code page, bridge's activeSessionId
+          // is still the original work session; forcing createNewSession
+          // would create a new plain session (default Yolo) and clobber the
+          // user's chosen Plan — surfacing as "switch back from code to work
+          // and the approval mode reverts to Yolo". Keep the original
+          // session; ChatView shows its measured mode after mounting.
+          const scopeKey = bs?.activeSessionId
+            ? createPinvouModeScopeKey(bs.activeSessionId)
+            : undefined;
+          savePinvouModeState({ mode: 'work' }, undefined, scopeKey);
+          if (bridge.available && !bs?.activeSessionId) bridge.sessions.createNewSession();
+          // While on the code page the original work session's mode may have
+          // changed (the code page has its own chain), so pull a fresh value
+          // before switching back — ChatView must not mount with a stale
+          // modeState.
+          if (bridge.available && bs?.activeSessionId) {
+            bridge.interaction.syncModeState().catch(() => {});
+          }
+          setCurrentView('chat');
+        }
+        closeMobileSidebar();
+      }
+
+      // AI 造卡:新对话 + 加持「卡牌制造专家」+ 一条 iOS 引导卡 → 用户在空输入框描述需求,复用 persona-card 草稿流程入库
+      async function startAICard() {
+        const created = await handleNewChat(null, 'chat');
+        if (!created) return;
+        if (!bridge.available) return;
+        const card = await bridge.personas.equipPersona('pinvou-card-creator'); // 先加持(落新 session + 加持气泡)
+        if (card) bridge.personas.postCardCreatorIntro();                     // 加持成功才追加引导卡(持久化,切会话/重启不丢);失败则放弃后续,避免错投(二审补充)
+      }
+
+      const handleSwitchSession = useCallback(async (id) => {
+        if (!bridge.available) return;
+        return runBrowserUiTransition(async ({ isCurrent }) => {
+          // Web RPC can cross a public relay. Close the drawer and enter chat before loading.
+          setCodeModeOn(false);
+          setCurrentView('chat');
+          closeMobileSidebar();
+          const switched = await bridge.sessions.switchToSession(id);
+          if (!switched || !isCurrent()) return false;
+          setActiveChat(id);
+          return true;
+        }, {
+          channel: 'session',
+          hideMode: 'workspace',
+          serialize: true,
+          sessionTarget: id,
+        });
+      }, [closeMobileSidebar, runBrowserUiTransition, setCurrentView]);
+
+      async function handleSearchSelect(id) {
+        await handleSwitchSession(id);
+        setSearchOverlayOpen(false);
+      }
+
+      // Stable useCallback: passed directly as the RecentItem memo's onSelect
+      // (codex branch).
+      const handleSwitchCodexSession = useCallback((id) => {
+        setCodeModeOn(true);
+        updateActiveCodexSession(id);
+        setCurrentView('codex');
+        closeMobileSidebar();
+      }, [updateActiveCodexSession, closeMobileSidebar, setCurrentView]);
+
+      // 用户在主窗口里亲眼看着完成的会话，公仔的活动卡属于冗余提醒——
+      // 完成瞬间若该会话正处于前台聊天视图且窗口有焦点，直接标记已读，
+      // 卡片自动消失，不需要用户再去点。
+      useEffect(() => {
+        const ev = isTauriAvailable() ? tauriEvents : null;
+        if (!ev) return;
+        let disposed = false;
+        const unlisteners = [];
+        const emitToPet = (name, payload) => emitPetEvent(ev, name, payload);
+        ev.listen('chat:done', (event) => {
+          if (disposed) return;
+          const payload = event.payload || {};
+          const sid = payload.session_id || payload.sessionId;
+          if (!sid) return;
+          if (typeof document.hasFocus === 'function' && !document.hasFocus()) return;
+          if (currentViewRef.current !== 'chat') return;
+          if (String(activeChatRef.current) !== String(sid)) return;
+          emitToPet('pet:session_viewed', {
+            session_id: sid,
+            completed: true,
+          }).catch(() => {});
+        }).then((unlisten) => {
+          if (disposed) unlisten();
+          else unlisteners.push(unlisten);
+        }).catch(() => {});
+        return () => {
+          disposed = true;
+          unlisteners.forEach((fn) => { try { fn(); } catch { /* listener teardown failure is ignorable */ } });
+        };
+        // Register once on mount: the body reads only refs (currentViewRef /
+        // activeChatRef) and the module-level emitPetEvent, so the listener
+        // never needs reattachment.
+      }, []);
+
+      // 用户从侧栏切进一个已经完成的会话时，也立即收掉对应完成气泡。
+      // 运行中的卡不会被 markSessionViewed 删除；等它完成时，上面的
+      // chat:done 监听会再次确认当前画面并完成收尾。
+      useEffect(() => {
+        const ev = isTauriAvailable() ? tauriEvents : null;
+        if (!ev || currentView !== 'chat' || !activeChat) return;
+        if (typeof document.hasFocus === 'function' && !document.hasFocus()) return;
+        const emit = emitPetEvent(ev, 'pet:session_viewed', { session_id: activeChat });
+        emit.catch(() => {});
+      }, [currentView, activeChat]);
+
+      useEffect(() => {
+        const ev = isTauriAvailable() ? tauriEvents : null;
+        const core = isTauriAvailable() ? tauriCommands : null;
+        if (!ev || !core) return;
+        const emitToPet = (name, payload) => emitPetEvent(ev, name, payload);
+        let disposed = false;
+        let consuming = false;
+        const unlisteners = [];
+        const consumePetNavigation = async () => {
+          if (disposed || consuming) return;
+          consuming = true;
+          try {
+            const request = await core.invoke('take_pet_navigation');
+            if (!request || disposed) return;
+            const scheduledRun = request.scheduled_run || request.scheduledRun;
+            if (scheduledRun) {
+              const automationId = scheduledRun.automationId || scheduledRun.automation_id;
+              const runId = scheduledRun.runId || scheduledRun.run_id;
+              const sessionId = scheduledRun.sessionId || scheduledRun.session_id;
+              const taskName = scheduledRun.taskName || scheduledRun.task_name;
+              const endedAt = scheduledRun.endedAt || scheduledRun.ended_at;
+              if (!bridge.available || !bridge.scheduled.openScheduledRunChat) {
+                emitToPet('pet:scheduled_notice_open_failed', { run_id: runId }).catch(() => {});
+                return;
+              }
+              let opened = false;
+              try {
+                const published = await runBrowserUiTransition(async ({ isCurrent }) => {
+                  opened = await bridge.scheduled.openScheduledRunChat({
+                    id: runId,
+                    automationId,
+                    sessionId,
+                    status: 'completed',
+                    endedAt,
+                    unread: true,
+                  }, {
+                    id: automationId,
+                    name: taskName,
+                  });
+                  if (!opened || !isCurrent()) return false;
+                  setCodeModeOn(false);
+                  setActiveChat(sessionId);
+                  setCurrentView('scheduled');
+                  return true;
+                }, {
+                  channel: 'session',
+                  hideMode: 'workspace',
+                  serialize: true,
+                  sessionTarget: sessionId,
+                });
+                if (!published) opened = false;
+              } catch (error) {
+                console.error('[pet scheduled navigation] open failed', error);
+              }
+              if (!opened) {
+                emitToPet('pet:scheduled_notice_open_failed', { run_id: runId }).catch(() => {});
+                return;
+              }
+              emitToPet('pet:scheduled_notice_opened', { run_id: runId }).catch(() => {});
+              return;
+            }
+            const sid = request.session_id || request.sessionId;
+            if (!sid) {
+              setCodeModeOn(false);
+              setCurrentView('chat');
+              setPetFocusComposerTick(value => value + 1);
+              return;
+            }
+            if (!bridge.available) return;
+            const sessionExists = petSnapshotRef.current.some((session) => String(session.id) === String(sid));
+            if (!sessionExists) {
+              emitToPet('pet:session_unavailable', { session_id: sid }).catch(() => {});
+              setCodeModeOn(false);
+              setCurrentView('chat');
+              setPetFocusComposerTick(value => value + 1);
+              return;
+            }
+            const switched = await handleSwitchSession(sid);
+            if (!switched) {
+              emitToPet('pet:session_unavailable', { session_id: sid }).catch(() => {});
+              return;
+            }
+            setPetFocusComposerTick(value => value + 1);
+            emitToPet('pet:session_viewed', { session_id: sid }).catch(() => {});
+          } catch (error) {
+            console.error('[pet navigation] consume failed', error);
+          } finally {
+            consuming = false;
+          }
+        };
+        const subscriptions = [ev.listen('pet:navigation_pending', consumePetNavigation)];
+        window.addEventListener('focus', consumePetNavigation);
+        void consumePetNavigation();
+        Promise.all(subscriptions).then((items) => {
+          if (disposed) items.forEach(fn => { fn(); });
+          else unlisteners.push(...items);
+        }).catch(() => {});
+        return () => {
+          disposed = true;
+          window.removeEventListener('focus', consumePetNavigation);
+          unlisteners.forEach(fn => { try { fn(); } catch { /* listener teardown failure is ignorable */ } });
+        };
+      }, [handleSwitchSession, runBrowserUiTransition, setCurrentView]);
+
+      useEffect(() => {
+        const ev = isTauriAvailable() ? tauriEvents : null;
+        const core = isTauriAvailable() ? tauriCommands : null;
+        if (!ev || !core || !bridge.available || !bridge.chat.sendMessageToSession) return;
+        let disposed = false;
+        let consuming = false;
+        let rerun = false;
+        let unlisten = null;
+        const emitToPet = (name, payload) => emitPetEvent(ev, name, payload);
+        // The consumption loop registers once on mount; error copy must follow the current UI language, read via latest-ref.
+        const petTextRef = petI18nTextRef;
+        const petSessionMissingText = () => (petTextRef.current && petTextRef.current.petSessionMissing) || '';
+        const petTaskStartFailedText = () => (petTextRef.current && petTextRef.current.petTaskStartFailed) || '';
+        const consume = async () => {
+          if (disposed) return;
+          if (consuming) {
+            rerun = true;
+            return;
+          }
+          consuming = true;
+          try {
+            if (typeof bridge.lifecycle.init === 'function') await bridge.lifecycle.init();
+            // disposed is only flipped in this effect's cleanup, immutable inside the loop;
+            // continue/return branches after each request decide whether to exit.
+            for (;;) {
+              if (disposed) break;
+              const request = await core.invoke('take_pet_reply');
+              if (!request) break;
+              const requestId = request.request_id || request.requestId;
+              const sid = request.session_id || request.sessionId;
+              const text = String(request.text || '').trim();
+              const liveSessions = bridge.state
+                ? (bridge.state.get('sessions').sessions || [])
+                : [];
+              const sessionExists = petSnapshotRef.current.some(
+                session => String(session.id) === String(sid),
+              ) || liveSessions.some(session => String(session.id) === String(sid));
+              if (!sessionExists) {
+                emitToPet('pet:reply_failed', {
+                  request_id: requestId,
+                  session_id: sid,
+                  error: petSessionMissingText(),
+                  unavailable: true,
+                }).catch(() => {});
+                continue;
+              }
+              try {
+                const result = await bridge.chat.sendMessageToSession(sid, text);
+                emitToPet('pet:reply_accepted', {
+                  request_id: requestId,
+                  session_id: sid,
+                }).catch(() => {});
+                if (result?.completion) {
+                  result.completion.then((outcome) => {
+                    if (outcome?.ok) return;
+                    return emitToPet('pet:reply_failed', {
+                      request_id: requestId,
+                      session_id: sid,
+                      error: String(outcome?.error?.message || outcome?.error || petTaskStartFailedText()),
+                    }).catch(() => {});
+                  });
+                }
+              } catch (error) {
+                emitToPet('pet:reply_failed', {
+                  request_id: requestId,
+                  session_id: sid,
+                  error: String(error && error.message ? error.message : error),
+                }).catch(() => {});
+              }
+            }
+          } catch (error) {
+            console.error('[pet reply] consume failed', error);
+          } finally {
+            consuming = false;
+            if (rerun && !disposed) {
+              rerun = false;
+              void consume();
+            }
+          }
+        };
+        ev.listen('pet:reply_pending', consume).then((fn) => {
+          if (disposed) fn();
+          else unlisten = fn;
+        }).catch(() => {});
+        void consume();
+        // The effect intentionally registers the pet-reply consumption loop once on mount; error copy reads the current language via ref,
+        // avoiding repeated listener reattachment on language switches.
+        return () => {
+          disposed = true;
+          if (unlisten) unlisten();
+        };
+      }, []);
+
+      // The four session-action callbacks below are all stable useCallbacks:
+      // the RecentItem/search management memos depend on their identities and
+      // their dependency arrays list exactly the state they read.
+      const handleDeleteSession = useCallback(async (id) => {
+        const isCodexSession = codexSessions.some(session => session.id === id);
+        if (bridge.available) await bridge.sessions.deleteSession(id);
+        if (isCodexSession) {
+          if (activeCodexId === id) updateActiveCodexSession(null);
+          await refreshCodexSessions().catch(() => {});
+        }
+      }, [codexSessions, activeCodexId, updateActiveCodexSession, refreshCodexSessions]);
+
+      const handleRenameSession = useCallback(async (id, title) => {
+        const isCodexSession = codexSessions.some(session => session.id === id);
+        if (bridge.available) await bridge.sessions.renameSession(id, title);
+        if (isCodexSession) await refreshCodexSessions().catch(() => {});
+      }, [codexSessions, refreshCodexSessions]);
+
+      // One-click full session log export (.tar.xz, full-fidelity context).
+      // The backend opens the native save dialog: cancellation resolves to
+      // null; the success toast carries the save path and failures surface
+      // through the settings-page toast. Sessions already exporting exit
+      // early (preventing concurrent duplicate exports) and their sidebar
+      // menu items are hidden at the same time as in-progress feedback. The
+      // default file name carries the session title (truncated by code
+      // points so surrogate pairs are not split) and a short id; the final
+      // name is sanitized by the backend (against path traversal and invalid
+      // characters). The task list is read via allSidebarTasksRef and the
+      // in-flight set via exportingSessionIdsRef so the callback identity
+      // stays stable (RecentItem is memoized).
+      const handleExportSessionArchive = useCallback(async (id) => {
+        if (!bridge.available || !bridge.sessions.exportSessionArchive) return;
+        if (exportingSessionIdsRef.current.has(id)) return;
+        const chat = (allSidebarTasksRef.current || []).find(c => c.id === id);
+        const title = ((chat && chat.title) || 'session').trim() || 'session';
+        const stem = [...title].slice(0, 30).join('');
+        const defaultName = `pinvou-session-${stem}-${id.slice(0, 8)}.tar.xz`;
+        setExportingSessionIds(prev => new Set(prev).add(id));
+        try {
+          const result = await bridge.sessions.exportSessionArchive(id, defaultName);
+          if (!result) return;
+          setSettingsToast(t.exportSessionDone(result.path));
+        } catch (error) {
+          // Rust 侧导出前置校验的拒绝串指名文件并给出改法（「rename or
+          // remove this file and retry the export」）——只透静态文案会把
+          // 恢复路径留在 console 里（review finding）。
+          const detail = String((error && error.message) || error || t.unknownError);
+          console.warn('export session archive failed', error);
+          // 拒绝串指名文件并给出改法（长文案）：8 秒 + 默认时长会把恢复路径
+          // 读完之前就收走（r7 minor）；multiline 放开窄窗口的单行截断（r8）。
+          setSettingsToast({ text: `${t.exportSessionFailed}: ${detail}`, duration: 8000, multiline: true });
+        } finally {
+          setExportingSessionIds(prev => {
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }
+      }, [t]);
+
+      const handleToggleSessionPinned = useCallback(async (id, pinned) => {
+        const isCodexSession = codexSessions.some(session => session.id === id);
+        if (bridge.available) await bridge.sessions.toggleSessionPinned(id, pinned);
+        if (isCodexSession) await refreshCodexSessions().catch(() => {});
+      }, [codexSessions, refreshCodexSessions]);
+
+      // The archive confirmation needs the session title: read through a
+      // latest-ref so the callback itself stays stable and the RecentItem
+      // memo is not defeated by this prop on every render.
+      const handleArchiveSession = useCallback((id) => {
+        const chat = (allSidebarTasksRef.current || []).find(c => c.id === id);
+        setArchiveConfirm(chat || { id, title: t.newChat });
+      }, [t]);
+
+      // "Open session folder": shared by RecentItem and the conversation
+      // management page; the bridge is a module singleton, so its dependency
+      // is constant.
+      const handleRevealSessionFolder = useCallback((id) => {
+        if (bridge.artifacts.revealSessionFolder) bridge.artifacts.revealSessionFolder(id);
+      }, []);
+
+      async function confirmArchiveSession() {
+        const id = archiveConfirm && archiveConfirm.id;
+        const isCodexSession = archiveConfirm && archiveConfirm.taskKind === 'codex';
+        setArchiveConfirm(null);
+        if (id && bridge.available) {
+          try {
+            const archived = await bridge.sessions.archiveSession(id);
+            if (archived === false) {
+              setSettingsToast(t.sessionBatchFailed(1));
+              return;
+            }
+            if (isCodexSession) {
+              if (activeCodexId === id) updateActiveCodexSession(null);
+              await refreshCodexSessions().catch(() => {});
+            }
+            setArchiveToast(true);
+          } catch (error) {
+            console.warn('archive session failed', error);
+            setSettingsToast(t.sessionBatchFailed(1));
+          }
+        }
+      }
+
+      async function handleRestoreArchivedSession(id) {
+        if (bridge.available) await bridge.sessions.restoreArchivedSession(id);
+        await refreshCodexSessions().catch(() => {});
+      }
+
+      // ── 项目层:分组归档是纯逻辑层操作,永不触碰会话的工作目录绑定。──
+      // 失败走专用的 opFailed toast(借用会话批处理文案会让报错指向错误
+      // 的操作对象);bridge.projects 仅桌面存在。
+      async function runProjectOp(op) {
+        if (!bridge.available || !bridge.projects || projectOpsBusy) return;
+        setProjectOpsBusy(true);
+        try {
+          await op(bridge.projects);
+        } catch (error) {
+          console.warn('project operation failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      }
+      const handleConvertFolderToProject = (path, name) => runProjectOp(p => p.createProject(name, [path]));
+      const handleRenameProject = (projectId, name) => runProjectOp(p => p.renameProject(projectId, name));
+      const handleDeleteProject = (projectId) => runProjectOp(p => p.deleteProject(projectId));
+      // 移动归属:纯归档操作(工作目录绑定不动)。目标 root 不覆盖会话目录时
+      // 由选择器先弹"仅移动"确认,确认后也只移动、不带 add_workspace_root。
+      // 成功 toast 只在 store 真返回 added_root 时带路径(当前移动语义下是
+      // 防御分支,见 commands 侧契约);失败走 runProjectOp 的 opFailed。
+      // 成功只关"这一笔"的弹窗:异步落地期间用户可能已把选择器换到另一个
+      // 会话上,无条件清 slot 会把别人的弹窗关掉。
+      const handleMoveSessionToProject = (sessionId, projectId, addWorkspaceRoot) => runProjectOp(async (p) => {
+        // The picker holds the snapshot it was opened with; if the session
+        // vanished meanwhile (e.g. deleted from another window), the store
+        // rejects every attempt and the confirm panel retries a doomed op
+        // forever — the dead-target loop the pendingProject derivation
+        // already prevents for projects. Retire the picker instead.
+        if ((allSidebarTasksRef.current || []).every(task => task.id !== sessionId)) {
+          setMoveToProjectSession(current => (current && current.id === sessionId) ? null : current);
+          return;
+        }
+        const outcome = await p.moveSessionToProject(sessionId, projectId, addWorkspaceRoot);
+        // The bridge notifies before this op resolves, but the sidebar
+        // regroup that notification triggers is an asynchronous React commit
+        // — querying the DOM right here would still see the pre-regroup row.
+        // Passive cleanup of the dialog unmount runs after that commit's DOM
+        // mutations, so store a resolver and look the moved row's new node up
+        // at close time (see useDialogFocusRestore). The row container is
+        // role="presentation" and cannot take focus, so resolve its label
+        // button — the same focusable element the context menu hands off to.
+        movePickerRestoreRef.current = () => {
+          const row = document.querySelector(
+            `[data-session-key="${CSS.escape(String(sessionId))}"]`,
+          );
+          return row ? row.querySelector('button[data-drag-surface]') : null;
+        };
+        setMoveToProjectSession(current => (current && current.id === sessionId) ? null : current);
+        // 提交后一并清预置目标,避免残留状态泄漏到下一次打开(finding 7)。
+        setMoveToPresetProject(null);
+        setSettingsToast(
+          outcome && outcome.added_root
+            ? t.uiProjects.movedNoticeWithFolder(outcome.added_root)
+            : t.uiProjects.movedNotice,
+        );
+      });
+      // 拖拽落点:root 已覆盖的直接移动;未覆盖的带着预置目标打开选择器,
+      // 进入"仅移动"确认(刻意 move-only:绝不带 add_workspace_root,面板
+      // 文案已说明文件夹留在项目外;menu 路径则不带预置)。判定用共享的
+      // needsAddFolderConfirm,与选择器的初始化器/选择路径保持同源。
+      const handleDropSessionOnProject = (sessionId, projectId) => {
+        // busy 在最外层统一静默忽略,两条路径一致:与侧栏其他拖拽反馈
+        // 相同不额外打断(runProjectOp 内部同样有守卫),也避免落点挂出
+        // 一个 busy 全禁用、无法关闭的预置确认面板。
+        if (projectOpsBusy) return;
+        const chat = sidebarTaskHistory.find(c => c.id === sessionId);
+        if (!chat) return;
+        const projects = sidebarProjectsData ? sidebarProjectsData.projects : [];
+        const target = (projects || []).find(p => p && p.id === projectId);
+        if (!target) return;
+        // 拖回当前所属项目 = 选择器里禁用当前项的同一语义,直接忽略。
+        if (resolveSessionProjectId(chat, projects, sidebarProjectsData ? sidebarProjectsData.assignments : {}) === projectId) return;
+        if (needsAddFolderConfirm(chat, target)) {
+          prefetchView('moveToProjectDialog');
+          setMoveToPresetProject(projectId);
+          setMoveToProjectSession(chat);
+          return;
+        }
+        handleMoveSessionToProject(sessionId, projectId, false);
+      };
+      // Folder rebind (repairs the broken link): click "Rebind" on a project
+      // header with an unavailable root → system folder picker → confirmation
+      // dialog. Two-phase confirmation: the first call omits confirmExisting,
+      // the backend rejects when the old folder still exists, and the dialog
+      // escalates to the strong warning for the user to confirm again.
+      const startRebindWorkspace = async (fromPath, headerEl) => {
+        // Do not reopen while rebindDraft is already open: with focus left on
+        // the badge, pressing Enter re-triggers onRebind (review #463 minor),
+        // and the projectOpsBusy guard does not cover that window. The
+        // pickingRef arm covers the picker window itself, which rebindDraft
+        // cannot see (round-10 minor 7).
+        if (!bridge.files || !bridge.files.pickRebindFolder || projectOpsBusy || rebindDraft || rebindPickingRef.current) return;
+        rebindPickingRef.current = true;
+        // Focus destination for the dialog's close (review #463 round-10 T7):
+        // the badge that opened it is removed by the very operation it starts,
+        // so the hook's default restore target would be detached. Resolved at
+        // close time via the surviving project header row.
+        rebindRestoreRef.current = headerEl
+          ? () => headerEl.querySelector('button')
+          : null;
+        // Warm the lazy dialog chunk during the picker window (#606): the
+        // pick round-trip hides the load.
+        prefetchView('rebindFolderDialog');
+        try {
+          // Single folder, with a title matching the rebind semantics
+          // (review #463 Minor 6): no longer borrowing KB's multi-select
+          // import picker.
+          const to = await bridge.files.pickRebindFolder();
+          if (!to) return;
+          // No session count: the command actually rebinds every session
+          // under `from`; the sidebar group's rendered count is only a
+          // subset, so a numeric promise would not match the
+          // RebindWorkspaceReport (finding 10).
+          setRebindDraft({ from: fromPath, to, warnExisting: false });
+        } catch (error) {
+          // Picker rejection must be user-visible (review #463 minor), not
+          // console-only; the generic opFailed copy covers this failure
+          // class, and the warn keeps the detail available for diagnostics.
+          console.warn('pick rebind folder failed', error);
+          setSettingsToast(t.uiProjects.opFailed);
+        } finally {
+          rebindPickingRef.current = false;
+        }
+      };
+      const confirmRebindWorkspace = async (confirmExisting) => {
+        if (!bridge.projects || !rebindDraft || projectOpsBusy) return;
+        setProjectOpsBusy(true);
+        // Clear the previous attempt's inline error/busy hint so it does
+        // not stack with this run's result.
+        setRebindDraft(prev => prev && { ...prev, error: null, busySessionIds: null });
+        // Feed the previous report's post-busy ids back (review #463
+        // F-Major): a session an earlier run moved and reported post-busy is
+        // routed by the backend into the same to-lane retry population as a
+        // healthy session, so without the feed-back a busy-refused carryover
+        // session would appear in NO report field and the dialog would close
+        // claiming full success while its old-cwd runtime stays resident.
+        // The backend honors only the intersection with its own retry
+        // population, so this list can never widen the eviction set.
+        const previousPostBusySessionIds = (rebindDraft.partial && rebindDraft.partial.postBusyIds) || [];
+        try {
+          const report = await bridge.projects.rebindWorkspaceRoot(
+            rebindDraft.from, rebindDraft.to, confirmExisting, previousPostBusySessionIds);
+          const rebound = (report && report.rebound_session_ids) ? report.rebound_session_ids.length : 0;
+          const failed = (report && report.failed_session_ids) ? report.failed_session_ids.length : 0;
+          const postBusy = (report && report.post_busy_session_ids) ? report.post_busy_session_ids.length : 0;
+          // The dialog stays open whenever the report still has something the
+          // user must act on — failed sessions to retry, or sessions whose
+          // runtime the idle gate refused (round-8 MAJOR-2: closing on the
+          // post-busy-only case left "retry once when idle" with no entry
+          // point, because the unavailable-root badge disappears once the root
+          // has moved — the badge renders strictly off the `available` wire
+          // field, the backend's per-root is_dir() stat; review #463 round-14
+          // B1 restored it after main #566 dropped it and badged every root).
+          // Rerunning the backend with the same from/to converges
+          // (the snapshot includes unsynced sessions; already-rebound ones are
+          // no-ops). The post-busy ids are kept for the next retry's
+          // feed-back (F-Major).
+          if (failed > 0 || postBusy > 0) {
+            setRebindDraft(prev => prev && {
+              ...prev,
+              // The run proceeded past the fence: the old-root warning is
+              // consumed (review #463 round-14 should-fix 3) — a later
+              // reappearance of the old root must re-arm the strong confirm.
+              warnExisting: false,
+              partial: {
+                rebound,
+                failed,
+                failedIds: (report && report.failed_session_ids) || [],
+                postBusy,
+                postBusyIds: (report && report.post_busy_session_ids) || [],
+              },
+            });
+          } else {
+            setRebindDraft(null);
+            if (rebound > 0) {
+              setSettingsToast(t.uiProjects.rebindSuccess(rebound));
+            } else {
+              // A retry after everything already converged (or a root with
+              // no sessions at all) returns an empty report; "Rebound 0"
+              // would read as a failure (review #463 minor).
+              setSettingsToast(t.uiProjects.rebindUpToDate);
+            }
+          }
+          await refreshCodexSessions().catch((error) => {
+            // Failure is not swallowed: the session list self-heals via the
+            // session:list_changed event, but a silent gap after an explicit
+            // failure must stay visible for troubleshooting
+            // (review #463 minor).
+            console.warn('refresh sessions after rebind failed', error);
+          });
+        } catch (error) {
+          // Typed-marker matching (finding 11 / Minor 7 / round-8 M4): the
+          // backend prefixes every user-reachable outcome with a stable ASCII
+          // marker and we match only that prefix, never human copy. The mapping
+          // lives in a pure helper so both halves of the contract are unit
+          // tested (review #463 round-8 minor 10).
+          const classified = classifyRebindError(error, t);
+          // Carryover honesty (review #463 round-14 should-fix 1): a
+          // roots-commit failure carries this run's moved ids as an error
+          // suffix — the session lanes were already durable at `to`. Feed
+          // them into the retry's post-busy carryover, or a refused eviction
+          // of an already-rebound session is dropped (untouched this run,
+          // carryover empty) and the dialog closes "up to date" with an
+          // old-cwd runtime still resident.
+          // The suffix ids UNION with the previous carryover (review #463
+          // round-15 Major 1): replacing would drop a still-busy carryover
+          // session from a prior run — it can never re-enter
+          // rebound_session_ids (a converged to-lane session routes to
+          // retry_evict_candidates only), so the next retry would close the
+          // dialog "up to date" while its old-cwd runtime stays resident.
+          // The backend honors only the intersection with its own retry
+          // population, so the union cannot widen the eviction set.
+          const carryoverPartial = (classified.reboundIds && classified.reboundIds.length > 0)
+            ? (prev) => {
+                // Full partial shape (the dialog reads failedIds.length
+                // unconditionally): the moved sessions are conservatively
+                // reported as post-busy — their runtime reclaim never ran on
+                // the error path, so "retry when idle" is the honest state.
+                const mergedIds = mergeRebindCarryoverIds(
+                  prev.partial && prev.partial.postBusyIds,
+                  classified.reboundIds,
+                );
+                // Spread first, counts after (review #463 round-17 SF-4): a
+                // trailing spread dragged the PREVIOUS run's rebound/failed
+                // counts into this error state — a mixed-run report where
+                // the same id could appear in two contradicting rows. This
+                // arm's only honest counts are the merged carryover. The
+                // spread tolerates a null partial natively (object spread
+                // ignores null/undefined; round-18 Blocker 1 — the explicit
+                // `|| {}` fallback trips unicorn/no-useless-fallback-in-spread).
+                return {
+                  ...prev.partial,
+                  rebound: 0,
+                  failed: 0,
+                  failedIds: [],
+                  postBusy: mergedIds.length,
+                  postBusyIds: mergedIds,
+                  // Round-18 minor 1: the post-busy recheck never ran on an
+                  // error path, so the "started a new turn during the rebind"
+                  // diagnosis would be fabricated — the dialog renders the
+                  // neutral carryover copy for this shape.
+                  carryover: true,
+                };
+              }
+            : null;
+          if (classified.kind === 'old-root-exists') {
+            setRebindDraft(prev => prev && { ...prev, warnExisting: true, error: null });
+          } else if (classified.kind === 'sessions-busy') {
+            // Busy rejection is the fence's high-frequency happy path
+            // (Minor 7): map it to i18n copy; only session ids follow the
+            // marker, and they are shown verbatim for troubleshooting.
+            // warnExisting is kept as-is out of deliberate conservatism
+            // (round-20 minor 14): both busy emission sites actually fire
+            // AFTER the old-root check, so the flag is already consumed —
+            // keeping it costs ZERO extra confirm round-trips (the comment
+            // previously claimed one; inverted per round-24 minor 18).
+            setRebindDraft(prev => prev && {
+              ...prev,
+              busySessionIds: classified.busySessionIds,
+              error: null,
+              ...(carryoverPartial ? { partial: carryoverPartial(prev) } : {}),
+            });
+          } else if (classified.kind === 'copy') {
+            // Consume the old-root warning ONLY when the run actually
+            // proceeded past the old-root check (round-17 SF-4): IN_PROGRESS
+            // / TO_ROOT / TO_NESTED / TO_UNUSABLE all classify as `copy` and
+            // all fire BEFORE require_confirm_existing, and clearing on them
+            // would let a re-appeared old root ride the stale flag silently.
+            // Clearing on a genuine post-fence failure (review #463 round-14
+            // should-fix 3) still re-arms the strong confirm on a later
+            // reappearance of the old root.
+            setRebindDraft(prev => prev && {
+              ...prev,
+              warnExisting: classified.passedFence ? false : prev.warnExisting,
+              error: classified.message,
+              ...(carryoverPartial ? { partial: carryoverPartial(prev) } : {}),
+            });
+          } else {
+            // Log hygiene (review #463 round-14 should-fix 5): the raw error
+            // chain embeds host paths; it is shown in the dialog verbatim by
+            // design, but stays out of the console. The classified kind is
+            // the path-free diagnostic.
+            console.warn('rebind workspace failed:', classified.kind);
+            // On failure keep the dialog open with the error inline
+            // (review #463 M7): in-place display persists and sits next to
+            // the retry; an unmapped backend error is shown verbatim as a
+            // diagnostic detail rather than guessed at. Its provenance is
+            // unknown (round-17 SF-4), so the strong-confirm flag is kept:
+            // an extra confirm round-trip at worst, never a skipped one.
+            setRebindDraft(prev => prev && {
+              ...prev,
+              warnExisting: prev.warnExisting,
+              error: classified.message,
+              ...(carryoverPartial ? { partial: carryoverPartial(prev) } : {}),
+            });
+          }
+        } finally {
+          setProjectOpsBusy(false);
+        }
+      };
+
+      function sessionRowsForIds(ids) {
+        const byId = new Map(allSidebarTasks.map(item => [item.id, item]));
+        return (ids || []).map(id => byId.get(id) || { id });
+      }
+
+      function reportBatchFailures(result) {
+        if (result.failed > 0) setSettingsToast(t.sessionBatchFailed(result.failed));
+      }
+
+      // 对话管理页批量操作:按会话类型分流并等待全部结果,避免未执行完成就误报成功。
+      async function handleBatchArchiveSessions(ids) {
+        if (!bridge.available || !ids || !ids.length) return;
+        const result = await runSessionBatch(sessionRowsForIds(ids), 'archive', {
+          archive: id => bridge.sessions.archiveSession(id),
+          archiveCodex: id => bridge.sessions.archiveSession(id),
+        });
+        const nextCodexSessions = await refreshCodexSessions().catch(() => null);
+        if (activeCodexId && Array.isArray(nextCodexSessions) && nextCodexSessions.every(session => session.id !== activeCodexId)) {
+          updateActiveCodexSession(null);
+        }
+        if (result.succeeded > 0) setArchiveToast(true);
+        reportBatchFailures(result);
+        return result;
+      }
+
+      async function handleBatchDeleteSessions(ids) {
+        if (!bridge.available || !ids || !ids.length) return;
+        const result = await runSessionBatch(sessionRowsForIds(ids), 'delete', {
+          delete: id => bridge.sessions.deleteSession(id),
+        });
+        const nextCodexSessions = await refreshCodexSessions().catch(() => null);
+        if (activeCodexId && Array.isArray(nextCodexSessions) && nextCodexSessions.every(session => session.id !== activeCodexId)) {
+          updateActiveCodexSession(null);
+        }
+        reportBatchFailures(result);
+        return result;
+      }
+
+      async function handleBatchRestoreArchived(ids) {
+        if (!bridge.available || !ids || !ids.length) return;
+        const result = await runSessionBatch(ids.map(id => ({ id })), 'restore', {
+          restore: id => bridge.sessions.restoreArchivedSession(id),
+        });
+        await refreshCodexSessions().catch(() => {});
+        reportBatchFailures(result);
+        return result;
+      }
+
+      useEffect(() => {
+        if (!archiveToast) return;
+        const timer = setTimeout(() => setArchiveToast(false), 3500);
+        return () => clearTimeout(timer);
+      }, [archiveToast]);
+
+      useEffect(() => {
+        if (!settingsToast) return;
+        const timer = setTimeout(() => setSettingsToast(''), settingsToastDuration);
+        return () => clearTimeout(timer);
+      }, [settingsToast, settingsToastDuration]);
+
+      async function handleToggleSuperPerm() {
+        const target = !superPerm;
+        if (!bridge.available) {
+          setSuperPerm(target);
+          return;
+        }
+        setSuperPerm(target);
+        try {
+          const result = await bridge.interaction.toggleSuperPerm();
+          if (!result || result.ok === false) {
+            setSuperPerm(!!(result && result.enabled));
+            setSettingsToast((result && result.error) || t.uiMainApp.superPermFailed);
+          }
+        } catch (error) {
+          setSuperPerm(!target);
+          setSettingsToast(String(error || t.uiMainApp.superPermFailed));
+        }
+      }
+
+      function handleSetTheme(scheme) {
+        setColorScheme(scheme);
+        if (isWeb) {
+          try { window.localStorage.setItem(COLOR_SCHEME_STORAGE_KEY, scheme); } catch { /* silently degrade when WebView disables storage */ }
+          return;
+        }
+        if (bridge.available) {
+          // `color_scheme` is the authoritative preference (system/light/dark);
+          // `theme` mirrors the resolved value so consumers that only know the
+          // legacy field (e.g. an older build running after a downgrade) keep rendering.
+          // Resolve against the current OS snapshot rather than the React hook:
+          // the media-query change event may not have reached `systemDark` yet
+          // when the user picks "system", which would persist a stale appearance.
+          bridge.settings.saveSettings({
+            theme: resolveTheme(scheme) === 'dark' ? 'genesis' : 'liquid-light',
+            color_scheme: scheme,
+          });
+        }
+      }
+
+      function handleSetSearchProvider(p) {
+        if (p === searchProvider) return;
+        setEnabledSearchProviders(prev => [...new Set(['bing', ...prev, p])]);
+        setSearchProvider(p);
+      }
+
+      function handleAddSearchProvider(p) {
+        setEnabledSearchProviders(prev => [...new Set(['bing', ...prev, p])]);
+        handleSetSearchProvider(p);
+      }
+
+      function handleDeleteSearchProvider(p) {
+        if (p === 'bing') return;
+        setEnabledSearchProviders(prev => {
+          const next = prev.filter(x => x !== p);
+          return next.length ? next : ['bing'];
+        });
+        setSearchKeyDrafts(prev => ({ ...prev, [p]: '' }));
+        setSearchKeyActions(prev => ({ ...prev, [p]: 'delete' }));
+        if (searchProvider === p) handleSetSearchProvider('bing');
+      }
+
+      function handleSetSearchApiKey(k, providerOverride) {
+        const targetProvider = providerOverride || searchProvider;
+        setSearchKeyDrafts(prev => ({ ...prev, [targetProvider]: k }));
+        setSearchKeyActions(prev => ({ ...prev, [targetProvider]: k.trim() ? 'replace' : 'keep_existing' }));
+      }
+
+      async function handleConfirmSearchConfig() {
+        if (!bridge.available) return;
+        const search = buildSearchSettingsPayload();
+        // 浏览器宿主没有重启桌面进程的权限；只保存，待桌面端下次重启后生效。
+        const saved = isWeb
+          ? await bridge.settings.saveSearchSettings(search)
+          : await bridge.settings.saveSearchSettingsAndRestart(search);
+        if (saved === false) setSettingsToast(t.uiMainApp.searchSaveFailed);
+      }
+
+      async function handleSaveSearchConfig() {
+        if (!bridge.available) return true;
+        const search = buildSearchSettingsPayload();
+        const saved = await bridge.settings.saveSearchSettings(search);
+        if (saved === false) {
+          setSettingsToast(t.uiMainApp.searchSaveFailed);
+          return false;
+        }
+        return true;
+      }
+
+      function handleSetLanguage(lang) {
+        // en/ja 是惰性词典 chunk:先装载再切状态/广播,辅助窗口(桌宠/阅读器)
+        // 收到 ui:language_changed 时词典必须已在本窗就位(各入口首帧引导只保证
+        // 初始语言)。装载失败(资源损坏)保持原语言,不产生半翻译界面。
+        // 经「最新选择胜出」门落地:ja chunk 静态依赖 en chunk,先选 ja 再选
+        // en 时旧 ja 请求可能后完成并覆盖新选择(见 createLatestLanguageGate)。
+        switchToLanguage(lang, () => {
+          setLanguage(lang);
+          if (isWeb) {
+            try { window.localStorage.setItem('pinvou.web.language', lang); } catch { /* silently degrade when WebView disables storage */ }
+            return;
+          }
+          if (isTauriAvailable()) {
+            tauriEvents.emit('ui:language_changed', { language: lang }).catch(() => {});
+          }
+          if (bridge.available) {
+            bridge.settings.saveSettings({ language: LANG_TO_TAG[lang] || 'zh-Hans' });
+          }
+        });
+      }
+
+      function handleSetMemoryEnabled(enabled) {
+        if (bridge.available) {
+          const memoryAvailable = (LANG_TO_TAG[language] || 'zh-Hans') === 'zh-Hans';
+          bridge.settings.saveSettings({ memory_enabled: memoryAvailable && !!enabled });
+        }
+      }
+
+      function handleSetPetEnabled(enabled) {
+        if (!can('pet') || !bridge.available) return;
+        // 单一路径:set_pet_enabled 负责持久化 + 窗口显隐 + 广播
+        // pet:enabled_changed(bridge 听到后刷新 settings 副本,防旧值回写)。
+        invokeTauri('set_pet_enabled', { enabled: !!enabled }).catch(() => {});
+      }
+
+      // Both notification switches share one save pipeline: optimistic set ->
+      // saveSettings, rollback on failure. The task-completion switch doubles
+      // as the desktop-notification master switch (payload carries enabled);
+      // the input switch carries only its own field, and the Rust side merges
+      // by field, so no other switch resets.
+      function makeNotifToggle(getCurrent, setCurrent, payloadFor) {
+        return async (enabled) => {
+          const nextEnabled = !!enabled;
+          const previousEnabled = getCurrent();
+          setCurrent(nextEnabled);
+          if (bridge.available) {
+            const saved = await bridge.settings.saveSettings({
+              notifications: payloadFor(nextEnabled),
+            });
+            if (saved === false) {
+              setCurrent(previousEnabled);
+            }
+          }
+        };
+      }
+      const handleSetTaskCompletedNotif = makeNotifToggle(
+        () => taskCompletedNotif,
+        setTaskCompletedNotif,
+        (nextEnabled) => ({ enabled: nextEnabled, task_completed: nextEnabled }),
+      );
+      const handleSetInputNeededNotif = makeNotifToggle(
+        () => inputNeededNotif,
+        setInputNeededNotif,
+        (nextEnabled) => ({ needs_input: nextEnabled }),
+      );
+
+      // 侧栏任务列表「按日期折叠」开关:纯 UI 偏好,写 settings.sidebar.date_grouping
+      function handleSetSidebarDateGrouping(enabled) {
+        if (bridge.available) bridge.settings.saveSettings({ sidebar: { date_grouping: !!enabled } });
+      }
+
+      // Streaming fade-in toggle: a pure UI preference persisted to
+      // settings.chat.streaming_animation; the animation module itself is
+      // synced by the effect watching the derived value below.
+      function handleSetChatStreamingAnimation(enabled) {
+        if (bridge.available) bridge.settings.saveSettings({ chat: { streaming_animation: !!enabled } });
+      }
+
+      // 移动壳层派生数据：顶栏标题跟随当前视图（对话态显示会话标题）；
+      // 未读红点与侧栏入口同源，避免两套提醒逻辑漂移。
+      const scheduledUnread = !!(bs && ((bs.scheduledTasks || []).some(task => task.hasUnreadRuns)
+        || (bs.scheduledTaskRecentRuns || []).some(run => run && run.unread)));
+      const mobileTitle = currentView === 'chat'
+        ? ((((chatHistory || []).find(c => c.id === activeChat)) || {}).title || 'PINVOU')
+        : currentView === 'codex'
+          ? ((((codexHistory || []).find(c => c.id === activeCodexId)) || {}).title || t.uiCodex.untitledSession)
+        : ({ search: t.searchChats, scheduled: t.scheduledPlans, monitor: t.monitor, cardpool: t.cardPool, toolStore: t.toolStore, outputs: t.outputs, knowledge: t.knowledge, settings: t.settings, browser: t.browser }[currentView] || 'PINVOU');
+      const mobileNavigate = (view, beforeNavigate) => {
+        setMobileMoreOpen(false);
+        navigateFromScheduledRun(view, beforeNavigate);
+      };
+      const mobileMoreViews = ['search', 'outputs', 'knowledge', 'toolStore', 'settings', 'browser'];
+      const mobileMoreActive = mobileMoreViews.includes(currentView)
+        || (currentView === 'scheduled' && !(bs && bs.scheduledRunContext));
+
+      // 侧栏任务列表按日期折叠(默认开;settings.sidebar.date_grouping === false 时平铺)
+      const sidebarDateGrouping = !bs || !bs.settings || !bs.settings.sidebar || bs.settings.sidebar.date_grouping !== false;
+      // Streaming fade-in for chat responses (default on; only an explicit
+      // settings.chat.streaming_animation === false turns it off).
+      const chatStreamingAnimation = !bs || !bs.settings || !bs.settings.chat || bs.settings.chat.streaming_animation !== false;
+      // Keep the animation module in sync with the resolved preference (also
+      // covers the default-on state before the first settings snapshot lands).
+      useEffect(() => {
+        setStreamFadePreference(chatStreamingAnimation);
+      }, [chatStreamingAnimation]);
+      // 一键折叠/展开「任务列表」下的全部分组:直接写入各组的展开 map,
+      // 不引入总开关变量;按钮状态由当前可见组的真实聚合推导——
+      // 全部展开显示「折叠」,其余(含全折叠/混合)显示「展开」,
+      // 手动逐组操作后按钮也不会与实际状态脱节。
+      const visibleTaskGroupOpens = sidebarCodeListActive
+        ? sidebarFolderGroups.map(g => folderGroupOpen[g.key] ?? true)
+        : (sidebarDateGrouping ? sidebarTaskGroups.map(g => dateGroupOpen[g.key] ?? (g.key === todayDateKey)) : []);
+      const allTaskGroupsExpanded = visibleTaskGroupOpens.length > 0 && visibleTaskGroupOpens.every(Boolean);
+      const setAllTaskGroups = (open) => {
+        if (sidebarCodeListActive) {
+          setFolderGroupOpen(prev => {
+            const next = { ...prev };
+            for (const g of sidebarFolderGroups) next[g.key] = open;
+            return next;
+          });
+        } else if (sidebarDateGrouping) {
+          setDateGroupOpen(prev => {
+            const next = { ...prev };
+            for (const g of sidebarTaskGroups) next[g.key] = open;
+            return next;
+          });
+        }
+      };
+      // Task-item renderer shared by the date-grouped and flat layouts.
+      const renderSidebarTaskItem = (chat) => {
+        const detachKind = chat.taskKind === 'codex' ? 'codex-session' : 'session';
+        // One availability gate for both dragging and the "move to project"
+        // menu item: with an empty project list (bootstrap windows, users
+        // with zero projects) the row is not draggable,
+        // avoiding a dead gesture with zero reachable drop targets. #445
+        // bound work sessions (taskKind regular + workspacePath) have the
+        // same rights as code sessions — grouping follows binding, and the
+        // move entry point follows too (same signal as review #452
+        // finding 5).
+        const projectMovesAvailable = (chat.taskKind === 'codex' || !!chat.workspacePath) && bridge.projects && !!sidebarProjectsData?.projects?.length;
+        return (
+          <RecentItem
+            key={chat.taskKind === 'scheduled' ? `${chat.scheduledRun?.automationId || ''}:${chat.scheduledRun?.id || chat.id}` : `${chat.taskKind}:${chat.id}`}
+            chat={chat}
+            theme={activeTheme}
+            t={t}
+            active={chat.taskKind === 'codex'
+              ? activeCodexId === chat.id && currentView === 'codex'
+              : chat.scheduledRun
+                ? !!(bs && bs.scheduledRunContext && bs.scheduledRunContext.sessionId === chat.id)
+                : activeChat === chat.id && currentView === 'chat'}
+            personaTarget={chat.taskKind !== 'codex' && !chat.scheduledRun && activeChat === chat.id && currentView === 'cardpool'}
+            onSelect={chat.taskKind === 'codex'
+              ? handleSwitchCodexSession
+              : chat.scheduledRun
+                ? cachedItemCallback(sidebarScheduledSelectCallbacks, chat, (c) => () => handleOpenScheduledRunShortcut(c.scheduledRun))
+                : handleSwitchSession}
+            onRename={handleRenameSession}
+            onDelete={handleDeleteSession}
+            onTogglePinned={handleToggleSessionPinned}
+            onOpenFolder={can('externalSystemOpen') ? handleRevealSessionFolder : undefined}
+            onExportArchive={chat.taskKind !== 'codex' && !exportingSessionIds.has(chat.id) && bridge.sessions.exportSessionArchive ? handleExportSessionArchive : undefined}
+            onArchive={handleArchiveSession}
+            onMoveToProject={projectMovesAvailable ? openMovePicker : undefined}
+            onViewWorkspace={can('desktopChrome') ? openSessionWorkspaceViewer : undefined}
+            dndPayload={projectMovesAvailable && sidebarCodeListActive
+              ? cachedItemCallback(sidebarDndPayloads, chat, (c) => ({ sessionId: c.id }))
+              : undefined}
+            dndDisabled={!!dragAvatar}
+            onDragEnd={clearDropTarget}
+            dragKind={detachKind}
+            dragging={canDetachWindows && !!dragAvatar && dragAvatar.key === `${detachKind}:${chat.id}`}
+            onPickUp={canDetachWindows
+              ? cachedItemCallback(sidebarPickUpCallbacks, chat, (c) => (geom) => beginTearOff(detachKind, c.id, c.title, geom))
+              : undefined}
+          />
+        );
+      };
+
+      // Sidebar main nav callback set (stable references): with NavItem
+      // memoized, onClick/onPickUp must be reference-stable or the memo never
+      // hits. Navigation goes through navigateFromScheduledRun (reads bsRef
+      // internally); the tear-off closure depends only on beginTearOff
+      // (stable) and the current language dictionary t.
+      const navNavigateHandlers = useMemo(() => ({
+        scheduled: () => navigateFromScheduledRun('scheduled'),
+        outputs: () => navigateFromScheduledRun('outputs'),
+        monitor: () => navigateFromScheduledRun('monitor'),
+        toolStore: () => navigateFromScheduledRun('toolStore'),
+        cardpool: () => navigateFromScheduledRun('cardpool', () => setPoolMyOnly(false)),
+        knowledge: () => navigateFromScheduledRun('knowledge'),
+        chat: () => navigateFromScheduledRun('chat'),
+      }), [navigateFromScheduledRun]);
+      const navPickUpHandlers = useMemo(() => ({
+        outputs: (geom) => beginTearOff('outputs', undefined, t.outputs, geom),
+        monitor: (geom) => beginTearOff('monitor', undefined, t.monitor, geom),
+        toolstore: (geom) => beginTearOff('toolstore', undefined, t.toolStore, geom),
+        cardpool: (geom) => beginTearOff('cardpool', undefined, t.cardPool, geom),
+        knowledge: (geom) => beginTearOff('knowledge', undefined, t.knowledge, geom),
+      }), [t, beginTearOff]);
+      const openSearchOverlay = useCallback(() => {
+        prefetchView('searchOverlay');
+        setSearchOverlayOpen(true);
+      }, []);
+      const apiKeyGateOpen = shouldShowApiKeyGate(bs, currentView, bridge.available);
+      const browserOverlayIntent = [
+        archiveConfirm ? 'archive-confirm' : '',
+        searchOverlayOpen ? 'search' : '',
+        personaEditor ? 'persona-editor' : '',
+        savedConfirm ? 'saved-confirm' : '',
+        can('webAccessAdmin') && webAccessOpen ? 'web-access' : '',
+        apiKeyGateOpen ? 'api-key' : '',
+        bs && bs.pinvouModal ? 'pinvou-review' : '',
+        isCompactShell && isSidebarOpen ? 'mobile-sidebar' : '',
+        isCompactShell && mobileMoreOpen ? 'mobile-more' : '',
+        moveToProjectSession ? 'move-picker' : '',
+        rebindDraft ? 'rebind' : '',
+      ].filter(Boolean).join('|');
+      const browserOverlayPublicationReady = !!browserOverlayIntent
+        && publishedBrowserOverlayIntent === browserOverlayIntent;
+      // Compact-shell drawer opens only after its overlay intent is published;
+      // defined once because the drawer style needs it for transform+visibility.
+      const mobileDrawerOpen = isCompactShell && isSidebarOpen && browserOverlayPublicationReady;
+      // Keep the surface hidden while one already-published overlay hands off to
+      // another. The replacement itself is still withheld until its own barrier
+      // attempt has settled.
+      const browserOverlayOpen = !!publishedBrowserOverlayIntent;
+      const browserBlockingLayerOpen = !browserPaneAllowed || browserOverlayOpen;
+      const browserSurfaceSuspended = browserResizeActive
+        || browserDocumentHidden
+        || rightDockOcclusionPublications.length > 0
+        || rightDockState.occluded
+        || rightDockState.activePanelId !== 'browser'
+        || browserBlockingLayerOpen;
+      const compactBrowserSurfaceSuspended = browserDocumentHidden
+        || browserOverlayOpen
+        || currentView !== 'browser';
+      const browserNativeSurfaceVisible = isCompactShell
+        ? browserActive && currentView === 'browser' && !compactBrowserSurfaceSuspended
+        : browserActive
+          && browserPaneOpen
+          && browserPaneSelected
+          && !browserSurfaceSuspended;
+      useLayoutEffect(() => {
+        browserSurfaceTransitionContextRef.current = {
+          sessionId: browserSessionId,
+          hasWorkspace: browserActive && !!browserSessionId,
+          visible: browserNativeSurfaceVisible,
+          compact: isCompactShell,
+          scheduledRunChat: !!(bs && bs.scheduledRunContext),
+        };
+      }, [
+        browserActive,
+        browserNativeSurfaceVisible,
+        browserSessionId,
+        bs,
+        isCompactShell,
+      ]);
+      useLayoutEffect(() => {
+        let disposed = false;
+        if (!browserOverlayIntent) {
+          browserUiTransitionGateRef.current.invalidate('overlay');
+          setPublishedBrowserOverlayIntent('');
+          return () => { disposed = true; };
+        }
+        void runBrowserUiTransition(() => {
+          if (disposed) return false;
+          setPublishedBrowserOverlayIntent(browserOverlayIntent);
+          return true;
+        }, {
+          channel: 'overlay',
+          hideMode: 'visible',
+        });
+        return () => { disposed = true; };
+      }, [browserOverlayIntent, runBrowserUiTransition]);
+
+      // The 11 props identical across ChatView's two mount points (main chat / scheduled-run chat) are
+      // consolidated into one block; each mount point writes only its differing props (prefill / focus tick / code-mode entry),
+      // so two long prop lists cannot silently drift after copy-paste.
+      // The props below are NOT consolidated and stay as JSX literals (source-string contracts: tests regex-assert
+      // that main.jsx contains these literals; see the individual test files):
+      // - onBackScheduledRun：scheduled_tasks_unit.test.js
+      // - browserDockAvailable / rightDockActivePanelId /
+      //   onRightDockPanelSelectionChange：browser_native_surface.test.mjs
+      const chatViewBaseProps = {
+        theme: activeTheme,
+        onOpenWorkspacePicker: ({ lane, mode }) => { setPickerExcluded(null); setWorkspacePicker({ lane, mode }); },
+        t,
+        bs,
+        onOpenEditor: handleOpenPersonaEditor,
+        justInstalledTool,
+        setJustInstalledTool,
+        onGotoSettings: () => openSettingsSection('general'),
+        onGotoModelSettings: () => openSettingsSection('model'),
+        onGotoTools: () => navigateFromScheduledRun('toolStore'),
+        // Reference-card navigation (session mention): reuse the sidebar's session switch (with view routing and browser transition).
+        onSwitchSession: handleSwitchSession,
+        browserDockOpen: browserPaneOpen,
+        onOpenBrowserDock: openBrowserDock,
+        // Align feedback (and other keychain notices) surface as the host
+        // toast: without this prop every align outcome is silent in the chat
+        // lane (review #484 M4).
+        onNotify: setSettingsToast,
+      };
+      // The three byte-identical empty states in the sidebar task list (task groups / date groups / flat list) share one node.
+      const sidebarTaskEmptyNode = (
+        <div className={`px-3 py-3 text-[13px] ${activeTheme === 'dark' ? 'text-[#9AA0A6]' : 'text-[#8A8F94]'}`}>
+          {t.sidebarTaskEmpty}
+        </div>
+      );
+
+      // Sidebar footer buttons (remote access / pet / settings): the collapsed and expanded variants
+      // differ only in size (w-10/w-9) and dark-mode idle text color; one shared helper derives both to avoid copy drift;
+      // the settings gear always goes through openSettingsSection (records the return view + general section).
+      const renderFooterButtons = (collapsed) => {
+        const sizeCls = collapsed ? 'w-10 h-10' : 'w-9 h-9';
+        const idleColorCls = activeTheme === 'dark'
+          ? (collapsed ? 'text-[#E3E3E3]' : 'text-[#C4C7C5]')
+          : 'text-[#444746]';
+        const hoverCls = activeTheme === 'dark' ? 'hover:bg-[#333537]' : 'hover:bg-[#E1E5EA]';
+        const petEnabled = !!(bs && bs.settings && bs.settings.pet && bs.settings.pet.enabled);
+        return (
+          <>
+            {can('webAccessAdmin') && <button type="button"
+              onClick={handleOpenWebAccess}
+              title={t.uiRemote.title}
+              className={`relative ${sizeCls} shrink-0 rounded-full flex items-center justify-center transition-colors ${idleColorCls} ${hoverCls}`}
+            >
+              <Smartphone size={18} />
+              {isWebAccessConnected && <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-[#34A853]" />}
+            </button>}
+            {can('pet') && <button type="button"
+              onClick={() => handleSetPetEnabled(!petEnabled)}
+              title={petEnabled ? t.uiPet.hide : t.uiMainApp.petSummon}
+              className={`relative ${sizeCls} shrink-0 rounded-full flex items-center justify-center transition-colors ${petEnabled ? 'text-[#34A853]' : idleColorCls} ${hoverCls}`}
+            >
+              <PetPawIcon />
+            </button>}
+            <button type="button"
+              data-testid="nav-settings"
+              onClick={() => openSettingsSection('general')}
+              title={t.settings}
+              className={`relative ${sizeCls} shrink-0 rounded-full flex items-center justify-center transition-colors ${idleColorCls} ${hoverCls}`}
+            >
+              <Settings size={18} />
+              {hasUpdate && <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-[#EA4335]" />}
+            </button>
+          </>
+        );
+      };
+
+      return (
+        <div data-testid="app-root" data-current-view={currentView} data-platform={isWeb ? 'web' : 'desktop'}
+          className={`flex flex-col h-screen font-sans overflow-hidden antialiased transition-colors duration-300 ${activeTheme === 'dark' ? 'bg-[#131314] text-[#E3E3E3]' : 'bg-white text-[#1F1F1F]'}`}
+          style={isWeb ? {
+            // inset shorthand expanded to physical properties: Safari 14.0 (iOS 14.0 web) cannot parse the shorthand.
+            ...(isCompactShell ? { position: 'fixed', top: 0, right: 0, bottom: 0, left: 0, width: '100%' } : {}),
+            height: visualViewportHeight ? `${visualViewportHeight}px` : '100dvh',
+            paddingTop: 'env(safe-area-inset-top)',
+            paddingRight: 'env(safe-area-inset-right)',
+            paddingBottom: 'env(safe-area-inset-bottom)',
+            paddingLeft: 'env(safe-area-inset-left)',
+          } : undefined}>
+
+          <VoiceShortcutRouter />
+          <WebConnectionStatus theme={activeTheme} t={t} />
+
+          {/* 撕离拖拽 avatar:被拎起的标签,跟随光标(DOM 实现,丝滑跟手、不选中文字) */}
+          {dragAvatar && (
+            <div style={{ position:'fixed', left: dragAvatar.x, top: dragAvatar.y, width: dragAvatar.w, height: dragAvatar.h,
+              pointerEvents:'none', zIndex:9999, borderRadius:14, overflow:'hidden', whiteSpace:'nowrap',
+              display:'flex', alignItems:'center', padding:'0 16px', fontWeight:600, fontSize:15,
+              background: activeTheme === 'dark' ? '#A8C7FA' : '#0B57D0', color: activeTheme === 'dark' ? '#041E49' : '#ffffff',
+              boxShadow:'0 14px 34px rgba(0,0,0,.5)', transform:'scale(1.03)', opacity:0.96 }}>
+              {dragAvatar.label}
+            </div>
+          )}
+
+          {archiveConfirm && browserOverlayPublicationReady && createPortal(
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyArchiveConfirmDialog
+                  theme={activeTheme}
+                  t={t}
+                  onCancel={() => setArchiveConfirm(null)}
+                  onConfirm={confirmArchiveSession}
+                />
+              </Suspense>
+            </ViewErrorBoundary>,
+            document.body
+          )}
+
+          {archiveToast && createPortal(
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyArchiveToast
+                  t={t}
+                  onClose={() => setArchiveToast(false)}
+                  onView={() => {
+                    setArchiveToast(false);
+                    setSearchShowArchived(true);
+                    navigateFromScheduledRun('search');
+                  }}
+                />
+              </Suspense>
+            </ViewErrorBoundary>,
+            document.body
+          )}
+
+          {settingsToast && createPortal(
+            // Layer sits above modal overlays (picker backdrop is z-[200]) so a
+            // failure raised under an open dialog stays visible; a filesystem
+            // path in the message must not push the pill past the viewport.
+            // multiline（r8）：长文案（导入四计数 + 补救指引 / 失败详情）在
+            // 窄窗口上单行 truncate 仍会裁掉恢复路径的尾部——换行 + 2xl 圆角
+            // 卡形态，宽度上限不变。
+            <div className={`fixed left-1/2 bottom-8 z-[210] -translate-x-1/2 max-w-[80vw] bg-black/80 px-4 py-2 text-[13px] font-medium text-white shadow-2xl ${settingsToastMultiline ? 'whitespace-normal break-words rounded-2xl leading-5' : 'truncate rounded-full'}`}>
+              {settingsToastText}
+            </div>,
+            document.body
+          )}
+
+          {manageFoldersProject && (
+            <Suspense fallback={null}>
+            <ManageProjectFoldersDialog
+              open
+              project={manageFoldersProject}
+              neverRoots={(sidebarProjectsData && sidebarProjectsData.neverMaterializeRoots) || []}
+              mode={activeLaneMode()}
+              // Same §6 stage-gate mirror as the picker: on the codex lane a
+              // third-party ACP agent only receives the primary root, so an
+              // added folder is recorded-not-delivered and the notice must
+              // say so (review #484 round-9 N1).
+              deliveryLimited={currentView === 'codex' && (codexLaneDeliveryReported ? codexLaneDeliveryLimited : true)}
+              busy={projectOpsBusy}
+              t={t}
+              onClose={closeManageFolders}
+              onAddFolder={handleManageAddFolder}
+              onRemoveRoot={handleManageRemoveRoot}
+              onSetPrimary={handleManageSetPrimary}
+              onRename={(name) => handleRenameProject(manageFoldersProject.id, name)}
+              onExcludeRoot={(root) => handleSetNeverMaterialize(root, true)}
+              onRevokeExclusion={(root) => handleSetNeverMaterialize(root, false)}
+            />
+            </Suspense>
+          )}
+
+          {viewWorkspaceChat && (
+            // Conditional mount (the ManageProjectFoldersDialog idiom): the
+            // snapshot shown belongs to the chat captured at open time.
+            <Suspense fallback={null}>
+            <SessionWorkspaceDialog
+              open
+              sessionTitle={viewWorkspaceChat.title}
+              roots={viewWorkspaceChat.workspaceRoots && viewWorkspaceChat.workspaceRoots.length
+                ? viewWorkspaceChat.workspaceRoots
+                : (viewWorkspaceChat.workspacePath ? [viewWorkspaceChat.workspacePath] : [])}
+              t={t}
+              onClose={() => setViewWorkspaceChat(null)}
+            />
+            </Suspense>
+          )}
+
+          {workspacePicker && (
+          // Conditional mount (the ManageProjectFoldersDialog idiom): the query
+          // and the expanded row must not leak across opens — remounting resets
+          // them, so a leftover filter can never render a false empty state.
+          <Suspense fallback={null}>
+          <WorkspacePickerDialog
+            open
+            rows={workspacePickerRows}
+            mode={workspacePicker.mode}
+            language={language}
+            busy={pickerBusy}
+            // Browse must also degrade when its channel is missing —
+            // rendering the row while handlePickerBrowse would silently
+            // no-op is a dead entry (review #484 round-10 m6; the AGENTS.md
+            // convention asks for an explicit unsupported signal, and the
+            // typed degrade lives in the picker's webOnly surface).
+            webOnly={!can('desktopChrome') || !bridge.projects || !bridge.files || !bridge.files.pickWorkspaceFolder}
+            excludedFolder={pickerExcluded}
+            deliveryLimited={!!workspacePicker.deliveryLimited}
+            t={t}
+            onClose={dismissWorkspacePicker}
+            onSelectProject={handlePickerSelectProject}
+            onTemporary={handlePickerTemporary}
+            onBrowse={handlePickerBrowse}
+            onBrowseExcluded={(folder) => applyWorkspaceTarget({ lane: pickerLane(), path: folder, projectId: null, roots: [folder] }).catch(reportPickerApplyFailure)}
+            onDismissExcluded={() => setPickerExcluded(null)}
+          />
+          </Suspense>
+          )}
+
+          {rebindDraft && browserOverlayPublicationReady && (
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyRebindFolderDialog
+                  from={rebindDraft.from}
+                  to={rebindDraft.to}
+                  warnExisting={rebindDraft.warnExisting}
+                  errorMessage={rebindDraft.error}
+                  partial={rebindDraft.partial || null}
+                  busySessionIds={rebindDraft.busySessionIds || null}
+                  t={t}
+                  busy={projectOpsBusy}
+                  restoreTargetRef={rebindRestoreRef}
+                  onCancel={() => setRebindDraft(null)}
+                  onConfirm={confirmRebindWorkspace}
+                />
+              </Suspense>
+            </ViewErrorBoundary>
+          )}
+
+          {moveToProjectSession && browserOverlayPublicationReady && (
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyMoveToProjectDialog
+                  session={moveToProjectSession}
+                  projects={sidebarProjectsData ? sidebarProjectsData.projects : []}
+                  currentProjectId={resolveSessionProjectId(
+                    moveToProjectSession,
+                    sidebarProjectsData ? sidebarProjectsData.projects : [],
+                    sidebarProjectsData ? sidebarProjectsData.assignments : {},
+                  )}
+                  presetProjectId={moveToPresetProject}
+                  t={t}
+                  busy={projectOpsBusy}
+                  restoreTargetRef={movePickerRestoreRef}
+                  onClose={() => { setMoveToPresetProject(null); setMoveToProjectSession(null); }}
+                  onMove={(projectId, addWorkspaceRoot) => handleMoveSessionToProject(
+                    moveToProjectSession.id, projectId, addWorkspaceRoot)}
+                />
+              </Suspense>
+            </ViewErrorBoundary>
+          )}
+
+          {searchOverlayOpen && browserOverlayPublicationReady && (
+            <ViewErrorBoundary t={t}>
+              {createPortal(
+                <Suspense fallback={null}>
+                  <LazySearchOverlay
+                    theme={activeTheme}
+                    history={chatHistory}
+                    t={t}
+                    onSelect={handleSearchSelect}
+                    onClose={() => setSearchOverlayOpen(false)}
+                  />
+                </Suspense>,
+                document.body,
+              )}
+            </ViewErrorBoundary>
+          )}
+
+          {can('desktopChrome') && <TitleBar t={t} sidebarOpen={isSidebarOpen} />}
+
+          {isCompactShell && (
+            <Suspense fallback={null}><MobileTopBar theme={activeTheme} t={t} title={mobileTitle}
+              onMenu={() => setIsSidebarOpen(true)}
+              onNewChat={currentView === 'chat' || currentView === 'codex' ? () => handleNewChat() : undefined} /></Suspense>
+          )}
+
+          <SidePanelLayoutProvider onPresenceChange={setOpenSidePanelCount}>
+          <RightDockProvider
+            onStateChange={handleRightDockStateChange}
+            onBeforeOcclusionPublish={publishRightDockOcclusion}
+            onOcclusionRelease={releaseRightDockOcclusion}
+          >
+          <div className={`flex flex-1 min-h-0 ${activeTheme === 'dark' ? (isSidebarOpen ? 'bg-[#1E1F20]' : 'bg-[#131314]') : 'bg-[#F0F4F9]'}`}>
+
+          {isWeb && (
+            <button
+              type="button"
+              data-testid="mobile-navigation-close"
+              // Driven by mobileDrawerOpen, not isSidebarOpen, so the dim and the
+              // drawer clear the overlay publication barrier together instead of
+              // showing a dimmed screen with no drawer for the barrier window.
+              aria-label={t.uiMainApp.closeNavigation}
+              onClick={(event) => {
+                // A real pointer click leaves focus on this button; blur before
+                // it turns aria-hidden — ARIA forbids aria-hidden on the focused
+                // element, and the old unmount-based close dropped focus to <body>.
+                event.currentTarget.blur();
+                setIsSidebarOpen(false);
+              }}
+              aria-hidden={!mobileDrawerOpen}
+              tabIndex={mobileDrawerOpen ? 0 : -1}
+              className={`fixed inset-0 z-30 hidden bg-black/40 max-sm:block transition-opacity duration-300 motion-reduce:transition-none ${mobileDrawerOpen ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
+            />
+          )}
+
+          {/* ================= Sidebar (Gemini Style) ================= */}
+          <div
+            id="app-sidebar"
+            data-testid="app-sidebar"
+            style={{
+              // The compact-shell drawer does not inherit the persisted desktop width:
+              // the drawer has no drag handle, and a width beyond the viewport would cover
+              // the tap-on-backdrop-to-dismiss channel (the z-30 backdrop sits below the
+              // z-40 sidebar).
+              width: isSidebarOpen && !isCompactShell ? sidebarWidth : undefined,
+              ...(isCompactShell ? {
+                // The drawer stays mounted: display:none cannot transition, so
+                // open/close animates transform while `visibility` (in the
+                // compact transition list below) flips only after the slide-out
+                // finishes and immediately on slide-in. Full height overlays the
+                // top bar and tab bar; the env() insets track the same top/bottom
+                // safe areas as the app root padding above (portrait notch /
+                // home indicator; landscape side insets are not tracked).
+                position: 'fixed',
+                left: 0,
+                top: 'env(safe-area-inset-top)',
+                bottom: 'env(safe-area-inset-bottom)',
+                transform: mobileDrawerOpen ? 'translateX(0)' : 'translateX(-100%)',
+                visibility: mobileDrawerOpen ? 'visible' : 'hidden',
+              } : {}),
+            }}
+            // Compact transitions stay scoped to the slide: broad transition-all
+            // would also fade the dark open/closed shades on every toggle and
+            // animate height when env() insets change with device rotation.
+            className={`${isCompactShell ? 'w-[280px]' : (isSidebarOpen ? '' : 'w-[68px]')} relative shrink-0 flex flex-col z-40 ${sidebarResizing ? '' : (isCompactShell ? 'transition-[transform,visibility] duration-300 motion-reduce:transition-none' : 'transition-all duration-300 motion-reduce:transition-none')} ${
+              activeTheme === 'light'
+                ? 'bg-[#F0F4F9]'
+                : (isSidebarOpen ? 'bg-[#1E1F20]' : 'bg-[#131314]')
+            }`}>
+
+            {/* Header / Logo */}
+            <div className={`px-4 py-3 max-sm:px-3 max-sm:py-0 flex items-center ${isSidebarOpen ? 'gap-3' : 'justify-center'} overflow-hidden`}>
+              <button type="button"
+                data-sidebar-toggle
+                onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                title={isSidebarOpen ? t.sidebarCollapse : t.sidebarExpand}
+                className={`w-10 h-10 shrink-0 rounded-full flex items-center justify-center transition-colors ${activeTheme === 'dark' ? 'hover:bg-[#333537]' : 'hover:bg-[#E1E5EA]'}`}
+              >
+                <Menu size={20} className={activeTheme === 'dark' ? 'text-[#E3E3E3]' : 'text-[#444746]'} />
+              </button>
+              <span className={`text-[18px] font-medium tracking-wide flex items-center gap-2 whitespace-nowrap transition-opacity duration-200 ${isSidebarOpen ? 'opacity-100' : 'opacity-0 w-0'}`}>
+                PINVOU
+              </span>
+              {isSidebarOpen && !isCompactShell && (
+                <button
+                  type="button"
+                  onClick={openSearchOverlay}
+                  title={t.searchChats}
+                  aria-label={t.searchChats}
+                  className={`ml-auto w-10 h-10 shrink-0 rounded-full flex items-center justify-center transition-colors ${
+                    searchOverlayOpen
+                      ? (activeTheme === 'dark' ? 'bg-[#333537] text-[#E3E3E3]' : 'bg-[#E1E5EA] text-[#0B57D0]')
+                      : (activeTheme === 'dark' ? 'text-[#E3E3E3] hover:bg-[#333537]' : 'text-[#444746] hover:bg-[#E1E5EA]')
+                  }`}
+                >
+                  <Search size={19} />
+                </button>
+              )}
+            </div>
+
+            {/* Navigation — shrink-0 keeps it from scrolling; no matter how long the
+                list is, it never squeezes the nav. The nav folds to a single expand row
+                only through the manual collapse button at the bottom of the list; the
+                choice persists and applies in every mode. The phone drawer (compact
+                shell) always keeps the full nav so the task list keeps its vertical
+                room (see web-ui.smoke's drawer-height contract). */}
+            <div data-testid="sidebar-primary-nav" className={`shrink-0 flex flex-col gap-0.5 mt-1.5 max-sm:gap-0 max-sm:mt-1 ${isSidebarOpen ? 'px-3' : 'px-2 items-center'}`}>
+              <NavItem
+                icon={NAV_ICON_NEW_CHAT} label={t.newChat}
+                theme={activeTheme}
+                isSidebarOpen={isSidebarOpen}
+                onClick={handleNewChat}
+              />
+              {/* On the compact shell search is only reachable from the nav, so it must
+                  stay pinned even when collapsed */}
+              {(!isSidebarOpen || isCompactShell) && (
+                <NavItem
+                  icon={NAV_ICON_SEARCH} label={t.searchChats}
+                  active={searchOverlayOpen}
+                  theme={activeTheme}
+                  isSidebarOpen={isSidebarOpen}
+                  onClick={openSearchOverlay}
+                />
+              )}
+              {isSidebarOpen && !isCompactShell && sidebarNavCollapsed ? (
+                <button
+                  type="button"
+                  data-testid="sidebar-primary-nav-expand"
+                  onClick={() => setSidebarNavCollapsedPersisted(false)}
+                  title={t.sidebarNavExpand}
+                  className={`w-full h-8 px-4 flex items-center justify-between rounded-full text-[13px] font-semibold transition-colors ${activeTheme === 'dark' ? 'text-[#9AA0A6] hover:bg-[#282A2C]' : 'text-[#8A8F94] hover:bg-[#E1E5EA]'}`}
+                >
+                  <span className="truncate">{t.sidebarNavExpand}</span>
+                  <ChevronDown size={14} className="shrink-0" />
+                </button>
+              ) : (
+              <>
+              <NavItem
+                icon={NAV_ICON_SCHEDULED} label={t.scheduledPlans}
+                active={currentView === 'scheduled'}
+                unread={scheduledUnread}
+                theme={activeTheme}
+                t={t}
+                isSidebarOpen={isSidebarOpen}
+                onClick={navNavigateHandlers.scheduled}
+                onPointerEnter={NAV_PREFETCH.scheduled} onFocus={NAV_PREFETCH.scheduled}
+              />
+              <NavItem
+                icon={NAV_ICON_OUTPUTS} label={t.outputs}
+                active={currentView === 'outputs'}
+                theme={activeTheme}
+                isSidebarOpen={isSidebarOpen}
+                onClick={navNavigateHandlers.outputs}
+                onPointerEnter={NAV_PREFETCH.knowledge} onFocus={NAV_PREFETCH.knowledge}
+                dragKind={canDetachWindows ? 'outputs' : undefined} dragging={canDetachWindows && !!dragAvatar && dragAvatar.key === 'outputs:'} onPickUp={canDetachWindows ? navPickUpHandlers.outputs : undefined}
+              />
+              <NavItem
+                icon={NAV_ICON_MONITOR} label={t.monitor}
+                active={currentView === 'monitor'}
+                theme={activeTheme}
+                isSidebarOpen={isSidebarOpen}
+                onPointerEnter={NAV_PREFETCH.monitor} onFocus={NAV_PREFETCH.monitor}
+                onClick={navNavigateHandlers.monitor}
+                dragKind={canDetachWindows ? 'monitor' : undefined} dragging={canDetachWindows && !!dragAvatar && dragAvatar.key === 'monitor:'} onPickUp={canDetachWindows ? navPickUpHandlers.monitor : undefined}
+              />
+              <NavItem
+                icon={NAV_ICON_TOOL_STORE} label={t.toolStore}
+                active={currentView === 'toolStore'}
+                theme={activeTheme}
+                isSidebarOpen={isSidebarOpen}
+                onClick={navNavigateHandlers.toolStore}
+                onPointerEnter={NAV_PREFETCH.toolStore} onFocus={NAV_PREFETCH.toolStore}
+                dragKind={canDetachWindows ? 'toolstore' : undefined} dragging={canDetachWindows && !!dragAvatar && dragAvatar.key === 'toolstore:'} onPickUp={canDetachWindows ? navPickUpHandlers.toolstore : undefined}
+              />
+              <NavItem
+                icon={NAV_ICON_CARD_POOL} label={t.cardPool}
+                active={currentView === 'cardpool'}
+                theme={activeTheme}
+                isSidebarOpen={isSidebarOpen}
+                onClick={navNavigateHandlers.cardpool}
+                onPointerEnter={NAV_PREFETCH.cardpool} onFocus={NAV_PREFETCH.cardpool}
+                dragKind={canDetachWindows ? 'cardpool' : undefined} dragging={canDetachWindows && !!dragAvatar && dragAvatar.key === 'cardpool:'} onPickUp={canDetachWindows ? navPickUpHandlers.cardpool : undefined}
+              />
+              <NavItem
+                icon={NAV_ICON_KNOWLEDGE} label={t.knowledge}
+                active={currentView === 'knowledge'}
+                theme={activeTheme}
+                isSidebarOpen={isSidebarOpen}
+                onClick={navNavigateHandlers.knowledge}
+                onPointerEnter={NAV_PREFETCH.knowledge} onFocus={NAV_PREFETCH.knowledge}
+                dragKind={canDetachWindows ? 'knowledge' : undefined} dragging={canDetachWindows && !!dragAvatar && dragAvatar.key === 'knowledge:'} onPickUp={canDetachWindows ? navPickUpHandlers.knowledge : undefined}
+              />
+              {/* 收起态专属:展开态近期列表的高亮项就是回会话入口,不重复渲染 */}
+              {!isSidebarOpen && (
+                <NavItem
+                  icon={NAV_ICON_CURRENT_CHAT} label={t.currentChat}
+                  active={currentView === 'chat'}
+                  theme={activeTheme}
+                  isSidebarOpen={isSidebarOpen}
+                  onClick={navNavigateHandlers.chat}
+                />
+              )}
+              {isSidebarOpen && !isCompactShell && (
+                <button
+                  type="button"
+                  data-testid="sidebar-primary-nav-collapse"
+                  onClick={() => setSidebarNavCollapsedPersisted(true)}
+                  title={t.sidebarNavCollapse}
+                  className={`w-full h-7 px-4 flex items-center justify-between rounded-full text-[12px] transition-colors ${activeTheme === 'dark' ? 'text-[#9AA0A6] hover:bg-[#282A2C]' : 'text-[#8A8F94] hover:bg-[#E1E5EA]'}`}
+                >
+                  <span className="truncate">{t.sidebarNavCollapse}</span>
+                  <ChevronDown size={14} className="shrink-0 rotate-180" />
+                </button>
+              )}
+              </>
+              )}
+            </div>
+
+            {/* Recents — 独立 flex-1 + overflow-y-auto,只在展开态显示。
+                min-h-0 关键:flex 子项默认 min-height: auto 会阻止 overflow,
+                显式压成 0 才允许内容溢出触发滚动条。
+                nav / list 分隔:「近期」label sticky top-0 + 实色背景,滚动时常驻顶端
+                遮住下滑的列表项,避免首项与上方 nav 贴死("重合")。 */}
+            {isSidebarOpen && (
+              <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar px-3 flex flex-col">
+                <div data-testid="sidebar-recents" className="pt-3 pb-2 max-sm:pt-2">
+                  <div ref={taskFilterRef} className="relative mb-2">
+                    {/* 第一行:「任务列表」标题 + 查看全部/筛选按钮;
+                        第二行:全部/项目 胶囊 + 一键折叠(分组)按钮。
+                        胶囊选择任务列表展示形态(标准列表 / code 样式按文件夹分组),
+                        与是否处于 code 模式无关;折叠按钮切换下方任务分组
+                        (日期组 / 文件夹组)的整体展开状态。 */}
+                    <div className={`group flex flex-col gap-1 rounded-2xl text-[13px] font-semibold ${
+                      activeTheme === 'dark' ? 'text-[#9AA0A6]' : 'text-[#8A8F94]'
+                    }`}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="h-8 px-1 min-w-0 truncate flex items-center">
+                          {t.sidebarTaskList} ({sidebarCodeListActive ? sidebarCodeTasks.length : sidebarTaskHistory.length})
+                        </span>
+                        <span className="flex items-center shrink-0">
+                        {/* 对话管理页入口:悬停任务列表行显现(触屏常显),替代原搜索入口 */}
+                        <button
+                          type="button"
+                          onClick={() => navigateFromScheduledRun('search')}
+                          className={`ml-1 h-6 px-2 shrink-0 rounded-full text-[12px] font-normal transition-opacity opacity-0 group-hover:opacity-100 max-sm:opacity-100 ${activeTheme === 'dark' ? 'text-[#A8C7FA] hover:bg-[#282A2C]' : 'text-[#0B57D0] hover:bg-[#E1E5EA]'}`}
+                        >
+                          {t.sidebarViewAll}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="sidebar-task-filter"
+                          onClick={() => setTaskFilterOpen(v => !v)}
+                          title={t.sidebarTaskFilter}
+                          className={`w-7 h-7 -mr-2 shrink-0 rounded-full flex items-center justify-center transition-colors ${
+                            taskFilterOpen
+                              ? (activeTheme === 'dark' ? 'bg-[#333537] text-[#E3E3E3]' : 'bg-[#E1E5EA] text-[#444746]')
+                              : (activeTheme === 'dark' ? 'hover:bg-[#282A2C]' : 'hover:bg-[#E1E5EA]')
+                          }`}
+                        >
+                          <Filter size={15} />
+                        </button>
+                        </span>
+                      </div>
+                      {/* 全部/项目 胶囊 + 一键折叠(分组)按钮:位于「任务列表」标题下方。
+                          flex-wrap 兜底:ja 等语言在 220px 最小宽度下此行已无富余
+                          (实测正好占满),字体渲染偏宽的环境让折叠按钮换行而非溢出。 */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+                        {/* biome-ignore lint/a11y/useSemanticElements: toggle-button pair in an ARIA group, not form controls; a <fieldset> would need its default styles reset */}
+                        <div className="flex items-center gap-0.5" role="group" aria-label={t.sidebarTaskStyle}>
+                        <button
+                          type="button"
+                          data-testid="sidebar-task-pill-all"
+                          aria-pressed={!sidebarCodeListActive}
+                          onClick={() => { setSidebarCodeStylePersisted('normal'); setTaskFilterOpen(false); }}
+                          className={`h-6 px-2.5 rounded-full text-[12px] font-normal transition-colors ${
+                            sidebarCodeListActive
+                              ? (activeTheme === 'dark' ? 'text-[#9AA0A6] hover:bg-[#282A2C]' : 'text-[#8A8F94] hover:bg-[#E1E5EA]')
+                              : (activeTheme === 'dark' ? 'bg-[#333537] text-[#E3E3E3]' : 'bg-[#E1E5EA] text-[#0B57D0]')
+                          }`}
+                        >
+                          {t.sidebarTaskFilterAll}
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="sidebar-task-pill-code"
+                          aria-pressed={sidebarCodeListActive}
+                          onClick={() => { setSidebarCodeStylePersisted('code'); setTaskFilterOpen(false); }}
+                          className={`h-6 px-2.5 rounded-full text-[12px] font-normal transition-colors ${
+                            sidebarCodeListActive
+                              ? (activeTheme === 'dark' ? 'bg-[#333537] text-[#E3E3E3]' : 'bg-[#E1E5EA] text-[#0B57D0]')
+                              : (activeTheme === 'dark' ? 'text-[#9AA0A6] hover:bg-[#282A2C]' : 'text-[#8A8F94] hover:bg-[#E1E5EA]')
+                          }`}
+                        >
+                          {t.sidebarTaskFilterCode}
+                        </button>
+                        </div>
+                        {/* 一键折叠/展开全部任务分组(日期组或文件夹组);
+                            无可分组列表(平铺/空列表)时不渲染,避免空操作 */}
+                        {visibleTaskGroupOpens.length > 0 && (
+                        <button
+                          type="button"
+                          data-testid="sidebar-collapse-all-groups"
+                          onClick={() => setAllTaskGroups(!allTaskGroupsExpanded)}
+                          title={allTaskGroupsExpanded ? t.sidebarCollapseAll : t.sidebarExpandAll}
+                          aria-label={allTaskGroupsExpanded ? t.sidebarCollapseAll : t.sidebarExpandAll}
+                          className={`h-6 px-2 shrink-0 whitespace-nowrap rounded-full text-[12px] font-normal transition-colors ${
+                            activeTheme === 'dark' ? 'text-[#9AA0A6] hover:bg-[#282A2C]' : 'text-[#8A8F94] hover:bg-[#E1E5EA]'
+                          }`}
+                        >
+                          <ChevronDown size={13} className={`inline -mt-0.5 transition-transform ${allTaskGroupsExpanded ? '' : 'rotate-180'}`} />
+                          {allTaskGroupsExpanded ? t.sidebarCollapseAll : t.sidebarExpandAll}
+                        </button>
+                        )}
+                      </div>
+                    </div>
+                    {taskFilterOpen && (
+                      <div
+                        data-testid="sidebar-task-filter-menu"
+                        className={`absolute right-0 top-16 z-50 w-44 overflow-hidden rounded-2xl border p-1.5 shadow-xl ${
+                          activeTheme === 'dark' ? 'border-white/10 bg-[#202124]' : 'border-black/10 bg-white'
+                        }`}
+                      >
+                        <div className={`px-2.5 pb-1 pt-1 text-[11px] font-semibold ${activeTheme === 'dark' ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}>
+                          {t.sidebarTaskFilter}
+                        </div>
+                        {sidebarTaskFilterOptions.map(option => (
+                          <button
+                            key={option.id}
+                            type="button"
+                            onClick={() => setTaskListFilter(option.id)}
+                            className={`w-full px-2.5 py-1.5 flex items-center gap-2 rounded-xl text-left text-[13px] leading-5 transition-colors ${activeTheme === 'dark' ? 'text-[#E3E3E3] hover:bg-[#303134]' : 'text-[#1F1F1F] hover:bg-[#F1F3F4]'}`}
+                          >
+                            <span className="w-4 shrink-0">{taskListFilter === option.id && <Check size={13} />}</span>
+                            <span className="truncate">{option.label}</span>
+                          </button>
+                        ))}
+                        <div className={`my-1 h-px ${activeTheme === 'dark' ? 'bg-white/10' : 'bg-black/10'}`} />
+                        <div className={`px-2.5 pb-1 pt-1 text-[11px] font-semibold ${activeTheme === 'dark' ? 'text-[#8E8E93]' : 'text-[#8A8A8E]'}`}>
+                          {t.sidebarTaskSort}
+                        </div>
+                        {sidebarTaskSortOptions.map(option => (
+                          <button
+                            key={option.id}
+                            type="button"
+                            onClick={() => setTaskListSort(option.id)}
+                            className={`w-full px-2.5 py-1.5 flex items-center gap-2 rounded-xl text-left text-[13px] leading-5 transition-colors ${activeTheme === 'dark' ? 'text-[#E3E3E3] hover:bg-[#303134]' : 'text-[#1F1F1F] hover:bg-[#F1F3F4]'}`}
+                          >
+                            <span className="w-4 shrink-0">{taskListSort === option.id && <Check size={13} />}</span>
+                            <span className="truncate">{option.label}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="space-y-0.5">
+                    {sidebarCodeListActive ? (
+                      (sidebarFolderPinned.length > 0 || sidebarFolderGroups.length > 0) ? (
+                        <>
+                          {sidebarFolderPinned.length > 0 && (
+                            <div className="space-y-0.5">
+                              {sidebarFolderPinned.map(renderSidebarTaskItem)}
+                            </div>
+                          )}
+                          {sidebarFolderGroups.map((group) => {
+                            const isOpen = folderGroupOpen[group.key] ?? true;
+                            const label = group.kind === 'project'
+                              ? group.name
+                              : group.kind === 'temporary'
+                                ? t.uiCodex.temporarySession
+                                : workspaceDisplayName(group.path);
+                            return (
+                              <div key={group.key}>
+                                <Suspense fallback={null}><ProjectGroupHeader
+                                  label={label}
+                                  kind={group.kind}
+                                  count={group.rows.length + (sidebarGroupPinnedCounts[group.key] || 0)}
+                                  isOpen={isOpen}
+                                  onToggle={() => setFolderGroupOpen(prev => ({ ...prev, [group.key]: !isOpen }))}
+                                  theme={activeTheme}
+                                  t={t}
+                                  busy={projectOpsBusy}
+                                  testId="sidebar-folder-group"
+                                  // bridge.projects 仅桌面存在:web 上目录组不渲染
+                                  // 死入口(点击无反馈违反显式不支持约定)。
+                                  onConvert={bridge.projects && group.kind === 'folder' ? (name) => handleConvertFolderToProject(group.path, name) : undefined}
+                                  onRename={bridge.projects && group.kind === 'project' ? (name) => handleRenameProject(group.projectId, name) : undefined}
+                                  onDelete={bridge.projects && group.kind === 'project' ? () => handleDeleteProject(group.projectId) : undefined}
+                                  onDropSession={bridge.projects && group.kind === 'project' ? (sessionId) => handleDropSessionOnProject(sessionId, group.projectId) : undefined}
+                                  onRebind={bridge.projects && group.kind === 'project' ? (rootPath, headerEl) => startRebindWorkspace(rootPath, headerEl) : undefined}
+                                  {...sidebarGroupHeaderProps(group)}
+                                  dropActive={dropTargetGroupKey === group.key}
+                                  onDropActive={(active) => setDropTargetGroupKey(active ? group.key : null)}
+                                /></Suspense>
+                                {isOpen && (
+                                  <div className="space-y-0.5">
+                                    {group.rows.map(renderSidebarTaskItem)}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </>
+                      ) : (
+                        sidebarTaskEmptyNode
+                      )
+                    ) : sidebarDateGrouping ? (sidebarPinnedHoisted.length > 0 || sidebarTaskGroups.length > 0) ? (
+                      <>
+                        {sidebarPinnedHoisted.length > 0 && (
+                          <div className="space-y-0.5">
+                            {sidebarPinnedHoisted.map(renderSidebarTaskItem)}
+                          </div>
+                        )}
+                        {sidebarTaskGroups.map((group) => {
+                      const isOpen = dateGroupOpen[group.key] ?? (group.key === todayDateKey);
+                      return (
+                        <div key={group.key}>
+                          <button
+                            type="button"
+                            onClick={() => setDateGroupOpen(prev => ({ ...prev, [group.key]: !isOpen }))}
+                            className={`w-full h-7 px-4 flex items-center justify-between rounded-full text-[12px] transition-colors ${activeTheme === 'dark' ? 'text-[#9AA0A6] hover:bg-[#282A2C]' : 'text-[#8A8F94] hover:bg-[#E1E5EA]'}`}
+                          >
+                            <span className="truncate">{formatDateGroupLabel(group.key, language)} ({group.rows.length})</span>
+                            <ChevronDown size={14} className={`shrink-0 transition-transform ${isOpen ? '' : '-rotate-90'}`} />
+                          </button>
+                          {isOpen && (
+                            <div className="space-y-0.5">
+                              {group.rows.map(renderSidebarTaskItem)}
+                            </div>
+                          )}
+                        </div>
+                      );
+                        })}
+                      </>
+                    ) : (
+                      sidebarTaskEmptyNode
+                    ) : (
+                      <div className="space-y-0.5">
+                        {sidebarTaskHistory.length > 0 ? sidebarTaskHistory.map(renderSidebarTaskItem) : (
+                          sidebarTaskEmptyNode
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Footer Profile */}
+            <div className={`p-3 mt-auto ${isSidebarOpen ? 'space-y-2' : 'flex flex-col items-center gap-3 pb-6'}`}>
+              <div className={`${isSidebarOpen ? 'flex items-center justify-between gap-2' : 'flex flex-col items-center gap-3'}`}>
+                {!isSidebarOpen && renderFooterButtons(true)}
+                {isSidebarOpen && (
+                  <div className="flex items-center gap-1">
+                    {renderFooterButtons(false)}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Right-edge drag to resize: only offered on the expanded desktop shell;
+                double-click resets to the default width. Focusable separator semantics
+                (tabIndex + value range + arrow keys) per the WAI-ARIA Window Splitter
+                pattern; the controlled pane is the sidebar itself. */}
+            {isSidebarOpen && !isCompactShell && (
+              <hr
+                data-testid="sidebar-resize-handle"
+                aria-orientation="vertical"
+                tabIndex={0}
+                aria-valuenow={sidebarWidth}
+                aria-valuemin={SIDEBAR_WIDTH_MIN}
+                aria-valuemax={SIDEBAR_WIDTH_MAX}
+                aria-label={t.sidebarResize}
+                aria-controls="app-sidebar"
+                title={t.sidebarResize}
+                onPointerDown={beginSidebarResize}
+                onDoubleClick={resetSidebarWidth}
+                onKeyDown={keyboardSidebarResize}
+                // h-full must stay: Tailwind preflight pins every <hr> to
+                // height:0, which would turn the 6px strip into a zero-area
+                // element that pointer hit-testing can never reach (the
+                // top-0/bottom-0 stretch only applies when height is auto).
+                className={`absolute top-0 bottom-0 right-0 h-full w-[6px] border-0 cursor-col-resize z-50 touch-none transition-colors focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#0B57D0] ${
+                  sidebarResizing
+                    ? 'bg-[#0B57D0]/40'
+                    : (activeTheme === 'dark' ? 'hover:bg-[#A8C7FA]/30' : 'hover:bg-[#0B57D0]/25')
+                }`}
+              />
+            )}
+          </div>
+
+          {/* ================= Main Content ================= */}
+          <div className={`flex-1 flex relative min-w-0 overflow-hidden ${activeTheme === 'dark' ? 'bg-[#131314]' : 'bg-white'} ${isCompactShell ? '' : 'rounded-tl-[28px]'}`}>
+            <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+
+            {/* Gemini Style Background Glow */}
+            {(currentView === 'chat'
+              || currentView === 'codex'
+              || (currentView === 'scheduled' && bs && bs.scheduledRunContext)) && (
+              activeTheme === 'light' ? (
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[1200px] h-[800px] bg-[radial-gradient(ellipse_at_center,_rgba(232,240,254,0.8)_0%,_transparent_60%)] pointer-events-none z-0"></div>
+              ) : (
+                <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-[40%] w-[1400px] h-[900px] bg-[radial-gradient(ellipse_at_center,_rgba(168,199,250,0.25)_0%,_transparent_60%)] pointer-events-none z-0"></div>
+              )
+            )}
+
+            {/* 单一常驻 Suspense 边界:React 19 下切视图时旧视图在本边界内被替换,
+                chunk 未就绪(未被预取覆盖的入口)保持旧视图不闪 fallback;失败由
+                ViewErrorBoundary 兜底(reload 重试绕开 React.lazy 的失败缓存)。
+                resetKey=currentView:某视图 chunk 失败仅锁该次渲染,切走时边界
+                复位,其余视图不受一次失败牵连。 */}
+            <ViewErrorBoundary t={t} resetKey={currentView}>
+              <Suspense fallback={<ViewFallback />}>
+            {currentView === 'monitor' && <LazyMonitorView theme={activeTheme} t={t} bs={bs} />}
+            {currentView === 'settings' && (
+              <ViewErrorBoundary heading={t.uiSettingsDetail.settingsLoadFailed} t={t}>
+                <LazySettingsView
+                  activeTheme={activeTheme} colorScheme={colorScheme} onColorSchemeChange={handleSetTheme}
+                  language={language} setLanguage={handleSetLanguage}
+                  superPerm={superPerm} setSuperPerm={handleToggleSuperPerm}
+                  taskCompletedNotif={taskCompletedNotif} setTaskCompletedNotif={handleSetTaskCompletedNotif}
+                  inputNeededNotif={inputNeededNotif} setInputNeededNotif={handleSetInputNeededNotif}
+                  setSettingsToast={setSettingsToast}
+                  searchProvider={searchProvider} setSearchProvider={handleSetSearchProvider}
+                  enabledSearchProviders={enabledSearchProviders}
+                  onAddSearchProvider={handleAddSearchProvider}
+                  onDeleteSearchProvider={handleDeleteSearchProvider}
+                  setSearchApiKey={handleSetSearchApiKey}
+                  savedModels={(bs && bs.savedModels) || []}
+                  activeModelId={bs && bs.activeModelId}
+                  onSaveModel={(m, options) => bridge.available && bridge.models.saveModel(m, options)}
+                  onDeleteModel={(m) => { if (bridge.available) bridge.models.deleteModel(m.id); }}
+                  onSetActiveModel={(id) => bridge.available && bridge.models.setActiveModel(id)}
+                  onSaveSearchConfig={handleSaveSearchConfig}
+                  onConfirmSearchConfig={handleConfirmSearchConfig}
+                  onMemoryEnabledChange={handleSetMemoryEnabled}
+                  onPetEnabledChange={handleSetPetEnabled}
+                  bs={bs}
+                  t={t}
+                  sidebarDateGrouping={sidebarDateGrouping}
+                  onSidebarDateGroupingChange={handleSetSidebarDateGrouping}
+                  chatStreamingAnimation={chatStreamingAnimation}
+                  onChatStreamingAnimationChange={handleSetChatStreamingAnimation}
+                  updateFocusTick={settingsUpdateFocusTick}
+                  initialSection={settingsInitialSection}
+                  onCloseSettings={() => navigateFromScheduledRun(settingsReturnViewRef.current || 'chat')}
+                />
+              </ViewErrorBoundary>
+            )}
+            {isCompactShell && browserActive && currentView === 'browser' && (
+              <LazyBrowserView
+                key={browserSessionId}
+                theme={activeTheme}
+                t={t}
+                sessionId={browserSessionId}
+                nativeSurfaceSuspended={compactBrowserSurfaceSuspended}
+              />
+            )}
+            {currentView === 'toolStore' && <LazyToolStoreView t={t} onNewChat={handleNewChat} />}
+            {currentView === 'cardpool' && <LazyCardPoolView theme={activeTheme} t={t} bs={bs} onAICreate={startAICard} initialMyOnly={poolMyOnly} />}
+            {currentView === 'chat' && (
+              <ChatView
+                {...chatViewBaseProps}
+                prefill={chatPrefill}
+                prefillAppend={chatPrefillAppend}
+                focusComposerTick={petFocusComposerTick}
+                onPrefillConsumed={() => { setChatPrefill(''); setChatPrefillAppend(false); }}
+                onBackScheduledRun={() => navigateFromScheduledRun('scheduled')}
+                codeModeAvailable={codexAcpSupported}
+                onSwitchHomeMode={handleSwitchHomeMode}
+                browserDockAvailable={browserDockAvailable}
+                rightDockActivePanelId={browserDockSelectedPanelId}
+                onRightDockPanelSelectionChange={selectRightDockPanel}
+              />
+            )}
+            {codexAcpSupported && currentView === 'codex' && (
+              <CodexAcpView
+                theme={activeTheme}
+                t={t}
+                sessions={codexSessions}
+                activeId={activeCodexId}
+                draftEpoch={codexDraftEpoch}
+                onActiveSessionChange={updateActiveCodexSession}
+                onSessionsChange={setCodexSessions}
+                onSwitchHomeMode={handleSwitchHomeMode}
+                onOpenSettingsSection={openSettingsSection}
+                onOpenWorkspacePicker={({ mode, deliveryLimited }) => { setPickerExcluded(null); setWorkspacePicker({ lane: 'codex', mode, deliveryLimited }); }}
+                workspacePickerRequest={pickerCodexRequest}
+                onWorkspacePickerRequestConsumed={() => setPickerCodexRequest(null)}
+                onLaneModeChange={setCodexLaneMode}
+                onLaneDeliveryChange={(limited) => { setCodexLaneDeliveryLimited(limited); setCodexLaneDeliveryReported(true); }}
+                bs={bs}
+                onGotoModelSettings={() => openSettingsSection('model')}
+                onGotoSettings={() => openSettingsSection('general')}
+                onGotoTools={() => navigateFromScheduledRun('toolStore')}
+                onNotify={setSettingsToast}
+              />
+            )}
+            {currentView === 'scheduled' && (
+              bs && bs.scheduledRunContext ? (
+                <ChatView {...chatViewBaseProps} prefill="" onPrefillConsumed={() => {}} onBackScheduledRun={() => navigateFromScheduledRun('scheduled')} browserDockAvailable={browserDockAvailable} rightDockActivePanelId={browserDockSelectedPanelId} onRightDockPanelSelectionChange={selectRightDockPanel} />
+              ) : (
+                <LazyScheduledTasksView theme={activeTheme} t={t} onOpenChat={() => { setCodeModeOn(false); setCurrentView('chat'); }} onGotoModelSettings={() => openSettingsSection('model')} />
+              )
+            )}
+            {/* 草稿态(无 session)也渲染挂件,但强制空态——让欢迎页保留「＋加持卡牌」入口。
+                点它跳卡牌池,选卡时 equipPersona 会先物化 session(lazy session)。 */}
+            {(currentView === 'chat' || (currentView === 'scheduled' && bs && bs.scheduledRunContext)) && bs && (
+              <Lanyard persona={bs.activeSessionId ? (bs.activePersona || null) : null} isDark={activeTheme === 'dark'} t={t}
+                onRemove={() => bridge.available && bridge.personas.unequipPersona()}
+                onOpenPicker={() => navigateFromScheduledRun('cardpool', () => setPoolMyOnly(false))} />
+            )}
+            {currentView === 'search' && (
+              <LazySearchView
+                theme={activeTheme} history={allSidebarTasks} t={t} language={language}
+                archived={(bs && bs.archivedSessions) || []}
+                showArchived={searchShowArchived}
+                onShowArchivedConsumed={() => setSearchShowArchived(false)}
+                onSelect={handleSwitchSession}
+                onOpenCodex={handleSwitchCodexSession}
+                onOpenScheduledRun={handleOpenScheduledRunShortcut}
+                onRename={handleRenameSession}
+                onDelete={handleDeleteSession}
+                onTogglePinned={handleToggleSessionPinned}
+                onOpenFolder={can('externalSystemOpen') ? handleRevealSessionFolder : undefined}
+                onExportArchive={bridge.sessions.exportSessionArchive ? handleExportSessionArchive : undefined}
+                onArchive={handleArchiveSession}
+                onArchiveMany={handleBatchArchiveSessions}
+                onDeleteMany={handleBatchDeleteSessions}
+                onRestoreArchived={handleRestoreArchivedSession}
+                onRestoreMany={handleBatchRestoreArchived}
+              />
+            )}
+            {currentView === 'outputs' && <LazyKnowledgeView theme={activeTheme} t={t} mode="outputs" />}
+            {currentView === 'knowledge' && <LazyKnowledgeView theme={activeTheme} t={t} />}
+              </Suspense>
+            </ViewErrorBoundary>
+
+            {can('webAccessAdmin') && webAccessOpen && browserOverlayPublicationReady && (
+              <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+              <LazyWebAccessModal bs={bs} t={t} onClose={() => setWebAccessOpen(false)} />
+            </Suspense>
+            </ViewErrorBoundary>
+            )}
+
+            {/* App 级自创卡编辑器: 聊天里「存入卡牌池」草稿走这条。错误边界与
+                WebAccessModal 同款:lazy chunk 拉取失败不能卸载整个应用窗口。 */}
+            {personaEditor && browserOverlayPublicationReady && (
+              <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+              <LazyPersonaEditorModal initial={personaEditor.initial} t={t}
+                onClose={() => setPersonaEditor(null)}
+                onSaved={(sum) => { const isEdit = personaEditor.initial && personaEditor.initial.id; setPersonaEditor(null); if (!isEdit) setSavedConfirm({ name: sum && sum.name }); }}
+                onDeleted={() => setPersonaEditor(null)} />
+              </Suspense>
+              </ViewErrorBoundary>
+            )}
+
+            {savedConfirm && browserOverlayPublicationReady && (
+              <ViewErrorBoundary t={t}>
+                <Suspense fallback={null}>
+                  <LazySavedPersonaConfirmDialog
+                    savedConfirm={savedConfirm}
+                    theme={activeTheme}
+                    t={t}
+                    onClose={() => setSavedConfirm(null)}
+                    onView={() => { setPoolMyOnly(true); setSavedConfirm(null); setCurrentView('cardpool'); }}
+                  />
+                </Suspense>
+              </ViewErrorBoundary>
+            )}
+
+            {apiKeyGateOpen && browserOverlayPublicationReady && (
+              // The gate must cover chat in every state of its lazy chunk:
+              // while loading (Suspense fallback) AND after a chunk failure
+              // (ViewErrorBoundary's in-flow error card). Both layers sit
+              // inside this outer backdrop, so React.lazy's cached rejection
+              // can never leave the composer interactable.
+              <div
+                className="fixed inset-0 z-[57] flex items-center justify-center overflow-auto p-6"
+                style={{ background: 'rgba(0,0,0,.5)' }}
+                aria-busy="true"
+              >
+                <ViewErrorBoundary t={t}>
+                  <Suspense fallback={null}>
+                    <LazyApiKeyGateDialog
+                      theme={activeTheme}
+                      t={t}
+                      onOpenModelSettings={() => openSettingsSection('model')}
+                    />
+                  </Suspense>
+                </ViewErrorBoundary>
+              </div>
+            )}
+
+            {/* Pinvou 检阅弹窗(品/悟) —— 居中弹窗 + 毛玻璃背景(虚化身后 app);全局,任何视图都能弹;点背景或卡内「跳过」关闭 */}
+            {bs && bs.pinvouModal && browserOverlayPublicationReady && (
+              <ViewErrorBoundary t={t}>
+                <Suspense fallback={null}>
+                  <LazyPinvouSummonModal item={bs.pinvouModal} theme={activeTheme} t={t} isLocal={activeModelIsLocal(bs)} />
+                </Suspense>
+              </ViewErrorBoundary>
+            )}
+
+            </div>
+            {browserDockAvailable && browserPaneOpen
+              && (browserActive || browserWorkspaceStarting || browserWorkspaceError) && (
+              <RightDockPanel
+                panelId="browser"
+                visible={browserPaneAllowed && browserPaneSelected}
+                activationKey={browserDockActivationKey}
+                className={`overflow-hidden border-l ${
+                  activeTheme === 'dark' ? 'border-[#2A2B2E] bg-[#101113]' : 'border-[#E5E7EB] bg-white'
+                }`}
+                dataTestId="browser-side-pane"
+              >
+                <div
+                  className={`flex h-9 shrink-0 items-center justify-between border-b px-3 text-[13px] ${
+                    activeTheme === 'dark' ? 'border-[#2A2B2E] text-[#E8E8E8]' : 'border-[#E5E7EB] text-[#222]'
+                  }`}
+                >
+                  <span className="truncate">{t.browser}</span>
+                  <div className="flex items-center gap-1">
+                    <div
+                      ref={setBrowserOwnershipSlot}
+                      className="contents"
+                      data-browser-control-slot="ownership"
+                    />
+                    <button
+                      type="button"
+                      className={`rounded p-1 ${activeTheme === 'dark' ? 'hover:bg-white/10' : 'hover:bg-black/5'}`}
+                      title={t.browserPaneClose}
+                      aria-label={t.browserPaneClose}
+                      onClick={() => {
+                        const selectedSessionId = browserSessionIdRef.current;
+                        closeBrowserDock(selectedSessionId);
+                      }}
+                    >
+                      <XIcon size={15} />
+                    </button>
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1">
+                  {browserActive ? (
+                    <ViewErrorBoundary t={t} variant="panel">
+                      <Suspense fallback={null}>
+                        <LazyBrowserView
+                          key={browserSessionId}
+                          theme={activeTheme}
+                          t={t}
+                          sessionId={browserSessionId}
+                          nativeSurfaceSuspended={browserSurfaceSuspended}
+                          ownershipSlot={browserOwnershipSlot}
+                        />
+                      </Suspense>
+                    </ViewErrorBoundary>
+                  ) : (
+                    <div
+                      className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-[13px]"
+                      data-testid="browser-workspace-starting"
+                      style={{ color: activeTheme === 'dark' ? '#B8B8B8' : '#555' }}
+                    >
+                      <Globe size={28} style={{ opacity: 0.45 }} />
+                      <div>{browserWorkspaceStarting ? t.browserLoading : t.browserError}</div>
+                      {browserWorkspaceError && (
+                        <>
+                          <div style={{ opacity: 0.7, wordBreak: 'break-word' }}>{browserWorkspaceError}</div>
+                          <button
+                            type="button"
+                            onClick={openBrowserDock}
+                            className={`rounded-full px-4 py-2 font-medium ${
+                              activeTheme === 'dark'
+                                ? 'bg-[#A8C7FA] text-[#062E6F] hover:bg-[#B8D2FA]'
+                                : 'bg-[#0B57D0] text-white hover:bg-[#0842A0]'
+                            }`}
+                          >
+                            {t.browserRetry}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </RightDockPanel>
+            )}
+            <RightDockHost
+              resizeLabel={t.uiMultiAgent.panelResize}
+              resizeHint={t.uiMultiAgent.panelResizeHint}
+              onResizeActiveChange={setBrowserResizeActive}
+            />
+          </div>
+          </div>
+          </RightDockProvider>
+          </SidePanelLayoutProvider>
+
+          {isCompactShell && (
+            <Suspense fallback={null}><MobileTabBar theme={activeTheme} tabs={[
+              { key: 'chat', label: t.currentChat, icon: <MessageSquare size={18} />,
+                active: currentView === 'chat' || !!(currentView === 'scheduled' && bs && bs.scheduledRunContext),
+                onClick: () => mobileNavigate('chat') },
+              { key: 'cardpool', label: t.cardPool, icon: <Layers size={18} />,
+                active: currentView === 'cardpool', onClick: () => mobileNavigate('cardpool', () => setPoolMyOnly(false)) },
+              { key: 'monitor', label: t.monitor, icon: <BarChart2 size={18} />,
+                active: currentView === 'monitor',
+                onClick: () => mobileNavigate('monitor') },
+              { key: 'more', label: t.mobileMore, icon: <MoreHorizontal size={18} />,
+                active: mobileMoreActive, dot: hasUpdate || scheduledUnread,
+                onClick: () => setMobileMoreOpen(true) },
+            ]} /></Suspense>
+          )}
+
+          {isCompactShell && mobileMoreOpen && browserOverlayPublicationReady && (
+            <Suspense fallback={null}><MobileMoreSheet theme={activeTheme} title={t.mobileMore} onClose={() => setMobileMoreOpen(false)} items={[
+              { key: 'search', label: t.searchChats, icon: <Search size={18} />,
+                active: currentView === 'search', onClick: () => mobileNavigate('search') },
+              ...(browserActive ? [{ key: 'browser', label: t.browser, icon: <Globe size={18} />,
+                active: currentView === 'browser', onClick: () => mobileNavigate('browser') }] : []),
+              { key: 'scheduled', label: t.scheduledPlans, icon: <Clock size={18} />,
+                active: currentView === 'scheduled', dot: scheduledUnread,
+                onClick: () => mobileNavigate('scheduled') },
+              { key: 'outputs', label: t.outputs, icon: <Package size={18} />,
+                active: currentView === 'outputs', onClick: () => mobileNavigate('outputs') },
+              { key: 'knowledge', label: t.knowledge, icon: <BookOpen size={18} />,
+                active: currentView === 'knowledge', onClick: () => mobileNavigate('knowledge') },
+              { key: 'toolStore', label: t.toolStore, icon: <Puzzle size={18} />,
+                active: currentView === 'toolStore', onClick: () => mobileNavigate('toolStore') },
+              { key: 'settings', label: t.settings, icon: <Settings size={18} />,
+                active: currentView === 'settings', dot: hasUpdate, onClick: () => mobileNavigate('settings') },
+            ]} /></Suspense>
+          )}
+
+          {(hasUpdate || updateNoticePreviewEnabled) && (
+            <ViewErrorBoundary t={t}>
+              <Suspense fallback={null}>
+                <LazyUpdateNoticeButton
+                  bs={bs}
+                  t={t}
+                  // 68 = the collapsed rail's w-[68px] (kept literal here; Tailwind
+                  // needs the class spelled out at the rail below).
+                  sidebarOffset={isCompactShell ? 0 : (isSidebarOpen ? sidebarWidth : 68)}
+                  bottomInset={isCompactShell ? 56 : 0}
+                  hidden={isCompactShell && isSidebarOpen}
+                  measureKey={currentView}
+                  onShowChangelog={() => {
+                    // Same settings entry path as the sidebar gear (openSettingsSection records the
+                    // return view and lets navigateFromScheduledRun own the view transition).
+                    openSettingsSection('update');
+                    setSettingsUpdateFocusTick(v => v + 1);
+                  }}
+                />
+              </Suspense>
+            </ViewErrorBoundary>
+          )}
+        </div>
+      );
+    };
+
+    // ==========================================
+    // 长按撕离:按住 ~350ms 不动 → onPickUp(info)(DOM avatar 浮起跟手 + begin_detach_drag 原生判落点);
+    // 长按达成前移动 >10px = 视为滚动/取消;长按达成后吞掉随之而来的 click(避免又切视图);
+    // 按在内部按钮/输入框上不起手(让它们自理)。按下即禁选,防止长按选中下方文字。
+    window.__PINVOU_STARTUP__.mark('react:create_root_start');
+    const root = createRoot(document.querySelector('#root'));
+    window.__PINVOU_STARTUP__.mark('react:create_root_done');
+    const __q = new URLSearchParams(window.location.search);
+    // 首帧语言引导:三种语言一致走惰性 chunk;先取所选语言词典再首渲染,
+    // 保证 t = dict[language] 首帧即有效。装载失败(离线/重部署后哈希失效)
+    // 时降级装载 zh,渲染腿 dict[language] || zhDict() 以中文兜底而非白屏。
+    const __initialLang = initialSystemLanguage();
+    const __storedLang = (() => {
+      if (!isWeb) return null;
+      try {
+        const value = window.localStorage.getItem('pinvou.web.language');
+        return value && ['zh', 'en', 'ja'].includes(value) ? value : null;
+      } catch { return null; }
+    })();
+    // 双失败引导终态(round-49 M2):装载返回 null(首选与 zh chunk 都不可达)
+    // 时照常挂载会让词典依赖组件在首帧 TypeError;由 mountWhenLanguageReady
+    // 以词典无关的静态失败/重试态替代(见 shared/entry-boot.js)。
+    mountWhenLanguageReady({
+      load: () => ensureLanguageWithZhFallback(__storedLang || __initialLang),
+      mount: function () {
+        if (__q.get('detached') === '1') {
+          window.__PINVOU_DETACHED__ = true;
+          root.render(
+            <Suspense fallback={<div className="p-6 text-sm opacity-60">…</div>}>
+              <LazyDetachedShell kind={__q.get('kind') || 'monitor'} id={__q.get('id') || ''} />
+            </Suspense>
+          );
+        } else {
+          window.__PINVOU_STARTUP__.mark('react:render_call');
+          root.render(<App />);
+        }
+      },
+    });

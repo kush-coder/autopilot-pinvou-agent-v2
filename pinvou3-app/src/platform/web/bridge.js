@@ -1,0 +1,6862 @@
+/**
+ * tauri-bridge.js — Tauri 后端通信桥
+ *
+ * 封装所有 invoke/listen，维护前端状态，通过 pub/sub 推给 React。
+ * window.__TAURI__ 由先加载的 platform/web/bootstrap.js 保证存在（桌面为原生注入，Web 为客户端 shim），不再保留无 Tauri 的降级桩。
+ */
+(function () {
+  // biome-ignore lint/suspicious/noRedundantUseStrict: verbatim copy of a classic script; strict mode is part of the payload
+  "use strict";
+
+let pinvouSharedwebCache = null;
+function pinvouSharedweb() {
+  if (!pinvouSharedwebCache) pinvouSharedwebCache = window.PinvouBridgeShared.create("web", { state, BT_TABLE: { get value() { return BT_TABLE; } }, PINVOU_SCENE_EVENTS_STORAGE_PREFIX: { get value() { return PINVOU_SCENE_EVENTS_STORAGE_PREFIX; } }, invoke, sessionStates: { get value() { return sessionStates; } }, restoreEvictedSessionDraft, sessionBufferTouchClock: { get value() { return sessionBufferTouchClock; }, set value(v) { sessionBufferTouchClock = v; } }, pruneScheduledSessionBuffers, pruneSessionBuffers, scheduledRunSessionOwners: { get value() { return scheduledRunSessionOwners; } }, scheduledRunOwnerTouchClock: { get value() { return scheduledRunOwnerTouchClock; }, set value(v) { scheduledRunOwnerTouchClock = v; } }, MAX_SCHEDULED_RUN_SESSION_OWNERS: { get value() { return MAX_SCHEDULED_RUN_SESSION_OWNERS; } }, recordAuthoritySyncDiagnostic, runSyncOnSession, notify, SCHEDULED_TEMPLATE_SOURCE_STORAGE_KEY, scheduledTaskTemplateSources: { get value() { return scheduledTaskTemplateSources; } }, persistScheduledTaskTemplateSources, scheduledTaskRequestTokens: { get value() { return scheduledTaskRequestTokens; } }, scheduledTaskRefreshInFlight: { get value() { return scheduledTaskRefreshInFlight; }, set value(v) { scheduledTaskRefreshInFlight = v; } }, scheduledRecentRunsRequestToken: { get value() { return scheduledRecentRunsRequestToken; }, set value(v) { scheduledRecentRunsRequestToken = v; } }, scheduledRunEventRefreshTimer: { get value() { return scheduledRunEventRefreshTimer; }, set value(v) { scheduledRunEventRefreshTimer = v; } }, scheduledTaskPendingLoads: { get value() { return scheduledTaskPendingLoads; } }, scheduledTaskSelectionGeneration: { get value() { return scheduledTaskSelectionGeneration; }, set value(v) { scheduledTaskSelectionGeneration = v; } }, scheduledRunShortcutRefreshes: { get value() { return scheduledRunShortcutRefreshes; } }, SCHEDULED_LINK_POLL_DEADLINE_MS: { get value() { return SCHEDULED_LINK_POLL_DEADLINE_MS; } }, SCHEDULED_LINK_POLL_FAST_ATTEMPTS: { get value() { return SCHEDULED_LINK_POLL_FAST_ATTEMPTS; } }, SCHEDULED_LINK_POLL_FAST_MS: { get value() { return SCHEDULED_LINK_POLL_FAST_MS; } }, SCHEDULED_LINK_POLL_SLOW_MS: { get value() { return SCHEDULED_LINK_POLL_SLOW_MS; } }, scheduledTaskBackendInput, forgetScheduledTaskTemplateSource, scheduledTaskAutoCreateSeq: { get value() { return scheduledTaskAutoCreateSeq; }, set value(v) { scheduledTaskAutoCreateSeq = v; } }, scheduledTaskAutoCreateInFlight: { get value() { return scheduledTaskAutoCreateInFlight; } }, personaSyncSeq: { get value() { return personaSyncSeq; }, set value(v) { personaSyncSeq = v; } }, addChatItem, candidateCardPatcher: patchItemByIdFor, enterDraft, evictedSessionDrafts: { get value() { return evictedSessionDrafts; } }, MAX_EVICTED_SESSION_DRAFT_CHARS: { get value() { return MAX_EVICTED_SESSION_DRAFT_CHARS; } }, MAX_EVICTED_SESSION_DRAFTS: { get value() { return MAX_EVICTED_SESSION_DRAFTS; } }, switchToSessionInternal, openScheduledRunChatOnce, scheduledRunOpenInFlight: { get value() { return scheduledRunOpenInFlight; } }, purgeSessionBuffer, personaPlaceholderTitles: { get value() { return personaPlaceholderTitles; } }, refreshHistoryList, sessionSwitchRequestToken: { get value() { return sessionSwitchRequestToken; }, set value(v) { sessionSwitchRequestToken = v; } }, reportSidecarReadFailure, historyRefreshTimer: { get value() { return historyRefreshTimer; }, set value(v) { historyRefreshTimer = v; } }, historyRefreshPending: { get value() { return historyRefreshPending; }, set value(v) { historyRefreshPending = v; } }, currentStreamText: { get value() { return currentStreamText; }, set value(v) { currentStreamText = v; } }, currentStreamId: { get value() { return currentStreamId; }, set value(v) { currentStreamId = v; } }, toolMeta: { get value() { return toolMeta; }, set value(v) { toolMeta = v; } }, SHELL_TOOL_NAMES: { get value() { return SHELL_TOOL_NAMES; } }, normalizeTerminalTail, latestShellToolIsWaitObserver, shellPollState: { get value() { return shellPollState; } }, DELIVERABLE_EXTS: { get value() { return DELIVERABLE_EXTS; } }, hasCommand: canInvoke, artifactInfo, monitorBaseline: { get value() { return monitorBaseline; }, set value(v) { monitorBaseline = v; } }, clearMonitorBaseline, monitorIntervalId: { get value() { return monitorIntervalId; }, set value(v) { monitorIntervalId = v; } }, gpuUtilHistory: { get value() { return gpuUtilHistory; }, set value(v) { gpuUtilHistory = v; } }, monitorPollInFlight: { get value() { return monitorPollInFlight; }, set value(v) { monitorPollInFlight = v; } }, settingsWriteQueue: { get value() { return settingsWriteQueue; }, set value(v) { settingsWriteQueue = v; } }, modelsLoadSeq: { get value() { return modelsLoadSeq; }, set value(v) { modelsLoadSeq = v; } }, loadSessionModel, setActiveModel, currentDraftModeState, memoryOverviewSeq: { get value() { return memoryOverviewSeq; }, set value(v) { memoryOverviewSeq = v; } }, setDraftMode, applyAuthoritativeModeState, sendMessage, pushUserEcho, dialogOpen, addAttachmentByPath, personaPoolCache: { get value() { return personaPoolCache; }, set value(v) { personaPoolCache = v; } }, deletedPersonaIds: { get value() { return deletedPersonaIds; } }, lastEquippedSid: { get value() { return lastEquippedSid; }, set value(v) { lastEquippedSid = v; } }, mountedCollectionDraftTarget: { get value() { return mountedCollectionDraftTarget; }, set value(v) { mountedCollectionDraftTarget = v; } }, ensureSession, mountedCollectionUpdate: { get value() { return mountedCollectionUpdate; }, set value(v) { mountedCollectionUpdate = v; } }, activeVoiceInput: { get value() { return activeVoiceInput; }, set value(v) { activeVoiceInput = v; } }, stopMediaTracks, VOICE_DEVICE_REQUEST_TIMEOUT_MS: { get value() { return VOICE_DEVICE_REQUEST_TIMEOUT_MS; } }, voiceOperations: { get value() { return voiceOperations; } }, pendingStreamNotifications: { get value() { return pendingStreamNotifications; } }, pendingAssistantText: { get value() { return pendingAssistantText; }, set value(v) { pendingAssistantText = v; } }, pendingAssistantBlocks: { get value() { return pendingAssistantBlocks; }, set value(v) { pendingAssistantBlocks = v; } }, finalizeAssistantStreamBeforeReasoning, flushPendingTextBlock, finishVoiceInput, ensureSessionBufferLoaded, reconcileRemoteTurn, doSendFor, flushQueued, itemIdSeq: { get value() { return itemIdSeq; }, set value(v) { itemIdSeq = v; } } });
+  return pinvouSharedwebCache;
+}
+
+  if (!window.PinvouPlatform || (window.PinvouPlatform.kind !== "web" && window.PinvouPlatform.isWeb !== true)) return;
+
+  const TAURI = window.__TAURI__;
+  const { invoke } = TAURI.core;
+  const invokeWithRequestId = typeof TAURI.core.invokeWithRequestId === "function"
+    ? TAURI.core.invokeWithRequestId
+    : function (command, args) { return invoke(command, args); };
+  const { listen } = TAURI.event;
+  const dialogOpen = TAURI.dialog?.open;
+  const PLATFORM = window.PinvouPlatform;
+  const IS_WEB = PLATFORM.kind === "web" || PLATFORM.isWeb === true;
+  function hasCapability(name) {
+    if (IS_WEB && typeof PLATFORM.can === "function") return PLATFORM.can(name) === true;
+    if (IS_WEB) return !!(PLATFORM.capabilities && PLATFORM.capabilities[name] === true);
+    return !PLATFORM.capabilities || PLATFORM.capabilities[name] !== false;
+  }
+  function canInvoke(command) {
+    return !IS_WEB || (typeof PLATFORM.canInvoke === "function" && PLATFORM.canInvoke(command) === true);
+  }
+  const WEB_CAPABILITIES_WAIT_TIMEOUT_MS = 10_000;
+  function webInvokeCapabilitiesReady() {
+    if (typeof PLATFORM.areInvokeCapabilitiesReady === "function") {
+      return PLATFORM.areInvokeCapabilitiesReady() === true;
+    }
+    return !!(window.PinvouWebClient && window.PinvouWebClient.desktopCapabilitiesReady === true);
+  }
+  function webConnectionState() {
+    if (typeof PLATFORM.getConnectionState !== "function") return null;
+    try {
+      return PLATFORM.getConnectionState();
+    } catch {
+      return null;
+    }
+  }
+  function webInvokeCapabilitiesUnavailable(connection) {
+    return !!(connection && connection.desktop_online === false && connection.status !== "connecting");
+  }
+  function unavailableWebCapabilitiesError() {
+    const error = new Error("desktop disconnected before command capabilities were ready");
+    error.code = "desktop_capabilities_unavailable";
+    return error;
+  }
+  function waitForWebInvokeCapabilities() {
+    if (webInvokeCapabilitiesReady()) return Promise.resolve();
+    if (webInvokeCapabilitiesUnavailable(webConnectionState())) {
+      return Promise.reject(unavailableWebCapabilitiesError());
+    }
+    return new Promise(function (resolve, reject) {
+      let settled = false;
+      let timeout = null;
+      function finish(error) {
+        if (settled) return;
+        settled = true;
+        if (timeout != null) clearTimeout(timeout);
+        window.removeEventListener("pinvou:web-capabilities", onCapabilities);
+        window.removeEventListener("pinvou:web-connection", onConnection);
+        if (error) reject(error); else resolve();
+      }
+      function onCapabilities() {
+        if (webInvokeCapabilitiesReady()) finish();
+      }
+      function onConnection(event) {
+        const connection = event && event.detail;
+        if (webInvokeCapabilitiesUnavailable(connection)) finish(unavailableWebCapabilitiesError());
+      }
+      window.addEventListener("pinvou:web-capabilities", onCapabilities);
+      window.addEventListener("pinvou:web-connection", onConnection);
+      timeout = setTimeout(function () {
+        const error = new Error("desktop command capability snapshot timed out");
+        error.code = "desktop_capabilities_timeout";
+        finish(error);
+      }, WEB_CAPABILITIES_WAIT_TIMEOUT_MS);
+      // Close the race where the snapshot arrives between the initial check
+      // and listener registration, and the equivalent race where a disconnect
+      // happens before its event listener is attached.
+      if (webInvokeCapabilitiesReady()) finish();
+      else if (webInvokeCapabilitiesUnavailable(webConnectionState())) {
+        finish(unavailableWebCapabilitiesError());
+      }
+    });
+  }
+  function normalizeVoiceMode(mode) {
+    // 与 features/voice-composer/voice-ui-policy.mjs 和 tauri/bridge/voice.js
+    // 同一映射(voice_edit/draft_edit 是编辑模式的别名;web 拷贝曾漏掉它们,
+    // 把编辑模式误路由到听写后处理 —— round-9 review)。三方一致性由
+    // tests/voice_mode_parity.test.mjs 钉住。
+    if (mode === "task") return "task";
+    if (["edit", "voice_edit", "draft_edit"].includes(mode)) return "edit";
+    return "dictation";
+  }
+  function webRequestId(prefix) {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return prefix + "_" + window.crypto.randomUUID(); // safari14-ok: guarded above
+    }
+    // eslint-disable-next-line sonarjs/pseudo-random -- not security-sensitive: only generates request dedup IDs; collisions are safely retryable
+    return prefix + "_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2);
+  }
+  function webTurnTerminal() {
+    return window.PinvouWebTurnTerminal || {};
+  }
+  function bridgeMessages() {
+    return window.PinvouBridgeMessages || {};
+  }
+
+  // ── Markdown rendering (vendor scripts loaded in index.html) ─────
+  // 抹平裸 <script>/<style>/<iframe> 等危险标签:它们一旦被 marked 透传成真 HTML,
+  // 浏览器按 HTML 解析时 script 元素会"吞掉"后续兄弟节点直到 </script>(或文档末尾),
+  // 然后 DOMPurify 把整段 script 连同被卷进去的内容一起剥掉。后果:LLM 正文里裸写
+  // "在同一个 <script> 标签内……"会把后续表格/文字整段吞掉(历史上品悟报告表格踩过)。
+  //
+  // 关键:在 marked.parse 【之后】做替换,而不是之前。原因:marked 给代码块/inline code 的
+  // 输出本身就已经把 < 转义成 &lt;(不会有真 <script>),只有用户在正文里裸写 HTML 时才会
+  // 透传出 <script>。post-process 只命中后者,不会双重转义代码块里的 `<script>` 字面量。
+  // 优先委托共享渲染器 window.PinvouMarkdownRenderer（npm 版，含语法高亮）；在其尚未安装的
+  // 短暂窗口退回 vendor 全局兜底。兜底实现已收敛到 shared/markdown-bridge-fallback.js
+  // （随 index.html 以普通脚本加载，暴露 window.PinvouMarkdownBridgeFallback），消除两份逐字复制。
+  // 最末级 fallback 必须自带 escapeHtml：renderMarkdown 仍会被 ChatView.jsx 的
+  // dangerouslySetInnerHTML 消费，原文返回即 fail-open。该安全原语如今与其余共享体一起住在
+  // shared/bridge-shared-helpers.js（本文件顶部的共享脚本同步加载，不再单独保留在本文件）；
+  // create() 装配被 tests/bridge_lane_deps.test.mjs 按车道逐字面钉死，装配漂移在测试期暴露。
+function renderMarkdown(text) { return pinvouSharedweb().renderMarkdown(text); }
+
+
+  // The pet is a separate WebView and must not own a second copy of the main
+  // application state. Keep only the renderer used by its activity cards and
+  // return before chat listeners, session loading, polling, or update checks.
+  const locationSearch = String((window.location && window.location.search) || "");
+  const isPetWindow = /(?:^|[?&])window=pet(?:&|$)/.test(locationSearch);
+  if (isPetWindow) {
+    window.TauriBridge = {
+      available: false,
+      renderMarkdown,
+    };
+    return;
+  }
+
+  // ── State ────────────────────────────────────────────────────────
+  const state = {
+    sessions: [],
+    archivedSessions: [],
+    activeSessionId: null,
+    // 模型 load_skill 触发的当前技能 id（如 'visual-design'）→ 点亮 composer 技能标；null=无。
+    // 内置自动技能（视觉设计）的"正在使用"指示：新一轮用户消息时清、相关时再点亮。
+    activeSkill: null,
+    // 「新建对话」点击计数:每次 enterDraft() 自增(含已在草稿态的提前返回)。前端 welcomeToolId
+    // 复位 effect 挂它 → 即便 activeSessionId 没变(draft→draft)也能重新求值,否则残留的工具欢迎卡
+    // 会一直顶掉「你好」欢迎语(该 tool 无 welcomeQueries 时整块空白)。
+    draftEpoch: 0,
+    // Same-shape desktop-slice stub: draft workspace directory binding is a desktop-only capability (the web has
+    // no system directory picker channel); always null on the web, but the sessions slice must match desktop key-by-key (see the bridge_state_domains contract).
+    draftWorkspacePath: null,
+    // 跨页面预填输入框请求。比如侧边栏「产出物」一级入口点击「续写/新项目」：
+    // 只把草稿放进 composer，不自动发送给模型。
+    composerPrefill: { id: 0, text: "" },
+    // 当前会话未发送的输入草稿。只存内存，随 session working set 切换；
+    // 不落盘，避免把敏感的未发送内容带到下次启动。
+    composerDraft: "",
+    messages: [],      // Anthropic Messages schema
+    chatItems: [],     // display items for React
+    // DeepSeek Turn 生命周期(user_start / assistant_done)，来自 timing_events.jsonl；
+    // 纯展示诊断数据，不进入 messages 或 LLM 上下文。
+    turnTimeline: [],
+    activeTurnTimelineId: null,
+    // 卡牌加持/卸下事件时间线(sidecar, 不进 messages/LLM)。每项 {kind,pos,...}。
+    // pos = 事件发生时的 messages 数, rerender 时按 pos 插回原位, 让重载历史不割裂。
+    personaEvents: [],
+    // Pinvou 召唤检阅时间线(sidecar, 同 personaEvents, 不进 messages/LLM)。每项 {pos, review}。
+    pinvouReviews: [],
+    // 专业子模式用户消息标签(sidecar, 不进 messages/LLM)。每项 {pos, scene}。
+    pinvouSceneEvents: [],
+    // Pinvou 检阅结果弹窗(不进对话流);null=关闭。一次只一个,裁决/跳过直接操作它的 review、不靠 pos。
+    pinvouModal: null,
+    // 本 turn 被 write/append/edit 改过的产物 path(去重)。chat:done 时给每个补一张成品卡
+    // (present 过的复用 title/desc;没 present 的兜底首卡),turn 内改几次都只一张。
+    turnDirtyArtifacts: [],
+    // 本 turn 已 present_artifact 出过成品卡的产物 path —— chat:done 兜底补卡时跳过,不重复。
+    turnPresentedArtifacts: [],
+    busy: false,
+    monitor: null,
+    backendOnline: null, // null=checking, true, false
+    settings: null,
+    selectedPet: "lingling",
+    memory: {
+      loading: false,
+      error: null,
+      profile: null,
+      preferences: [],
+      work_context: [],
+      current_focus: [],
+      recent_activity: [],
+      pending: [],
+      runtime: null,
+    },
+    // 「添加模型」方案:已保存模型列表 + 全局默认 id + 当前会话绑定的模型 id
+    savedModels: [],
+    activeModelId: null,
+    currentSessionModelId: null, // 当前 active session 显式绑定的模型;null=跟随全局默认
+    superPermEnabled: false,
+    modeState: { mode: "yolo" },
+    // Per-lane (work/code) global default modes (null = the lane was never
+    // explicitly chosen; defaults code→plan, work→yolo). Source of truth for
+    // the draft-state chip display and switches: fetched at startup via
+    // get_mode_defaults, written back on draft switches via set_mode_default.
+    modeDefaults: { work: null, code: null },
+    // The lane the current chat page is in (work; the code page lane has its
+    // own draft-control logic). The lane is a pure frontend concept, passed
+    // in explicitly by ChatView with pinvouMode; the bridge never reads
+    // localStorage.
+    modeLane: "work",
+    // 最新 plan/todos 快照（用于 mode header 进度 chip，与 plan_ready 卡解耦）
+    planSnapshot: { plan: null, todos: null },
+    // 当前 session 产物列表 [{ path, basename }]
+    artifacts: [],
+    // 最近一次磁盘产物变更。用于刷新已打开的预览；列表是否变化不能作为唯一信号。
+    artifactChange: { seq: 0, path: "", event: "", sessionId: "", at: 0 },
+    // 多 session 并发:每个 session 是否正在生成 { session_id: bool }，会话列表显示「工作中」转圈
+    sessionBusy: {},
+    // Sessions with a compaction in flight, { session_id: set-at epoch ms }.
+    // chat:compaction start sets it and done/fail/cancel clears it; the main
+    // lane's compact entry disables off it (the same mechanism as the code
+    // lane's lane.compacting). Outside the working set (not among
+    // saveWorkingSetTo's explicit fields), so session swaps don't touch it;
+    // session deletion/eviction clears it together with turnUsageDirty.
+    compactingSessions: {},
+    compactionStarts: {},
+    compactionSeq: 0,
+    // 排队式输入:当前 session 生成中时积压的待发消息 [{ id, text, displayText, attachments }]
+    queued: [],
+    // 输入框待发附件 [{ id, basename, status:'parsing'|'ready'|'error', result, error }]
+    attachments: [],
+    // Token budget (input_tokens / maxModelLen). max=0 means the window is
+    // unknown: the context meter line stays hidden (its render guard needs
+    // max > 0) until a real window lands — a chat:usage context_window or a
+    // local backend max_model_len. No fabricated denominator.
+    tokens: { input: 0, max: 0 },
+    // 思考指示器：active 时 React 渲染计时气泡（Braille + 思考中/调用工具 + 秒数）
+    thinking: { active: false, phase: "thinking", toolName: "", startedAt: 0 },
+    // 卡片池: 专家面具。activePersona = 当前 session 加持的专家卡(完整对象)或 null,
+    // 驱动聊天室右上角挂件。
+    activePersona: null,
+    // 知识库挂载: 当前 session 挂载的知识集 id(number)或 null。仿 activePersona 走 buffer,
+    // 仅驻内存(后端也只驻内存),重启回到未挂载。名字由前端用知识集列表解析。
+    mountedCollection: null,
+    mountedCollections: [],
+    // Same-shape desktop-slice stub: remote knowledge-base mounting is operable only on desktop; always an empty array on the web.
+    mountedRemoteCollections: [],
+    mountedCollectionsRevision: 0,
+    // personaPool 只放轻量元信息(loadState),1078 张卡放模块级 personaPoolCache,
+    // 不进 state/订阅快照，避免每个流式 token 都复制完整卡池。
+    personaPool: { loadState: "idle" }, // idle | loading | ready | error
+    // 应用内升级: updateInfo = check_for_update 返回值(available=true 才有意义)
+    appVersion: null,
+    updateInfo: null,
+    webAccess: {
+      active: false,
+      endpoint_id: null,
+      url: null,
+      qr_data_url: null,
+      status: "idle",
+      relay_url: "",
+      web_client_connected: false,
+      last_error: null,
+      starting: false,
+    },
+    updateChecking: false,
+    updateCheckError: null,   // 手动检查的错误/「已是最新」提示文案
+    updateDownloading: false,
+    updateProgress: 0,        // 0-100
+    updateReady: false,       // 安装完成,等用户点重启
+    updateError: null,        // 下载/安装阶段错误(sha256/apt stderr 透传)
+    updateCancelling: false,  // 用户点了取消,据此把后端「已取消下载」当正常而非错误
+    // projects 域桌面专属;Web 端不挂载该切片数据,但 domain-adapter 的
+    // fields 注册表中留了键位。桩必须与桌面快照同形
+    // (state.projectsList = { projects, assignments, neverMaterializeRoots,
+    // loadedAt } — see tauri/bridge/projects.js), otherwise grouping reads
+    // undefined and can only fall back defensively.
+    projectsList: { projects: [], assignments: {}, neverMaterializeRoots: [], loadedAt: null },
+    // Round-36 P2b: seeded for the desktop-only projects domain's degraded
+    // create-channel notice bump (web never writes it — the field exists so
+    // the shared slice shape stays identical across platforms).
+    projectsAssignmentDegradedAt: 0,
+    // 依赖体检(设置页): deps = [{key, installed, apt}], null = 尚未检测
+    deps: null,
+    depsChecking: false,
+    depsInstalling: false,    // 一键安装进行中(pkexec apt)
+    depsInstallError: null,   // 安装失败原因(apt stderr 透传/取消/pkexec 不可用)
+    // Same-shape desktop-slice stub: install progress events occur only during a desktop one-click install; always null on the web.
+    depsInstallProgress: null,
+    voiceInput: {
+      status: "idle",         // idle | requesting_permission | recording | transcribing | completed | cancelled | failed
+      message: "",
+      error: null,
+      category: null,
+      stage: null,
+      sessionId: null,
+      startedAt: 0,
+    },
+    // 本地语音识别依赖安装引导（首次点麦克风缺组件时弹框）
+    voiceAsrSetup: {
+      open: false,        // 弹框是否展示
+      status: null,       // voice_asr_status 返回 { engine, ffmpeg, model, ready, missing }
+      installing: false,  // 安装中
+      progress: null,     // { stage:'ffmpeg'|'model'|'done', downloaded, total }
+      error: null,
+    },
+    // 知识库 embedding 模型按需下载引导（知识库页未装模型时显 gate）
+    kbModelSetup: {
+      downloading: false, // 下载/部署中
+      startupLoading: false,
+      startupReady: null,
+      status: null,       // kb_model_status 返回 { installed, ready, loading, downloading, ... }
+      progress: null,     // kb_model:progress 事件 { stage:'download'|'verify'|'prepare'|'done', downloaded, total, ready }
+      error: null,
+      cancelled: false,   // 最近一次下载被用户取消（中性态，与 error 互斥；web 上 downloading 恒 false）
+    },
+    scheduledTasks: [],
+    selectedScheduledTaskId: null,
+    scheduledTaskSelectionGeneration: 0,
+    scheduledTaskDetail: null,
+    scheduledTaskRuns: [],
+    scheduledTaskRecentRuns: [],
+    scheduledTaskLoading: false,
+    scheduledTaskBusyAction: null,
+    scheduledTaskError: null,
+    scheduledTaskErrorKind: null,
+    scheduledTaskCreationSessionId: null,
+    scheduledTaskAutoOpenId: null,
+    scheduledRunContext: null,
+    // 「通过聊天创建」的引导词:只随该会话首条消息发给模型,永不显示在气泡里。
+    scheduledTaskPendingGuide: null,
+  };
+  let initPromise = null;
+  let webInitRetryArmed = false;
+  let webInitRetryHandler = null;
+  // 卡片池 1078 张卡的前端缓存。只读,通过 getPersonas() 取引用,不走 notify 快照。
+  let personaPoolCache = [];
+  const SCHEDULED_TEMPLATE_SOURCE_STORAGE_KEY = "pinvou3-scheduled-task-template-sources-v1";
+  const scheduledTaskTemplateSources = loadScheduledTaskTemplateSources();
+
+  // internal streaming state
+  let currentStreamText = "";
+  let currentStreamId = 0;
+  let pendingAssistantText = "";
+  let pendingAssistantBlocks = [];
+  let itemIdSeq = 0;
+  let toolMeta = {};       // id → { name, args }
+  const shellPollState = Object.create(null); // session_id → { timer, inFlight, waitBudget }
+  // 上下文行口径保护：TurnComplete 的 usage.input_tokens 是本轮所有请求的累加
+  // （计费口径）。只有单请求的"干净轮"该值才等于当前上下文占用；本轮一旦出现
+  // 工具调用/重试/压缩（= 多请求），就跳过这次 tokens 更新，保留上一个准确值。
+  const turnUsageDirty = {};  // session_id → bool
+  let monitorIntervalId = null;
+  let monitorPollInFlight = false;
+  let gpuUtilHistory = [];
+  // 0 = no real max_model_len received yet from get_backend_status or the
+  // 监控页「清除统计」基准点：vLLM 的几个累计 counter（TTFT/TPOT/tokens/prefix
+  // cache）无法真正清零（它们跟随远端 vLLM 进程生命周期，归零要重启共享进程）。
+  // 改为记一个基准快照，显示值 = 当前 counter − 基准。换模型 / vLLM 重启 → counter
+  // 倒退到小于基准，自动判定基准失效并丢弃，回落到生命周期累计值。持久化到
+  // localStorage，关掉应用再开仍保持「自某时起」的统计。
+  const MONITOR_BASELINE_KEY = "pinvou3.monitorStatsBaseline.self";
+  let monitorBaseline = null;
+  try {
+    const _mb = localStorage.getItem(MONITOR_BASELINE_KEY);
+    if (_mb) monitorBaseline = JSON.parse(_mb);
+  } catch { monitorBaseline = null; }
+  let attachIdSeq = 0;
+  let scheduledTaskSelectionGeneration = 0;
+  const scheduledTaskRequestTokens = { tasks: 0, detail: 0, runs: 0 };
+  let scheduledTaskRefreshInFlight = null;
+  let scheduledRecentRunsRequestToken = 0;
+  let scheduledRunEventRefreshTimer = null;
+  const scheduledTaskPendingLoads = Object.create(null);
+  const scheduledTaskAutoCreateInFlight = Object.create(null);
+  let sessionSwitchRequestToken = 0;
+  let pendingCapabilitySessionSwitch = null;
+  // 能力快照迟到时的切换宽限：等待期间不向用户报错，快照到达即自动重试；
+  // 宽限期内快照仍未到达才报错并按失败收口（见 switchToSessionInternal 的 catch）。
+  const WEB_CAPABILITY_SWITCH_RETRY_GRACE_MS = 5000;
+  // modeState 读取请求序号（评审 P1，定义前置供 syncSessionPresentationState
+  // 与权威写回收敛点共用）：任何权威 modeState 写回（invoke 返回 / 事件负载 /
+  // 会话切换状态恢复）都必须 bump 它，作废在途 syncModeState 的旧读取——
+  // 否则旧读返回时序号未变、校验通过，把刚写回的权威值覆盖回去。
+  let modeSyncSeq = 0;
+
+  // ── bridge 层 UI 文案（系统消息/状态标签）──────────────────────
+  // bridge 在事件回调里生成文案,拿不到 React 的 t;按 state.settings.language 取词,中文兜底。
+  // 注意:发给 LLM 的指令不在此表,保持中文。
+  const BT_TABLE = {
+    en: {
+      newChatFailed: "⚠️ Failed to create chat: ", loadChatFailed: "⚠️ Failed to load chat: ", deleteFailed: "⚠️ Delete failed: ",
+      personaUnequipped: "🎴 Expert card removed: ",
+      reviewFixHeader: "Apply the review notes below — **revise only the targeted sections, do not rewrite the whole document**:",
+      reviewVerifyHeader: "The items below involve external facts — **verify first, cite your sources, and don't edit from memory**:",
+      reviewAdoptHeader: "The following decisions are final — update the artifacts accordingly:",
+      reviewAskHeader: "For the pending items below, ask me formally via request_user_input instead of guessing:",
+      reviewFillHeader: "The artifact is still missing the dimensions below — add them (keep everything else; add only, don't rewrite):",
+      reviewFillFooter: "(For anything involving external facts, verify before writing and cite sources — don't fabricate from memory.)",
+      planStuckReplanPrompt: "Use the todo_write tool to lay out the full plan steps — don't call write tools directly.",
+      planStuckGoPrompt: "Continue the task per the plan discussed above — write files / run commands directly; no more plan discussion.",
+      planHistorical: "📜 Past plan", planSuperseded: "📜 Superseded by a newer plan",
+      attachStillParsing: "⚠️ Attachment still parsing, try again shortly",
+      imageUnsupported: "The current model does not support images. Switch to an image-capable model, or configure a vision model in model settings.",
+      imageUnknown: "Image input capability of the current model is unknown. If it supports images, set image input to “Supports images” in model settings; you can also configure a vision model.",
+      sessionModelStale: id => `The model selected for this conversation is no longer available (missing saved model: ${id}). Please pick a model again in this conversation.`,
+      attachStillUploading: "⚠️ Attachment still uploading, try again shortly",
+      deviceUploadTooLarge: name => `⚠️ ${name} exceeds the 50 MB attachment limit`,
+      deviceUploadCacheFull: "⚠️ Upload buffer is full: a large attachment is still uploading. Wait for it to finish, then retry",
+      deviceParsedTooLarge: "⚠️ The parsed attachment exceeds the 32 MB remote-desktop cache limit and cannot be added",
+      deviceCacheFull: "⚠️ Too many attachments are cached on the remote desktop. Remove one, then retry",
+      archiveTooManyEntries: "the archive contains more than 50 entries and cannot be attached",
+      archiveExpandedTooLarge: "the archive expands beyond 100 MB and cannot be attached",
+      archiveUnsafeEntry: "the archive contains unsafe links or paths and cannot be attached",
+      deviceUploadEmpty: name => `⚠️ ${name} is empty and cannot be attached`,
+      deviceUploadFailed: "⚠️ Upload failed: ",
+      deviceUploadDigestInvalid: "the attachment integrity digest was invalid. Try again.",
+      deviceUploadIntegrityMismatch: "the attachment content was corrupted in transit. Upload it again.",
+      turnAlreadyInProgress: "⚠️ This chat is already processing a turn. The duplicate send was not executed.",
+      webSessionUnavailable: "This session is no longer available on the desktop. Reopen it from the session list.",
+      compactStart: "⏳ Compacting context", compactDone: "✓ Context compacted", compactFail: "⚠️ Compaction failed", compactCancel: "Context compaction canceled", compactAuto: " (auto)",
+      compactPruneMerged: "Auto-compaction: tool-result cleanup, messages unchanged",
+      gpuUnavailable: "GPU info unavailable",
+      superOn: "⚠️ Super permission enabled", superOff: "Super permission disabled",
+      approved: "✅ Approved", echoGo: "✅ Do it",
+      acceptPlanFailed: "⚠️ accept_plan failed: ",
+      planDiscarded: "🚪 Plan discarded", discardPlanFailed: "⚠️ discard_plan failed: ", exitPlanFailed: "⚠️ Failed to exit Plan: ", switchModeFailed: "⚠️ Failed to switch mode: ", planContinueFailed: "⚠️ Failed to send continue instruction: ",
+      replanRequested: "📋 Asking the AI to re-plan…",
+      openFailed: "⚠️ Open failed: ", pasteImageFailed: "⚠️ Paste image failed: ",
+      filePickUnavailable: "⚠️ File picker unavailable", filePickFailed: "⚠️ File selection failed: ",
+      equipFailed: "⚠️ Equip failed: ",
+      shellOutputOmitted: kind => `[Earlier ${kind} output omitted]`, shellUnknownExit: "unknown",
+      shellTaskFinished: code => `[Task finished, exit code: ${code}]`,
+      sessionChunkInvalid: "The desktop app returned an invalid session chunk",
+      sessionChunkChanged: "Session data changed while reading. Please try again",
+      sessionChunkOverflow: "Session chunk exceeds the declared length",
+      sessionChunkEarlyEnd: "Session chunks ended prematurely",
+      sessionChunkNoProgress: "Session chunks made no progress",
+      scheduledCreateFailed: "Failed to create scheduled task: ",
+      scheduledTaskFallbackName: "Scheduled task",
+      scheduledActionBusy: "Another scheduled task operation is still in progress",
+      scheduledCreateNoId: "Failed to create scheduled task: the backend returned no task ID",
+      scheduledChatPrefill: "I'd like to create a scheduled task: ",
+      runNoSession: "This run has no session to open",
+      sessionDataInvalid: "Invalid session data",
+      skillContentHidden: "(Skill loaded; content hidden)",
+      turnSyncRejected: "This session is syncing a turn completed elsewhere. Please try again shortly",
+      targetSessionMissing: "Target session does not exist",
+      replyContentEmpty: "Reply content is empty",
+      targetSessionSyncing: "The target session is still syncing a turn completed elsewhere",
+      sessionIdMissing: "The desktop app returned no new session ID",
+      turnSyncRetry: "⚠️ This session is still syncing a turn completed elsewhere. Please try again shortly",
+      summonNeedsSession: "Start a conversation first, then summon Pinvou to review.",
+      remoteDoneUnsynced: "⚠️ The chat finished on the desktop, but the authoritative record is not synced yet. Retry after reconnecting.",
+      pickFolderTitle: "Choose a working directory",
+      fileMediaFilterName: "Images and videos",
+      kbPickFolderTitle: "Choose a folder to import into the knowledge base",
+      rebindPickFolderTitle: "Choose the folder to rebind this project to",
+      manageAddFolderTitle: "Choose a folder to add to the project",
+      workspacePickFolderTitle: "Choose a workspace folder",
+      metricUnavailable: "Not provided",
+      memoryWriteFailed: "Failed to write memory: ",
+      memoryIgnoreFailed: "Failed to ignore memory: ",
+      memoryNeverFailed: "Failed to update the never-ask setting: ",
+      planTicketExpired: "⚠️ The plan ticket has expired. Regenerate the plan before running it",
+      downloadLimitSuffix: size => " (current file " + size + " MiB)",
+      downloadLimitError: suffix => "Remote artifact downloads are limited to 256 MiB" + suffix + ". Open the file directly on the desktop.",
+      downloadUnsupported: "⚠️ This desktop version does not support remote artifact download. Update the desktop app and try again.",
+      downloadFailed: "⚠️ Artifact download failed: ",
+      downloadNotEnabled: "Remote artifact download is not enabled in this environment",
+      artifactMissing: "The artifact does not exist or has been removed",
+      artifactSizeInvalid: "The desktop app returned an invalid artifact size. Download stopped",
+      artifactChunkInvalid: "The desktop app returned an invalid artifact chunk. Download stopped",
+      artifactChanged: "The artifact changed during download. Please try again",
+      artifactOverflow: "The desktop app sent more artifact data than declared. Download stopped",
+      artifactIncomplete: "The artifact download is incomplete. Please try again",
+      attachPathUnavailable: "WebUI does not expose desktop attachment paths",
+      attachDownloadUnsupported: "⚠️ This desktop version does not support remote attachment download. Update the desktop app and try again.",
+      attachChunkInvalid: "The desktop app returned an invalid attachment chunk. Download stopped",
+      attachChanged: "The attachment changed during download. Please try again",
+      attachOverflow: "The desktop app sent more attachment data than declared. Download stopped",
+      attachIncomplete: "The attachment download is incomplete. Please try again",
+      attachNoData: "Attachment download returned no data",
+      attachNoProgress: "Attachment download made no progress",
+      artifactNoData: "Artifact download returned no data",
+      artifactNoProgress: "Artifact download made no progress",
+      newChatFallbackTitle: "New chat",
+      echoOtherPrefix: "(Other) ",
+      mountCollectionFailed: "Failed to mount knowledge collection: ",
+      voicePermissionDenied: "Microphone access was denied. Allow this app to use the microphone in system settings, then try again.",
+      voiceNoDevice: "No available microphone detected. Check that the recording device is enabled and not in use.",
+      voiceDeviceTimeout: "Microphone detection timed out; no recording device found. Check the device connection and the system microphone settings, then try again.",
+      voiceConstraintUnsupported: "Could not start recording: the current microphone or WebView does not support the required audio configuration. Try again; if it still fails, check microphone settings or update system components.",
+      voiceEmptyResult: "No speech recognized. Move closer to the microphone and try again.",
+      voiceContextMismatch: "Recognition finished, but the active session changed, so the result was not inserted.",
+      voiceTimeout: "Voice input timed out. Please try again.",
+      voiceRecognitionFailed: "Speech recognition failed. Please try again later.",
+      voiceRecordingTooLong: "Recording is too long. Please shorten it and try again.",
+      voiceAudioInvalid: "The recorded audio is invalid. Please record again.",
+      voiceMicUnavailable: "The microphone is in use by another app. Close it or pick another microphone, then try again.",
+      voiceInputFailed: "Voice input failed. Check the microphone and try again.",
+      voiceCancelled: "Voice input cancelled",
+      voiceTranscribing: "Recognizing speech…",
+      voiceTooShort: "Recording too short. Please try again.",
+      voiceWritten: "Voice text inserted into the input box",
+      voiceTaskSent: "Voice task sent",
+      voiceNeedDesktopAsr: "Install the speech recognition component on the desktop first, then use the microphone from the browser.",
+      voiceRequestingPermission: "Requesting microphone permission…",
+      voiceNoMicCapture: "This WebView does not support microphone capture.",
+      voiceNoAudioRecording: "This WebView does not support audio recording.",
+      voiceNeedSession: "Select or start a session before using voice input.",
+      voiceAudioStartBlocked: "The browser did not allow audio capture to start. Click the microphone again.",
+      voiceRecording: "Recording… press again to stop",
+      webChatFailed: "The desktop could not admit this turn. Reopen the conversation and try again.",
+      webSessionCreateFailed: "The desktop could not create this chat. Reopen the conversation list and try again.",
+      editStaleRevision: "This conversation changed on the desktop since it was loaded. Reopen the conversation, then edit again.",
+      editRevisionUnavailable: "The conversation state could not be verified for this edit. Reopen the conversation and try again.",
+      artifactTooLarge: "This artifact is too large to preview over remote control. Download it instead.",
+      artifactPreviewTooLarge: "The rendered preview exceeds the remote-control response limit. Download the artifact instead.",
+      artifactEditTooLarge: "This markdown is too large to edit over remote control. Download it instead.",
+      artifactReadFailed: "The artifact could not be read on the desktop.",
+      attachReadFailed: "This attachment could not be read on the desktop.",
+    },
+    ja: {
+      newChatFailed: "⚠️ 新規チャットの作成に失敗: ", loadChatFailed: "⚠️ チャットの読み込みに失敗: ", deleteFailed: "⚠️ 削除に失敗: ",
+      personaUnequipped: "🎴 エキスパートカードを外しました: ",
+      reviewFixHeader: "下のレビュー意見に従い、**該当するセクションのみを修正してください。全文の書き直しはしないでください**：",
+      reviewVerifyHeader: "以下の項目は外部事実に関わります。**必ず検証してから修正し、根拠を示してください（記憶に頼った編集はしないでください）**：",
+      reviewAdoptHeader: "以下の事項は確定しました。この通り成果物を更新してください：",
+      reviewAskHeader: "以下の未確定項目については、推測せず request_user_input で正式に私に質問してください：",
+      reviewFillHeader: "成果物には以下の観点が不足しています。補足してください（既存部分は保持し、追記のみで書き換えないでください）：",
+      reviewFillFooter: "（外部事実に関わる部分は、検証してから記述し、根拠を示してください。記憶からの創作はしないでください。）",
+      planStuckReplanPrompt: "todo_write ツールで計画の全ステップを出力してください。書き込み系ツールを直接実行しないでください。",
+      planStuckGoPrompt: "上で議論した計画に従ってタスクを続行してください。ファイルの書き込みやコマンドの実行を直接行い、計画の再議論はしないでください。",
+      planHistorical: "📜 過去のプラン", planSuperseded: "📜 新しいプランで上書きされました",
+      attachStillParsing: "⚠️ 添付ファイルを解析中です。少し待ってから送信してください",
+      imageUnsupported: "現在のモデルは画像に対応していません。画像対応モデルに切り替えるか、モデル設定でビジョンモデルを構成してください。",
+      imageUnknown: "現在のモデルの画像入力能力は不明です。画像に対応している場合は、モデル設定で画像入力能力を「画像対応」に設定してください。ビジョンモデルを構成することもできます。",
+      sessionModelStale: id => `この会話で選択したモデルの設定は無効になりました（見つからない設定: ${id}）。会話でモデルを選び直してください。`,
+      attachStillUploading: "⚠️ 添付ファイルをアップロード中です。少し待ってから送信してください",
+      deviceUploadTooLarge: name => `⚠️ ${name} は添付の上限 50 MB を超えています`,
+      deviceUploadCacheFull: "⚠️ アップロードバッファがいっぱいです：別の大きな添付ファイルをアップロード中です。完了してから再試行してください",
+      deviceParsedTooLarge: "⚠️ 解析後の添付ファイルがリモートデスクトップのキャッシュ上限 32 MB を超えているため追加できません",
+      deviceCacheFull: "⚠️ リモートデスクトップの添付キャッシュがいっぱいです。1つ削除してから再試行してください",
+      archiveTooManyEntries: "アーカイブに 50 個を超える項目が含まれているため添付できません",
+      archiveExpandedTooLarge: "アーカイブの展開後サイズが 100 MB を超えるため添付できません",
+      archiveUnsafeEntry: "アーカイブに安全でないリンクまたはパスが含まれているため添付できません",
+      deviceUploadEmpty: name => `⚠️ ${name} は空のため添付できません`,
+      deviceUploadFailed: "⚠️ アップロードに失敗: ",
+      deviceUploadDigestInvalid: "添付ファイルの整合性ダイジェストが無効です。もう一度お試しください。",
+      deviceUploadIntegrityMismatch: "添付ファイルの内容が転送中に破損しました。再度アップロードしてください。",
+      turnAlreadyInProgress: "⚠️ このチャットでは別のターンを処理中です。重複した送信は実行されませんでした。",
+      webSessionUnavailable: "このセッションはデスクトップ側で利用できなくなりました。セッション一覧から開き直してください。",
+      compactStart: "⏳ コンテキストを圧縮中", compactDone: "✓ コンテキスト圧縮完了", compactFail: "⚠️ 圧縮に失敗", compactCancel: "コンテキストの圧縮をキャンセルしました", compactAuto: "（自動）",
+      compactPruneMerged: "自動圧縮: ツール結果を整理、メッセージ数は不変",
+      gpuUnavailable: "GPU 情報を取得できません",
+      superOn: "⚠️ スーパー権限が有効になりました", superOff: "スーパー権限が無効になりました",
+      approved: "✅ 承認済み", echoGo: "✅ これでいく",
+      acceptPlanFailed: "⚠️ accept_plan に失敗: ",
+      planDiscarded: "🚪 プランを破棄", discardPlanFailed: "⚠️ discard_plan に失敗: ", exitPlanFailed: "⚠️ Plan の終了に失敗: ", switchModeFailed: "⚠️ モード切替に失敗: ", planContinueFailed: "⚠️ 継続指示の送信に失敗: ",
+      replanRequested: "📋 AI にプランを出し直させています…",
+      openFailed: "⚠️ 開けませんでした: ", pasteImageFailed: "⚠️ 画像の貼り付けに失敗: ",
+      filePickUnavailable: "⚠️ ファイル選択を利用できません", filePickFailed: "⚠️ ファイル選択に失敗: ",
+      equipFailed: "⚠️ 装備に失敗: ",
+      shellOutputOmitted: kind => `[途中の${kind === "stderr" ? "標準エラー" : "標準出力"}を省略]`, shellUnknownExit: "不明",
+      shellTaskFinished: code => `[タスク終了、終了コード: ${code}]`,
+      sessionChunkInvalid: "デスクトップ側が無効なセッションチャンクを返しました",
+      sessionChunkChanged: "読み込み中にセッションデータが変更されました。もう一度お試しください",
+      sessionChunkOverflow: "セッションチャンクが宣言された長さを超えています",
+      sessionChunkEarlyEnd: "セッションチャンクが途中で終了しました",
+      sessionChunkNoProgress: "セッションチャンクが進みませんでした",
+      scheduledCreateFailed: "スケジュールタスクの作成に失敗：",
+      scheduledTaskFallbackName: "スケジュールタスク",
+      scheduledActionBusy: "別のスケジュールタスク操作がまだ進行中です",
+      scheduledCreateNoId: "スケジュールタスクの作成に失敗：バックエンドがタスク ID を返しませんでした",
+      scheduledChatPrefill: "スケジュールタスクを作成したいです：",
+      runNoSession: "この実行記録には開けるセッションがありません",
+      sessionDataInvalid: "セッションデータが無効です",
+      skillContentHidden: "（スキルを読み込みました。内容は表示しません）",
+      turnSyncRejected: "このセッションは別端末で完了したターンを同期中です。しばらくしてから再試行してください",
+      targetSessionMissing: "対象のセッションが存在しません",
+      replyContentEmpty: "返信内容が空です",
+      targetSessionSyncing: "対象のセッションは別端末で完了したターンをまだ同期中です",
+      sessionIdMissing: "デスクトップ側が新しいセッション ID を返しませんでした",
+      turnSyncRetry: "⚠️ このセッションは別端末で完了したターンをまだ同期中です。しばらくしてから再試行してください",
+      summonNeedsSession: "先に会話を始めてから Pinvou レビューを召喚してください。",
+      remoteDoneUnsynced: "⚠️ チャットはデスクトップ側で完了しましたが、正式な記録がまだ同期されていません。接続回復後に再試行できます。",
+      pickFolderTitle: "作業ディレクトリを選択",
+      fileMediaFilterName: "画像と動画",
+      kbPickFolderTitle: "知識ベースにインポートするフォルダーを選択",
+      rebindPickFolderTitle: "このプロジェクトの再バインド先フォルダーを選択",
+      manageAddFolderTitle: "プロジェクトに追加するフォルダーを選択",
+      workspacePickFolderTitle: "ワークスペースフォルダーを選択",
+      metricUnavailable: "未提供",
+      memoryWriteFailed: "メモリの書き込みに失敗：",
+      memoryIgnoreFailed: "メモリの無視に失敗：",
+      memoryNeverFailed: "「今後表示しない」の設定に失敗：",
+      planTicketExpired: "⚠️ プランの認証情報が失効しました。プランを再生成してから実行してください",
+      downloadLimitSuffix: size => "（現在のファイル " + size + " MiB）",
+      downloadLimitError: suffix => "リモート制御での成果物ダウンロード上限は 256 MiB です" + suffix + "。デスクトップ側で直接開いてください。",
+      downloadUnsupported: "⚠️ 現在のデスクトップ側はリモート制御による成果物ダウンロードに対応していません。デスクトップを更新して再試行してください。",
+      downloadFailed: "⚠️ 成果物のダウンロードに失敗: ",
+      downloadNotEnabled: "現在の環境ではリモート制御による成果物ダウンロードが有効になっていません",
+      artifactMissing: "成果物が存在しないか、削除されています",
+      artifactSizeInvalid: "デスクトップ側が無効な成果物サイズを返しました。ダウンロードを中止しました",
+      artifactChunkInvalid: "デスクトップ側が無効な成果物チャンクを返しました。ダウンロードを中止しました",
+      artifactChanged: "ダウンロード中に成果物が変更されました。もう一度お試しください",
+      artifactOverflow: "デスクトップ側が宣言サイズを超える成果物データを返しました。ダウンロードを中止しました",
+      artifactIncomplete: "成果物のダウンロードが不完全です。もう一度お試しください",
+      attachPathUnavailable: "WebUI はデスクトップ側の添付ファイルパスを公開していません",
+      attachDownloadUnsupported: "⚠️ 現在のデスクトップ側はリモート添付ファイルのダウンロードに対応していません。デスクトップを更新して再試行してください。",
+      attachChunkInvalid: "デスクトップ側が無効な添付ファイルチャンクを返しました。ダウンロードを中止しました",
+      attachChanged: "ダウンロード中に添付ファイルが変更されました。もう一度お試しください",
+      attachOverflow: "デスクトップ側が宣言サイズを超える添付ファイルデータを返しました。ダウンロードを中止しました",
+      attachIncomplete: "添付ファイルのダウンロードが不完全です。もう一度お試しください",
+      attachNoData: "添付ファイルのダウンロードがデータを返しませんでした",
+      attachNoProgress: "添付ファイルのダウンロードが進みませんでした",
+      artifactNoData: "成果物のダウンロードがデータを返しませんでした",
+      artifactNoProgress: "成果物のダウンロードが進みませんでした",
+      newChatFallbackTitle: "新しいチャット",
+      echoOtherPrefix: "(その他) ",
+      mountCollectionFailed: "ナレッジセットのマウントに失敗: ",
+      voicePermissionDenied: "マイクへのアクセスが拒否されました。システム設定でこのアプリのマイク使用を許可してから再試行してください。",
+      voiceNoDevice: "利用可能なマイクが検出されませんでした。録音デバイスが有効か、他で使用されていないか確認してください。",
+      voiceDeviceTimeout: "マイク検出がタイムアウトし、録音デバイスが見つかりませんでした。デバイスの接続とシステムのマイク設定を確認して再試行してください。",
+      voiceConstraintUnsupported: "録音を開始できません：現在のマイクまたは WebView が必要な録音設定に対応していません。再試行し、それでも失敗する場合はマイク設定を確認するかシステムコンポーネントを更新してください。",
+      voiceEmptyResult: "音声を認識できませんでした。マイクに近づいて再試行してください。",
+      voiceContextMismatch: "認識は完了しましたが、セッションが切り替わったため結果は自動入力されませんでした。",
+      voiceTimeout: "音声入力がタイムアウトしました。もう一度お試しください。",
+      voiceRecognitionFailed: "音声認識に失敗しました。しばらくしてから再試行してください。",
+      voiceRecordingTooLong: "録音が長すぎます。短くして再試行してください。",
+      voiceAudioInvalid: "録音データが無効です。もう一度録音してください。",
+      voiceMicUnavailable: "マイクは他のアプリで使用中です。使用中のアプリを終了するか、別のマイクを選んでから再試行してください。",
+      voiceInputFailed: "音声入力に失敗しました。マイクを確認して再試行してください。",
+      voiceCancelled: "音声入力をキャンセルしました",
+      voiceTranscribing: "音声を認識中…",
+      voiceTooShort: "録音が短すぎます。もう一度お試しください。",
+      voiceWritten: "音声を入力欄に書き込みました",
+      voiceTaskSent: "音声タスクを送信しました",
+      voiceNeedDesktopAsr: "先にデスクトップ側で音声認識コンポーネントをインストールしてから、ブラウザーでマイクを使用してください。",
+      voiceRequestingPermission: "マイクの権限を要求中…",
+      voiceNoMicCapture: "現在の WebView はマイク入力に対応していません。",
+      voiceNoAudioRecording: "現在の WebView は音声録音に対応していません。",
+      voiceNeedSession: "音声入力を使う前に、セッションを選択または新規作成してください。",
+      voiceAudioStartBlocked: "ブラウザーが音声キャプチャの開始を許可しませんでした。マイクをもう一度クリックしてください。",
+      voiceRecording: "録音中です。もう一度押すと終了します",
+      webChatFailed: "デスクトップがこのターンを受理できませんでした。会話を開き直してから再試行してください。",
+      webSessionCreateFailed: "デスクトップでこのチャットを作成できませんでした。会話一覧を開き直してから再試行してください。",
+      editStaleRevision: "この会話は読み込み後にデスクトップで更新されています。会話を開き直してから編集してください。",
+      editRevisionUnavailable: "この編集では会話の状態を検証できませんでした。会話を開き直してから再試行してください。",
+      artifactTooLarge: "この成果物はリモートコントロールのプレビュー上限を超えています。代わりにダウンロードしてください。",
+      artifactPreviewTooLarge: "レンダリングされたプレビューがリモートコントロールの応答上限を超えました。成果物をダウンロードしてください。",
+      artifactEditTooLarge: "この Markdown はリモートコントロールで編集できる上限を超えています。代わりにダウンロードしてください。",
+      artifactReadFailed: "デスクトップで成果物を読み取れませんでした。",
+      attachReadFailed: "この添付ファイルはデスクトップで読み取れませんでした。",
+    },
+    zh: {
+      newChatFailed: "⚠️ 新建对话失败: ", loadChatFailed: "⚠️ 加载对话失败: ", deleteFailed: "⚠️ 删除失败: ",
+      personaUnequipped: "🎴 已卸下专家卡牌: ",
+      reviewFixHeader: "请按下面的检阅意见，**只定向修改对应段落，不要全文重写**：",
+      reviewVerifyHeader: "以下几条涉及外部事实，**先查证再改、标明依据，别凭记忆直接改**：",
+      reviewAdoptHeader: "以下事项我已拍板，按此更新产物：",
+      reviewAskHeader: "以下待定项请用 request_user_input 正式问我，别自己猜：",
+      reviewFillHeader: "以下维度产物还缺，请补充进去（保留其余、只增不改）：",
+      reviewFillFooter: "（涉及外部事实的，先查证再写、标依据，别凭记忆编。）",
+      planStuckReplanPrompt: "请用 todo_write 工具输出完整方案步骤,不要直接调写工具。",
+      planStuckGoPrompt: "按上面讨论的方案继续执行任务,直接写文件/跑命令,不要再讨论方案。",
+      planHistorical: "📜 历史方案", planSuperseded: "📜 已被新方案覆盖",
+      attachStillParsing: "⚠️ 附件还在解析,请稍后再发",
+      imageUnsupported: "当前模型不支持图片。请切换到支持图片的模型，或在模型设置中配置视觉模型。",
+      imageUnknown: "当前模型的图片输入能力未知。如果它支持图片，请在模型设置中将图片输入能力设为“支持图片”后重试；也可以配置视觉模型。",
+      sessionModelStale: id => `当前会话选择的模型配置已失效（缺失配置：${id}），请在对话中重新选择模型。`,
+      attachStillUploading: "⚠️ 附件还在上传,请稍后再发",
+      deviceUploadTooLarge: name => `⚠️ ${name} 超过附件 50 MB 上限`,
+      deviceUploadCacheFull: "⚠️ 上传缓存已满：另一批大附件还在上传，请等待其完成后再试",
+      deviceParsedTooLarge: "⚠️ 解析后的附件超过远程桌面缓存上限 32 MB，无法添加",
+      deviceCacheFull: "⚠️ 远程桌面附件缓存已满，请移除一个附件后重试",
+      archiveTooManyEntries: "压缩包包含超过 50 个条目，无法添加",
+      archiveExpandedTooLarge: "压缩包解压后超过 100 MB，无法添加",
+      archiveUnsafeEntry: "压缩包包含不安全的链接或路径，无法添加",
+      deviceUploadEmpty: name => `⚠️ ${name} 是空文件，无法添加`,
+      deviceUploadFailed: "⚠️ 上传失败: ",
+      deviceUploadDigestInvalid: "附件完整性校验值无效，请重试",
+      deviceUploadIntegrityMismatch: "附件内容在传输中损坏，请重新上传",
+      turnAlreadyInProgress: "⚠️ 当前会话已有一轮正在处理，本次重复发送未执行。",
+      webSessionUnavailable: "该会话在桌面端已不可用，请从会话列表重新打开。",
+      compactStart: "⏳ 正在压缩上下文", compactDone: "✓ 上下文压缩完成", compactFail: "⚠️ 压缩失败", compactCancel: "已取消上下文压缩", compactAuto: "（自动）",
+      compactPruneMerged: "自动压缩：已整理工具结果，消息数不变",
+      gpuUnavailable: "GPU 信息不可用",
+      superOn: "⚠️ 超级权限已开启", superOff: "超级权限已关闭",
+      approved: "✅ 已批准", echoGo: "✅ 就这么干",
+      acceptPlanFailed: "⚠️ accept_plan 失败: ",
+      planDiscarded: "🚪 已放弃此方案", discardPlanFailed: "⚠️ discard_plan 失败: ", exitPlanFailed: "⚠️ 退出 Plan 失败: ", switchModeFailed: "⚠️ 切换模式失败: ", planContinueFailed: "⚠️ 发送继续执行指令失败: ",
+      replanRequested: "📋 让 AI 重出方案…",
+      openFailed: "⚠️ 打开失败: ", pasteImageFailed: "⚠️ 粘贴图片失败: ",
+      filePickUnavailable: "⚠️ 文件选择不可用", filePickFailed: "⚠️ 选择文件失败: ",
+      equipFailed: "⚠️ 加持失败: ",
+      shellOutputOmitted: kind => `[中间${kind === "stderr" ? "错误" : "标准"}输出已省略]`, shellUnknownExit: "未知",
+      shellTaskFinished: code => `[任务已结束，退出码: ${code}]`,
+      sessionChunkInvalid: "桌面端返回了无效的会话分块",
+      sessionChunkChanged: "读取期间会话数据发生变化，请重试",
+      sessionChunkOverflow: "会话分块超出声明长度",
+      sessionChunkEarlyEnd: "会话分块提前结束",
+      sessionChunkNoProgress: "会话分块没有前进",
+      scheduledCreateFailed: "定时任务创建失败：",
+      scheduledTaskFallbackName: "定时任务",
+      scheduledActionBusy: "另一个定时任务操作仍在进行中",
+      scheduledCreateNoId: "创建定时任务失败：后端未返回任务 ID",
+      scheduledChatPrefill: "我想创建一个定时任务：",
+      runNoSession: "该运行记录没有可打开的会话",
+      sessionDataInvalid: "会话数据无效",
+      skillContentHidden: "（技能已加载，内容不展示）",
+      turnSyncRejected: "该会话正在同步另一端完成的回合，请稍后重试",
+      targetSessionMissing: "目标会话不存在",
+      replyContentEmpty: "回复内容为空",
+      targetSessionSyncing: "目标会话仍在同步另一端完成的回合",
+      sessionIdMissing: "桌面端未返回新会话 ID",
+      turnSyncRetry: "⚠️ 该会话仍在同步另一端完成的回合，请稍后重试",
+      summonNeedsSession: "先开始一个对话,再召唤 Pinvou 检阅。",
+      remoteDoneUnsynced: "⚠️ 对话已在桌面端完成，但权威记录暂未同步；恢复连接后可重试。",
+      pickFolderTitle: "选择工作目录",
+      fileMediaFilterName: "图片和视频",
+      kbPickFolderTitle: "选择要导入知识库的文件夹",
+      rebindPickFolderTitle: "选择重绑定项目的新文件夹",
+      manageAddFolderTitle: "选择要添加到项目的文件夹",
+      workspacePickFolderTitle: "选择工作区文件夹",
+      metricUnavailable: "未提供",
+      memoryWriteFailed: "记忆写入失败：",
+      memoryIgnoreFailed: "忽略记忆失败：",
+      memoryNeverFailed: "设置不再提示失败：",
+      planTicketExpired: "⚠️ 方案凭证已失效，请重新生成方案后再执行",
+      downloadLimitSuffix: size => "（当前文件 " + size + " MiB）",
+      downloadLimitError: suffix => "远程控制单个产物下载上限为 256 MiB" + suffix + "，请在桌面端直接打开该文件。",
+      downloadUnsupported: "⚠️ 当前桌面端不支持远程控制产物下载，请更新桌面端后重试。",
+      downloadFailed: "⚠️ 产物下载失败: ",
+      downloadNotEnabled: "当前环境未启用远程控制产物下载能力",
+      artifactMissing: "产物不存在或已被移除",
+      artifactSizeInvalid: "桌面端返回了无效的产物大小，已停止下载",
+      artifactChunkInvalid: "桌面端返回了无效的产物分块，已停止下载",
+      artifactChanged: "产物在下载期间发生变化，请重试",
+      artifactOverflow: "桌面端返回的产物数据超过声明大小，已停止下载",
+      artifactIncomplete: "产物下载不完整，请重试",
+      attachPathUnavailable: "WebUI 无法访问桌面端附件路径",
+      attachDownloadUnsupported: "⚠️ 当前桌面端不支持远程附件下载，请更新桌面端后重试。",
+      attachChunkInvalid: "桌面端返回了无效的附件分块，已停止下载",
+      attachChanged: "附件在下载期间发生变化，请重试",
+      attachOverflow: "桌面端返回的附件数据超过声明大小，已停止下载",
+      attachIncomplete: "附件下载不完整，请重试",
+      attachNoData: "附件下载未返回数据",
+      attachNoProgress: "附件下载没有进展",
+      artifactNoData: "产物下载未返回数据",
+      artifactNoProgress: "产物下载没有进展",
+      newChatFallbackTitle: "新对话",
+      echoOtherPrefix: "(其他) ",
+      mountCollectionFailed: "挂载知识集失败: ",
+      voicePermissionDenied: "麦克风权限被拒绝，请在系统设置中允许本应用访问麦克风后重试。",
+      voiceNoDevice: "未检测到可用麦克风，请检查录音设备是否启用或被占用。",
+      voiceDeviceTimeout: "麦克风检测超时，未发现可用录音设备。请检查设备连接和系统麦克风设置后重试。",
+      voiceConstraintUnsupported: "无法启动录音：当前麦克风或 WebView 不支持所需的录音配置。请重试；若仍失败，请检查麦克风设置或更新系统组件。",
+      voiceEmptyResult: "未识别到语音内容，请靠近麦克风后重试。",
+      voiceContextMismatch: "识别已完成，但当前会话已切换，结果未自动写入。",
+      voiceTimeout: "本次语音输入超时，请重试。",
+      voiceRecognitionFailed: "语音识别失败，请稍后重试。",
+      voiceRecordingTooLong: "录音过长，请缩短后重试。",
+      voiceAudioInvalid: "录音数据无效，请重新录制。",
+      voiceMicUnavailable: "麦克风被其他应用占用，请关闭占用它的应用或更换麦克风后重试。",
+      voiceInputFailed: "语音输入失败，请检查麦克风后重试。",
+      voiceCancelled: "已取消语音输入",
+      voiceTranscribing: "正在识别语音…",
+      voiceTooShort: "录音时间过短，请重试。",
+      voiceWritten: "语音已写入输入框",
+      voiceTaskSent: "语音任务已发送",
+      voiceNeedDesktopAsr: "请先在桌面端安装语音识别组件，再从浏览器使用麦克风。",
+      voiceRequestingPermission: "正在请求麦克风权限…",
+      voiceNoMicCapture: "当前 WebView 不支持麦克风采集。",
+      voiceNoAudioRecording: "当前 WebView 不支持音频录制。",
+      voiceNeedSession: "请先选择或新建一个会话，再使用语音输入。",
+      voiceAudioStartBlocked: "浏览器未允许启动音频采集，请再次点击麦克风。",
+      voiceRecording: "正在录音，再按一次结束",
+      webChatFailed: "桌面端未能受理这一轮消息，请重新打开会话后重试。",
+      webSessionCreateFailed: "桌面端未能创建这个对话，请重新打开会话列表后重试。",
+      editStaleRevision: "该会话在桌面端已有更新，当前视图已过期。请重新打开会话后再编辑重发。",
+      editRevisionUnavailable: "无法校验会话当前状态，编辑未执行。请重新打开会话后重试。",
+      artifactTooLarge: "产物过大，无法在远程控制中预览，请改为下载。",
+      artifactPreviewTooLarge: "产物预览超过远程控制响应上限，请改为下载。",
+      artifactEditTooLarge: "Markdown 过大，无法在远程控制中编辑，请改为下载。",
+      artifactReadFailed: "桌面端无法读取该产物。",
+      attachReadFailed: "桌面端无法读取该附件。",
+    },
+  };
+function bt(key) { return pinvouSharedweb().bt(key); }
+  // Transfer badges are restored from message text, but messages persist in the
+  // UI language used at send time; replay must match all three variants instead
+  // of only the current language. Used for the review/plan wording keys.
+
+  // ── Per-session 工作集缓冲（多 session 并发）────────────────────
+  // active session 的工作集 = state.* + 上面那批模块级 stream 变量(保持原逻辑零改动)。
+  // 后台 session 的工作集存在 sessionStates[id];后台事件进来时临时把工作集切到对应
+  // buffer 跑同步逻辑再切回(saveWorkingSetTo/loadWorkingSetFrom),期间 suppressNotify
+  // 避免把后台渲染成 active。异步收尾(落盘)按显式 session_id 路由,不依赖工作集。
+  const sessionStates = {};
+  // Web 草稿首条消息的本地提交记录。内容只留在当前页面内，用固定 RPC ID
+  // 支撑断线重发与人工重试；切走草稿后不会把待发内容泄漏到其他会话。
+  const firstTurnSubmissions = Object.create(null);
+  const authoritativeTranscriptSyncs = Object.create(null);
+  let authoritySyncTraceSequence = 0;
+  function recordAuthoritySyncDiagnostic(event, details) {
+    try {
+      const diagnostics = window.PinvouAuthoritySyncDiagnostics;
+      if (diagnostics && typeof diagnostics.record === "function") {
+        diagnostics.record(event, details || {});
+      }
+    } catch { /* diagnostics reporting failure must degrade silently */ }
+  }
+function authoritySyncBufferSnapshot(sid, buf) { return pinvouSharedweb().authoritySyncBufferSnapshot(sid, buf); }
+  const scheduledRunSessionOwners = Object.create(null);
+  const scheduledRunOpenInFlight = Object.create(null);
+  const MAX_SCHEDULED_SESSION_BUFFERS = 64;
+  const MAX_SCHEDULED_RUN_SESSION_OWNERS = 64;
+  // All-session buffer cap: each sessionStates entry holds the full
+  // messages+chatItems (heavy sessions run 1-4MB each); previously only
+  // scheduled sessions had a 64-entry LRU — normal sessions stayed
+  // resident forever once visited. Cap at 32: typical users actively
+  // switch among single-digit counts, 32 × 1-4MB worst case is
+  // ~32-128MB, and cold sessions beyond the cap have near-zero hit
+  // rate; revisiting an evicted session goes through load_session disk
+  // rehydration, costing one reload.
+  const MAX_SESSION_BUFFERS = 32;
+  // Unsent composer drafts are the one piece of a working set that cannot be
+  // rebuilt from disk (this bridge never persists drafts; transcripts hold
+  // committed content only): before a buffer is dropped, its draft moves to
+  // this side table and every rebuild path restores it. The table is bounded
+  // (256 entries, 1M chars per draft — 10x the composer input cap), and when
+  // a bound would be exceeded the eviction is refused instead: the buffer
+  // stays resident rather than silently losing user input. Real session
+  // deletion (purgeSessionBuffer) invalidates stashed drafts so they never
+  // flow back into a recycled session id.
+  const MAX_EVICTED_SESSION_DRAFTS = 256;
+  const MAX_EVICTED_SESSION_DRAFT_CHARS = 1000000;
+  const evictedSessionDrafts = Object.create(null);
+  // Returns true when the buffer's non-rehydratable state is safely retained
+  // (or empty) and the caller may drop the buffer; false means eviction must
+  // be skipped so the draft stays in the live buffer.
+  function stashEvictedSessionDraft(id, buf) { return pinvouSharedweb().stashEvictedSessionDraft(id, buf); }
+  function restoreEvictedSessionDraft(id, buf) {
+    if (!id || !buf || buf.composerDraft) return;
+    const draft = evictedSessionDrafts[id];
+    if (draft) buf.composerDraft = draft;
+  }
+  let sessionBufferTouchClock = 0;
+  let scheduledRunOwnerTouchClock = 0;
+  let suppressNotify = false;
+  // init() 启动窗口内的批量抑制:置位期间 loader 的 notify 全部静默(状态照
+  // 写),窗口结束在 finally 里翻转并发布一个连贯快照,与 tauri 桥
+  // startupNotificationBatching 同口径。启动完成后此值恒为 false。
+  let startupNotificationBatching = false;
+  // sessionId → true:标题当前是「卡牌占位名」(加卡时自动取的),可被首条用户消息覆盖。
+  // 卡牌名只在「加了卡但还没开口」时当临时标题;一旦开始对话,对话内容更能区分同卡会话。
+  // 内存态(不持久化):重启后丢标记仅影响「加卡→重启→才发首条消息」这一冷门路径。
+  const personaPlaceholderTitles = {};
+  const PINVOU_SCENE_EVENTS_STORAGE_PREFIX = "pinvou_scene_events_v1:";
+function normalizePinvouScene(scene) { return pinvouSharedweb().normalizePinvouScene(scene); }
+function pinvouSceneStorageKey(sid) { return pinvouSharedweb().pinvouSceneStorageKey(sid); }
+function normalizePinvouSceneEvents(events) { return pinvouSharedweb().normalizePinvouSceneEvents(events); }
+function loadPinvouSceneEventsForSession(sid) { return pinvouSharedweb().loadPinvouSceneEventsForSession(sid); }
+function savePinvouSceneEventsForSession(sid, events) { return pinvouSharedweb().savePinvouSceneEventsForSession(sid, events); }
+  // Mirrors the Tauri bridge: a missing sidecar is a normal empty result, and only
+  // unreadable/malformed durable data reaches the catch. Scene tags are decorative,
+  // so a bad sidecar must not make the session unopenable — but reporting it keeps a
+  // durable-data defect from looking like "no tags". The one-time localStorage→backend
+  // migration write is reported separately: the session switch path awaits this
+  // function bare, so a write error must degrade rather than abort the switch.
+  function reportSidecarReadFailure(kind, sid, error) {
+    console.warn(`[sidecar] ${kind} read failed for session ${sid}; falling back to the local cache`, error);
+  }
+  function reportSidecarWriteFailure(kind, sid, error) {
+    console.warn(`[sidecar] ${kind} migration write failed for session ${sid}; keeping the local cache`, error);
+  }
+  async function syncPinvouSceneEventsForSession(sid) {
+    const cached = loadPinvouSceneEventsForSession(sid);
+    if (!sid) return cached;
+    let remote;
+    try {
+      remote = normalizePinvouSceneEvents(
+        await invoke("get_session_pinvou_scene_events", { sessionId: sid })
+      );
+    } catch (error) {
+      reportSidecarReadFailure("pinvou scene", sid, error);
+      return cached;
+    }
+    if (remote.length) {
+      try {
+        window.localStorage.setItem(pinvouSceneStorageKey(sid), JSON.stringify(remote));
+      } catch { /* fall back to the remote data when the localStorage write fails */ }
+      return remote;
+    }
+    if (cached.length) {
+      try {
+        await invoke("save_session_pinvou_scene_events", { sessionId: sid, events: cached });
+      } catch (error) {
+        reportSidecarWriteFailure("pinvou scene", sid, error);
+      }
+    }
+    return cached;
+  }
+  // Persona events and pinvou reviews have no local migration cache, but the
+  // backend now fails a corrupt sidecar explicitly (missing stays []). Degrade
+  // to [] exactly as before, just not silently — report like the scene/steered
+  // readers so a durable-data defect cannot pose as "no data".
+  function loadPersonaEventsForSession(sid) { return pinvouSharedweb().loadPersonaEventsForSession(sid); }
+  function loadPinvouReviewsForSession(sid) { return pinvouSharedweb().loadPinvouReviewsForSession(sid); }
+  function raisePinvouSummonHighwater(reviews) { return pinvouSharedweb().raisePinvouSummonHighwater(reviews); }
+function recordPinvouSceneForMessage(sid, pos, scene) { return pinvouSharedweb().recordPinvouSceneForMessage(sid, pos, scene); }
+  function recordPinvouSceneForBufferMessage(sid, buffer, pos, scene) {
+    scene = normalizePinvouScene(scene);
+    if (!sid || !buffer || !scene) return;
+    pos = Number(pos);
+    if (!Number.isFinite(pos) || pos < 0) return;
+    let events = normalizePinvouSceneEvents(buffer.pinvouSceneEvents)
+      .filter(function (event) { return event.pos !== Math.floor(pos); });
+    events.push({ pos: Math.floor(pos), scene });
+    events = normalizePinvouSceneEvents(events);
+    buffer.pinvouSceneEvents = events;
+    savePinvouSceneEventsForSession(sid, events);
+  }
+function freshBuffer() { return pinvouSharedweb().freshBuffer(); }
+function getBuffer(id) { return pinvouSharedweb().getBuffer(id); }
+function isProtectedScheduledBuffer(id, buf) { return pinvouSharedweb().isProtectedScheduledBuffer(id, buf); }
+  function pruneScheduledSessionBuffers(keepId) {
+    const scheduledIds = Object.keys(sessionStates).filter(function (id) {
+      return !!sessionStates[id].scheduledRunSession;
+    });
+    let overflow = scheduledIds.length - MAX_SCHEDULED_SESSION_BUFFERS;
+    if (overflow <= 0) return;
+    scheduledIds.sort(function (left, right) {
+      const delta = (sessionStates[left].lastTouched || 0) - (sessionStates[right].lastTouched || 0);
+      return delta || left.localeCompare(right);
+    });
+    for (let i = 0; i < scheduledIds.length && overflow > 0; i++) {
+      const id = scheduledIds[i];
+      const buf = sessionStates[id];
+      if (!buf || id === keepId || isProtectedScheduledBuffer(id, buf)) continue;
+      if (!stashEvictedSessionDraft(id, buf)) continue; // draft cannot be safely retained; keep the buffer
+      // Defense in depth: protection predicates make live stream timers
+      // unreachable here today, but a stray timer must not outlive its
+      // evicted buffer (purgeSessionBuffer does the same).
+      cancelStreamTimers(id);
+      delete sessionStates[id];
+      delete turnUsageDirty[id];
+      delete state.compactingSessions[id];
+      delete state.compactionStarts[id];
+      // personaPlaceholderTitles is lightweight session metadata (the marker
+      // for placeholder titles that auto-rename may override); rehydration
+      // never restores it, so capacity eviction must keep it and only real
+      // session deletion (purgeSessionBuffer) cleans it.
+      // The localStorage cache of scene events is the only recovery copy
+      // when the sidecar save fails or we are offline
+      // (savePinvouSceneEventsForSession intentionally swallows backend
+      // failures; syncPinvouSceneEventsForSession replays from this
+      // cache); capacity eviction must not delete the key — only real
+      // session deletion (purgeSessionBuffer) cleans it.
+      // The owner tombstone has its own bounded LRU and must outlive a
+      // presentation-buffer eviction. Otherwise a stale `running` list row can
+      // resurrect a run that already emitted chat:done.
+      overflow -= 1;
+    }
+  }
+function touchSessionBuffer(id, buf, scheduled) { return pinvouSharedweb().touchSessionBuffer(id, buf, scheduled); }
+  // All-session LRU: shares the scheduled eviction's protection
+  // predicates (busy/queued/remote turns are never reclaimed); only
+  // idle buffers are evicted. messages/chatItems rehydrate from disk;
+  // non-rehydratable drafts such as composerDraft move to the
+  // evictedSessionDrafts side table first and are restored on rebuild;
+  // when the table cannot hold a draft the eviction is refused (see
+  // stashEvictedSessionDraft).
+  function pruneSessionBuffers(keepId) {
+    const ids = Object.keys(sessionStates);
+    let overflow = ids.length - MAX_SESSION_BUFFERS;
+    if (overflow <= 0) return;
+    ids.sort(function (left, right) {
+      const delta = (sessionStates[left].lastTouched || 0) - (sessionStates[right].lastTouched || 0);
+      return delta || left.localeCompare(right);
+    });
+    for (let i = 0; i < ids.length && overflow > 0; i++) {
+      const id = ids[i];
+      const buf = sessionStates[id];
+      if (!buf || id === keepId || isProtectedScheduledBuffer(id, buf)) continue;
+      if (!stashEvictedSessionDraft(id, buf)) continue; // draft cannot be safely retained; keep the buffer
+      // Defense in depth: protection predicates make live stream timers
+      // unreachable here today, but a stray timer must not outlive its
+      // evicted buffer (purgeSessionBuffer does the same).
+      cancelStreamTimers(id);
+      delete sessionStates[id];
+      delete turnUsageDirty[id];
+      delete state.compactingSessions[id];
+      delete state.compactionStarts[id];
+      // personaPlaceholderTitles survives capacity eviction (see the
+      // comment at the scheduled eviction site); only purgeSessionBuffer
+      // (real deletion) cleans it.
+      // The scene cache key survives capacity eviction (the only offline
+      // recovery copy), see the comment at the scheduled eviction site
+      // above; only purgeSessionBuffer (real session deletion) cleans
+      // it.
+      overflow -= 1;
+    }
+  }
+  function purgeSessionBuffer(id) {
+    if (typeof id !== "string" || !id) return;
+    cancelStreamTimers(id);
+    delete sessionStates[id];
+    // Real session deletion: any stashed draft is invalidated too and must not flow back into a rebuilt buffer with the same id.
+    delete evictedSessionDrafts[id];
+    delete turnUsageDirty[id];
+    delete state.compactingSessions[id];
+    delete state.compactionStarts[id];
+    delete personaPlaceholderTitles[id];
+    delete scheduledRunSessionOwners[id];
+    // The scene-events localStorage key is cleaned together with session deletion, avoiding unbounded accumulation across historical sessions.
+    if (window.localStorage) {
+      try { window.localStorage.removeItem(PINVOU_SCENE_EVENTS_STORAGE_PREFIX + id); } catch { /* localStorage may be unavailable or full; the key is a cache and its loss is non-fatal */ }
+    }
+    if (state.scheduledRunContext && state.scheduledRunContext.sessionId === id) {
+      state.scheduledRunContext = null;
+    }
+    if (state.scheduledTaskCreationSessionId === id) {
+      state.scheduledTaskCreationSessionId = null;
+    }
+    if (state.activeSessionId === id) {
+      state.activeSessionId = null;
+      loadWorkingSetFrom(freshBuffer());
+    }
+  }
+
+
+
+
+
+function rememberScheduledRunOwner(run) { return pinvouSharedweb().rememberScheduledRunOwner(run); }
+function scheduledRunBuffer(id) { return pinvouSharedweb().scheduledRunBuffer(id); }
+
+function markScheduledInitialTurnTerminal(id) { return pinvouSharedweb().markScheduledInitialTurnTerminal(id); }
+function beginScheduledOpenActivation(id) { return pinvouSharedweb().beginScheduledOpenActivation(id); }
+function rollbackScheduledOpenActivation(snapshot) { return pinvouSharedweb().rollbackScheduledOpenActivation(snapshot); }
+  function saveWorkingSetTo(buf) { return pinvouSharedweb().saveWorkingSetTo(buf); }
+  function loadWorkingSetFrom(buf) { return pinvouSharedweb().loadWorkingSetFrom(buf); }
+  function hydrateWorkingSetFromSaved(buf, saved) {
+    if (!buf || !saved) return;
+    const completedRemoteTurn = !!buf.remoteTerminalSeen || (!!buf.remoteTurnActive && !buf.busy);
+    buf.messages = Array.isArray(saved.messages) ? saved.messages : [];
+    buf.sessionRevision = String(saved.transcript_revision || saved.transcriptRevision || "");
+    buf.chatItems = [];
+    buf.turnTimeline = [];
+    buf.activeTurnTimelineId = null;
+    buf.artifacts = Array.isArray(saved.artifacts) ? saved.artifacts.map(function (a) {
+      const p = typeof a === "string" ? a : (a.storage_path || a.path || "");
+      return { path: p, basename: basename(p) };
+    }) : [];
+    buf.artifacts = filterSessionArtifacts(buf.artifacts, saved.metadata && saved.metadata.id);
+    buf.personaEvents = [];
+    buf.pinvouReviews = [];
+    buf.pinvouSceneEvents = loadPinvouSceneEventsForSession(saved.metadata && saved.metadata.id);
+    if (completedRemoteTurn) {
+      buf.remoteTurnActive = false;
+      buf.remoteTerminalSeen = false;
+      buf.remoteBaselineMessageCount = null;
+      buf.remoteBaselineTrusted = false;
+      buf.remoteExpectedAssistantKey = "";
+      buf.remoteCommittedRevision = "";
+      buf.deferredRemoteUserEvent = null;
+    }
+    buf.stream = {
+      currentStreamText: "", currentStreamId: 0, pendingAssistantText: "",
+      pendingAssistantBlocks: [], itemIdSeq: 0, toolMeta: {},
+    };
+  }
+  function decodeBase64Bytes(encoded) {
+    const binary = window.atob(String(encoded || ""));
+    const bytes = new Uint8Array(binary.length);
+// binary is a single-byte Latin-1 string produced by atob; charCode is the byte value. codePointAt is equivalent here but gains nothing.
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i); // eslint-disable-line unicorn/prefer-code-point
+    return bytes;
+  }
+  function encodeBase64Bytes(bytes) {
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+      // chunk only holds 0-255 byte values; fromCharCode/fromCodePoint are equivalent. Keep the apply-chunked hot path.
+      binary += String.fromCharCode.apply(null, chunk); // eslint-disable-line unicorn/prefer-code-point
+    }
+    return window.btoa(binary);
+  }
+  const SESSION_DOWNLOAD_LEASES_KEY = "pinvou.web_session_download_leases.v1";
+  const activeSessionDownloads = Object.create(null);
+  let sessionDownloadLeases = null;
+  let sessionDownloadCleanupPromise = null;
+  function readSessionDownloadLeases() {
+    if (sessionDownloadLeases !== null) return [...sessionDownloadLeases];
+    try {
+      const raw = window.sessionStorage && window.sessionStorage.getItem(SESSION_DOWNLOAD_LEASES_KEY);
+      let parsed = raw ? JSON.parse(raw) : [];
+      if (!Array.isArray(parsed)) parsed = [];
+      sessionDownloadLeases = parsed.filter(function (entry) {
+        return entry && typeof entry.download_id === "string" && entry.download_id &&
+          typeof entry.session_id === "string" && entry.session_id;
+      }).slice(-16);
+      return [...sessionDownloadLeases];
+    } catch {
+      sessionDownloadLeases = [];
+      return [...sessionDownloadLeases];
+    }
+  }
+  function writeSessionDownloadLeases(entries) {
+    sessionDownloadLeases = entries.slice(-16);
+    try {
+      if (!window.sessionStorage) return;
+      if (sessionDownloadLeases.length) {
+        window.sessionStorage.setItem(SESSION_DOWNLOAD_LEASES_KEY, JSON.stringify(sessionDownloadLeases));
+      } else {
+        window.sessionStorage.removeItem(SESSION_DOWNLOAD_LEASES_KEY);
+      }
+    } catch { /* when storage is unavailable the lease stays in memory only */ }
+  }
+  function rememberSessionDownloadLease(downloadId, sid) {
+    const entries = readSessionDownloadLeases().filter(function (entry) {
+      return entry.download_id !== downloadId;
+    });
+    entries.push({ download_id: downloadId, session_id: sid });
+    writeSessionDownloadLeases(entries);
+  }
+  function forgetSessionDownloadLease(downloadId) {
+    writeSessionDownloadLeases(readSessionDownloadLeases().filter(function (entry) {
+      return entry.download_id !== downloadId;
+    }));
+  }
+  async function cancelSessionDownloadLease(downloadId, sid) {
+    return invoke("web_access_cancel_session_download", {
+      id: sid,
+      downloadId,
+    });
+  }
+  async function cleanupAbandonedSessionDownloads(diagnostics) {
+    const entries = readSessionDownloadLeases().filter(function (entry) {
+      return !activeSessionDownloads[entry.download_id];
+    });
+    if (!entries.length) return;
+    diagnostics.cleanup_requested_count = entries.length;
+    const failed = [];
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      try {
+        await cancelSessionDownloadLease(entry.download_id, entry.session_id);
+        forgetSessionDownloadLease(entry.download_id);
+      } catch {
+        failed.push(entry.download_id);
+      }
+    }
+    diagnostics.cleanup_failed_count = failed.length;
+    diagnostics.cleanup_succeeded_count = entries.length - failed.length;
+  }
+  function validSessionDownloadId(downloadId) {
+    return typeof downloadId === "string" && downloadId.length >= 8 && downloadId.length <= 128 &&
+      /^download_[A-Za-z0-9_-]+$/.test(downloadId);
+  }
+  function scheduleAbandonedSessionDownloadCleanup() {
+    if (!IS_WEB || sessionDownloadCleanupPromise) return sessionDownloadCleanupPromise;
+    const diagnostics = {
+      transport_kind: "web_chunked_rpc",
+      cleanup_requested_count: 0,
+      cleanup_failed_count: 0,
+      cleanup_succeeded_count: 0,
+    };
+    sessionDownloadCleanupPromise = waitForWebInvokeCapabilities().then(async function () {
+      if (!canInvoke("web_access_cancel_session_download")) return false;
+      await cleanupAbandonedSessionDownloads(diagnostics);
+      recordAuthoritySyncDiagnostic("session_download_cleanup", diagnostics);
+      return true;
+    }).catch(function () {
+      return false;
+    }).finally(function () {
+      sessionDownloadCleanupPromise = null;
+    });
+    return sessionDownloadCleanupPromise;
+  }
+  function newSessionDownloadId() {
+    let token = "";
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        token = window.crypto.randomUUID().replaceAll('-', ""); // safari14-ok: guarded above
+      }
+    } catch { /* on UUID generation failure, fall through to the fallback below */ }
+    // eslint-disable-next-line sonarjs/pseudo-random -- not security-sensitive: download ID dedup; failures are safely retryable
+    if (!token) token = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    return "download_web_" + token;
+  }
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy bridge; refactor tracked separately
+  async function loadSessionForClient(sid, setActive, diagnostics) {
+    diagnostics = diagnostics || {};
+    diagnostics.transport_kind = "web_chunked_rpc";
+    diagnostics.started_at_ms = Date.now();
+    diagnostics.chunk_count = 0;
+    diagnostics.bytes_received = 0;
+    // New WebUI can run against an older desktop. The cancel command is the
+    // capability boundary for client-selected/persisted leases: older
+    // desktops keep their server-generated download id protocol and must not
+    // be blocked by cleanup RPCs they do not implement.
+    try {
+      await waitForWebInvokeCapabilities();
+    } catch (capabilityError) {
+      diagnostics.elapsed_ms = Date.now() - diagnostics.started_at_ms;
+      diagnostics.error_present = true;
+      diagnostics.error_category = capabilityError && capabilityError.code === "desktop_capabilities_timeout"
+        ? "capability_snapshot_timeout"
+        : "capability_snapshot_unavailable";
+      recordAuthoritySyncDiagnostic("session_download_capability_wait_failed", {
+        session_id: sid,
+        transport: diagnostics,
+      });
+      throw capabilityError;
+    }
+    const supportsSessionDownloadCancellation = canInvoke("web_access_cancel_session_download");
+    if (supportsSessionDownloadCancellation) {
+      await cleanupAbandonedSessionDownloads(diagnostics);
+    }
+    let offset = 0;
+    let total = null;
+    let payload = null;
+    let downloadId = supportsSessionDownloadCancellation ? newSessionDownloadId() : "";
+    let unexpectedDownloadId = "";
+    const maxSessionBytes = 256 * 1024 * 1024;
+    diagnostics.cancellable_lease = supportsSessionDownloadCancellation;
+    if (supportsSessionDownloadCancellation) {
+      activeSessionDownloads[downloadId] = true;
+      rememberSessionDownloadLease(downloadId, sid);
+      diagnostics.download_id = downloadId;
+    }
+    try {
+      while (true) {
+        const chunkArgs = {
+          id: sid,
+          downloadId: offset ? downloadId : null,
+          offset,
+          // 不传 limit，由桌面端按自身版本上限决定块大小；新 WebUI
+          // 先于桌面部署时也不会因为块大小超过旧桌面上限而被拒绝。
+        };
+        if (supportsSessionDownloadCancellation && !offset) {
+          chunkArgs.requestedDownloadId = downloadId;
+        }
+        const chunk = await invoke("web_access_load_session_chunk", chunkArgs);
+        diagnostics.chunk_count += 1;
+        const chunkOffset = Number(chunk && chunk.offset);
+        const chunkTotal = Number(chunk && chunk.total);
+        const chunkDownloadId = String((chunk && (chunk.download_id || chunk.downloadId)) || "");
+        if (supportsSessionDownloadCancellation && downloadId &&
+            chunkDownloadId !== downloadId && validSessionDownloadId(chunkDownloadId)) {
+          unexpectedDownloadId = chunkDownloadId;
+          rememberSessionDownloadLease(unexpectedDownloadId, sid);
+          diagnostics.error_category = "download_id_mismatch";
+        }
+        if (!Number.isSafeInteger(chunkOffset) || chunkOffset !== offset ||
+            !Number.isSafeInteger(chunkTotal) || chunkTotal < 0 || chunkTotal > maxSessionBytes ||
+            !chunkDownloadId || (downloadId && chunkDownloadId !== downloadId)) {
+          throw new Error(bt("sessionChunkInvalid"));
+        }
+        if (!downloadId) downloadId = chunkDownloadId;
+        diagnostics.download_id = downloadId;
+        if (total === null) {
+          total = chunkTotal;
+          payload = new Uint8Array(total);
+        } else if (chunkTotal !== total) {
+          throw new Error(bt("sessionChunkChanged"));
+        }
+        const data = decodeBase64Bytes(chunk.data_base64 || chunk.dataBase64);
+        diagnostics.bytes_received += data.length;
+        diagnostics.declared_total_bytes = total;
+        if (offset + data.length > total) throw new Error(bt("sessionChunkOverflow"));
+        payload.set(data, offset);
+        offset += data.length;
+        if (chunk.eof) {
+          if (offset !== total) throw new Error(bt("sessionChunkEarlyEnd"));
+          if (supportsSessionDownloadCancellation) {
+            delete activeSessionDownloads[downloadId];
+            forgetSessionDownloadLease(downloadId);
+          }
+          break;
+        }
+        if (!data.length) throw new Error(bt("sessionChunkNoProgress"));
+      }
+    } catch (error) {
+      if (supportsSessionDownloadCancellation && downloadId) {
+        const cancellationIds = [downloadId];
+        if (unexpectedDownloadId && unexpectedDownloadId !== downloadId) {
+          cancellationIds.push(unexpectedDownloadId);
+        }
+        cancellationIds.forEach(function (id) { delete activeSessionDownloads[id]; });
+        diagnostics.cancel_requested = true;
+        diagnostics.cancel_succeeded = true;
+        for (let cancelIndex = 0; cancelIndex < cancellationIds.length; cancelIndex++) {
+          const cancellationId = cancellationIds[cancelIndex];
+          try {
+            await cancelSessionDownloadLease(cancellationId, sid);
+            forgetSessionDownloadLease(cancellationId);
+          } catch {
+            diagnostics.cancel_succeeded = false;
+            diagnostics.error_category = "cancel_rpc_failed";
+          }
+        }
+      }
+      throw error;
+    }
+    diagnostics.elapsed_ms = Date.now() - diagnostics.started_at_ms;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(payload));
+  }
+  async function ensureSessionBufferLoaded(sid) {
+    if (!sid) return;
+    if (sid === state.activeSessionId) return;
+    const buf = getBuffer(sid);
+    const meta = state.sessions.find(function (s) { return s.id === sid; }) || {};
+    const knownCount = Number(meta.message_count || 0);
+    if (buf.busy) return;
+    if (buf.loadedFromDisk && (!knownCount || buf.messages.length >= knownCount)) return;
+    if (!buf.loadedFromDisk && (buf.messages.length || buf.chatItems.length) && (!knownCount || buf.messages.length >= knownCount)) return;
+    const saved = await loadSessionForClient(sid, false);
+    const savedCount = saved && saved.metadata ? Number(saved.metadata.message_count || 0) : 0;
+    if ((buf.messages.length || buf.chatItems.length) && savedCount <= buf.messages.length) {
+      buf.loadedFromDisk = true;
+      return;
+    }
+    // 下载挂起期间后台回合可能已开始（busy 置位、直播流写入中）：此时用磁盘
+    // 快照 hydrate 会截断正在流式生成的内容，必须复检后放弃（审计）。
+    if (buf.busy || buf.remoteTurnActive) return;
+    hydrateWorkingSetFromSaved(buf, saved);
+    buf.personaEvents = await loadPersonaEventsForSession(sid);
+    buf.pinvouReviews = await loadPinvouReviewsForSession(sid);
+    raisePinvouSummonHighwater(buf.pinvouReviews); // 后台缓冲提交即验收抬底(r5 审 M1)
+    buf.pinvouSceneEvents = await syncPinvouSceneEventsForSession(sid);
+    try { buf.turnTimeline = await invoke("get_session_timeline", { sessionId: sid }) || []; } catch { buf.turnTimeline = []; }
+    // 手机可能在桌面仍停留草稿页/其他 session 时先唤醒这个后台 session。
+    // 仅 hydrate messages 而把 chatItems 留空，会让后续 switchToSession 命中缓存快路径，
+    // 不再 rerenderFromMessages，桌面便只看得到手机唤醒后的新内容，历史像是“丢了”。
+    // 在首次磁盘 hydration 后先完整重建展示层，流式增量随后照常追加；
+    // buf.busy 时上方已提前返回，不会覆盖正在流式生成的实时 chatItems。
+    runSyncOnSession(sid, function () {
+      resetPendingAssistant();
+      rerenderFromMessages();
+    });
+    buf.loadedFromDisk = true;
+  }
+  // 把 active 工作集存好后切到 id 的 buffer(opts.fresh=新建空 buffer)。
+  function switchActiveTo(id, opts) {
+    // Set the new active id before touching the old buffer: the LRU prune
+    // triggered by that touch protects the target via activeSessionId. Touching
+    // the old buffer first (active id still old) could evict an idle target as
+    // the oldest entry, and the freshBuffer() fallback below would silently
+    // show an empty session.
+    const previousActiveId = state.activeSessionId;
+    state.activeSessionId = id;
+    if (previousActiveId) saveWorkingSetTo(getBuffer(previousActiveId));
+    let buf = sessionStates[id];
+    if (!buf || (opts && opts.fresh)) {
+      buf = sessionStates[id] = freshBuffer();
+      // `fresh` is used for a Session this client just created, so its empty
+      // buffer is authoritative rather than an event-created partial cache —
+      // and it must not resurrect a draft stashed from an earlier eviction of
+      // the same (recycled) id. Non-fresh fallback recreates an evicted
+      // buffer, so restore its stashed draft.
+      if (opts && opts.fresh) buf.loadedFromDisk = true;
+      else restoreEvictedSessionDraft(id, buf);
+    }
+    touchSessionBuffer(id, buf, id.indexOf("sched-") === 0);
+    loadWorkingSetFrom(buf);
+    state.artifacts = filterSessionArtifacts(state.artifacts, id);
+    scheduleShellPoll(id, true);
+  }
+  // 在指定 session 的工作集上跑一段【同步】逻辑。sid 是 active → 直接跑(零行为变化);
+  // 否则临时切到该 buffer 跑完再切回(期间不 notify)。
+  function runSyncOnSession(sid, fn) {
+    if (!sid || sid === state.activeSessionId) { fn(); return; }
+    const bg = sessionStates[sid]; if (!bg) return;
+    touchSessionBuffer(sid, bg, isScheduledRunSession(sid));
+    const realId = state.activeSessionId;
+    const draftComposer = realId ? "" : (state.composerDraft || "");
+    // A null active id no longer guarantees an empty draft: WebUI can already
+    // be showing an optimistic first message while its Session is being
+    // materialized. Snapshot the complete draft just like a regular Session
+    // before routing a late event from another Session in the background.
+    const restoreBuffer = realId ? getBuffer(realId) : freshBuffer();
+    saveWorkingSetTo(restoreBuffer);
+    loadWorkingSetFrom(bg);
+    state.activeSessionId = sid;
+    const prev = suppressNotify; suppressNotify = true;
+    try { fn(); }
+    finally {
+      suppressNotify = prev;
+      saveWorkingSetTo(bg);
+      state.activeSessionId = realId;
+      // Restore the exact draft/Session working set that was visible before
+      // the background event; replacing a draft with freshBuffer() would erase
+      // its optimistic first message or unsent composer text.
+      if (!realId) restoreBuffer.composerDraft = draftComposer;
+      loadWorkingSetFrom(restoreBuffer);
+    }
+  }
+  // 事件监听器统一入口:按 payload.session_id 路由同步逻辑;后台变更后补一次 notify 刷新列表。
+function markRemoteTurn(sid, buf, preserveCommittedRevision, cause) { return pinvouSharedweb().markRemoteTurn(sid, buf, preserveCommittedRevision, cause); }
+function onSessionEvent(e, fn, options) { return pinvouSharedweb().onSessionEvent(e, fn, options); }
+function isScheduledRunSession(sid) { return pinvouSharedweb().isScheduledRunSession(sid); }
+
+  // Transcript persistence is authoritative in Rust. The UI only persists the
+  // presentation-side artifact index and derives the optional auto-title.
+  async function persistMessagesFor(sid) { return pinvouSharedweb().persistMessagesFor(sid); }
+
+  async function reconcileRemoteTurn(sid) {
+    if (!sid) return true;
+    const buf = sessionStates[sid];
+    if (!buf || (!buf.remoteTurnActive && !buf.remoteTerminalSeen)) return true;
+    if (!buf.remoteTerminalSeen && isBusyFor(sid)) {
+      recordAuthoritySyncDiagnostic("reconcile_deferred_busy", authoritySyncBufferSnapshot(sid, buf));
+      return false;
+    }
+    if (authoritativeTranscriptSyncs[sid]) {
+      recordAuthoritySyncDiagnostic("reconcile_joined_inflight", authoritySyncBufferSnapshot(sid, buf));
+      return authoritativeTranscriptSyncs[sid];
+    }
+    const traceId = "authority_reconcile_" + Date.now().toString(36) + "_" + (++authoritySyncTraceSequence);
+    // chat:done 与远端 load_session 分属两条异步通道。尤其是 WebUI 刚创建的
+    // Session，第一份可读快照可能仍停在本轮 user，若立即拿它重建展示层，会把
+    // 已完整显示的流式 assistant 气泡一闪覆盖掉。优先用后端已提交 revision
+    // 建立 authority barrier；旧桌面端未提供 revision 时，才回退到消息数与
+    // 最后一条 assistant 的展示身份校验。
+    const expectedAssistantKey = buf.remoteTerminalSeen
+      ? String(buf.remoteExpectedAssistantKey || "")
+      : "";
+    // The committed revision identifies the canonical terminal transcript.
+    // Streamed/native-tool blocks may be normalized before persistence, so a
+    // presentation-derived message key is only a fallback for older desktops.
+    let expectedCommittedRevision = buf.remoteTerminalSeen
+      ? String(buf.remoteCommittedRevision || "")
+      : "";
+    const minimumTerminalMessageCount = expectedAssistantKey && Array.isArray(buf.messages)
+      ? buf.messages.length
+      : 0;
+    recordAuthoritySyncDiagnostic("reconcile_started", Object.assign({
+      trace_id: traceId,
+      expected_committed_revision: expectedCommittedRevision,
+      minimum_terminal_message_count: minimumTerminalMessageCount,
+    }, authoritySyncBufferSnapshot(sid, buf)));
+    const sync = (async function () {
+      for (let attempt = 0; attempt < 6; attempt++) {
+        if (attempt) await new Promise(function (resolve) { setTimeout(resolve, 250); });
+        // Relay replay may deliver the commit marker immediately after done,
+        // and a newer turn's commit can land while this retry window is open.
+        // Re-read the live revision every attempt so a bumped expected value
+        // converges instead of comparing a stale one (which would report a
+        // false unsynced warning and block queued sends until the next event).
+        if (buf.remoteTerminalSeen) {
+          expectedCommittedRevision = String(buf.remoteCommittedRevision || "");
+        }
+        const attemptStartedAt = Date.now();
+        const transfer = {};
+        try {
+          const saved = await loadSessionForClient(sid, false, transfer);
+          if (!saved || !Array.isArray(saved.messages)) {
+            recordAuthoritySyncDiagnostic("reconcile_attempt_rejected", {
+              trace_id: traceId, session_id: sid, attempt: attempt + 1,
+              reason: "invalid_snapshot", elapsed_ms: Date.now() - attemptStartedAt,
+              snapshot_present: !!saved, transport: transfer,
+            });
+            continue;
+          }
+          const savedRevision = String(saved.transcript_revision || saved.transcriptRevision || "");
+          // 仅当快照确实携带 revision 时才用严格相等作为权威屏障;旧后端/旧契约
+          // 不含该字段时降级到消息数与 assistant 身份校验,避免「期望非空但快照
+          // 无字段」导致对账必然失败(每轮误报)。
+          if (expectedCommittedRevision && savedRevision) {
+            if (savedRevision !== expectedCommittedRevision) {
+              recordAuthoritySyncDiagnostic("reconcile_attempt_rejected", {
+                trace_id: traceId, session_id: sid, attempt: attempt + 1,
+                reason: "revision_mismatch", elapsed_ms: Date.now() - attemptStartedAt,
+                expected_committed_revision: expectedCommittedRevision,
+                saved_revision: savedRevision, saved_message_count: saved.messages.length,
+                transport: transfer,
+              });
+              continue;
+            }
+          } else {
+            if (minimumTerminalMessageCount && saved.messages.length < minimumTerminalMessageCount) {
+              recordAuthoritySyncDiagnostic("reconcile_attempt_rejected", {
+                trace_id: traceId, session_id: sid, attempt: attempt + 1,
+                reason: "message_count_short", elapsed_ms: Date.now() - attemptStartedAt,
+                expected_committed_revision: expectedCommittedRevision,
+                saved_revision: savedRevision,
+                minimum_terminal_message_count: minimumTerminalMessageCount,
+                saved_message_count: saved.messages.length, transport: transfer,
+              });
+              continue;
+            }
+          }
+          if ((!expectedCommittedRevision || !savedRevision) && expectedAssistantKey) {
+            const hasExpectedAssistant = saved.messages.some(function (message) {
+              return message && message.role === "assistant" &&
+                hydratedMessageKey(message, isScheduledRunSession(sid)) === expectedAssistantKey;
+            });
+            if (!hasExpectedAssistant) {
+              recordAuthoritySyncDiagnostic("reconcile_attempt_rejected", {
+                trace_id: traceId, session_id: sid, attempt: attempt + 1,
+                reason: "assistant_identity_missing", elapsed_ms: Date.now() - attemptStartedAt,
+                expected_committed_revision: expectedCommittedRevision,
+                saved_revision: savedRevision,
+                expected_assistant_key_length: expectedAssistantKey.length,
+                saved_message_count: saved.messages.length,
+                saved_roles: saved.messages.map(function (message) { return message && message.role || "invalid"; }).slice(-12),
+                transport: transfer,
+              });
+              continue;
+            }
+          }
+          // 写入前回合归属校验（审计）：重试窗口内新回合可能已开始
+          // （markRemoteTurn 置 busy/remoteTurnActive、重置 revision），此时用
+          // 旧终稿重建工作集会截断新回合直播流——放弃本轮对账，由新回合自己的
+          // done 事件重新对账。放弃条件只用 busy：不能用 remoteTurnActive（正常
+          // 远端回合 done 后它恒为 true，会拦死所有对账），也不能用
+          // !remoteTerminalSeen（tauri 版 scheduled run 不置 terminalSeen）。
+          if (buf.busy) return false;
+          runSyncOnSession(sid, function () {
+            // The durable transcript already reconstructs user/assistant/tool
+            // items. Preserve only presentation-side cards; otherwise a client
+            // joining mid-turn appends its replayed tail after the full answer.
+            const rawLiveChatItems = Array.isArray(state.chatItems) ? state.chatItems : [];
+            const resolvedPlanTickets = Object.create(null);
+            const activePlanCards = Object.create(null);
+            rawLiveChatItems.forEach(function (item) {
+              if (!item || item.type !== "plan_card") return;
+              const key = planCardHydrationKey(item);
+              if (!key) return;
+              if (!item.resolved && item.cardState === "active" && item.planId) {
+                if (!activePlanCards[key]) activePlanCards[key] = [];
+                activePlanCards[key].push(item);
+                return;
+              }
+              if (!item.planId) return;
+              if (!resolvedPlanTickets[key]) resolvedPlanTickets[key] = [];
+              resolvedPlanTickets[key].push(String(item.planId));
+            });
+            const liveChatItems = rawLiveChatItems.filter(function (item) { return pinvouSharedweb().liveChatItemKeptForHydration(item); });
+            state.messages = saved.messages;
+            state.artifacts = filterSessionArtifacts(
+              mergeHydratedArtifacts(saved.artifacts, state.artifacts),
+              sid,
+            );
+            resetPendingAssistant();
+            state.chatItems = [];
+            rerenderFromMessages();
+            // A plan ticket is transport metadata rather than model context, so
+            // the durable transcript cannot reconstruct it on its own. Carry
+            // active state or resolved tickets onto the matching canonical card,
+            // newest-to-newest for repeated identical plans.
+            for (let planIndex = state.chatItems.length - 1; planIndex >= 0; planIndex--) {
+              const hydratedPlan = state.chatItems[planIndex];
+              if (!hydratedPlan || hydratedPlan.type !== "plan_card") continue;
+              const hydratedKey = planCardHydrationKey(hydratedPlan);
+              const activeQueue = hydratedKey && activePlanCards[hydratedKey];
+              if (activeQueue && activeQueue.length) {
+                const liveActivePlan = activeQueue.pop();
+                hydratedPlan.planId = String(liveActivePlan.planId);
+                hydratedPlan.cardState = "active";
+                hydratedPlan.resolved = false;
+                hydratedPlan.statusLabel = liveActivePlan.statusLabel || "";
+                hydratedPlan.planResolutionConfirmed = !!liveActivePlan.planResolutionConfirmed;
+                continue;
+              }
+              const ticketQueue = hydratedKey && resolvedPlanTickets[hydratedKey];
+              if (!hydratedPlan.planId && ticketQueue && ticketQueue.length) hydratedPlan.planId = ticketQueue.pop();
+            }
+            const unmatchedActivePlans = [];
+            Object.keys(activePlanCards).forEach(function (key) {
+              (activePlanCards[key] || []).forEach(function (item) { unmatchedActivePlans.push(item); });
+            });
+            mergeHydratedChatItems(unmatchedActivePlans, 0);
+            mergeHydratedChatItems(liveChatItems, 0);
+            currentStreamId = 0;
+            currentStreamText = "";
+            pendingAssistantText = "";
+            pendingAssistantBlocks = [];
+            state.busy = false;
+            stopThinking();
+          });
+          buf.loadedFromDisk = true;
+          buf.sessionRevision = String(saved.transcript_revision || saved.transcriptRevision || buf.sessionRevision || "");
+          buf.localTurnOwned = false;
+          buf.remoteTurnActive = false;
+          buf.remoteTerminalSeen = false;
+          buf.remoteBaselineMessageCount = null;
+          buf.remoteBaselineTrusted = false;
+          buf.remoteExpectedAssistantKey = "";
+          buf.remoteCommittedRevision = "";
+          buf.deferredRemoteUserEvent = null;
+          buf.busy = false;
+          if (sid === state.activeSessionId) saveWorkingSetTo(buf);
+          notify();
+          recordAuthoritySyncDiagnostic("reconcile_succeeded", Object.assign({
+            trace_id: traceId,
+            attempt: attempt + 1,
+            elapsed_ms: Date.now() - attemptStartedAt,
+            saved_revision: savedRevision,
+            saved_message_count: saved.messages.length,
+            transport: transfer,
+          }, authoritySyncBufferSnapshot(sid, buf)));
+          return true;
+        } catch {
+          recordAuthoritySyncDiagnostic("reconcile_attempt_failed", {
+            trace_id: traceId,
+            session_id: sid,
+            attempt: attempt + 1,
+            reason: "load_session_error",
+            error_category: "snapshot_load_failed",
+            error_present: true,
+            elapsed_ms: Date.now() - attemptStartedAt,
+            expected_committed_revision: expectedCommittedRevision,
+            transport: transfer,
+          });
+        }
+      }
+      recordAuthoritySyncDiagnostic("reconcile_exhausted", Object.assign({
+        trace_id: traceId,
+        attempts: 6,
+        expected_committed_revision: expectedCommittedRevision,
+        minimum_terminal_message_count: minimumTerminalMessageCount,
+      }, authoritySyncBufferSnapshot(sid, buf)));
+      return false;
+    })();
+    authoritativeTranscriptSyncs[sid] = sync;
+    try { return await sync; }
+    finally { if (authoritativeTranscriptSyncs[sid] === sync) delete authoritativeTranscriptSyncs[sid]; }
+  }
+
+  // ── Pub/Sub ──────────────────────────────────────────────────────
+  let subscribers = [];
+  function snapshotState() {
+    if (typeof structuredClone === "function") {
+      try { return structuredClone(state); } catch { /* silently fall back to JSON */ } // safari14-ok: typeof-guarded with JSON fallback
+    }
+    return JSON.parse(JSON.stringify(state));
+  }
+  // Build immutable persistent subscription snapshots. Reconcile nested values
+  // so unchanged transcript history is shared across notifications, while each
+  // in-place streaming mutation gets a detached changed path.
+function subscriptionStateValue(value, previous, ancestors) { return pinvouSharedweb().subscriptionStateValue(value, previous, ancestors); }
+  let subscriptionSnapshot = null;
+  function subscriptionState() {
+    subscriptionSnapshot = subscriptionStateValue(state, subscriptionSnapshot);
+    return subscriptionSnapshot;
+  }
+  let notificationQueue = [];
+  let notificationDispatching = false;
+  // Stream coalescing state lives next to notify() so it is initialized
+  // before the first publication can run (see scheduleStreamNotify).
+  const STREAM_NOTIFY_MAX_WAIT_MS = 32;
+  const pendingStreamNotifications = Object.create(null);
+  const STREAM_RENDER_THROTTLE_MS = 180;
+  const streamRenderTimers = Object.create(null);
+  function notify() {
+    // Any ordinary publication is a semantic stream boundary. Its snapshot
+    // already contains all accumulated text, so cancel the pending frame to
+    // avoid a duplicate callback after done/error/tool/session events. The
+    // cancel runs before the suppression check on purpose — the desktop
+    // bridge also cancels the pending frame while a background working set
+    // has suppressed callbacks, because the semantic publication that
+    // follows the restore carries the accumulated content.
+    cancelPendingStreamNotify(state.activeSessionId);
+    immediateNotify();
+  }
+  function immediateNotify() {
+    if (suppressNotify) return;
+    if (startupNotificationBatching) return;
+    // 会话列表「工作中」指示:active 取活动工作集 state.busy,其余取各自 buffer.busy
+    state.sessionBusy = {};
+    for (const id in sessionStates) state.sessionBusy[id] = !!sessionStates[id].busy;
+    if (state.activeSessionId) state.sessionBusy[state.activeSessionId] = !!state.busy;
+    const snapshot = subscriptionState();
+    // Each queued round fixes both state and membership. Callback-time
+    // subscription changes apply only to rounds queued afterwards.
+    notificationQueue.push({ snapshot, subscribers: [...subscribers] });
+    if (notificationDispatching) return;
+    notificationDispatching = true;
+    try {
+      while (notificationQueue.length) {
+        const round = notificationQueue.shift();
+        for (let i = 0; i < round.subscribers.length; i++) round.subscribers[i](round.snapshot);
+      }
+    } catch (error) {
+      // Preserve synchronous callback error propagation. Later queued rounds may
+      // depend on the interrupted callback, so discard them instead of replaying
+      // stale work on the next notification.
+      notificationQueue = [];
+      throw error;
+    } finally {
+      notificationDispatching = false;
+    }
+  }
+  function subscribe(fn) {
+    subscribers.push(fn);
+    return function () {
+      subscribers = subscribers.filter(function (f) { return f !== fn; });
+    };
+  }
+
+function loadScheduledTaskTemplateSources() { return pinvouSharedweb().loadScheduledTaskTemplateSources(); }
+
+  function persistScheduledTaskTemplateSources() {
+    try {
+      window.localStorage.setItem(
+        SCHEDULED_TEMPLATE_SOURCE_STORAGE_KEY,
+        JSON.stringify(scheduledTaskTemplateSources)
+      );
+    } catch { /* ignore when localStorage is unavailable */ }
+  }
+
+
+  function forgetScheduledTaskTemplateSource(taskId) {
+    // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 floor: Object.hasOwn is unavailable; this call is already the safe form
+    if (!taskId || !Object.prototype.hasOwnProperty.call(scheduledTaskTemplateSources, taskId)) return;
+    delete scheduledTaskTemplateSources[taskId];
+    persistScheduledTaskTemplateSources();
+  }
+
+
+
+
+
+function applyScheduledRunViewed(automationId, runId, receipt) { return pinvouSharedweb().applyScheduledRunViewed(automationId, runId, receipt); }
+
+function invalidateScheduledTaskReads(automationId) { return pinvouSharedweb().invalidateScheduledTaskReads(automationId); }
+
+function scheduleScheduledRunRefresh() { return pinvouSharedweb().scheduleScheduledRunRefresh(); }
+
+
+function setScheduledTaskError(error, kind) { return pinvouSharedweb().setScheduledTaskError(error, kind); }
+
+function dismissScheduledTaskError() { return pinvouSharedweb().dismissScheduledTaskError(); }
+
+
+
+
+
+
+
+
+
+
+
+function selectScheduledTask(id) { return pinvouSharedweb().selectScheduledTask(id); }
+
+
+
+
+
+
+
+
+  // 聊天创建拿到合法参数后立即落成任务。草稿不会进入可渲染 state，避免再出现一层确认卡。
+  // autoOpenId 全局 last-writer：两会话并发创建时后完成者覆盖，且 startScheduledTaskChat
+  // 清空后陈旧 completion 会复活 auto-open（审计 f）。全局单调创建序号，仅最新意图可写。
+  let scheduledTaskAutoCreateSeq = 0;
+
+async function loadScheduledTasks() { return pinvouSharedweb().loadScheduledTasks(); }
+
+  // 侧边栏"定时任务记录"一次读取所有保留的运行。后端只做一次 reconcile 和
+  // Session 元数据扫描，避免任务数增长后形成 N 次命令调用与重复完整会话读取。
+async function loadScheduledTaskRecentRuns() { return pinvouSharedweb().loadScheduledTaskRecentRuns(); }
+
+function refreshScheduledTaskData(limit) { return pinvouSharedweb().refreshScheduledTaskData(limit); }
+
+  const scheduledRunShortcutRefreshes = Object.create(null);
+  const SCHEDULED_LINK_POLL_FAST_MS = 1000;
+  const SCHEDULED_LINK_POLL_SLOW_MS = 5000;
+  const SCHEDULED_LINK_POLL_FAST_ATTEMPTS = 15;
+  // 兜底上限:只在 run 卡在 queued/running 且永不终态时才会走到,正常路径靠下面
+  // 「拿到 sessionId」或「进入终态」提前收工。
+  const SCHEDULED_LINK_POLL_DEADLINE_MS = 30 * 60 * 1000;
+
+
+
+
+
+
+  const SCHEDULED_TASK_WRITABLE_FIELDS = ["name", "prompt", "rrule", "model", "modelId", "paused"];
+
+  // Scheduled tasks always run as Yolo. Keep the wire boundary intentionally narrow so
+  // legacy callers cannot reintroduce task-level permissions or external directories.
+  function scheduledTaskBackendInput(input) {
+    const source = input || {};
+    const backendInput = { mode: "yolo" };
+    SCHEDULED_TASK_WRITABLE_FIELDS.forEach(function (field) {
+      // biome-ignore lint/suspicious/noPrototypeBuiltins: Safari 14 floor: Object.hasOwn is unavailable; this call is already the safe form
+      if (Object.prototype.hasOwnProperty.call(source, field)) backendInput[field] = source[field];
+    });
+    return backendInput;
+  }
+
+async function createScheduledTask(input) { return pinvouSharedweb().createScheduledTask(input); }
+
+async function updateScheduledTask(id, input) { return pinvouSharedweb().updateScheduledTask(id, input); }
+
+async function pauseScheduledTask(id) { return pinvouSharedweb().pauseScheduledTask(id); }
+
+async function resumeScheduledTask(id) { return pinvouSharedweb().resumeScheduledTask(id); }
+
+async function deleteScheduledTask(id) { return pinvouSharedweb().deleteScheduledTask(id); }
+
+async function runScheduledTaskNow(id) { return pinvouSharedweb().runScheduledTaskNow(id); }
+
+  // 不直接替用户发消息:引导词存为 pending,预填一句短话进输入框,由用户编辑后自己发送。
+async function startScheduledTaskChat() { return pinvouSharedweb().startScheduledTaskChat(); }
+
+  // ── Chat Items (display format for React) ────────────────────────
+  function addChatItem(item) {
+    item.id = ++itemIdSeq;
+    state.chatItems.push(item);
+  }
+  function toolCallAlreadyStarted(toolCallId) { return pinvouSharedweb().toolCallAlreadyStarted(toolCallId); }
+function toolCallAlreadyFinished(toolCallId) { return pinvouSharedweb().toolCallAlreadyFinished(toolCallId); }
+function hasChatItemForTool(type, toolCallId) { return pinvouSharedweb().hasChatItemForTool(type, toolCallId); }
+function addSystemItem(text, meta) { return pinvouSharedweb().addSystemItem(text, meta); }
+function addAuthoritySyncNotice(text) { return pinvouSharedweb().addAuthoritySyncNotice(text); }
+
+
+function addOrMergePruneCompaction(compactId) { return pinvouSharedweb().addOrMergePruneCompaction(compactId); }
+function timeStr() { return pinvouSharedweb().timeStr(); }
+
+  // ── Flush helpers ──────────────────────────────────────────────
+  function flushPendingTextBlock() {
+    if (pendingAssistantText) {
+      pendingAssistantBlocks.push({ type: "text", text: pendingAssistantText });
+      pendingAssistantText = "";
+    }
+  }
+  function flushAssistantMessageToHistory() { return pinvouSharedweb().flushAssistantMessageToHistory(); }
+
+  function resetPendingAssistant() {
+    pendingAssistantText = "";
+    pendingAssistantBlocks = [];
+    currentStreamText = "";
+    currentStreamId = 0;
+  }
+
+  // ── Session management ───────────────────────────────────────────
+  let refreshHistoryInflight = null;
+  let refreshHistoryQueued = false;
+  async function refreshHistoryList() {
+    if (refreshHistoryInflight) {
+      refreshHistoryQueued = true;
+      return refreshHistoryInflight;
+    }
+    refreshHistoryInflight = (async function () {
+      try {
+        do {
+          refreshHistoryQueued = false;
+          try {
+            state.sessions = await invoke("web_access_list_sessions");
+          } catch (e) {
+            console.warn("list_sessions failed", e);
+            // Keep the previously observed list on a transient refresh
+            // failure: an empty snapshot would read as "every task deleted"
+            // to the aux-chat purge reconcile (wireAuxSessionPurge), which
+            // would purge every task's unsent drafts and staged quotes. The
+            // archived leg below keeps its previous list for the same reason.
+            state.sessions = state.sessions || [];
+          }
+          try {
+            state.archivedSessions = await invoke(
+              "web_access_list_archived_sessions",
+            );
+          } catch {
+            state.archivedSessions = state.archivedSessions || [];
+          }
+          notify();
+        } while (refreshHistoryQueued);
+      } finally {
+        refreshHistoryInflight = null;
+      }
+    })();
+    return refreshHistoryInflight;
+  }
+
+  // 进入草稿态:不创建 session,只清空工作集 + activeSessionId=null,落在「你好」欢迎页。
+  // session 在首次有实质内容(发消息 / 加卡牌,见 ensureSession)时才物化——这样会话列表里
+  // 永远不会堆积没用过的空「新对话」(ChatGPT/Claude 式 lazy session)。
+  function enterDraft() {
+    state.chatItems.forEach(function (item) {
+      if (item && item.clientMessageId) {
+        const submission = firstTurnSubmissions[item.clientMessageId];
+        // A submission still in flight settles its own operation from the RPC
+        // outcome; closing it here would mark a message that is about to be
+        // delivered as cancelled. Finished submissions (rejected or parked on
+        // an unknown outcome) are closed: the record is discarded, so a
+        // parked operation could never reconcile and would stay unadoptable
+        // and unsweepable until the page closes.
+        if (submission && submission.voiceOperationId && !submission.inFlight) {
+          completeVoiceSubmission(submission.voiceOperationId, null, false);
+          abandonVoiceResult(submission.voiceOperationId);
+        }
+        delete firstTurnSubmissions[item.clientMessageId];
+      }
+    });
+    sessionSwitchRequestToken += 1; // 新建/返回草稿会话使任何仍在等待的 load_session 结果失效
+    state.scheduledRunContext = null;
+    state.draftEpoch++; // 每次点击都自增——含下面提前返回的「已在草稿态」分支,让前端能重置 welcomeToolId
+    state.scheduledTaskPendingGuide = null; // 换了对话,未发送的定时任务引导词作废
+
+    // 已在干净草稿态 → 只 notify(epoch 已自增)。注意要连 chatItems 一起判空:messages 与 chatItems
+    // 会背离(persona 气泡 / ensureSession 失败的 system 报错卡只进 chatItems),否则残留卡顶掉「你好」。
+    if (!state.activeSessionId && state.messages.length === 0 && state.chatItems.length === 0) {
+      state.composerDraft = "";
+      // Draft mode display = the current lane's global default (two-lane
+      // semantics).
+      state.modeState = currentDraftModeState();
+      notify();
+      return;
+    }
+    if (state.activeSessionId) saveWorkingSetTo(getBuffer(state.activeSessionId));
+    state.activeSessionId = null;
+    loadWorkingSetFrom(freshBuffer());
+    // freshBuffer's modeState is the generic default (yolo); the draft
+    // display must be overridden with this lane's global default (the work
+    // lane's last_mode).
+    state.modeState = currentDraftModeState();
+    notify();
+  }
+  // 公开「新建对话」入口(侧边栏按钮)= 进草稿态。名字保留以兼容前端调用。
+async function createNewSession() { return pinvouSharedweb().createNewSession(); }
+
+  // 草稿态首次有实质内容时真正向后端创建 session 并切为 active;已有 active 直接返回。
+  // 返回新 session id,创建失败返回 null。调用方:sendMessage(首条消息) / equipPersona(加卡)。
+  // 并发防护（审计）：草稿态双击发送会并发 create_session，导致两条消息分家到两个新
+  // 会话——in-flight 复用同一 promise；create_session await 期间用户切走会物化在错误
+  // 会话（导航被劫持）——物化前校验 activeSessionId 仍为空，已切走则只登记后台 buffer。
+  let ensureSessionInFlight = null;
+  let ensureSessionDraftOutcome = null;
+  async function ensureSession(draftOwner) {
+    function applyDraftOutcome(outcome) {
+      if (!draftOwner || !outcome || draftOwner.draftEpoch !== outcome.epoch) return;
+      draftOwner.createdSessionId = outcome.createdSessionId;
+      // No rollback branch here: outcome.rollbackEpoch is desktop-only (the
+      // multi-agent toggle rollback lives in the tauri sessions lane and
+      // setMultiAgentMode is desktopOnly), so the web applier carries the
+      // created-session binding only.
+    }
+    if (state.activeSessionId) return state.activeSessionId;
+    if (ensureSessionInFlight) {
+      const pendingOutcome = ensureSessionDraftOutcome;
+      const pendingResult = await ensureSessionInFlight;
+      if (draftOwner && pendingOutcome && draftOwner.draftEpoch === pendingOutcome.epoch) {
+        applyDraftOutcome(pendingOutcome);
+      }
+      return pendingResult;
+    }
+    // 捕获导航 token：仅判 activeSessionId 覆盖不了「再进草稿」——enterDraft
+    // 只推进 token 不改 activeSessionId（仍为 null），在途 create_session 返回
+    // 后必须连同 token 一起校验，否则会劫持用户新进的草稿（三审 P1）。
+    const navToken = sessionSwitchRequestToken;
+    const draftOutcome = { epoch: Number(state.draftEpoch || 0), createdSessionId: null };
+    ensureSessionDraftOutcome = draftOutcome;
+    const p = (async function () {
+      // 多 session 并发:不预热 engine。新建空 session 的 buffer 由 switchActiveTo({fresh}) 起。
+      try {
+        const meta = await invoke("web_access_create_session");
+        // create_session 等待期间用户可能已发送/清空输入，迁移当下的最新值。
+        const composerDraft = state.composerDraft || "";
+        // create_session 等待期间用户可能已退出草稿（切到既有会话或再进草稿）：
+        // 物化不得劫持 active（审计），新会话登记为后台 buffer 等下次切换，
+        // 调用方按 null 处理不发送本条消息。「切到既有会话」→ activeSessionId
+        // 非空；「再进草稿」→ activeSessionId 仍为 null 但导航 token 已前移——
+        // 两种导航都中止物化（三审 P1）。
+        if (state.activeSessionId || navToken !== sessionSwitchRequestToken) {
+          const bg = freshBuffer();
+          sessionStates[meta.id] = bg;
+          bg.loadedFromDisk = true;
+          bg.sessionRevision = String(meta.transcript_revision || meta.transcriptRevision || "");
+          draftOutcome.createdSessionId = meta.id;
+          return null;
+        }
+        switchActiveTo(meta.id, { fresh: true });
+        draftOutcome.createdSessionId = meta.id;
+        state.composerDraft = composerDraft;
+        sessionStates[meta.id].composerDraft = composerDraft;
+        getBuffer(meta.id).sessionRevision = String(meta.transcript_revision || meta.transcriptRevision || "");
+        await refreshHistoryList();
+        await syncModeState();
+        // Two-lane semantics: the backend's plain default is always Yolo and
+        // lanes are only work/code; when the materializing session's lane
+        // global default is plan, apply it right now (the write becomes that
+        // session's own per-session record; the global default is
+        // unaffected).
+        const laneDefault = state.modeDefaults
+          && state.modeDefaults[state.modeLane === "code" ? "code" : "work"];
+        // 用物化时捕获的 meta.id 而非 activeSessionId：上面的 await 期间用户
+        // 可能已切走，对当前 active 会话执行 set_plan_mode_next 会改错对象。
+        if (laneDefault === "plan") {
+          try {
+            const laneModeState = await invoke("set_plan_mode_next", { sessionId: meta.id });
+            applyAuthoritativeModeState(meta.id, laneModeState);
+          } catch (laneModeError) {
+            runSyncOnSession(meta.id, function () {
+              addSystemItem(bt("switchModeFailed") + laneModeError);
+            });
+          }
+        }
+        await syncActivePersona();
+        await syncMountedCollection();
+        notify();
+        // 尾部这些 await 期间用户仍可能切走（activeSessionId 已是别的会话）或
+        // 再进草稿（activeSessionId 仍为 null 但 token 已前移）：与 create_session
+        // 窗口同一契约——导航即物化中止，返回 null 让调用方放弃，不得返回切走后
+        // 的 active 让操作漂进新会话（二审 F1、三审 P1）。返回非 null 时 active
+        // 必等于 meta.id 且无任何新导航，调用方重读 state.activeSessionId
+        // 即为目标会话。
+        return navToken === sessionSwitchRequestToken
+          && state.activeSessionId === meta.id ? meta.id : null;
+      } catch (e) {
+        addSystemItem(wireLaneError(e, "newChatFailed"));
+        return null;
+      }
+    })();
+    ensureSessionInFlight = p;
+    try {
+      const result = await p;
+      if (draftOwner && draftOwner.draftEpoch === draftOutcome.epoch) {
+        applyDraftOutcome(draftOutcome);
+      }
+      return result;
+    } finally {
+      // Reset on every path: a lingering in-flight entry would make every
+      // future draft send await a dead promise forever.
+      if (ensureSessionInFlight === p) ensureSessionInFlight = null;
+    }
+  }
+
+function reportSessionSwitchFailure(error, errorScope) { return pinvouSharedweb().reportSessionSwitchFailure(error, errorScope); }
+
+  function invokeOutcome(command, args) {
+    return invoke(command, args).then(function (value) {
+      return { ok: true, value };
+    }, function (error) {
+      return { ok: false, error };
+    });
+  }
+
+  // The transcript is the only navigation-critical payload. Fetch the four
+  // presentation-only states in parallel and commit them once, guarded by the
+  // switch token so a slow response cannot leak into a newer active Session.
+  async function syncSessionPresentationState(sessionId, requestToken) {
+    const results = await Promise.all([
+      invokeOutcome("get_mode_state", { sessionId }),
+      invokeOutcome("get_active_persona", { sessionId }),
+      invokeOutcome("session_mounted_collections_snapshot", { sessionId }),
+      invokeOutcome("session_mounted_collections", { sessionId }),
+      invokeOutcome("session_mounted_collection", { sessionId }),
+      invokeOutcome("get_memory_overview", { sessionId }),
+    ]);
+    if (requestToken !== sessionSwitchRequestToken || state.activeSessionId !== sessionId) return false;
+
+    // 本链路的 modeState 写回同样 bump modeSyncSeq：与会话切换并发在途的
+    // syncModeState 读取互不感知（各自独立校验），不 bump 则两条读取链可
+    // 互相覆盖（评审 P1）。
+    modeSyncSeq += 1;
+    // persona/memory 写回同理 bump 各自序号：本通道与会话切换并发在途的
+    // syncActivePersona / loadMemoryOverview 读取互不感知（各自独立校验
+    // sid+seq），不 bump 则 A→B→A 快速切回时可被旧 sync 响应覆盖(二审补充)。
+    personaSyncSeq += 1;
+    memoryOverviewSeq += 1;
+    const mode = results[0];
+    const persona = results[1];
+    const snapshot = results[2];
+    const collections = results[3];
+    const legacyCollection = results[4];
+    const memory = results[5];
+    state.modeState = mode.ok && mode.value
+      ? { mode: mode.value.mode || "yolo", multiAgent: !!mode.value.multi_agent }
+      : { mode: "yolo", multiAgent: false };
+    state.activePersona = persona.ok && persona.value && !deletedPersonaIds.has(persona.value.id) ? persona.value : null;
+    if (snapshot.ok && snapshot.value && Array.isArray(snapshot.value.collections)) {
+      applyMountedCollections(snapshot.value);
+    } else if (collections.ok && Array.isArray(collections.value)) {
+      applyMountedCollections(collections.value);
+    } else {
+      applyMountedCollections(legacyCollection.ok && legacyCollection.value != null ? [legacyCollection.value] : []);
+    }
+    if (memory.ok) {
+      applyMemoryOverview(memory.value);
+      rehydratePendingMemoryCandidates(memory.value);
+    } else {
+      state.memory = Object.assign({}, state.memory, {
+        loading: false,
+        error: String(memory.error || "memory overview unavailable"),
+      });
+    }
+    notify();
+    return true;
+  }
+
+  function beginSessionPresentationSync(sessionId, requestToken) {
+    state.memory = Object.assign({}, state.memory, { loading: true, error: null });
+    return syncSessionPresentationState(sessionId, requestToken).catch(function (error) {
+      if (requestToken !== sessionSwitchRequestToken || state.activeSessionId !== sessionId) return;
+      state.memory = Object.assign({}, state.memory, { loading: false, error: String(error) });
+      notify();
+      return false;
+    });
+  }
+
+  function publishSessionTranscriptReady(options) {
+    if (options && typeof options.onTranscriptReady === "function") {
+      options.onTranscriptReady();
+    }
+    notify();
+  }
+
+function hydratedMessageKey(message, hideInternalEnvelope) { return pinvouSharedweb().hydratedMessageKey(message, hideInternalEnvelope); }
+function mergeHydratedMessages(durableMessages, liveMessages, hideInternalEnvelope) { return pinvouSharedweb().mergeHydratedMessages(durableMessages, liveMessages, hideInternalEnvelope); }
+
+function mergeHydratedArtifacts(durableArtifacts, liveArtifacts) { return pinvouSharedweb().mergeHydratedArtifacts(durableArtifacts, liveArtifacts); }
+function hydratedChatItemKey(item) { return pinvouSharedweb().hydratedChatItemKey(item); }
+
+  function mergeHydratedChatItems(liveChatItems, liveCurrentStreamId) {let pinvouSharedwebN158313Cache = null;
+function pinvouSharedwebN158313() {
+  if (!pinvouSharedwebN158313Cache) pinvouSharedwebN158313Cache = window.PinvouBridgeShared.create("web:158313", { state });
+  return pinvouSharedwebN158313Cache;
+}
+
+
+    let remappedCurrentStreamId = 0;
+    const availableByKey = Object.create(null);
+function interruptedDisplayRange(item) { return pinvouSharedwebN158313().interruptedDisplayRange(item); }
+    state.chatItems.forEach(function (item, index) {
+      const key = hydratedChatItemKey(item);
+      if (!key) return;
+      if (!availableByKey[key]) availableByKey[key] = [];
+      availableByKey[key].push(index);
+    });
+    (liveChatItems || []).forEach(function (item) {
+      const key = hydratedChatItemKey(item);
+      const range = interruptedDisplayRange(item);
+      let existingIndex = -1;
+      if (range) {
+        for (let rangeIndex = range.start; rangeIndex < range.end; rangeIndex++) {
+          const rangeItem = state.chatItems[rangeIndex];
+          if (rangeItem && rangeItem.interruptedDisplayOnly !== true &&
+              hydratedChatItemKey(rangeItem) === key) {
+            existingIndex = rangeIndex;
+            break;
+          }
+        }
+      } else {
+        const matches = key && availableByKey[key];
+        existingIndex = matches && matches.length ? matches.shift() : -1;
+      }
+      if (existingIndex >= 0) {
+        const existingId = state.chatItems[existingIndex].id;
+        state.chatItems[existingIndex] = Object.assign({}, state.chatItems[existingIndex], item, {
+          id: existingId,
+        });
+        if (item && item.id === liveCurrentStreamId) remappedCurrentStreamId = existingId;
+        return;
+      }
+      const clone = Object.assign({}, item, { id: ++itemIdSeq });
+      if (item && item.id === liveCurrentStreamId) remappedCurrentStreamId = clone.id;
+      if (range && range.end < state.chatItems.length) {
+        state.chatItems.splice(range.end, 0, clone);
+        Object.keys(availableByKey).forEach(function (availableKey) {
+          availableByKey[availableKey] = availableByKey[availableKey].map(function (index) {
+            return index >= range.end ? index + 1 : index;
+          });
+        });
+      } else state.chatItems.push(clone);
+    });
+    return remappedCurrentStreamId;
+  }
+
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy bridge; refactor tracked separately
+  async function switchToSessionInternal(id, preserveScheduledRunContext, errorScope, options) {
+    const requestToken = ++sessionSwitchRequestToken;
+    settlePendingCapabilitySessionSwitch(false);
+    const forceDurableLoad = !!(options && options.forceDurableLoad);
+    let hydrateLiveSession = !!(options && options.hydrateLiveSession);
+    if (!id) {
+      reportSessionSwitchFailure(new Error(bt("runNoSession")), errorScope);
+      return false;
+    }
+    if (hydrateLiveSession && !sessionStates[id]) {
+      sessionStates[id] = freshBuffer();
+      restoreEvictedSessionDraft(id, sessionStates[id]);
+    }
+    const existingBuffer = sessionStates[id];
+    if (existingBuffer && (existingBuffer.remoteTurnActive ||
+        (!existingBuffer.loadedFromDisk &&
+          (existingBuffer.busy || existingBuffer.messages.length || existingBuffer.chatItems.length)))) {
+      // Events can arrive for a running background Session before this Web
+      // client has loaded its durable history. Merge that live tail onto a
+      // desktop snapshot instead of treating the partial buffer as complete.
+      hydrateLiveSession = true;
+    }
+    if (id === state.activeSessionId && !forceDurableLoad && !hydrateLiveSession) {
+      if (!preserveScheduledRunContext) state.scheduledRunContext = null;
+      state.scheduledTaskPendingGuide = null;
+      notify();
+      return true;
+    }
+    // 多 session 并发:切换【不再 cancel】旧 session —— 它在自己的 engine 上继续跑,
+    // 工作集存进 sessionStates 后台累积。切回来能看到完整(含切走期间产生的)内容。
+    // 已有 buffer(切过/在跑)→ 直接换工作集;没有 → load_session 建 buffer + 重渲染。
+    if (sessionStates[id] && sessionStates[id].loadedFromDisk &&
+        !forceDurableLoad && !hydrateLiveSession) {
+      if (!preserveScheduledRunContext) state.scheduledRunContext = null;
+      state.scheduledTaskPendingGuide = null; // 仅在目标会话已确认可用后提交导航状态
+      switchActiveTo(id, null);
+      const cachedPresentationSync = beginSessionPresentationSync(id, requestToken);
+      publishSessionTranscriptReady(options);
+      await cachedPresentationSync;
+      if (requestToken !== sessionSwitchRequestToken || state.activeSessionId !== id) return false;
+      reconcileArtifacts(id); // 对账磁盘产物(fire-and-forget)
+      return true;
+    }
+    let saved;
+    let personaEvents;
+    let pinvouReviews;
+    const pinvouSceneEvents = await syncPinvouSceneEventsForSession(id);
+    let turnTimeline;
+    try {
+      const primary = await Promise.all([
+        loadSessionForClient(id, false),
+        loadPersonaEventsForSession(id),
+        loadPinvouReviewsForSession(id),
+        invoke("get_session_timeline", { sessionId: id }).catch(function () { return []; }),
+      ]);
+      saved = primary[0];
+      personaEvents = primary[1] || [];
+      pinvouReviews = primary[2] || [];
+      turnTimeline = primary[3] || [];
+    } catch (e) {
+      if (IS_WEB && e && e.code === "desktop_capabilities_timeout" &&
+          requestToken === sessionSwitchRequestToken) {
+        // 能力快照迟到的切换进入宽限等待：快照到达就自动重试，并让原调用方
+        // await 到重试的最终结果——scheduled 收尾（terminal 标记/已查看回执/
+        // 返回上下文）与 UI 错误状态始终与最终结果一致；宽限期内快照仍未到
+        // 达才报错并按失败收口，避免“先报错、后台静默重试成功”的状态分裂。
+        const capabilityRetry = {
+          spec: {
+            id,
+            preserveScheduledRunContext,
+            errorScope,
+            options,
+            requestToken,
+          },
+          resolve: null,
+          timer: null,
+        };
+        // await is redundant in an async function return; passing the Promise through has identical semantics.
+        return new Promise(function (resolve) {
+          capabilityRetry.resolve = resolve;
+          capabilityRetry.timer = setTimeout(function () {
+            if (pendingCapabilitySessionSwitch !== capabilityRetry) return;
+            if (capabilityRetry.spec.requestToken !== sessionSwitchRequestToken) {
+              // 等待期间用户已进入草稿（enterDraft 作废旧切换但未收口 pending）：
+              // 按失败静默收口，不在草稿页误报加载失败，与快照到达路径的
+              // “被取代的等待不报错”语义保持一致。
+              settlePendingCapabilitySessionSwitch(false);
+              return;
+            }
+            reportSessionSwitchFailure(e, errorScope);
+            settlePendingCapabilitySessionSwitch(false);
+          }, WEB_CAPABILITY_SWITCH_RETRY_GRACE_MS);
+          pendingCapabilitySessionSwitch = capabilityRetry;
+        });
+      }
+      if (requestToken === sessionSwitchRequestToken) reportSessionSwitchFailure(e, errorScope);
+      return false;
+    }
+    if (requestToken !== sessionSwitchRequestToken) return false;
+    if (!saved || !saved.metadata || !saved.metadata.id) {
+      reportSessionSwitchFailure(new Error(bt("sessionDataInvalid")), errorScope);
+      return false;
+    }
+    raisePinvouSummonHighwater(pinvouReviews); // 验收后才抬底:被拒导航不得抬账目底(JensenChen28 审 P2)
+
+    // load_session 与必要的直接会话数据均成功后，才一次性提交 active/context。
+    if (state.activeSessionId) saveWorkingSetTo(getBuffer(state.activeSessionId));
+    if (!preserveScheduledRunContext) state.scheduledRunContext = null;
+    state.scheduledTaskPendingGuide = null;
+    state.activeSessionId = saved.metadata.id;
+    if (hydrateLiveSession) {
+      const liveBuffer = sessionStates[id] || freshBuffer();
+      loadWorkingSetFrom(liveBuffer);
+      const liveMessages = Array.isArray(state.messages) ? [...state.messages] : [];
+      const liveChatItems = Array.isArray(state.chatItems) ? [...state.chatItems] : [];
+      const liveArtifacts = Array.isArray(state.artifacts) ? [...state.artifacts] : [];
+      const liveCurrentStreamId = currentStreamId;
+      const hasLivePresentation = !!state.busy || !!currentStreamText || !!pendingAssistantText ||
+        (Array.isArray(pendingAssistantBlocks) && pendingAssistantBlocks.length > 0);
+      state.messages = mergeHydratedMessages(
+        saved.messages,
+        liveMessages,
+        isScheduledRunSession(id)
+      );
+      state.personaEvents = personaEvents.length ? personaEvents : (liveBuffer.personaEvents || []);
+      state.pinvouReviews = pinvouReviews.length ? pinvouReviews : (liveBuffer.pinvouReviews || []);
+      state.pinvouSceneEvents = pinvouSceneEvents.length ? pinvouSceneEvents : (liveBuffer.pinvouSceneEvents || []);
+      state.turnTimeline = turnTimeline.length ? turnTimeline : (liveBuffer.turnTimeline || []);
+      state.artifacts = filterSessionArtifacts(
+        mergeHydratedArtifacts(saved.artifacts, liveArtifacts),
+        state.activeSessionId
+      );
+      // Live hydration: toolMeta may hold in-flight tool entries
+      // (tool_use not yet in messages); keep them for the later
+      // chat:tool_end.
+      rerenderFromMessages({ keepLiveToolMeta: true });
+      if (hasLivePresentation) {
+        currentStreamId = mergeHydratedChatItems(liveChatItems, liveCurrentStreamId);
+      } else {
+        resetPendingAssistant();
+      }
+      liveBuffer.loadedFromDisk = true;
+      liveBuffer.sessionRevision = String(saved.transcript_revision || saved.transcriptRevision || "");
+      saveWorkingSetTo(liveBuffer);
+    } else {
+      sessionStates[id] = freshBuffer();
+      // The slow-path disk rehydration bypasses getBuffer; the draft stashed at eviction time must be restored here.
+      restoreEvictedSessionDraft(id, sessionStates[id]);
+      loadWorkingSetFrom(sessionStates[id]);
+      state.messages = Array.isArray(saved.messages) ? saved.messages : [];
+      sessionStates[id].loadedFromDisk = true;
+      sessionStates[id].sessionRevision = String(saved.transcript_revision || saved.transcriptRevision || "");
+      state.personaEvents = personaEvents;
+      state.pinvouReviews = pinvouReviews;
+      state.pinvouSceneEvents = pinvouSceneEvents;
+      state.turnTimeline = turnTimeline;
+      resetPendingAssistant();
+      state.chatItems = [];
+      state.artifacts = mergeHydratedArtifacts(saved.artifacts, []);
+      state.artifacts = filterSessionArtifacts(state.artifacts, state.activeSessionId);
+      rerenderFromMessages();
+    }
+    // The full-load path rebuilds tool cards after the active workspace is
+    // selected. Start Shell reconciliation only after that rebuild; polling
+    // earlier can attach task ids to a transient card which hydration replaces.
+    scheduleShellPoll(id, true);
+    const presentationSync = beginSessionPresentationSync(id, requestToken);
+    publishSessionTranscriptReady(options);
+    await presentationSync;
+    if (requestToken !== sessionSwitchRequestToken || state.activeSessionId !== saved.metadata.id) return false;
+    reconcileArtifacts(id); // 对账磁盘产物(修重启/跟踪遗漏导致的面板缺文件)
+    return true;
+  }
+  function settlePendingCapabilitySessionSwitch(outcome) {
+    const pending = pendingCapabilitySessionSwitch;
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    pendingCapabilitySessionSwitch = null;
+    pending.resolve(outcome);
+  }
+  function retryCapabilityBlockedSessionSwitch() {
+    const pending = pendingCapabilitySessionSwitch;
+    if (!pending || !webInvokeCapabilitiesReady()) return;
+    if (pending.spec.requestToken !== sessionSwitchRequestToken) {
+      // 已有更新的切换请求：按失败收口旧调用方，不让其悬停等待。
+      settlePendingCapabilitySessionSwitch(false);
+      return;
+    }
+    if (pending.timer) clearTimeout(pending.timer);
+    pendingCapabilitySessionSwitch = null;
+    switchToSessionInternal(
+      pending.spec.id,
+      pending.spec.preserveScheduledRunContext,
+      pending.spec.errorScope,
+      pending.spec.options
+    ).catch(function () { return false; }).then(function (switched) {
+      pending.resolve(switched);
+    });
+  }
+
+async function switchToSession(id) { return pinvouSharedweb().switchToSession(id); }
+
+  async function openScheduledRunChatOnce(run, task) {
+    const sessionId = run && typeof run.sessionId === "string" ? run.sessionId.trim() : "";
+    if (!sessionId) {
+      reportSessionSwitchFailure(new Error(bt("runNoSession")), "scheduled");
+      return false;
+    }
+    rememberScheduledRunOwner(run);
+    const runStatus = String(run && run.status || "").toLowerCase();
+    let openActivation = null;
+    if (runStatus === "queued" || runStatus === "running") {
+      openActivation = beginScheduledOpenActivation(sessionId);
+    } else {
+      scheduledRunBuffer(sessionId);
+    }
+    setScheduledTaskError(null);
+    notify();
+    const returnSessionId = state.scheduledRunContext
+      ? state.scheduledRunContext.returnSessionId
+      : state.activeSessionId;
+    const automationId = (run && run.automationId) || (task && task.id) || null;
+    const runId = (run && (run.runId || run.id)) || null;
+    const scheduledContext = {
+      sessionId,
+      returnSessionId,
+      automationId,
+      runId,
+      taskName: (task && task.name) || (run && (run.taskName || run.name)) || "",
+      model: (task && task.model) || (run && run.taskModel) || null,
+      mode: "yolo",
+    };
+    const liveBuffer = sessionStates[sessionId];
+    const hasLiveTurn = !!(liveBuffer && (
+      liveBuffer.busy ||
+      liveBuffer.scheduledInitialTurnPhase === "active" ||
+      (liveBuffer.queued && liveBuffer.queued.length) ||
+      (liveBuffer.thinking && liveBuffer.thinking.active)
+    ));
+    const isTerminalRun = ["completed", "failed", "canceled"].includes(runStatus);
+    const forceDurableLoad = isTerminalRun && !hasLiveTurn;
+    const switched = await switchToSessionInternal(sessionId, true, "scheduled", {
+      forceDurableLoad,
+      hydrateLiveSession: !isTerminalRun,
+      onTranscriptReady: function () {
+        state.scheduledRunContext = scheduledContext;
+      },
+    });
+    if (!switched) {
+      rollbackScheduledOpenActivation(openActivation);
+      notify();
+      return false;
+    }
+    if (forceDurableLoad) markScheduledInitialTurnTerminal(sessionId);
+    else scheduledRunBuffer(sessionId);
+    // 先发布完整会话视图；只有已完成的运行才持久化为已查看。
+    notify();
+    if (automationId && runId && runStatus === "completed") {
+      try {
+        const receipt = await invoke("mark_scheduled_run_viewed", {
+          automationId,
+          runId,
+        });
+        invalidateScheduledTaskReads(automationId);
+        applyScheduledRunViewed(automationId, runId, receipt);
+      } catch (e) {
+        setScheduledTaskError(e, "action");
+      }
+    }
+    notify();
+    return true;
+  }
+
+function openScheduledRunChat(run, task) { return pinvouSharedweb().openScheduledRunChat(run, task); }
+
+async function exitScheduledRunChat() { return pinvouSharedweb().exitScheduledRunChat(); }
+
+
+
+
+
+  // Session storage is authoritative in Rust, but every desktop/Web frontend
+  // owns a separate presentation index. Apply the committed deletion event
+  // idempotently in either client so a remote delete cannot leave an ENOENT
+  // sidebar row behind in the other one.
+function applyDeletedSession(id) { return pinvouSharedweb().applyDeletedSession(id); }
+
+function onSessionDeleted(listener) { return pinvouSharedweb().onSessionDeleted(listener); }
+
+  async function deleteSession(id) {
+    try {
+      // 后端按 SessionKind 分发:定时运行会话在 delete_session 里联动删除
+      // 该次 Session、Run 与底座 Task,任务定义与共享工作间保留。
+      await invoke("delete_session", { id });
+      // Reuse the unified cleanup path shared by remote events and local operations,
+      // and preserve the result semantics needed by batch operations.
+      return applyDeletedSession(id);
+    } catch (e) {
+      addSystemItem(wireLaneError(e, "deleteFailed"));
+      return false;
+    }
+  }
+
+async function renameSession(id, title) { return pinvouSharedweb().renameSession(id, title); }
+
+async function toggleSessionPinned(id, pinned) { return pinvouSharedweb().toggleSessionPinned(id, pinned); }
+
+async function archiveSession(id) { return pinvouSharedweb().archiveSession(id); }
+
+async function restoreArchivedSession(id) { return pinvouSharedweb().restoreArchivedSession(id); }
+
+  // 实时态有专属气泡的工具（方案卡），重建时要还原成原卡而非普通工具卡。
+  const PLAN_TOOLS = new Set(["update_plan", "checklist_write", "todo_write"]);
+
+  // tool_result.content 可能是 string 或 Anthropic content blocks 数组，归一成纯文本。
+
+
+
+function toolResultDisplayContent(content) { return pinvouSharedweb().toolResultDisplayContent(content); }
+
+  // plan 类工具结果格式："...updated:\n{json}"——切第一个换行后 parse（与 engine.rs 一致）。
+
+  // request_user_input 结果是纯 JSON {answers:[{id,label,value}]}（turn_loop.rs ToolResult::json）。
+  // 按 question.id 匹配，还原成 UserInputCard 的 answers 数组（顺序对齐 questions）。
+  // multi_select 多选保留全部同 id 答案、不塌缩（与 code-native-lane parseNativeUserAnswers 对齐）。
+
+  // careful hook 拦截结果(shell.rs BLOCKED 固定格式)→ 反解出 careful_blocked 卡所需 metadata。
+  // metadata 不进持久化 messages,session 重载只能从 tool_result 文本识别,否则 🛑 红卡重启即丢。
+
+  // isInternalRuntimeUserMessage（live 路径同一判定）与共享 userMessageDisplayText 的
+  // 信封判定等价：历史重载与实时事件两条展示路径共用同一判定，避免两处实现漂移。
+
+  // Engine 的运行时恢复提示为了兼容模型协议会以 role=user 持久化，但它不是用户输入。
+  // 子智能体完成交接同理：结果必须留在父模型上下文，但不能冒充用户消息上屏。
+  // 原始 blocks 必须保留给模型续聊；展示层只隐藏该内部消息，避免伪装成用户气泡/新 Turn。
+  // 定时会话还会过滤送模 envelope，只投影真实任务正文。
+  function userMessageDisplayText(blocks, hideInternalEnvelope) { return pinvouSharedweb().userMessageDisplayText(blocks, hideInternalEnvelope); }
+
+  // ── Rerender from messages (session restore) ─────────────────────
+  // opts.keepLiveToolMeta: passed when hydrating a live session
+  // (hydrateLiveSession) — toolMeta may hold entries for in-flight
+  // tools (tool_use not yet in messages), and clearing it would leave
+  // the later chat:tool_end without its meta (stuck selection card /
+  // degraded artifact card).
+  function rerenderFromMessages(opts) {let pinvouSharedwebN189622Cache = null;
+function pinvouSharedwebN189622() {
+  if (!pinvouSharedwebN189622Cache) pinvouSharedwebN189622Cache = window.PinvouBridgeShared.create("web:189622", { pe, addChatItem, bt });
+  return pinvouSharedwebN189622Cache;
+}
+
+
+    // 卡牌事件按 pos 插回原位(pos=事件发生时的 messages 数)。让重载历史不割裂。
+    const pe = Array.isArray(state.personaEvents) ? state.personaEvents : [];
+function emitPersonaAt(atOrAfter, isTail) { return pinvouSharedwebN189622().emitPersonaAt(atOrAfter, isTail); }
+    // 重放主体在 shared/bridge-shared-helpers.js 的 rerenderFromMessagesCore；
+    // 以下为 web lane 的差异 hooks（无 steering / toolMeta 全量重建且不删 /
+    // careful_blocked 卡附 toolCallId / 无未决 sweep）。
+    return pinvouSharedweb().rerenderFromMessagesCore({
+      itemIdSeq: { get value() { return itemIdSeq; }, set value(v) { itemIdSeq = v; } },
+      toolMeta: { get value() { return toolMeta; }, set value(v) { toolMeta = v; } },
+      emitPersonaAt,
+      userMessageDisplayText,
+      updateToolItem,
+      PLAN_TOOLS,
+      renderMarkdown,
+      markSteered: function () {},
+      carefulBlockedItem: function (c, tm, blockedMd) {
+        return {
+          type: "careful_blocked", toolCallId: c.tool_use_id,
+          args: tm.args, metadata: blockedMd, time: "",
+        };
+      },
+      afterToolResultBackfill: function () {},
+      // Replay re-adds every historical tool_use's metadata (including
+      // write/patch's large args) to toolMeta for tool_result backfill and
+      // never deletes after backfill — the residue resides in the buffer
+      // with the working set, and memory is bounded by the 32-entry
+      // all-session LRU cap (desktop lane instead rebuilds only entries
+      // with a pending result and deletes right after consuming).
+      rebuildToolMeta: function (b) {
+        toolMeta[b.id] = { name: b.name, args: b.input };
+      },
+      sweepUnsettledTools: function () {},
+    }, opts);
+  }
+
+  function updateToolItem(toolId, output, success) { return pinvouSharedweb().updateToolItem(toolId, output, success); }
+
+  // keep in sync with tauri/bridge/terminal.js
+  const SHELL_TOOL_NAMES = ["bash", "exec_shell", "exec_shell_wait", "exec_wait", "task_shell_start", "task_shell_wait", "shell", "Bash"];
+  const SHELL_WAIT_TOOL_NAMES = ["exec_shell_wait", "exec_wait", "task_shell_wait"];
+
+function isShellExecutionTool(name) { return pinvouSharedweb().isShellExecutionTool(name); }
+
+  function latestShellToolIsWaitObserver() {
+    for (let i = state.chatItems.length - 1; i >= 0; i--) {
+      const item = state.chatItems[i];
+      if (item && item.type === "tool" &&
+          (isShellExecutionTool(item.name) || SHELL_WAIT_TOOL_NAMES.includes(item.name))) {
+        // Lowercase `bash` is canonical in v0.9.12. Uppercase `Bash` and the
+        // dedicated wait names remain here for replayed legacy sessions.
+        return SHELL_WAIT_TOOL_NAMES.includes(item.name) ||
+          (item.name === "Bash" && item.args != null && item.args.action === "wait");
+      }
+    }
+    return false;
+  }
+
+  function mentionsShellTool(text) {
+    // 子智能体的工具调用不产生 chat:tool_start，forwarder 把 mailbox 的
+    // ToolCallStarted 转成 multiagent:agent_progress（status 形如
+    // "🔧 bash (step 3)"，历史记录也可能是 exec_shell）。据此调度快照轮询，让子 agent 的后台
+    // shell 任务被 applyShellSnapshots 发现。
+    const raw = String(text || "");
+    return SHELL_TOOL_NAMES.some((name) => raw.includes(name));
+  }
+
+
+
+  // Shell snapshots are a tail view, not an append-only byte stream. Normalize
+  // terminal control sequences and state omissions explicitly instead of
+  // pretending the visible tail is the complete log.
+  function normalizeTerminalTail(text) {
+    // terminal control sequences are protocol content themselves (OSC/CSI/DEL); match them verbatim. See the eslint-disable-line comments below.
+    const value = String(text || "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: protocol delimiters: ESC/BEL/ST are terminal protocol bytes, same rationale as the eslint comment on the same line
+      .replaceAll(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "") // eslint-disable-line no-control-regex, sonarjs/no-control-regex -- OSC terminator (BEL/ST) and ESC are terminal protocol bytes
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: protocol delimiters: CSI sequences follow the terminal protocol definition
+      .replaceAll(/\x1B\[[0-?]*[ -/]*[@-~]/g, ""); // eslint-disable-line no-control-regex -- CSI sequences follow the protocol definition
+    const out = [];
+    value.split("\n").forEach(function (line) {
+      // After splitting on LF, a normal Windows CRLF line still ends in CR.
+      // Remove that delimiter first; only an *internal* CR means a terminal
+      // progress line overwrote earlier content on the same row.
+      let visible = line.endsWith("\r") ? line.slice(0, -1) : line;
+      const overwriteAt = visible.lastIndexOf("\r");
+      if (overwriteAt >= 0) visible = visible.slice(overwriteAt + 1);
+      while (visible.includes("\x08")) {
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: protocol delimiters: backspace is a terminal protocol byte
+        visible = visible.replaceAll(/[^\x08]\x08/g, "").replace(/^\x08+/, ""); // eslint-disable-line no-control-regex, sonarjs/no-control-regex -- backspace is a terminal protocol byte
+      }
+      out.push(visible);
+    });
+    return out.join("\n");
+  }
+
+
+
+
+
+
+
+
+
+
+
+function scheduleShellPoll(sid, immediate) { return pinvouSharedweb().scheduleShellPoll(sid, immediate); }
+
+
+
+  async function cancelShellTask(sessionId, taskId) {
+    if (!sessionId || !taskId) throw new Error("Missing shell task identity");
+    try {
+      await invoke("cancel_shell_task", { sessionId, taskId });
+    } finally {
+      scheduleShellPoll(sessionId, true);
+    }
+  }
+
+  // 找最后一条匹配的 chat item（用于卡片状态机更新）
+function patchLastItem(pred, patch) { return pinvouSharedweb().patchLastItem(pred, patch); }
+  // 是否已存在未处理（未 resolved）的某类型卡片 —— 防重复插入
+function hasUnresolvedItem(type) { return pinvouSharedweb().hasUnresolvedItem(type); }
+
+  // ── 产物跟踪 ─────────────────────────────────────────────────────
+function basename(p) { return pinvouSharedweb().basename(p); }
+function isAbsPath(p) { return pinvouSharedweb().isAbsPath(p); }
+function normalizedPath(p) { return pinvouSharedweb().normalizedPath(p); }
+function noteArtifactChange(path, event, sessionId) { return pinvouSharedweb().noteArtifactChange(path, event, sessionId); }
+function isSharedMcpArtifactPath(path) { return pinvouSharedweb().isSharedMcpArtifactPath(path); }
+function artifactBelongsToSession(path, sid) { return pinvouSharedweb().artifactBelongsToSession(path, sid); }
+function filterSessionArtifacts(artifacts, sid) { return pinvouSharedweb().filterSessionArtifacts(artifacts, sid); }
+  // 「成品型」扩展名:write_file 写出这类文件即自动当成品进面板(模型常忘 present_artifact)。
+  // 办公文档 + markdown 报告 + 数据表 + 图片 + 打包件都算成品(覆盖 AI 常见产出格式)。
+  // 中间/草稿(.txt/.json/.xml 等)刻意不在此列 → 不进面板,避免一堆过程文件污染产物列表;
+  // 这类格式若确是成品,靠模型 present_artifact 显式挂出(present 过的不受扩展名门控)。
+  const DELIVERABLE_EXTS = new Set([
+    "pptx", "ppt", "docx", "doc", "pdf", "html", "htm", "xlsx", "xls",
+    "md", "csv", "png", "jpg", "jpeg", "svg", "gif", "webp", "zip",
+  ]);
+
+function isDeliverable(path) { return pinvouSharedweb().isDeliverable(path); }
+  function trackArtifact(path) {
+    if (!path) return;
+    if (state.activeSessionId && !artifactBelongsToSession(path, state.activeSessionId)) return;
+    const bn = basename(path);
+    for (let i = 0; i < state.artifacts.length; i++) {
+      if (basename(state.artifacts[i].path) === bn) {
+        // 已有同名:write_file 跟踪的是相对路径、disk watcher 推的是绝对路径——同一文件
+        // 两种 path 会重复。新 path 绝对而旧的相对则用绝对替换(open 可靠),否则忽略重复。
+        if (isAbsPath(path) && !isAbsPath(state.artifacts[i].path)) {
+          state.artifacts[i] = { path, basename: bn };
+          notify();
+        }
+        return;
+      }
+    }
+    state.artifacts.push({ path, basename: bn });
+    notify();
+  }
+function markTurnDirtyArtifact(path) { return pinvouSharedweb().markTurnDirtyArtifact(path); }
+function untrackArtifact(path) { return pinvouSharedweb().untrackArtifact(path); }
+  // Prefer an exact normalized path so an older card is not hidden by a newer
+  // same-named artifact from another directory. Fall back to the basename for
+  // persisted relative paths that must reconcile with an absolute watcher path.
+function findPresentedArtifact(path) { return pinvouSharedweb().findPresentedArtifact(path); }
+  // Updates an existing presentation card in place (stable id and position)
+  // instead of appending a duplicate card. Returns null when the caller must
+  // append a fresh card instead:
+  // - no card for this basename yet, or the matching card's absolute path
+  //   differs from the presented path (same-named files in different
+  //   directories are distinct artifacts, never rewritten into each other);
+  // - a user message is newer than the existing card with no file mutation
+  //   after it: the model is answering a fresh "show it again" request, and
+  //   replaying that turn must stay a visible new card.
+function updatePresentedArtifact(card) { return pinvouSharedweb().updatePresentedArtifact(card); }
+  // 切换 session 时对账:扫 workspace 磁盘,把实际存在、但跟踪列表里没有的文件补进来。
+  // 修「文件已生成在盘上、却因 app 中途重启/跟踪遗漏而不在产物面板」(以磁盘为准)。
+  async function reconcileArtifacts(sid) { return pinvouSharedweb().reconcileArtifacts(sid); }
+  function extractArtifactPaths(args) { return pinvouSharedweb().extractArtifactPaths(args); }
+
+function fileMutationAction(name, args) { return pinvouSharedweb().fileMutationAction(name, args); }
+
+  // ── Plan markdown 拼接（accept 时发给后端，与 main.js 对齐）────────
+function composePlanMarkdown(snapshots) { return pinvouSharedweb().composePlanMarkdown(snapshots); }
+
+  // ── Send message ─────────────────────────────────────────────────
+  // 指定 session 是否正在生成(active 看工作集 busy,后台看其 buffer)。
+function isBusyFor(sid) { return pinvouSharedweb().isBusyFor(sid); }
+function formatAttachmentDisplayText(text, attachments) { return pinvouSharedweb().formatAttachmentDisplayText(text, attachments); }
+
+function makeQueuedMessage(id, userText, payloadText, displayText, attachments, meta, restrictTools) { return pinvouSharedweb().makeQueuedMessage(id, userText, payloadText, displayText, attachments, meta, restrictTools); }
+function rebuiltQueuedPayload(item, userText) { return pinvouSharedweb().rebuiltQueuedPayload(item, userText); }
+function rebuiltQueuedMetaPayload(item, userText) { return pinvouSharedweb().rebuiltQueuedMetaPayload(item, userText); }
+  // 桌宠窗口靠全局事件感知回合起止,但 Web 端没有宠物窗口(capabilities.pet=false),
+  // 且 bootstrap 的事件 emit 本身就是 no-op:这里保留调用点形状,不做广播。
+  function emitPetEvent() {
+    /* 桌宠是纯装饰,Web 端不广播 */
+  }
+
+  // 后端命令错误的展示文本:稳定错误码(如 image_input_unsupported,与
+  // src-tauri chat.rs IMAGE_INPUT_*_ERROR 对应)按码替换为三语指引,而非剥前缀
+  // 透传后端硬编码中文——英/日界面不该看到中文结论;文案与 ChatView 前置警告
+  // (t.uiAttachments.*)同源语义。与 tauri bridge chat.js 同一口径。
+  // 远端折叠错误码(remote_control.rs 折叠族,原生错误链只留在桌面日志)与
+  // edit_last_turn 乐观并发护栏码在此映射为三语文案;未识别文本仍走下方
+  // 脱敏兜底。码表与 Rust 侧 stable_web_error_codes_are_locked 同步演进。
+  const WEB_TURN_ERROR_KEYS = {
+    web_session_chat_failed: "webChatFailed",
+    // 专属完整句文案:复用 newChatFailed(供 wireLaneError 拼接细节的前缀串)
+    // 会渲染成悬空冒号。码表与 Rust 侧 stable_web_error_codes_are_locked 同步演进。
+    web_session_create_session_failed: "webSessionCreateFailed",
+    web_session_turn_in_progress: "turnAlreadyInProgress",
+    session_revision_conflict: "editStaleRevision",
+    session_revision_unavailable: "editRevisionUnavailable",
+    web_artifact_too_large: "artifactTooLarge",
+    web_artifact_preview_too_large: "artifactPreviewTooLarge",
+    web_artifact_edit_too_large: "artifactEditTooLarge",
+    web_artifact_read_failed: "artifactReadFailed",
+    web_session_read_artifact_chunk_failed: "artifactReadFailed",
+    web_session_artifact_access_failed: "artifactReadFailed",
+    web_session_read_conversation_attachment_chunk_failed: "attachReadFailed",
+    // Round-9 复审:下载车道可达的 admission 层码——瞬态的
+    // web_session_unavailable 与确定态的 invalid_web_session_id 此前落兜
+    // 底,渲染原始码或后端语言的 admission 文案。
+    web_session_unavailable: "webSessionUnavailable",
+    invalid_web_session_id: "webSessionUnavailable",
+  };
+  function displayTurnError(err) {
+    // RPC rejections arrive as Error objects (bootstrap.js wraps message.error
+    // in new Error), Tauri invoke rejections as plain strings; prefer
+    // Error.message over toString() so stable codes match without the
+    // "Error: " prefix that toString() prepends.
+    const text = String(err && err.message ? err.message : err || "");
+    if (text.indexOf("image_input_unsupported") === 0) {
+      return text.includes("能力未知") ? bt("imageUnknown") : bt("imageUnsupported");
+    }
+    // session_model_binding_stale:<missing id> (engine_pool.rs
+    // SESSION_MODEL_BINDING_STALE_ERROR) → localized copy carrying the id.
+    if (text.indexOf("session_model_binding_stale") === 0) {
+      return bt("sessionModelStale")(
+        text.slice("session_model_binding_stale:".length).trim(),
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(WEB_TURN_ERROR_KEYS, text)) {
+      return bt(WEB_TURN_ERROR_KEYS[text]);
+    }
+    // Same policy as the tauri bridge: redact raw submit-failure bodies
+    // before display (classification may miss, credentials must not). Pass
+    // state so the placeholder matches the UI language. If the helper is
+    // missing, return raw and keep the previous behavior.
+    if (window.PinvouBridgeMessages && typeof window.PinvouBridgeMessages.redactRawError === "function") {
+      return window.PinvouBridgeMessages.redactRawError(text, state);
+    }
+    return text;
+  }
+
+  // 侧车道(建聊/删除/打开产物与附件)的同一码表消费:折叠码替换为三语
+  // 文案而非拼接原始机器码;未识别文本保持「前缀 + 原文」的既有行为。
+  // 与 displayTurnError 的差别仅在兜底:侧车道保留各自的失败前缀文案。
+  // 查表与 displayTurnError 同款 hasOwnProperty 守卫:裸原型链查找会把
+  // 恰好同名的错误文本("constructor"/"valueOf"/…)映射成非字符串真值,
+  // 渲染出 "undefined" 并吞掉真实错误(Round-11 复审 minor)。
+  function wireLaneError(err, prefixKey) {
+    const text = String(err && err.message ? err.message : err || "");
+    if (Object.prototype.hasOwnProperty.call(WEB_TURN_ERROR_KEYS, text)) {
+      return bt(WEB_TURN_ERROR_KEYS[text]);
+    }
+    return bt(prefixKey) + text;
+  }
+
+  // 真正发送:在 sid 的工作集上加 user 气泡 + 流式占位 + busy,然后 invoke chat。
+  // active/后台通用(后台走 runSyncOnSession 临时切工作集)。
+  function doSendFor(sid, text, displayText, attachmentsPayload, meta, restrictTools, surfaceFailure) {
+    turnUsageDirty[sid] = false; // 新一轮开始，重置口径保护
+    const turnOwnerBuffer = getBuffer(sid);
+    let submittedMessage = null;
+    let submittedMessagePos = -1;
+    let submittedUserItemId = 0;
+    let submittedStreamId = 0;
+    if (turnOwnerBuffer && turnOwnerBuffer.remoteTurnActive) {
+      recordAuthoritySyncDiagnostic("local_send_blocked_by_remote_sync", authoritySyncBufferSnapshot(sid, turnOwnerBuffer));
+      return Promise.reject(new Error(bt("turnSyncRejected")));
+    }
+    if (turnOwnerBuffer) {
+      turnOwnerBuffer.localTurnOwned = true;
+      turnOwnerBuffer.remoteTurnActive = false;
+      turnOwnerBuffer.remoteTerminalSeen = false;
+      turnOwnerBuffer.remoteCommittedRevision = "";
+      recordAuthoritySyncDiagnostic("local_turn_claimed", Object.assign({
+        operation: "send",
+      }, authoritySyncBufferSnapshot(sid, turnOwnerBuffer)));
+    }
+    runSyncOnSession(sid, function () {
+      state.chatItems = state.chatItems.filter(function (item) {
+        return !item.turnErrorNotice && !item.authoritySyncNotice;
+      });
+      const uitem = {
+        type: "user",
+        text: displayText,
+        time: timeStr(),
+        messageIndex: state.messages.length,
+      };
+      if (meta && meta.pinvouTransfer) uitem.pinvouTransfer = meta.pinvouTransfer; // 仅展示层,不进 messages/LLM
+      if (meta && meta.pinvouScene) uitem.pinvouScene = meta.pinvouScene; // 仅展示层,不进 messages/LLM
+      addChatItem(uitem);
+      submittedUserItemId = uitem.id;
+      submittedMessage = { role: "user", content: [{ type: "text", text: displayText }] };
+      submittedMessagePos = state.messages.length;
+      state.messages.push(submittedMessage);
+      state.busy = true;
+      startThinking();
+      currentStreamText = "";
+      currentStreamId = ++itemIdSeq;
+      submittedStreamId = currentStreamId;
+      state.chatItems.push({ id: currentStreamId, type: "assistant", text: "", html: "", time: timeStr(), streaming: true });
+    });
+    notify();
+    emitPetEvent();
+    const chatCommand = "web_access_chat";
+    const chatArgs = {
+      message: text,
+      attachmentHandles: (attachmentsPayload || []).map(function (attachment) {
+        return attachment && attachment.handle;
+      }).filter(Boolean),
+      sessionId: sid,
+      restrictTools: !!restrictTools,
+    };
+    return invoke(chatCommand, chatArgs)
+      .then(function () {
+        // 新一轮已被后端受理：会话中未提交的「打开」（pending enable）自此进入
+        // 上下文并锁死（ComposerToolMenu 监听）。bridge 层不反向依赖 features，
+        // 经 shared/tool-store-events.js 派发。
+        try { window.PinvouToolStoreEvents.notifyChatRoundCommitted(); } catch { /* silently ignored */ }
+        recordAuthoritySyncDiagnostic("local_turn_admitted", Object.assign({
+          operation: "send",
+        }, authoritySyncBufferSnapshot(sid, turnOwnerBuffer)));
+        if (turnOwnerBuffer) turnOwnerBuffer.deferredRemoteUserEvent = null;
+        if (meta && meta.pinvouScene) {
+          runSyncOnSession(sid, function () {
+            recordPinvouSceneForMessage(sid, submittedMessagePos, meta.pinvouScene);
+          });
+        }
+        return true;
+      })
+      .catch(function (err) {
+        // web_access_chat 在 Rust 侧全量折叠:这里只会收到稳定码,busy 的
+        // 码 `web_session_turn_in_progress` 按契约保留 `session_turn_in_progress`
+        // 后缀——按完整码锚定,与折叠器的锚定契约互为镜像。
+        const errorText = String(err && err.message ? err.message : err || "");
+        const concurrentTurn = errorText.includes("web_session_turn_in_progress");
+        recordAuthoritySyncDiagnostic("local_turn_admission_failed", Object.assign({
+          operation: "send",
+          concurrent_turn: concurrentTurn,
+          error_category: concurrentTurn ? "session_turn_in_progress" : "command_rejected",
+          error_present: true,
+        }, authoritySyncBufferSnapshot(sid, turnOwnerBuffer)));
+        if (turnOwnerBuffer) turnOwnerBuffer.localTurnOwned = false;
+        emitPetEvent();
+        runSyncOnSession(sid, function () {
+          // 按引用移除本地乐观提交：buffer 权威重载后引用自然消失，无需按位置
+          // 二次限定（位置过滤在"引用仍在但位置移动"时会残留本地消息，且与
+          // tauri 端纯身份过滤分叉——审计后回退该谓词微调）。
+          state.messages = state.messages.filter(function (message) { return message !== submittedMessage; });
+          state.chatItems = state.chatItems.filter(function (item) {
+            return item.id !== submittedUserItemId && item.id !== submittedStreamId;
+          });
+          flushPendingStreamRender(); // admission reject mid-stream: emit final html before the reset
+          resetPendingAssistant();
+          state.busy = false;
+          stopThinking();
+        });
+        const deferredApplied = applyDeferredRemoteUserMessage(sid, turnOwnerBuffer);
+        if (concurrentTurn && turnOwnerBuffer && !deferredApplied) {
+          markRemoteTurn(sid, turnOwnerBuffer, false, "local_send_concurrent_turn");
+        }
+        runSyncOnSession(sid, function () {
+          addSystemItem(concurrentTurn
+            ? bt("turnAlreadyInProgress")
+            : "⚠️ " + displayTurnError(err), {
+            turnErrorNotice: true,
+          });
+        });
+        notify();
+        if (surfaceFailure) throw err;
+        return false;
+      });
+  }
+  // 本轮跑完(或被停止)后,若该 session 不忙且有排队消息 → 严格按 FIFO
+  // 只发送队首一条。剩余消息留给后续 turn 的 done 继续逐条触发，避免把用户
+  // 连续输入的多个独立任务合并成一个模型请求。
+  function flushQueued(sid) {
+    const pendingBuffer = sessionStates[sid];
+    if (pendingBuffer && pendingBuffer.remoteTurnActive) {
+      reconcileRemoteTurn(sid).then(function (ready) {
+        if (ready) flushQueued(sid);
+      }).catch(function () {});
+      return;
+    }
+    if (isBusyFor(sid)) return;            // 已在生成中（新一轮已起）→ 留给那轮的 done 再 flush
+    const q = sid === state.activeSessionId ? state.queued : (sessionStates[sid] && sessionStates[sid].queued);
+    if (!q || q.length === 0) return;
+    const item = q.shift();
+    const attachments = item.attachments || [];
+    const displayText = item.displayText == null
+      ? formatAttachmentDisplayText(item.text, attachments)
+      : item.displayText;
+    notify();
+    doSendFor(sid, item.payloadText == null ? item.text : item.payloadText, displayText, attachments, item.meta || null, !!item.restrictTools, true)
+      .catch(function () {
+        const retryQueue = sid === state.activeSessionId
+          ? state.queued
+          : (sessionStates[sid] && sessionStates[sid].queued);
+        if (!retryQueue) return;
+        retryQueue.unshift(item);
+        notify();
+      });
+  }
+
+  async function sendMessageToSession(sessionId, text, meta) { return pinvouSharedweb().sendMessageToSession(sessionId, text, meta); }
+
+  // ── Aux chat ─────────────────────────────────────────────────────
+  // The domain bodies live in the shared lane (cluster "auxChat" in
+  // src/shared/bridge-shared-helpers.js, round-31 M7): aux sessions are
+  // filtered out of list_sessions by the backend (they never enter
+  // state.sessions), so sendMessageToSession cannot be reused; turn events
+  // are still routed into the per-session buffer by the existing chat:*
+  // listeners keyed on session_id. This lane keeps only its genuine
+  // difference — the send dispatch (command parity with doSendFor: Web goes
+  // through web_access_chat, the attachment-handle channel; a desktop host
+  // of this file goes through chat). The web-only session_turn_in_progress
+  // translation wrapper is gone (M7): both lanes hit the same backend turn
+  // gate, and the aux-chat controller only console.warns send errors while
+  // the panel renders the static localized sendFailed copy — the translated
+  // text never reached the user on either lane.
+  function auxChatSendDispatch(sid, message) {
+    return IS_WEB
+      ? invoke("web_access_chat", { message, attachmentHandles: [], sessionId: sid, restrictTools: true })
+      : invoke("chat", { message, attachments: [], sessionId: sid, restrictTools: true });
+  }
+  const auxChatShared = window.PinvouBridgeShared.create("auxChat", {
+    state, invoke, bt,
+    sessionStates: { get value() { return sessionStates; } },
+    ensureSessionBufferLoaded, purgeSessionBuffer, touchSessionBuffer, isBusyFor,
+    auxChatDispatch: auxChatSendDispatch,
+  });
+  const auxChatEnsure = auxChatShared.auxChatEnsure;
+  const auxChatSend = auxChatShared.auxChatSend;
+  const auxChatSnapshot = auxChatShared.auxChatSnapshot;
+  const auxChatReset = auxChatShared.auxChatReset;
+
+  function findFirstTurnItem(clientMessageId) {
+    return state.chatItems.find(function (item) {
+      return item && item.clientMessageId === clientMessageId;
+    }) || null;
+  }
+
+  function firstTurnStillVisible(submission) {
+    return !!submission &&
+      !state.activeSessionId &&
+      state.draftEpoch === submission.draftEpoch &&
+      !!findFirstTurnItem(submission.clientMessageId);
+  }
+
+  function restoreFirstTurnUiState(submission) {
+    if (!submission || !submission.uiSnapshot || !firstTurnStillVisible(submission)) return;
+    const snapshot = submission.uiSnapshot;
+    state.scheduledTaskPendingGuide = snapshot.scheduledTaskPendingGuide;
+    state.scheduledTaskCreationSessionId = snapshot.scheduledTaskCreationSessionId;
+    state.activeSkill = snapshot.activeSkill;
+  }
+
+  function consumeFirstTurnUiState(text, meta) {
+    const snapshot = {
+      scheduledTaskPendingGuide: state.scheduledTaskPendingGuide,
+      scheduledTaskCreationSessionId: state.scheduledTaskCreationSessionId,
+      activeSkill: state.activeSkill,
+    };
+    const requestedPayloadText = meta && meta.pinvouPayloadText
+      ? String(meta.pinvouPayloadText || "").trim()
+      : "";
+    let payloadText = requestedPayloadText || text;
+    let restrictTools = false;
+    if (state.scheduledTaskPendingGuide) {
+      payloadText = state.scheduledTaskPendingGuide + "\n\n" + (requestedPayloadText || text);
+      restrictTools = true;
+      state.scheduledTaskPendingGuide = null;
+    }
+    state.activeSkill = null;
+    return { snapshot, payloadText, restrictTools };
+  }
+
+  function seedAcceptedFirstTurn(sessionId, buffer, submission) {
+    let existingUser = null;
+    for (let index = buffer.chatItems.length - 1; index >= 0; index--) {
+      if (buffer.chatItems[index] && buffer.chatItems[index].type === "user") {
+        existingUser = buffer.chatItems[index];
+        break;
+      }
+    }
+    if (existingUser) {
+      existingUser.deliveryState = "accepted";
+      existingUser.clientMessageId = submission.clientMessageId;
+      if (submission.pinvouScene) existingUser.pinvouScene = submission.pinvouScene;
+      recordPinvouSceneForBufferMessage(sessionId, buffer, 0, submission.pinvouScene);
+      return;
+    }
+
+    const nextItemId = Math.max(
+      Number(buffer.stream && buffer.stream.itemIdSeq || 0),
+      Number(submission.optimisticItemId || 0),
+    ) + 1;
+    const userItem = {
+      id: nextItemId,
+      type: "user",
+      text: submission.displayText,
+      time: submission.time,
+      messageIndex: 0,
+      deliveryState: "accepted",
+      clientMessageId: submission.clientMessageId,
+    };
+    if (submission.pinvouScene) userItem.pinvouScene = submission.pinvouScene;
+    recordPinvouSceneForBufferMessage(sessionId, buffer, buffer.messages.length, submission.pinvouScene);
+    buffer.chatItems.push(userItem);
+    buffer.messages.push({
+      role: "user",
+      content: [{ type: "text", text: submission.displayText }],
+    });
+    buffer.localTurnOwned = true;
+    buffer.remoteTurnActive = false;
+    buffer.remoteTerminalSeen = false;
+    buffer.remoteCommittedRevision = "";
+    buffer.busy = true;
+    buffer.thinking = {
+      active: true,
+      phase: "thinking",
+      toolName: "",
+      startedAt: Date.now(),
+    };
+    if (!buffer.stream) buffer.stream = {};
+    buffer.stream.itemIdSeq = nextItemId;
+  }
+
+  function syncNewFirstTurnSessionInBackground() {
+    // The new session already starts with the local default mode/persona/KB
+    // state. Only refresh the sidebar here: the other sync helpers read and
+    // write the globally active session, so running them after the user has
+    // navigated elsewhere could overwrite the newly selected session's UI.
+    Promise.resolve(refreshHistoryList()).then(function () {
+      notify();
+    }, function (error) {
+      console.warn("[sessions] first-turn history refresh failed", error);
+      notify();
+    });
+  }
+
+  function acceptFirstTurnSubmission(submission, metadata) {
+    const sessionId = String(metadata && metadata.id || "").trim();
+    if (!sessionId) throw new Error(bt("sessionIdMissing"));
+    const existingMetaIndex = state.sessions.findIndex(function (session) {
+      return session && session.id === sessionId;
+    });
+    if (existingMetaIndex >= 0) state.sessions[existingMetaIndex] = metadata;
+    else state.sessions.unshift(metadata);
+
+    const buffer = getBuffer(sessionId);
+    buffer.loadedFromDisk = true;
+    buffer.sessionRevision = String(
+      metadata.transcript_revision || metadata.transcriptRevision || buffer.sessionRevision || "",
+    );
+    seedAcceptedFirstTurn(sessionId, buffer, submission);
+
+    // The desktop consumed these one-shot handles even if the user navigated
+    // away while the atomic first turn was in flight. Remove the exact
+    // attachment objects from whichever composer is now visible so a later
+    // draft cannot retry already-consumed handles.
+    state.attachments = state.attachments.filter(function (attachment) {
+      return !submission.readyAttachments.includes(attachment);
+    });
+    const shouldActivate = firstTurnStillVisible(submission);
+    if (shouldActivate) {
+      if (submission.uiSnapshot && submission.uiSnapshot.scheduledTaskPendingGuide) {
+        state.scheduledTaskCreationSessionId = sessionId;
+      }
+      delete firstTurnSubmissions[submission.clientMessageId];
+      switchActiveTo(sessionId);
+      notify();
+    } else {
+      delete firstTurnSubmissions[submission.clientMessageId];
+    }
+    syncNewFirstTurnSessionInBackground();
+  }
+
+  async function runFirstTurnSubmission(submission) {
+    if (!submission || submission.inFlight) return;
+    submission.inFlight = true;
+    if (submission.voiceOperationId) beginVoiceSubmission(submission.voiceOperationId);
+    const item = findFirstTurnItem(submission.clientMessageId);
+    if (item) {
+      item.deliveryState = "sending";
+      item.deliveryError = "";
+      notify();
+    }
+    try {
+      const metadata = await invokeWithRequestId(
+        "web_access_create_session_and_chat",
+        submission.args,
+        submission.requestId,
+      );
+      // 首轮提交成功 = 新一轮已受理：未提交的「打开」转正锁死（同 doSendFor）。
+      try { window.PinvouToolStoreEvents.notifyChatRoundCommitted(); } catch { /* silently ignored */ }
+      acceptFirstTurnSubmission(submission, metadata);
+      // Admission truth lives here: an accepted first turn ends its voice
+      // operation (the retryable association is for rejections only, and the
+      // optimistic `return true` in sendMessage must not end it early).
+      if (submission.voiceOperationId) {
+        completeVoiceSubmission(submission.voiceOperationId, metadata.id, true);
+      }
+    } catch (error) {
+      submission.inFlight = false;
+      submission.lastErrorCode = String(error && error.code || "rpc_failed");
+      submission.lastError = String(error && error.message ? error.message : error || "");
+      // An explicit first-turn rejection keeps the retryable association; an
+      // unknown outcome keeps waiting for reconciliation and must not consume
+      // an admission decision (the retry may still land).
+      if (submission.voiceOperationId && submission.lastErrorCode !== "outcome_unknown") {
+        completeVoiceSubmission(submission.voiceOperationId, null, false);
+      }
+      if (!firstTurnStillVisible(submission)) return;
+      const failedItem = findFirstTurnItem(submission.clientMessageId);
+      if (failedItem) {
+        failedItem.deliveryState = submission.lastErrorCode === "outcome_unknown"
+          ? "unknown"
+          : "failed";
+        failedItem.deliveryError = submission.lastError;
+      }
+      restoreFirstTurnUiState(submission);
+      notify();
+    }
+  }
+
+  function submitFirstWebTurn(text, displayText, readyAttachments, attachmentsPayload, meta) {
+    const prepared = consumeFirstTurnUiState(text, meta);
+    const clientMessageId = webRequestId("chat");
+    const requestId = "first_turn_" + clientMessageId;
+    const time = timeStr();
+    const optimisticItem = {
+      type: "user",
+      text: displayText,
+      time,
+      messageIndex: 0,
+      deliveryState: "sending",
+      deliveryError: "",
+      clientMessageId,
+    };
+    if (meta && meta.pinvouScene) optimisticItem.pinvouScene = meta.pinvouScene;
+    addChatItem(optimisticItem);
+    const submission = {
+      clientMessageId,
+      requestId,
+      draftEpoch: state.draftEpoch,
+      optimisticItemId: optimisticItem.id,
+      time,
+      displayText,
+      pinvouScene: meta && meta.pinvouScene,
+      readyAttachments: [...readyAttachments],
+      uiSnapshot: prepared.snapshot,
+      voiceOperationId: meta && meta.voiceOperationId,
+      args: {
+        message: prepared.payloadText,
+        attachmentHandles: attachmentsPayload.map(function (attachment) {
+          return attachment && attachment.handle;
+        }).filter(Boolean),
+        restrictTools: !!prepared.restrictTools,
+      },
+      inFlight: false,
+      lastErrorCode: "",
+      lastError: "",
+    };
+    firstTurnSubmissions[clientMessageId] = submission;
+    notify();
+    runFirstTurnSubmission(submission);
+  }
+
+  function retryFirstTurn(clientMessageId) {
+    const submission = firstTurnSubmissions[String(clientMessageId || "")];
+    if (!submission || submission.inFlight || !firstTurnStillVisible(submission)) return;
+    if (submission.lastErrorCode !== "rpc_timeout") {
+      submission.requestId = "first_turn_" + webRequestId("retry");
+    }
+    runFirstTurnSubmission(submission);
+  }
+
+  // Return protocol (issue #406; mirrors the tauri bridge's sendMessage):
+  // - true         dispatched: sent or queued for delivery.
+  // Web first turn (no session yet): a first turn already in flight blocks a
+  // duplicate admission; otherwise the first turn dispatches through its own
+  // pipeline. Returns the send verdict for the caller.
+  function maybeSubmitFirstWebTurn(text, displayText, readyAttachments, attachmentsPayload, meta) {
+    const existingFirstTurn = state.chatItems.some(function (item) {
+      return item && item.type === "user" && !!item.deliveryState;
+    });
+    if (existingFirstTurn) return false;
+    submitFirstWebTurn(text, displayText, readyAttachments, attachmentsPayload, meta);
+    return true;
+  }
+
+  // Materialization-abort recovery: the scoped restore owns the stripped body
+  // (the mention injection block never re-enters any composer or buffer). A
+  // refs-only message strips to "" (nothing restorable), but the abort
+  // semantics are unchanged — the send never dispatched and the draft is
+  // still alive — so it resolves "restored" too (round-18 MAJOR-1,
+  // superseding round-8 M1's false here): the caller's failure tail clears
+  // the provisional draft→session mapping and keeps the draft's chips
+  // scoped to the draft. Mirrors the tauri lane's inline branch.
+  function restoreAbortedMaterialization(text, draftOwner) {
+    const restoredBody = stripMentionBlockForComposerRestore(text);
+    if (!restoredBody) return "restored";
+    return restoreTaskDraft(restoredBody, draftOwner) ? "restored" : false;
+  }
+
+  // - "restored"   nothing dispatched, but the text is already back in the
+  //                composer (bridge-side restore) — the caller must not
+  //                restore again, it would duplicate the draft.
+  // - false        nothing dispatched and the text was NOT restored
+  //                (notice-only early returns / admission rejected) — the
+  //                caller owns putting the draft back.
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- single send state machine mirroring the tauri lane (ownership guard + first-turn materialization + admission); split tracked separately
+  async function sendMessage(text, meta, voiceOwner) {let pinvouSharedwebN247496Cache = null;
+function pinvouSharedwebN247496() {
+  if (!pinvouSharedwebN247496Cache) pinvouSharedwebN247496Cache = window.PinvouBridgeShared.create("web:247496", { state, sid: { get value() { return sid; } } });
+  return pinvouSharedwebN247496Cache;
+}
+
+
+    // Ownership guard: capability preparation or first-turn materialization can
+    // outlive the originating voice composer; do not let the bridge resolve its
+    // current active session/draft as our owner (mirrors the tauri lane).
+    if (voiceOwner && ((state.activeSessionId || null) !== voiceOwner.sessionId
+      || (!voiceOwner.sessionId && Number(state.draftEpoch || 0) !== voiceOwner.draftEpoch))) return false;
+    text = (text || "").trim();
+    const readyAttachments = state.attachments.filter(function (a) { return a.status === "ready" && a.result; });
+    if (!text && readyAttachments.length === 0) return false;
+    // 还有解析中/上传中的附件 → 等
+    if (state.attachments.some(function (a) { return a.status === "parsing"; })) {
+      addSystemItem(bt("attachStillParsing"));
+      return false;
+    }
+    if (state.attachments.some(function (a) { return a.status === "uploading"; })) {
+      addSystemItem(bt("attachStillUploading"));
+      return false;
+    }
+
+    const displayText = formatAttachmentDisplayText(text, readyAttachments);
+    const attachmentsPayload = readyAttachments.map(function (a) { return a.result; });
+
+    if (!state.activeSessionId && IS_WEB && canInvoke("web_access_create_session_and_chat")) {
+      return maybeSubmitFirstWebTurn(text, displayText, readyAttachments, attachmentsPayload, meta);
+    }
+
+    if (!state.activeSessionId) {
+      // 草稿态首条消息 → 物化 session(命名靠下方 persistSession auto-title)。
+      // 必须用返回值判空：切走场景 ensureSession 返回 null 但 activeSessionId
+      // 非空（用户已切到别的会话），按 activeSessionId 继续会把本条消息发进
+      // 错误会话（审计 #257）。
+      const draftOwner = { sessionId: null, draftEpoch: Number(state.draftEpoch || 0),
+        operationId: meta && meta.voiceOperationId, restored: false };
+      const materialized = await ensureSession(draftOwner);
+      // Materialization aborted (the session was switched away during the
+      // await) → restore against the original draft ownership; never write
+      // into whatever session is currently selected. (Mirrors the tauri lane,
+      // round-2 finding F3; ensureSession itself reports the real reason.)
+      if (!materialized || state.activeSessionId !== materialized) {
+        if (materialized) draftOwner.createdSessionId = materialized;
+        // Round-27 asto MAJOR 2(a), mirrors the tauri m2(a) write: the
+        // commit-then-navigate tail COMMITS the created session to a
+        // background buffer (the draft epoch is dead) even though
+        // ensureSession returned null — report it so the send closure's
+        // verdict mapping routes the chips to the created session. The web
+        // lane has no rollback tail (desktop-only), so any null-return with
+        // a createdSessionId binding is this shape.
+        if (!materialized && draftOwner.createdSessionId && meta) {
+          meta.materializedSessionId = draftOwner.createdSessionId;
+        }
+        return restoreAbortedMaterialization(text, draftOwner);
+      }
+      // Round-24 MAJOR (PR #586 review, mirrors the tauri lane): report the
+      // committed materialization through the caller-owned meta out-param —
+      // the composer's scope effect cannot observe a draft→session transition
+      // that lands while ChatView is unmounted, so the send closure records
+      // the ledger mapping itself. Lane boundary (round-27 asto MAJOR 2(b)):
+      // this covers the legacy-ensureSession first send; the optimistic
+      // web_access_create_session_and_chat first turn returns true BEFORE the
+      // create runs, so its settle precedes any materialization and no
+      // report can exist for it (async failure recovery is the retry-chip
+      // path, not a settle verdict) — disclosed in the PR's Current
+      // limitations.
+      if (meta) meta.materializedSessionId = materialized;
+    }
+    const sid = state.activeSessionId;
+    // In-bridge submission gate (mirrors the tauri chat bridge): any future
+    // dispatch path carrying a voice operation id parks here, so a cancel
+    // racing the send waits for admission instead of recording a
+    // cancellation for a delivered message. begin is idempotent.
+    beginVoiceMetaSubmission(meta, sid);
+    const activeTurnBuffer = getBuffer(sid);
+    function consumeUiTurnState() {
+      const consumed = {
+        scheduledTaskPendingGuide: state.scheduledTaskPendingGuide,
+        scheduledTaskCreationSessionId: state.scheduledTaskCreationSessionId,
+        activeSkill: state.activeSkill,
+      };
+      const requestedPayloadText = meta && meta.pinvouPayloadText
+        ? String(meta.pinvouPayloadText || "").trim()
+        : "";
+      let payloadText = requestedPayloadText || text;
+      let restrictTools = false;
+      // 定时任务引导只进入模型 payload；准入失败时由下面的 snapshot 恢复。
+      if (state.scheduledTaskPendingGuide) {
+        payloadText = state.scheduledTaskPendingGuide + "\n\n" + text;
+        if (requestedPayloadText) payloadText = state.scheduledTaskPendingGuide + "\n\n" + requestedPayloadText;
+        restrictTools = true;
+        state.scheduledTaskPendingGuide = null;
+        state.scheduledTaskCreationSessionId = sid;
+      }
+      // 新一轮先熄灭技能标；本轮 load_skill 会重新点亮。
+      state.activeSkill = null;
+      return { snapshot: consumed, payloadText, restrictTools };
+    }
+function restoreUiTurnState(consumed) { return pinvouSharedwebN247496().restoreUiTurnState(consumed); }
+    // Navigation interrupted the send: the text goes back to the session it
+    // was typed in (buffer draft), never into the session now on screen —
+    // "restored" keeps the caller from prefilling it there (#406). A
+    // refs-only message restores nothing: resolve false so the caller's
+    // non-dispatch recovery keeps its chips armed (round-8 M1).
+    function abandonToOwnSession() {
+      return restoreComposerText(sid, text) ? "restored" : false;
+    }
+    function queuePrepared(prepared) {
+      state.queued.push(makeQueuedMessage(
+        ++itemIdSeq,
+        text,
+        prepared.payloadText,
+        displayText,
+        attachmentsPayload,
+        meta || null,
+        prepared.restrictTools,
+      ));
+      state.attachments = state.attachments.filter(function (attachment) {
+        return !readyAttachments.includes(attachment);
+      });
+      notify();
+    }
+
+    // 排队式:当前 session 正在生成 → 这句进队列(不打断当前轮),本轮 chat:done 后自动发。
+    // 输入框上方显示待发 chip(可✕撤销)。停止按钮仍只硬打断当前轮。
+    if (isBusyFor(sid) || state.queued.length > 0) {
+      const queuedPreparation = consumeUiTurnState();
+      queuePrepared(queuedPreparation);
+      if (!isBusyFor(sid)) flushQueued(sid);
+      settleAcceptedVoiceSubmission(meta, sid);
+      return true;
+    }
+    if (activeTurnBuffer && activeTurnBuffer.remoteTurnActive &&
+        !(await reconcileRemoteTurn(sid))) {
+      if (state.activeSessionId !== sid) {
+        // The user navigated away during the hydrate: the text goes back to
+        // the session it was typed in (buffer draft), never into the session
+        // now on screen (issue #406).
+        return abandonToOwnSession();
+      }
+      recordAuthoritySyncDiagnostic("remote_sync_blocked_action", Object.assign({
+        operation: "send",
+      }, authoritySyncBufferSnapshot(sid, activeTurnBuffer)));
+      addAuthoritySyncNotice(bt("turnSyncRetry"));
+      return false;
+    }
+    // The authoritative hydrate above is asynchronous. Never let an input that
+    // originated in Session A drift into Session B if the user navigated away.
+    if (state.activeSessionId !== sid) {
+      return abandonToOwnSession();
+    }
+    if (isBusyFor(sid) || state.queued.length > 0) {
+      const racedQueuePreparation = consumeUiTurnState();
+      queuePrepared(racedQueuePreparation);
+      if (!isBusyFor(sid)) flushQueued(sid);
+      settleAcceptedVoiceSubmission(meta, sid);
+      return true;
+    }
+
+    const preparation = consumeUiTurnState();
+    const accepted = await doSendFor(
+      sid,
+      preparation.payloadText,
+      displayText,
+      attachmentsPayload,
+      meta,
+      preparation.restrictTools,
+    );
+    if (accepted) {
+      // Do not clear files selected while the admission RPC was in flight.
+      state.attachments = state.attachments.filter(function (attachment) {
+        return !readyAttachments.includes(attachment);
+      });
+      notify();
+      settleAcceptedVoiceSubmission(meta, sid);
+      return true;
+    }
+    // Admission rejected (notice already surfaced by doSendFor): nothing was
+    // dispatched, so the cleared composer draft is the caller's to restore
+    // (issue #406 — it used to resolve undefined here and the draft was
+    // silently lost).
+    restoreUiTurnState(preparation.snapshot);
+    notify();
+    return false;
+  }
+function setComposerDraft(value) { return pinvouSharedweb().setComposerDraft(value); }
+  // Mirrors the tauri bridge: template/navigation prefills replace the draft;
+  // failure recovery passes append=true for separator-joined appending
+  // (re-review #4 parity).
+function prefillComposer(text, append) { return pinvouSharedweb().prefillComposer(text, append); }
+  // Composer restores strip the injection block on restore — one shared
+  // implementation in bridge-shared-helpers.js now serves both platform
+  // lanes (round-8 minor 10).
+  function stripMentionBlockForComposerRestore(text) { return pinvouSharedweb().stripMentionBlockForComposerRestore(text); }
+  // Session-scoped composer text restore for sends abandoned by a session
+  // switch mid-send (issue #406; mirrors the tauri bridge's restoreSteerText,
+  // including the boolean verdict: a refs-only message strips to "" and
+  // restores nothing, and the caller must not report "restored" then).
+  // A bare setComposerDraft is invisible (the composer is React-local state
+  // that only re-reads the store on [activeSessionId, draftEpoch]). Active
+  // session: append at the store level with a "\n" separator and bump
+  // draftEpoch so the draft-restore effect re-reads the accumulated draft.
+  // Background session: write the session buffer only — setComposerDraft
+  // targets the active working set and would leak background text into the
+  // active draft.
+  function restoreComposerText(sid, text) {
+    const value = stripMentionBlockForComposerRestore(text);
+    if (!sid || !value) return false;
+    if (sid === state.activeSessionId) {
+      const current = String(state.composerDraft || "");
+      setComposerDraft(current ? current + "\n" + value : value);
+      state.draftEpoch = (state.draftEpoch || 0) + 1;
+      notify();
+      return true;
+    }
+    const buffer = sessionStates[sid];
+    if (!buffer) return false;
+    const current = String(buffer.composerDraft || "");
+    buffer.composerDraft = current ? current + "\n" + value : value;
+    return true;
+  }
+
+  // Retained recovery for a task draft whose send was abandoned mid-await:
+  // when the user moved on to another session (or the session creation
+  // failed), the text cannot go into the unrelated active composer, so it is
+  // kept in this single in-memory slot. Returning to the draft consumes it
+  // once (append-only); the slot is not keyed by draft identity — the next
+  // draft return is the one chance to hand the text back before it is lost.
+  const pendingTaskDraftRecovery = { buffer: null };
+  function readComposerDraftWithRecovery() {
+    // Consumed once on returning to the draft, never while an unrelated
+    // session is open. No epoch gate: re-entering the draft always allocates
+    // a new epoch (enterDraft increments unconditionally), so an epoch match
+    // could never fire and the retained text would be silently dropped.
+    if (pendingTaskDraftRecovery.buffer && !state.activeSessionId) {
+      state.composerDraft = [state.composerDraft, pendingTaskDraftRecovery.buffer.text].filter(Boolean).join("\n");
+      // The text is visibly back in the live draft: the voice association
+      // follows it, or a manual retry would be orphaned in the dead
+      // recording-time epoch.
+      if (pendingTaskDraftRecovery.buffer.operationId) {
+        rebindVoiceOperationToDraft(pendingTaskDraftRecovery.buffer.operationId, state.draftEpoch);
+      }
+      pendingTaskDraftRecovery.buffer = null;
+    }
+    return String(state.composerDraft || "");
+  }
+
+  // A dispatched send ends its voice operation (mirrors the desktop lane);
+  // false/"restored" returns keep the retryable association and are settled
+  // by the ChatView funnel / restoreTaskDraft / first-turn admission.
+  // In-bridge counterpart of the funnel-level begin: parks a dispatched
+  // voice operation even if a caller skipped the funnel's own begin.
+  function beginVoiceMetaSubmission(meta, sessionId) {
+    if (meta && meta.voiceOperationId) beginVoiceSubmission(meta.voiceOperationId, sessionId || null);
+  }
+
+  function settleAcceptedVoiceSubmission(meta, sessionId) {
+    const operationId = meta && meta.voiceOperationId;
+    if (operationId) completeVoiceSubmission(operationId, sessionId || null, true);
+  }
+
+  // Scoped task-draft restore: resolves by the original ownership (session,
+  // created-but-abandoned session, or the operation's voice binding), never
+  // into the unrelated active session. Returns whether the restore landed —
+  // restoreComposerText's own verdict must be honored (round-23 asto minor 1,
+  // mirrors the tauri lane): an evicted/purged background buffer restores
+  // nothing, and reporting success anyway made the caller skip its own
+  // recovery and the text was gone.
+  function restoreTaskDraft(text, owner) {
+    if (!owner || owner.restored) return false;
+    const sid = owner.sessionId || owner.createdSessionId || voiceOperationSessionId(owner.operationId);
+    // Every restore branch settles the submission (un-park + consume a
+    // queued dismiss); without it a rejected send would leave the operation
+    // parked forever and never adoptable by a retry.
+    if (sid) {
+      if (owner.operationId) completeVoiceSubmission(owner.operationId, sid, false);
+      // Honor the verdict: false means the text landed NOWHERE — keep
+      // owner.restored unset so a caller retry is not blocked.
+      if (!restoreComposerText(sid, text)) return false;
+    } else if (state.activeSessionId) {
+      // Retain one departed draft in memory, never in the unrelated active session.
+      if (owner.operationId) completeVoiceSubmission(owner.operationId, null, false);
+      const retained = pendingTaskDraftRecovery.buffer ? pendingTaskDraftRecovery.buffer.text : "";
+      const retainedOperationId = pendingTaskDraftRecovery.buffer ? pendingTaskDraftRecovery.buffer.operationId : null;
+      pendingTaskDraftRecovery.buffer = {
+        text: [retained, text].filter(Boolean).join("\n"),
+        // The newest operation wins: the rebind on draft return adopts the
+        // most recent stranded send (one operation per manual send).
+        operationId: owner.operationId || retainedOperationId || null,
+      };
+    } else {
+      // Back in the draft — any epoch, because re-entering the draft
+      // allocates a new one (enterDraft increments unconditionally).
+      if (owner.operationId) {
+        completeVoiceSubmission(owner.operationId, null, false);
+        // The text is visibly back in the live draft: rebind the operation to
+        // the new epoch so a manual retry adopts it instead of orphaning the
+        // association in the dead recording-time epoch (the complete above
+        // may already have terminalized it via a queued cancel; the rebind
+        // refuses terminal operations).
+        rebindVoiceOperationToDraft(owner.operationId, state.draftEpoch);
+      }
+      prefillComposer(text, true);
+    }
+    owner.restored = true;
+    return true;
+  }
+  // Undo one queued message (the ✕ on its chip). Attachment handles carried
+  // by the queued item are released in lockstep, matching the discard
+  // semantics of the desktop removeQueued path.
+  function removeQueued(id) {
+    let removed = null;
+    state.queued = state.queued.filter(function (q) {
+      if (q.id !== id) return true;
+      removed = q;
+      return false;
+    });
+    if (removed && Array.isArray(removed.attachments)) {
+      removed.attachments.forEach(releaseAttachmentOnDesktop);
+    }
+    notify();
+  }
+
+  function queueForSession(sid) {
+    return sid === state.activeSessionId
+      ? state.queued
+      : (sessionStates[sid] && sessionStates[sid].queued);
+  }
+
+  function prioritizeQueued(sid, queuedId) {
+    const queue = queueForSession(sid);
+    if (!queue) return false;
+    const index = queue.findIndex(function (item) { return item && item.id === queuedId; });
+    if (index < 0) return false;
+    const item = queue.splice(index, 1)[0];
+    queue.unshift(item);
+    notify();
+    if (!isBusyFor(sid)) flushQueued(sid);
+    return true;
+  }
+
+  function editQueued(sid, queuedId, nextText) {
+    const queue = queueForSession(sid);
+    if (!queue) return false;
+    const item = queue.find(function (queued) { return queued && queued.id === queuedId; });
+    if (!item) return false;
+    const text = String(nextText == null ? "" : nextText).trim();
+    if (!text && !(item.attachments || []).length) return false;
+    const payloadText = rebuiltQueuedPayload(item, text);
+    if (payloadText === null) return false;
+    let metaPayloadText = null;
+    // Match send-time admission: only a non-empty meta payload gets an
+    // envelope, so only that shape can be rebuilt around the new text.
+    const hasMetaPayload = !!(item.meta && item.meta.pinvouPayloadText);
+    if (hasMetaPayload) {
+      metaPayloadText = rebuiltQueuedMetaPayload(item, text);
+      if (metaPayloadText === null) return false;
+    }
+    item.text = text;
+    item.payloadText = payloadText;
+    item.displayText = formatAttachmentDisplayText(text, item.attachments || []);
+    if (hasMetaPayload) {
+      item.meta = Object.assign({}, item.meta, { pinvouPayloadText: metaPayloadText });
+    }
+    notify();
+    // Parity with the desktop bridge: both mutations drain an idle queue.
+    if (!isBusyFor(sid)) flushQueued(sid);
+    return true;
+  }
+
+  // ── Pinvou v4 召唤式检阅:Boss 主动呼叫,审当前 session 前面的工作 ──
+  // 纯召唤、不替 Boss 决策。
+  // 审查卡进 chatItems(当前会话可见);跨会话持久化(进 messages/独立存储)是后续增强。
+async function summonPinvou(focus, mode) { return pinvouSharedweb().summonPinvou(focus, mode); }
+
+  // 通盘体检(覆盖镜头):查产物"全不全"=缺哪些完整性维度。独立入口,走 mode=coverage。
+function inspectPinvou(focus) { return pinvouSharedweb().inspectPinvou(focus); }
+
+  // B2: 审查卡进 sidecar 时间线(pos=当前 messages 数),落盘。同 recordPersonaEvent
+  // 范式,**不进 messages/LLM**;rerenderFromMessages 按 pos 插回,切会话/重载不丢。
+
+  // §2 按勾选裁决:resolution 已由前端写回 review 对象(引用→sidecar),这里持久化 +
+  // 把勾「让AI改」的条目走 B1 发定向修订指令(只改对应段落、禁全文重写)。Boss 驾驶,非自动。
+async function resolvePinvouReview(resolutions, actions) { return pinvouSharedweb().resolvePinvouReview(resolutions, actions); }
+
+  // 整卡跳过:Boss 看了不处理这次检阅 → 直接关窗(sidecar entry 留着、无 resolution,无害)。
+function dismissPinvouReview() { return pinvouSharedweb().dismissPinvouReview(); }
+function applyWorkspaceReboundMark(payload) { return pinvouSharedweb().applyWorkspaceReboundMark(payload); }
+  // 把当前 session 的审查时间线(含勾选写回的 resolution)重新落盘。返回 promise 供 await。
+
+  // Same transport timeout as the Tauri bridge's stop/interrupt cancels
+  // (STEER_INVOKE_TIMEOUT_MS there): a wedged engine never settles the
+  // invoke, and without the race this function never returns — ChatView's
+  // single-flight flag never clears and the stop button stays disabled
+  // forever. Cancel is idempotent, so a late settle/rejection is harmless.
+  const CANCEL_INVOKE_TIMEOUT_MS = 25_000;
+
+  async function cancelGeneration() {
+    if (!state.busy) return;
+    try {
+      const cancelPromise = invoke("cancel_generation", { sessionId: state.activeSessionId });
+      let cancelTimeoutId = null;
+      const cancelTimeout = new Promise(function (_, reject) {
+        cancelTimeoutId = setTimeout(function () {
+          reject(new Error("cancel_generation timed out"));
+        }, CANCEL_INVOKE_TIMEOUT_MS);
+      });
+      cancelPromise.catch(function () { /* swallow the late rejection after a timeout */ });
+      try {
+        await Promise.race([cancelPromise, cancelTimeout]);
+      } finally {
+        clearTimeout(cancelTimeoutId);
+      }
+    } catch (e) {
+      console.warn("cancel failed", e);
+    }
+  }
+
+  // ── Event listeners ──────────────────────────────────────────────
+  listen("session:deleted", function (e) {
+    applyDeletedSession(e && e.payload && e.payload.id);
+  });
+  // Burst coalescing (review #463 round-20 R3): the rebind command emits one
+  // session:list_changed per affected id, and each undebounced refresh costs
+  // an IPC round trip + an O(n) backend list_sessions + a React commit — a
+  // large rebind burst translated into hundreds of full history refreshes
+  // exactly while the report dialog opens. Leading + trailing: the first
+  // event refreshes immediately (single-event semantics unchanged), events
+  // inside the window set a pending flag collapsed into ONE trailing
+  // refresh. Harnesses without timers fall back to the immediate refresh.
+  let historyRefreshTimer = null;
+  let historyRefreshPending = false;
+  function scheduleHistoryRefresh() { return pinvouSharedweb().scheduleHistoryRefresh(); }
+  listen("session:list_changed", function (e) {
+    const payload = e && e.payload || {};
+    // The rebind command's mark (review #463 round-B Major 1 + round-C
+    // Major 1): consumed by rebaseArtifactPathsForRebind so the wholesale
+    // artifact saves of THIS host cannot durably revert the backend lane's
+    // rebase while a resident web-client buffer holds stale paths. Segment
+    // chain with append-on-chain / refresh-on-identical-retry semantics,
+    // memory-only and never pruned — the shared applyWorkspaceReboundMark
+    // owns the stamp (round-13 — previously byte-duplicated with the tauri
+    // listener).
+    applyWorkspaceReboundMark(payload);
+    scheduleHistoryRefresh();
+  });
+  listen("session:model_changed", function (e) {
+    const payload = e && e.payload || {};
+    if (payload.id !== state.activeSessionId) return;
+    loadSessionModel(payload.id).catch(function (error) {
+      console.error("[sessions] session:model_changed refresh failed", error);
+    });
+  });
+  listen("session:persona_changed", function (e) {
+    const payload = e && e.payload || {};
+    if (payload.id !== state.activeSessionId) return;
+    Promise.resolve(syncActivePersona()).then(notify).catch(function (error) {
+      console.error("[sessions] session:persona_changed refresh failed", error);
+    });
+  });
+
+  // Builtin feature switches (docs/builtin-toolset-contract.md §3.3): the host
+  // emits remote_control:tools_changed after every toggle; re-dispatch the same
+  // DOM CustomEvent the desktop bridge (chat-events.js) produces so ChatView's
+  // registry subscription hot-refreshes on browser clients too.
+  listen("remote_control:tools_changed", function () {
+    try { window.PinvouToolStoreEvents.notifyComposerToolsChanged(); } catch { /* DOM dispatch failure only affects the refresh timing */ }
+  });
+
+  // 所有 chat:* 事件都带 session_id(后端 spawn_event_forwarder 打的 tag)。
+  // onSessionEvent 按 session_id 把同步逻辑路由到对应 session 的工作集:active 直接跑,
+  // 后台临时切工作集跑完再切回。下面每个监听器的 body 与旧单 session 版逐字一致,
+  // 只是包了一层路由,所以 active session 行为零变化。
+  function isInternalRuntimeUserMessage(value) {
+    return window.PinvouBridgeMessages.isInternalRuntimeUserMessage(value);
+  }
+
+  function applyRemoteUserMessageEvent(e, force) {
+    const payload = e && e.payload || {};
+    const sid = payload.session_id || state.activeSessionId;
+    if (!sid) return false;
+    const userBuffer = getBuffer(sid);
+    if (!userBuffer) return false;
+    if (userBuffer.localTurnOwned && !force) {
+      // Usually this is the acknowledgement for our optimistic bubble. Keep
+      // it briefly so a losing admission race can replay the competing UI's
+      // event after its own RPC returns session_turn_in_progress.
+      userBuffer.deferredRemoteUserEvent = e;
+      return false;
+    }
+    const content = String(payload.content || "");
+    const hideInternalRuntimeMessage = isInternalRuntimeUserMessage(content);
+    const operation = String(payload.operation || "append");
+    const action = String(payload.action || "");
+    const actionPlanId = String(payload.plan_id || payload.planId || "").trim();
+    const baseRevision = String(payload.base_transcript_revision || "");
+    const admissionKey = baseRevision
+      ? operation + ":" + baseRevision
+      : (e && e.id ? "event:" + e.id : "");
+    if (admissionKey && userBuffer.remoteAdmissionKeys.includes(admissionKey)) return false;
+    if (admissionKey) {
+      userBuffer.remoteAdmissionKeys.push(admissionKey);
+      if (userBuffer.remoteAdmissionKeys.length > 32) userBuffer.remoteAdmissionKeys.shift();
+    }
+    let lastUserText = "";
+    for (let messageIndex = userBuffer.messages.length - 1; messageIndex >= 0; messageIndex--) {
+      const candidate = userBuffer.messages[messageIndex];
+      if (candidate && candidate.role === "user") {
+        lastUserText = userMessageDisplayText(candidate.content || [], false);
+        break;
+      }
+    }
+    const snapshotAlreadyCoversTurn = !!(
+      userBuffer.loadedFromDisk && baseRevision && userBuffer.sessionRevision &&
+      userBuffer.sessionRevision !== baseRevision && lastUserText === content
+    );
+    markRemoteTurn(sid, userBuffer, false, "remote_user_message_event");
+    runSyncOnSession(sid, function () {
+      if (action === "accept_plan") {
+        state.chatItems.forEach(function (item) {
+          if (item && item.type === "plan_card" && item.cardState === "active" && !item.resolved &&
+              (!actionPlanId || String(item.planId || "") === actionPlanId)) {
+            item.cardState = "approved";
+            item.resolved = true;
+            item.statusLabel = bt("approved");
+          }
+        });
+        const acceptedMode = payload.mode_state || payload.modeState;
+        // 事件负载的权威 mode 写回走收敛点（bump seq 防在途旧读覆盖；
+        // 此回调在 runSyncOnSession(sid) 内，sid 即触发会话）。
+        if (acceptedMode) applyAuthoritativeModeState(sid, acceptedMode);
+      }
+      state.chatItems = state.chatItems.filter(function (item) { return !item.turnErrorNotice; });
+      if (!snapshotAlreadyCoversTurn && !hideInternalRuntimeMessage) {
+        if (operation === "edit_last") {
+          for (let index = state.chatItems.length - 1; index >= 0; index--) {
+            if (state.chatItems[index] && state.chatItems[index].type === "user") {
+              state.chatItems.splice(index);
+              break;
+            }
+          }
+          // Stream throttle invariant: the flush must precede the stream
+          // state reset. The old streaming bubble was already removed by the
+          // splice above, so the flush has no render target and only cancels
+          // the session's trailing-edge timer.
+          flushPendingStreamRender();
+          resetPendingAssistant();
+        }
+        addChatItem({ type: "user", text: content, time: timeStr() });
+      }
+      state.busy = true;
+      if (!state.thinking.active) startThinking();
+      flushPendingStreamRender(); // the old streaming bubble gets its final html before the new turn resets stream state
+      currentStreamText = "";
+      currentStreamId = 0;
+    });
+    notify();
+    return true;
+  }
+
+function planCardHydrationKey(item) { return pinvouSharedweb().planCardHydrationKey(item); }
+
+  function applyDeferredRemoteUserMessage(_sid, buf) {
+    if (!buf || !buf.deferredRemoteUserEvent) return false;
+    const deferredEvent = buf.deferredRemoteUserEvent;
+    buf.deferredRemoteUserEvent = null;
+    return applyRemoteUserMessageEvent(deferredEvent, true);
+  }
+
+  listen("chat:user_message", function (e) {
+    applyRemoteUserMessageEvent(e, false);
+  });
+
+  listen("chat:transcript_committed", function (e) {
+    const payload = e && e.payload || {};
+    const sid = payload.session_id || state.activeSessionId;
+    if (!sid) return;
+    const committedBuffer = getBuffer(sid);
+    if (!committedBuffer) return;
+    const revision = String(payload.transcript_revision || payload.transcriptRevision || "");
+    if (revision) {
+      committedBuffer.sessionRevision = revision;
+      committedBuffer.remoteCommittedRevision = revision;
+    }
+    recordAuthoritySyncDiagnostic("transcript_committed_event_received", Object.assign({
+      event_revision: revision,
+      terminal_seen_before_event: !!committedBuffer.remoteTerminalSeen,
+    }, authoritySyncBufferSnapshot(sid, committedBuffer)));
+    if (committedBuffer.remoteTerminalSeen && !isBusyFor(sid)) {
+      reconcileRemoteTurn(sid).then(function (ready) {
+        if (ready) flushQueued(sid);
+      }).catch(function () {});
+    }
+  });
+
+
+  function latestOpenTimelineStart() { return pinvouSharedweb().latestOpenTimelineStart(); }
+
+  function recordTurnStarted() { return pinvouSharedweb().recordTurnStarted(); }
+
+  function preserveInterruptedAssistantPresentation() { return pinvouSharedweb().preserveInterruptedAssistantPresentation(); }
+
+  listen("chat:turn_started", function (e) { onSessionEvent(e, function () {
+    state.busy = true;
+    if (!state.thinking.active) startThinking();
+    recordTurnStarted();
+    notify();
+  }); });
+
+function reasoningEventIndex(e) { return pinvouSharedweb().reasoningEventIndex(e); }
+
+function streamingReasoningItem(index) { return pinvouSharedweb().streamingReasoningItem(index); }
+
+function finalizeStreamingReasoning(index) { return pinvouSharedweb().finalizeStreamingReasoning(index); }
+
+  // Keep Web and Tauri streaming cadence aligned. requestAnimationFrame gives
+  // foreground rendering one update per paint; the timer keeps hidden tabs
+  // and throttled WebViews bounded. State is isolated per session so remote
+  // background streams cannot overwrite the visible working set.
+  function cancelPendingStreamNotify(sid) { return pinvouSharedweb().cancelPendingStreamNotify(sid); }
+  function scheduleStreamNotify(sid, firstDelta) {
+    // A first delta publishes immediately so the visible bubble paints
+    // without waiting for a frame. Inside a background working set the
+    // immediate notify is suppressed and schedules no frame at all, so the
+    // session's first delta would never publish — a suppressed first delta
+    // must fall through to the coalesced frame below, whose publish() runs
+    // after the working set is restored and carries the accumulated text.
+    if (!sid || (firstDelta && !suppressNotify) || typeof setTimeout !== "function") {
+      notify();
+      return;
+    }
+    if (pendingStreamNotifications[sid]) return;
+    const pending = { frame: null, timer: null };
+    pendingStreamNotifications[sid] = pending;
+    function publish() {
+      if (pendingStreamNotifications[sid] !== pending) return;
+      cancelPendingStreamNotify(sid);
+      let didRun = false;
+      const wasBackground = sid !== state.activeSessionId;
+      // A throwing subscriber must not escape as an unhandled rAF/timer
+      // error (the synchronous first-delta path keeps the dispatch-loop
+      // throw semantics). runSyncOnSession's finally restores the working
+      // set before the error lands here.
+      try {
+        runSyncOnSession(sid, function () {
+          didRun = true;
+          immediateNotify();
+        });
+      } catch (error) {
+        console.error("[chat] coalesced stream notify failed", error);
+      }
+      if (didRun && wasBackground) {
+        try { immediateNotify(); } catch (error) { console.error("[chat] coalesced stream notify failed", error); }
+      }
+    }
+    if (typeof window.requestAnimationFrame === "function") {
+      pending.frame = window.requestAnimationFrame(publish);
+    }
+    pending.timer = setTimeout(publish, STREAM_NOTIFY_MAX_WAIT_MS);
+  }
+
+  // Markdown parsing is substantially heavier than snapshot publication in a
+  // real browser. Match the desktop bridge: render the first delta immediately
+  // and accumulate subsequent text behind one trailing-edge render per
+  // session. Every stream transition flushes synchronously before resetting
+  // the bubble, so final text and terminal cards cannot observe stale HTML.
+  function renderStreamItemHtml() {
+    const item = state.chatItems.find(function (candidate) { return candidate.id === currentStreamId; });
+    if (!item) return false;
+    item.text = currentStreamText;
+    item.html = renderMarkdown(currentStreamText);
+    item.htmlSource = currentStreamText;
+    return true;
+  }
+  // Must run inside an onSessionEvent/runSyncOnSession extent: it flushes the
+  // extent's own session (the timer table is keyed by state.activeSessionId),
+  // so calling it outside an extent would target the visible session instead.
+  function flushPendingStreamRender() {
+    const sid = state.activeSessionId;
+    if (sid && streamRenderTimers[sid]) {
+      clearTimeout(streamRenderTimers[sid]);
+      delete streamRenderTimers[sid];
+    }
+    if (!currentStreamId || !currentStreamText) return false;
+    return renderStreamItemHtml();
+  }
+  function scheduleStreamRender(sid) {
+    if (!sid || typeof setTimeout !== "function") {
+      if (currentStreamId && currentStreamText) renderStreamItemHtml();
+      return;
+    }
+    if (streamRenderTimers[sid]) return;
+    streamRenderTimers[sid] = setTimeout(function () {
+      delete streamRenderTimers[sid];
+      let rendered = false;
+      runSyncOnSession(sid, function () {
+        if (!currentStreamId || !currentStreamText) return;
+        rendered = renderStreamItemHtml();
+      });
+      if (rendered) notify();
+    }, STREAM_RENDER_THROTTLE_MS);
+  }
+  function cancelStreamTimers(sid) {
+    cancelPendingStreamNotify(sid);
+    if (sid && streamRenderTimers[sid]) {
+      clearTimeout(streamRenderTimers[sid]);
+      delete streamRenderTimers[sid];
+    }
+  }
+
+  function finalizeAssistantStreamBeforeReasoning() {
+    flushPendingStreamRender();
+    flushPendingTextBlock();
+    const item = state.chatItems.find(function (it) { return it.id === currentStreamId; });
+    if (item) {
+      if (item.html) item.streaming = false;
+      else state.chatItems = state.chatItems.filter(function (it) { return it !== item; });
+    }
+    currentStreamText = "";
+    currentStreamId = 0;
+  }
+
+  function startReasoningBlock(index) { return pinvouSharedweb().startReasoningBlock(index); }
+
+  function appendReasoningBlock(text) { return pinvouSharedweb().appendReasoningBlock(text); }
+
+  listen("chat:reasoning_start", function (e) { onSessionEvent(e, function () {
+    startReasoningBlock(reasoningEventIndex(e));
+    notify();
+  }); });
+
+  listen("chat:reasoning_delta", function (e) { onSessionEvent(e, function () {
+    const text = String(e.payload && e.payload.text || "");
+    if (!text) return;
+    const index = reasoningEventIndex(e);
+    let item = streamingReasoningItem(index);
+    if (!item) {
+      item = startReasoningBlock(index);
+    }
+    const firstDelta = !item.text;
+    item.text += text;
+    appendReasoningBlock(text);
+    scheduleStreamNotify(e.payload && e.payload.session_id || state.activeSessionId, firstDelta);
+  }, { deferBackgroundNotify: true }); });
+
+  listen("chat:reasoning_done", function (e) { onSessionEvent(e, function () {
+    const index = reasoningEventIndex(e);
+    const item = streamingReasoningItem(index);
+    finalizeStreamingReasoning(index);
+    if (item && !item.text) {
+      state.chatItems = state.chatItems.filter(function (candidate) { return candidate !== item; });
+      const last = pendingAssistantBlocks[pendingAssistantBlocks.length - 1];
+      if (last && last.type === "thinking" && !last.thinking) pendingAssistantBlocks.pop();
+    }
+    notify();
+  }); });
+
+  listen("chat:delta", function (e) { onSessionEvent(e, function () {
+    finalizeStreamingReasoning();
+    const text = e.payload && e.payload.text || "";
+    pendingAssistantText += text;
+    currentStreamText += text;
+    const item = state.chatItems.find(function (it) { return it.id === currentStreamId; });
+    const firstDelta = !item;
+    if (item) {
+      item.text = currentStreamText;
+      if (!item.html) {
+        item.html = renderMarkdown(currentStreamText);
+        item.htmlSource = currentStreamText;
+      }
+      item.streaming = true;
+    } else {
+      // New bubble needed (after tool card)
+      currentStreamId = ++itemIdSeq;
+      state.chatItems.push({
+        id: currentStreamId,
+        type: "assistant",
+        text: currentStreamText,
+        html: renderMarkdown(currentStreamText),
+        htmlSource: currentStreamText,
+        time: timeStr(),
+        streaming: true,
+      });
+    }
+    scheduleStreamRender(e.payload && e.payload.session_id || state.activeSessionId);
+    scheduleStreamNotify(e.payload && e.payload.session_id || state.activeSessionId, firstDelta);
+  }, { deferBackgroundNotify: true }); });
+
+  listen("scheduled_task:run_updated", function () {
+    scheduleScheduledRunRefresh();
+  });
+
+  listen("chat:memory_write", function (e) {
+    handleMemoryWrite(e && e.payload);
+  });
+
+  // present_artifact MCP 工具名匹配:兼容底座 MCP adapter 可能加的 server 前缀
+  // (实测透传名若带前缀仍命中)。命中则渲染成品卡而非灰色工具卡。
+function isPresentArtifactTool(name) { return pinvouSharedweb().isPresentArtifactTool(name); }
+
+function artifactPathFromToolOutput(toolResultContent) { return pinvouSharedweb().artifactPathFromToolOutput(toolResultContent); }
+function shouldUseToolOutputAsArtifact(name) { return pinvouSharedweb().shouldUseToolOutputAsArtifact(name); }
+function presentArtifactAbsPath(toolResultContent, fallbackPath) { return pinvouSharedweb().presentArtifactAbsPath(toolResultContent, fallbackPath); }
+
+  // 子智能体不产生 chat:tool_start/chat:tool_end（forwarder 只转发 mailbox 进展），
+  // 它启动的后台 shell 任务若无人调度轮询，就要等到会话切换或顶层 shell 调用
+  // 才会被 applyShellSnapshots 发现。从进展文本认出 shell 工具即补一次调度；
+  // 轮询自身会在没有运行中任务时自停，不会常驻。
+  listen("multiagent:agent_progress", function (e) {
+    const p = e.payload || {};
+    if (p.session_id && mentionsShellTool(p.status)) {
+      scheduleShellPoll(p.session_id, true);
+    }
+  });
+
+  listen("chat:tool_start", function (e) { onSessionEvent(e, function () {
+    const p = e.payload || {};
+    // Relay reconnects and the desktop event bridge may replay the last frame.
+    // Tool-call ids are durable identities, so never create a second message/card
+    // for the same call. Normal repeated calls have distinct ids and remain visible.
+    if (toolCallAlreadyStarted(p.id) || toolCallAlreadyFinished(p.id)) return;
+    if (p.session_id) turnUsageDirty[p.session_id] = true; // 多请求轮，usage 累加值不可当占用
+    toolMeta[p.id] = { name: p.name, args: p.args };
+    finalizeStreamingReasoning();
+    thinkingTool(p.name);
+    flushPendingTextBlock();
+    pendingAssistantBlocks.push({ type: "tool_use", id: p.id, name: p.name, input: p.args || {} });
+
+    flushPendingStreamRender();
+    const streamItem = state.chatItems.find(function (it) { return it.id === currentStreamId; });
+    if (streamItem) {
+      streamItem.streaming = false;
+    }
+    currentStreamText = "";
+    currentStreamId = 0;
+
+    // request_user_input：不渲染默认工具卡，等 chat:user_input_required 单独渲染选择卡片
+    if (p.name === "request_user_input") { notify(); return; }
+
+    // present_artifact：不渲染灰色工具卡，等 tool_end 成功时渲染成品卡
+    if (isPresentArtifactTool(p.name)) { notify(); return; }
+
+    // load_skill：模型加载技能 → 点亮 composer 技能标（内置自动技能"正在使用"指示）。
+    if (p.name === "load_skill") {
+      const skArg = ((p.args && (p.args.name || p.args.skill)) || "").toString();
+      const skLower = skArg.toLowerCase();
+      if (skArg.includes("视觉设计") || skLower.includes("visual-design")) state.activeSkill = "visual-design";
+      else if (skArg.includes("插件包标准化") || skLower.includes("package-author")) state.activeSkill = "package-author";
+      else if (skArg.includes("技能创建") || skLower.includes("skill-author")) state.activeSkill = "skill-author";
+      else if (skArg.includes("公文写作") || skLower.includes("government-writing")) state.activeSkill = "government-writing";
+      else if (skArg.includes("PPT") || skArg.includes("幻灯片") || skLower.includes("pptx")) state.activeSkill = "pptx";
+      else if (skArg.includes("数据分析可视化") || skArg.includes("数据可视化") || skLower.includes("visualizer")) state.activeSkill = "visualizer";
+      // 不 return：照常出工具卡。卡内容在 tool_end / rerender 处脱敏成占位，
+      // 展开看不到 SKILL.md 全文（防设计系统泄露），但保留"加载了技能"的痕迹。
+    }
+
+    addChatItem({
+      type: "tool", toolId: p.id, name: p.name, args: p.args,
+      output: null, success: null, state: "running", sessionId: p.session_id || state.activeSessionId,
+    });
+    if (isShellExecutionTool(p.name)) {
+      scheduleShellPoll(p.session_id || state.activeSessionId, true);
+    }
+    notify();
+  }); });
+
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- legacy bridge; refactor tracked separately
+  listen("chat:tool_end", function (e) { onSessionEvent(e, function () {
+    const p = e.payload || {};
+    if (toolCallAlreadyFinished(p.id)) return;
+    const meta = toolMeta[p.id];
+    thinkingIdle();
+    const resultContent = typeof p.output === "string" ? p.output : JSON.stringify(p.output);
+    flushAssistantMessageToHistory();
+    const trBlock = { type: "tool_result", tool_use_id: p.id, content: resultContent };
+    if (!p.success) trBlock.is_error = true;
+    state.messages.push({ role: "user", content: [trBlock] });
+
+    // request_user_input 结束：把选择卡片标记为已提交/取消，不渲染工具卡
+    if (meta && meta.name === "request_user_input") {
+      patchLastItem(
+        function (it) { return it.type === "user_input" && it.toolCallId === p.id && !it.resolved; },
+        { resolved: true, cardState: p.success ? "submitted" : "cancelled" }
+      );
+      delete toolMeta[p.id];
+      flushPendingStreamRender(); // terminal path: emit final html before the reset
+      currentStreamText = ""; currentStreamId = 0;
+      notify();
+      return;
+    }
+
+    // present_artifact 结束：成功 → 弹成品卡(点击打开);失败 → 落普通工具卡显错误,
+    // 让 AI 从 tool_result 看到错误自行重试。成品卡是真工具调用,tool_use 已进
+    // messages(chat:tool_start),rerenderFromMessages 按 name 还原,切会话不丢。
+    if (meta && isPresentArtifactTool(meta.name)) {
+      if (p.success) {
+        // 用 server 解析好的绝对路径(present_artifact_server.py 的 abs_path),而非模型可能
+        // 给的相对 args.path → 卡片 path 绝对,点 Open 不再报「path must be absolute」。
+        const presentedPath = presentArtifactAbsPath(p.output, meta.args && meta.args.path);
+        const presentedCard = {
+          type: "artifact_card",
+          path: presentedPath,
+          title: (meta.args && meta.args.title) || "",
+          description: (meta.args && meta.args.description) || "",
+          time: timeStr(),
+          sessionId: p.session_id || state.activeSessionId,
+        };
+        const presentationCard = updatePresentedArtifact(presentedCard) || presentedCard;
+        if (presentationCard === presentedCard) addChatItem(presentedCard);
+        if (presentedPath) state.turnPresentedArtifacts.push(presentedPath); // 本 turn 已出成品卡,chat:done 不再兜底补
+        // 同步进产物面板:present_artifact 出卡的产物也算「产出物」。修「自己生成文件、
+        // 不走 write_file 的工具(如 make_pptx)→ 卡有、面板无」。trackArtifact 已去重。
+        if (presentedPath) trackArtifact(presentedPath);
+        delete toolMeta[p.id];
+        flushPendingStreamRender(); // terminal path: emit final html before the reset
+        currentStreamText = ""; currentStreamId = 0;
+        notify();
+        // Keep the web adapter aligned with desktop: an in-place card update does
+        // not change artifactCount, but an explicit presentation must remain visible.
+        try {
+          window.dispatchEvent(new CustomEvent("pinvou:present-artifact", { detail: {
+            sessionId: presentedCard.sessionId,
+            path: presentationCard.path,
+            toolCallId: p.id,
+          } }));
+        } catch { /* DOM event dispatch failure leaves the artifact available from the dock */ }
+        return;
+      }
+      // 失败:补一张工具卡承载错误输出(tool_start 时跳过了灰卡)
+      addChatItem({
+        type: "tool", toolId: p.id, name: meta.name, args: meta.args,
+        output: p.output, success: false, state: "done",
+      });
+      delete toolMeta[p.id];
+      flushPendingStreamRender(); // terminal path: emit final html before the reset
+      currentStreamText = ""; currentStreamId = 0;
+      notify();
+      return;
+    }
+
+    // 通用工具产物兜底：PPT / 公文等 MCP 工具会先返回 {path: "..."}，
+    // 随后模型按约定再调 present_artifact。若模型漏调，仍把该成品归到当前
+    // tool_end 所属 session，并在 chat:done 统一补一张成品卡。
+    if (p.success && meta && shouldUseToolOutputAsArtifact(meta.name)) {
+      const producedPath = artifactPathFromToolOutput(p.output);
+      if (producedPath && isDeliverable(producedPath)) {
+        trackArtifact(producedPath);
+        markTurnDirtyArtifact(producedPath);
+      }
+    }
+
+    // load_skill：卡照出，但不把返回的 SKILL.md 全文写进卡，展开只见占位（防设计系统泄露）。
+    const outForCard = (meta && meta.name === "load_skill")
+      ? bt("skillContentHidden")
+      : toolResultDisplayContent(p.output);
+    const updatedToolItem = updateToolItem(p.id, outForCard, p.success);
+    const shellTaskId = p.metadata && (p.metadata.task_id || p.metadata.taskId);
+    if (updatedToolItem && shellTaskId) {
+      const syntheticShellItem = state.chatItems.find(function (it) {
+        return it !== updatedToolItem && it.shellSnapshot === true && it.taskId === shellTaskId;
+      });
+      if (syntheticShellItem) {
+        ["shellStatus", "exitCode", "elapsedMs", "output", "state", "success", "shellSnapshotKey"]
+          .forEach(function (key) {
+            if (syntheticShellItem[key] !== undefined) updatedToolItem[key] = syntheticShellItem[key];
+          });
+        const syntheticIndex = state.chatItems.indexOf(syntheticShellItem);
+        if (syntheticIndex >= 0) state.chatItems.splice(syntheticIndex, 1);
+      }
+      updatedToolItem.taskId = shellTaskId;
+      updatedToolItem.sessionId = p.session_id || state.activeSessionId;
+      // 后台 shell 任务标记：供后台任务指示器区分"真后台"与被轮询命令匹配
+      // 回退挂上 taskId 的前台卡（桌面端 backgrounded 快速通道等价逻辑）。
+      if (p.metadata && p.metadata.backgrounded === true) updatedToolItem.background = true;
+      const shellStatus = String((p.metadata && p.metadata.status) || "").toLowerCase();
+      if (shellStatus === "running" || /running|background/i.test(String(p.output || ""))) {
+        updatedToolItem.state = "running";
+        updatedToolItem.success = null;
+      }
+      scheduleShellPoll(updatedToolItem.sessionId, true);
+    }
+
+    // Careful hook：CodeWhale shell.rs 拦截 Dangerous → 红色拦截卡
+    const md = p.metadata;
+    if (md && md.safety_level === "dangerous" && md.blocked && !hasChatItemForTool("careful_blocked", p.id)) {
+        addChatItem({
+          type: "careful_blocked", toolCallId: p.id,
+          args: meta && meta.args, metadata: md, time: timeStr(),
+        });
+      }
+
+    // File.write/File.edit/File.patch 改了产物 → 记账,turn 结束(chat:done)统一补成品卡。
+    // 改成记账+去重:AI 一个 turn 会 edit_file 改很多次,实时续会刷出一堆卡;且 edit_file
+    // 之前不触发续卡 → 改完没新卡片 → 没法对改后产物再召唤 pinvou(核账闭环断裂)。
+    const mutationAction = meta && fileMutationAction(meta.name, meta.args);
+    if (p.success && mutationAction) {
+      extractArtifactPaths(meta.args).forEach(function (ap) {
+        // 面板只收「成品」:成品型扩展名(自动当成品)或之前 present_artifact 过的文件;
+        // 中间草稿(content_p1.txt / *_params.json 等)不进面板。edit_file 只改已有不新建。
+        if (mutationAction !== "edit" && (isDeliverable(ap) || findPresentedArtifact(ap))) trackArtifact(ap);
+        // 产物(present 过的成品 或 write/append 写进产物列表的)被写/改 → turn 结束补卡。
+        // 不再要求 present 过:AI 经常写完产物忘了 present_artifact → 没成品卡 = 没召唤入口。
+        // 按 basename 比对:disk watcher(artifact:disk)写盘后抢先用**绝对**路径 trackArtifact
+        // 占了名额,而这里 ap 是 write_file 的**相对**参数 —— 用 a.path===ap 比绝对≠相对永远落空,
+        // turnDirty 收不到 → 实时不补成品卡(只能靠重启 rerender 才出)。basename 比对消除该竞态。
+        const _apbn = basename(ap);
+        const isArtifact = !!findPresentedArtifact(ap) || state.artifacts.some(function (a) { return basename(a.path) === _apbn; });
+        if (isArtifact) markTurnDirtyArtifact(ap);
+      });
+    }
+
+    // 兜底：Plan 模式下 AI 调了被白名单/sandbox 拦的工具 → 弹兜底卡，给两条出路
+    if (!p.success && state.modeState.mode === "plan" && typeof p.output === "string" &&
+        (p.output.includes("not available in the current tool catalog") ||
+         p.output.includes("unavailable in Plan mode") ||
+         p.output.includes("PermissionDenied")) && !hasUnresolvedItem("plan_stuck")) {
+        addChatItem({ type: "plan_stuck", toolName: meta && meta.name, resolved: false, time: timeStr() });
+      }
+
+    delete toolMeta[p.id];
+    flushPendingStreamRender(); // terminal path: emit final html before the reset
+    currentStreamText = "";
+    currentStreamId = 0;
+    notify();
+  }); });
+
+  // chat:done 特殊:同步收尾(flush/busy=false/mode 复位)走 runSyncOnSession
+  // 路由到对应 session;异步收尾(discard_plan/落盘/刷新列表)按显式 sid 路由,
+  // 不依赖工作集 —— 这样后台 session 跑完也能正确落盘。
+  listen("chat:done", function (e) {
+    const sid = (e.payload && e.payload.session_id) || state.activeSessionId;
+    const knownDoneSession = !!sid && state.sessions.some(function (session) { return session.id === sid; });
+    const scheduledDoneSession = isScheduledRunSession(sid);
+    if (sid && sid !== state.activeSessionId && !sessionStates[sid] &&
+        !knownDoneSession && !scheduledDoneSession) {
+      // A stale/malformed terminal for an unknown ordinary Session must not
+      // allocate a background buffer or persist the active Session into it.
+      return;
+    }
+    const doneBuffer = sid ? getBuffer(sid) : null;
+    // Match the Tauri client: rejected optimistic edits must hydrate the
+    // unchanged authoritative transcript before another local turn starts.
+    const operationRejected = !!(e.payload && e.payload.operation_rejected);
+    const completedLocalTurn = !!(
+      doneBuffer && doneBuffer.localTurnOwned && !isScheduledRunSession(sid) && !operationRejected
+    );
+    recordAuthoritySyncDiagnostic("chat_done_classified", Object.assign({
+      completed_local_turn: completedLocalTurn,
+      operation_rejected: operationRejected,
+      requires_authority_reconcile: !isScheduledRunSession(sid),
+      terminal_status: String(e.payload && e.payload.status || ""),
+      terminal_error_present: !!(e.payload && e.payload.error),
+    }, authoritySyncBufferSnapshot(sid, doneBuffer)));
+    if (doneBuffer && !doneBuffer.localTurnOwned && !isScheduledRunSession(sid)) {
+      // transcript_committed precedes chat:done. Preserve its revision when a
+      // reconnecting client first materializes the turn at the terminal tail.
+      markRemoteTurn(sid, doneBuffer, true, "chat_done_without_local_owner");
+    }
+    if (isScheduledRunSession(sid)) markScheduledInitialTurnTerminal(sid);
+    runSyncOnSession(sid, function () {
+      if (isScheduledRunSession(sid)) markScheduledInitialTurnTerminal(sid);
+      const error = e.payload && e.payload.error;
+      const terminal = webTurnTerminal();
+      let terminalRecord = null;
+      if (typeof terminal.recordCompleted === "function") {
+        terminalRecord = terminal.recordCompleted(
+          state,
+          latestOpenTimelineStart(),
+          e.payload || {}
+        );
+      }
+      // 401/鉴权失败:刷新 effectiveModelConfig → 前端拦截遮罩自动弹出引导配置。
+      // \b401\b 词边界锚定,避免误匹配 "port 4014"/"row 401" 等含 401 子串的无关报错。
+      if (error && /\b401\b|unauthorized|authentication/i.test(String(error))) loadEffectiveModelConfig();
+      if (error) {
+        const messages = bridgeMessages();
+        if (!(typeof messages.addModelServiceErrorNotice === "function" && messages.addModelServiceErrorNotice(e.payload || {}, state, addSystemItem, true, terminalRecord))) {
+          // Same premise as addModelServiceErrorNotice: the bubble is only
+          // hidden when the timeline terminal record actually carries an
+          // error (the timeline takes over with the raw error in small
+          // text); otherwise it stays visible.
+          const timelineTakesOver = !!(terminalRecord && terminalRecord.error);
+          // The fallback bubble must share the transient fallback's
+          // redacted text, or the find-based dedup misses over wording
+          // differences and produces a double bubble.
+          const displayError = typeof messages.redactRawError === "function"
+            ? messages.redactRawError(error, state)
+            : error;
+          const finalNotice = "⚠️ " + displayError;
+          const finalNoticeItem = state.chatItems.find(function (item) {
+            return item && item.turnErrorNotice && item.text === finalNotice;
+          });
+          if (finalNoticeItem) {
+            if (timelineTakesOver) finalNoticeItem.legacyConversationOnly = true;
+          } else {
+            addSystemItem(finalNotice, {
+              turnErrorNotice: true,
+              legacyConversationOnly: timelineTakesOver,
+            });
+          }
+        }
+      } else {
+        // Successful (error-free) terminal: the turn has recovered, so the
+        // transient bubbles' "will keep retrying" claim is stale and they
+        // are hidden uniformly (sending already cleared the previous
+        // turn's items).
+        const messages = bridgeMessages();
+        if (typeof messages.settleModelServiceErrorNotices === "function") {
+          messages.settleModelServiceErrorNotices(state);
+        }
+      }
+      const shellMessages = bridgeMessages();
+      if (typeof shellMessages.showShellCleanupFailure === "function") {
+        shellMessages.showShellCleanupFailure(e.payload, state, addSystemItem);
+      }
+      const terminalStatus = String(e.payload && e.payload.status || "").toLowerCase();
+      const interrupted = ["interrupted", "cancelled", "canceled"].includes(terminalStatus);
+      flushPendingStreamRender();
+      // The trailing notify() only cancels the visible session's frame; a
+      // background session's terminal must cancel its own pending frame or a
+      // redundant late round fires within 32ms.
+      cancelPendingStreamNotify(sid);
+      if (interrupted) preserveInterruptedAssistantPresentation();
+      else flushAssistantMessageToHistory();
+      // Refresh artifacts written in this turn in place when already presented.
+      // Add only the first card for artifacts the model did not present, and
+      // skip artifacts already presented in this turn or changed repeatedly.
+      (state.turnDirtyArtifacts || []).forEach(function (ap) {
+        // 按 basename 比对:present 存 server 绝对路径、turnDirty 存 write 相对路径,
+        // 直接 indexOf 比不中 → present 过的文件会被兜底再补一张(重复)。
+        const _apbn = basename(ap);
+        if ((state.turnPresentedArtifacts || []).some(function (pp) { return basename(pp) === _apbn; })) return;
+        const prev = findPresentedArtifact(ap);
+        // 补卡 path 优先用 disk watcher 落进产物列表的同名**绝对**路径(open 可靠、跨 session 稳);
+        // 没有再退回 write_file 的相对 ap(由 sessionId 兜底解析)。
+        const tracked = state.artifacts.find(function (a) {
+          return normalizedPath(a.path) === normalizedPath(ap) && isAbsPath(a.path);
+        }) || state.artifacts.find(function (a) {
+          return basename(a.path) === _apbn && isAbsPath(a.path);
+        });
+        const cardPath = (tracked && tracked.path) || ap;
+        if (prev) {
+          // A user re-request after the previous card returns null and still
+          // receives a fresh visible card.
+          const refreshed = updatePresentedArtifact({ type: "artifact_card", path: cardPath, title: prev.title, description: prev.description, time: timeStr(), sessionId: sid });
+          if (!refreshed) addChatItem({ type: "artifact_card", path: cardPath, title: prev.title, description: prev.description, time: timeStr(), sessionId: sid });
+        } else {
+          addChatItem({ type: "artifact_card", path: cardPath, title: basename(ap), description: "", time: timeStr(), sessionId: sid });
+        }
+      });
+      state.turnDirtyArtifacts = [];
+      state.turnPresentedArtifacts = [];
+      finalizeStreamingReasoning();
+      // Finalize streaming bubble
+      const streamItem = state.chatItems.find(function (it) { return it.id === currentStreamId; });
+      if (streamItem) streamItem.streaming = false;
+      // Remove empty assistant bubbles
+      state.chatItems = state.chatItems.filter(function (it) {
+        return !(it.type === "assistant" && !it.html);
+      });
+      state.busy = false;
+      stopThinking();
+      currentStreamText = "";
+      currentStreamId = 0;
+    });
+    if (doneBuffer && !completedLocalTurn && !isScheduledRunSession(sid)) {
+      // Rust has already committed the final transcript before chat:done. Keep
+      // both UIs behind a short authority barrier until that snapshot is loaded.
+      let finalAssistantMessage = null;
+      for (let doneMessageIndex = doneBuffer.messages.length - 1; doneMessageIndex >= 0; doneMessageIndex--) {
+        if (doneBuffer.messages[doneMessageIndex] && doneBuffer.messages[doneMessageIndex].role === "assistant") {
+          finalAssistantMessage = doneBuffer.messages[doneMessageIndex];
+          break;
+        }
+      }
+      doneBuffer.remoteExpectedAssistantKey = finalAssistantMessage
+        ? hydratedMessageKey(finalAssistantMessage, isScheduledRunSession(sid))
+        : "";
+      if (doneBuffer.localTurnOwned) doneBuffer.deferredRemoteUserEvent = null;
+      doneBuffer.localTurnOwned = false;
+      doneBuffer.remoteTurnActive = true;
+      doneBuffer.remoteTerminalSeen = true;
+      doneBuffer.busy = false;
+      if (sid === state.activeSessionId) saveWorkingSetTo(doneBuffer);
+    } else if (completedLocalTurn || isScheduledRunSession(sid)) {
+      // A local turn is already authoritative in this desktop process. Saved
+      // transcript verification remains best-effort and must not lock the next
+      // local message behind a cross-client synchronization state. Scheduled
+      // runs skip transcript reconciliation entirely (Rust owns the durable
+      // transcript), so the same full release applies: markRemoteTurn may have
+      // armed the remote-authority gate during the streamed turn, and a stale
+      // gate would send flushQueued into reconcileRemoteTurn, whose
+      // write-ownership busy check then deadlocks the queued follow-up forever.
+      doneBuffer.deferredRemoteUserEvent = null;
+      doneBuffer.localTurnOwned = false;
+      doneBuffer.remoteTurnActive = false;
+      doneBuffer.remoteTerminalSeen = false;
+      doneBuffer.remoteBaselineMessageCount = null;
+      doneBuffer.remoteBaselineTrusted = false;
+      doneBuffer.remoteExpectedAssistantKey = "";
+      doneBuffer.remoteCommittedRevision = "";
+      doneBuffer.busy = false;
+      if (sid === state.activeSessionId) saveWorkingSetTo(doneBuffer);
+    }
+    notify();
+    // 异步收尾(按 sid 路由,active/后台通用)
+    (async function () {
+      await persistMessagesFor(sid);
+      // Scheduled runs skip transcript reconciliation entirely, mirroring the
+      // Tauri bridge: Rust owns the durable transcript for a scheduled session,
+      // and the gate was already fully released in the synchronous tail above.
+      const reconciled = (completedLocalTurn || isScheduledRunSession(sid))
+        ? true
+        : await reconcileRemoteTurn(sid);
+      if (reconciled) await persistMessagesFor(sid);
+      await refreshHistoryList();
+      if (!reconciled) {
+        recordAuthoritySyncDiagnostic("authority_sync_notice_shown", Object.assign({
+          notice: "remote_done_unsynced",
+        }, authoritySyncBufferSnapshot(sid, doneBuffer)));
+        runSyncOnSession(sid, function () {
+          addAuthoritySyncNotice(bt("remoteDoneUnsynced"));
+        });
+      }
+      notify();
+      // 排队式:本轮跑完,若该 session 不忙且有待发消息 → 自动发下一条
+      if (reconciled) flushQueued(sid);
+    })();
+  });
+
+  listen("chat:usage", function (e) { onSessionEvent(e, function () {
+    const sid = e.payload && e.payload.session_id;
+    // 真实窗口是模型能力常量，不随轮内请求数变化，必须先于 dirty guard 消费：
+    // 工具轮（最常见的 Agent 场景）只跳过不可信的累计 input，分母仍要更新。
+    const windowTok = Number(e.payload && e.payload.context_window) || 0;
+    if (windowTok > 0 && windowTok !== state.tokens.max) {
+      state.tokens.max = windowTok; // 云端真实窗口，替代 32K 假分母
+      notify(); // 窗口变化也要通知 UI（即使本轮 input 不可信）
+    }
+    // 逐请求占用口径（context_input_tokens：本轮最后一次父请求的 reported
+    // input = 回合结束时真实上下文占用）。chat:usage 每轮只在 TurnComplete
+    // 发一次，而本轮任意 tool_start 都会把 turnUsageDirty 锁到下一轮发送才
+    // 解——只消费累计口径意味着工具轮的读数永远冻结在「— / … · 0%」，只有
+    // 手动压缩的 post_tokens 能刷新。逐请求值不是累加值，dirty 口径保护不
+    // 适用：先于 dirty guard 消费，且消费后不得再让累计口径覆写。
+    const ctxInput = Number(e.payload && e.payload.context_input_tokens || 0);
+    if (ctxInput > 0) {
+      // 超窗同累计口径的守卫：分母声明失真时不透出超上限数字，保留上个准确值。
+      if (ctxInput <= state.tokens.max) {
+        state.tokens = { input: ctxInput, max: state.tokens.max };
+        notify();
+      }
+      return;
+    }
+    if (sid && turnUsageDirty[sid]) return; // 本轮多请求，累加 input 不可信，保留上个准确值
+    const input = Number(e.payload && e.payload.input_tokens || 0);
+    // 累加值超过窗口说明仍有多请求（内部重试等无事件轮），跳过避免显示超上限
+    if (input > 0 && input <= state.tokens.max) {
+      state.tokens = { input, max: state.tokens.max };
+      notify();
+    }
+  }); });
+
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- 终态分支（start/prune-done/rewrite-done/fail/cancel）本就贴着 30 上限；r7 M2 的计数基线重置以单个条件位并入 done 腿（与 tauri 车道逐字同文，bridge-messages 计数器原语旁），内聚高于拆分
+  listen("chat:compaction", function (e) { onSessionEvent(e, function () {
+    if (e.payload && e.payload.session_id) turnUsageDirty[e.payload.session_id] = true; // 压缩轮 usage 含摘要请求
+    const phase = e.payload && e.payload.phase;
+    const msg = e.payload && e.payload.message || "";
+    const auto = e.payload && e.payload.auto ? bt("compactAuto") : "";
+    const compactId = e.payload && e.payload.id;
+    const before = Number(e.payload && e.payload.messages_before);
+    const after = Number(e.payload && e.payload.messages_after);
+    const looksLikePruneOnly = /0 removed|messages unchanged|tool results pruned/i.test(msg);
+    const pruneOnlyAuto = !!(e.payload && e.payload.auto) &&
+      phase === "done" &&
+      Number.isFinite(before) &&
+      Number.isFinite(after) &&
+      before === after &&
+      looksLikePruneOnly &&
+      msg.indexOf("Emergency compaction") !== 0;
+    // The compaction in-flight marker: start sets it, a terminal
+    // (done/fail/cancel) clears it, and the main lane's compact entry
+    // disables off it (the same mechanism as the code lane's
+    // lane.compacting). start stores a timestamp: the terminal event may
+    // never arrive (evicting the engine aborts its forwarder — see the
+    // reclaim_engine_entry comment in engine_pool.rs; a desktop restart on
+    // the web side loses it the same way), so the read side heals after 15
+    // minutes, the same fallback as Rust's MAX_COMPACTION_LATCH_AGE, and
+    // the entry is not disabled forever. The fallback reads the wall clock
+    // (Date.now), not a Rust-side monotonic Instant: a clock jump or resume
+    // from sleep re-enables early, and a compaction running past 15 minutes
+    // re-enables the entry before the engine finishes — the cost of a
+    // duplicate enqueue equals the Rust latch expiring (pool.compact_now
+    // does not coalesce enqueues), which is accepted; no extra
+    // monotonic-clock alignment machinery is introduced for it.
+    // The post_tokens carried by done is a post-compaction usage estimate
+    // (the forwarder gained it to refresh the usage bar; the Rust side
+    // computes it as a conservative estimated_input_tokens). The compaction
+    // turn already set turnUsageDirty, so subsequent usage accumulations
+    // are untrustworthy and the usage bar can only be refreshed by this
+    // post_tokens — it must not be swallowed by the dirty semantics.
+    const sid = e.payload && e.payload.session_id;
+    // The compactionStarts signal is persistent BY DESIGN: it survives the
+    // terminal and prune-only merges, so the UI can reconcile a manual
+    // compact marker whose start and terminal coalesced before any render
+    // (review 5874108926 follow-up) — cleared with the session.
+    // The compactionStarts signal carries the bridge's monotonic
+    // compaction sequence (NOT a wall-clock time — review 5876783763:
+    // timestamp ordering of persistent events breaks on
+    // same-millisecond collisions and clock rollbacks). It survives
+    // the terminal and prune-only merges, so the UI can reconcile a
+    // manual compact marker whose start and terminal coalesced before
+    // any render (review 5874108926 follow-up) — cleared with the
+    // session.
+    if (sid) {
+      if (phase === "start") {
+        state.compactingSessions[sid] = Date.now();
+        state.compactionSeq = (state.compactionSeq || 0) + 1;
+        state.compactionStarts[sid] = state.compactionSeq;
+      } else delete state.compactingSessions[sid];
+      notify();
+    }
+    if (phase === "start") addSystemItem(bt("compactStart") + auto + " " + msg, { compactId, compactPhase: "start" });
+    else if (phase === "done" && pruneOnlyAuto) addOrMergePruneCompaction(compactId);
+    else if (phase === "done") addSystemItem(bt("compactDone") + auto + " " + msg);
+    else if (phase === "fail") addSystemItem(bt("compactFail") + auto + ": " + msg);
+    else if (phase === "cancel") addSystemItem(bt("compactCancel") + auto + (msg ? ": " + msg : ""), { compactId, compactPhase: "cancel" });
+    if (phase === "done") {
+      // <context_update> 计数基线在真重写（after < before）后重置（r7 M2）：
+      // 压缩把旧漂移增量从磁盘转写里摘除，而客户端气泡仍携带压缩前的
+      // 老 vintage——不重置的话权威重同步会被老消费量钳在 0（序号整体
+      // 低计）。实现与 prune-only 语义见 bridge-messages 的
+      // healRuntimeContextUpdatesVintageAfterCompaction；返回是否有改动。
+      if (sid && window.PinvouBridgeMessages?.healRuntimeContextUpdatesVintageAfterCompaction?.(getBuffer(sid), state.chatItems, before, after)) {
+        notify();
+      }
+      const postTokens = Number(e.payload && e.payload.post_tokens);
+      if (Number.isFinite(postTokens) && postTokens > 0 && postTokens <= state.tokens.max) {
+        state.tokens = { input: postTokens, max: state.tokens.max };
+        notify();
+      }
+    }
+  }); });
+
+  // ── request_user_input：渲染选择卡片（不进 messages.json）─────────
+  // payload: { id: tool_call_id, questions: [{header, id, question, options:[{label, description}]}] }
+  listen("chat:user_input_required", function (e) { onSessionEvent(e, function () {
+    const p = e.payload || {};
+    const questions = p.questions || [];
+    if (!Array.isArray(questions) || questions.length === 0) return;
+    if (hasChatItemForTool("user_input", p.id)) return;
+    addChatItem({
+      type: "user_input", toolCallId: p.id, questions,
+      resolved: false, cardState: "active", time: timeStr(),
+    });
+    notify();
+  }); });
+
+  // 可恢复的瞬态错误（SSE idle timeout / 瞬态工具失败）：turn 没结束，引擎会 retry，
+  // 绝不 setBusy(false)，只飘一条 ⚠️ 提示。
+  listen("chat:transient_error", function (e) { onSessionEvent(e, function () {
+    if (e.payload && e.payload.session_id) turnUsageDirty[e.payload.session_id] = true; // 重试轮 usage 含重发请求
+    const error = e.payload && e.payload.error;
+    if (error) {
+      const messages = bridgeMessages();
+      if (!(typeof messages.addModelServiceErrorNotice === "function" && messages.addModelServiceErrorNotice(e.payload || {}, state, addSystemItem, false))) {
+        const displayError = typeof messages.redactRawError === "function"
+          ? messages.redactRawError(error, state)
+          : error;
+        const notice = "⚠️ " + displayError;
+        const duplicate = state.chatItems.some(function (item) {
+          return item && item.turnErrorNotice && item.text === notice;
+        });
+        if (!duplicate) addSystemItem(notice, { turnErrorNotice: true });
+      }
+    }
+    // 401/鉴权失败:刷新 effectiveModelConfig → 前端拦截遮罩自动弹出引导配置。
+    // 兜底启动检测被绕过/中途删 key 的场景。
+    // \b401\b 词边界锚定,避免误匹配 "port 4014"/"row 401" 等含 401 子串的无关报错。
+    if (error && /\b401\b|unauthorized|authentication/i.test(String(error))) loadEffectiveModelConfig();
+  }); });
+
+  // File watcher 推送的产物事件：session workspace 下新文件/修改/删除。
+  // 路由到对应 session 的产物列表(后台 session 的产物也跟踪)。
+  listen("artifact:disk", function (e) {
+    const p = e.payload || {};
+    if (!p.path) return;
+    // 公共 MCP 产物目录没有真实 session 归属；归属由对应 chat:tool_end
+    // 的 session_id 决定。这里跳过，避免文件系统事件把 PPT/公文错塞到 default/当前会话。
+    if ((p.session_id === "default" || !p.session_id) && isSharedMcpArtifactPath(p.path)) return;
+    onSessionEvent(e, function () {
+      noteArtifactChange(p.path, p.event || "modified", p.session_id || state.activeSessionId || "");
+      if (p.event === "removed") { untrackArtifact(p.path); return; }
+      // 面板只收成品:成品型扩展名 或 present_artifact 过的;中间 / infra / 目录不进面板
+      // (file_watcher 递归会推 tmp/ _state/ 等子目录与 infra 文件 → 此处兜住)。
+      if (isDeliverable(p.path) || findPresentedArtifact(p.path)) trackArtifact(p.path);
+    });
+  });
+
+  // chat:plan_snapshot —— update_plan/checklist_write 后实时更新进度，与 plan_ready 解耦
+  listen("chat:plan_snapshot", function (e) { onSessionEvent(e, function () {
+    const p = e.payload || {};
+    if (p.plan_snapshot) state.planSnapshot.plan = p.plan_snapshot;
+    if (p.todos_snapshot) state.planSnapshot.todos = p.todos_snapshot;
+    notify();
+  }); });
+
+  // chat:plan_ready —— 底座式:Plan 模式调过 update_plan 即弹方案卡(快照非空)
+  listen("chat:plan_ready", function (e) { onSessionEvent(e, function () {
+    const p = e.payload || {};
+    const planId = String(p.plan_id || p.planId || "").trim();
+    const readyMode = p.mode_state || p.modeState;
+    // 事件负载的权威 mode 写回走收敛点（bump seq 防在途旧读覆盖）。
+    if (readyMode) applyAuthoritativeModeState(state.activeSessionId, readyMode);
+    if (planId && state.chatItems.some(function (item) {
+      return item && item.type === "plan_card" && String(item.planId || "") === planId;
+    })) return;
+    // 新方案出现 → 旧的 active 方案卡冻结
+    state.chatItems.forEach(function (it) {
+      if (it.type === "plan_card" && it.cardState === "active") {
+        it.cardState = "frozen"; it.statusLabel = bt("planSuperseded");
+      }
+    });
+    const snaps = { plan: p.plan_snapshot || null, todos: p.todos_snapshot || null };
+    addChatItem({
+      type: "plan_card", plan: snaps.plan, todos: snaps.todos,
+      planMarkdown: composePlanMarkdown(snaps), planId: planId || null,
+      cardState: planId ? "active" : "frozen", resolved: !planId,
+      planResolutionConfirmed: false,
+      statusLabel: planId ? "" : bt("planHistorical"), time: timeStr(),
+    });
+    notify();
+  }); });
+
+  // A discard is a shared plan-state transition but not a model turn. Apply it
+  // directly to the matching ticket without marking the Session busy or adding
+  // a synthetic user bubble.
+  listen("chat:plan_resolved", function (e) {
+    const p = e && e.payload || {};
+    const sid = p.session_id || state.activeSessionId;
+    const planId = String(p.plan_id || p.planId || "").trim();
+    if (!sid || !planId) return;
+    runSyncOnSession(sid, function () {
+      state.chatItems.forEach(function (item) {
+        if (item && item.type === "plan_card" && String(item.planId || "") === planId) {
+          item.cardState = "frozen";
+          item.resolved = true;
+          item.planResolutionConfirmed = true;
+          item.statusLabel = bt("planDiscarded");
+        }
+      });
+      const resolvedMode = p.mode_state || p.modeState;
+      // 事件负载的权威 mode 写回走收敛点（bump seq 防在途旧读覆盖）。
+      if (resolvedMode) applyAuthoritativeModeState(sid, resolvedMode);
+    });
+    notify();
+  });
+
+  // ── Monitor ──────────────────────────────────────────────────────
+  // pollMonitor/appQueueSnapshot/monitorFmtEqual 与格式化 fallback 统一在
+  // shared/bridge-shared-helpers.js 的 tauriMonitor/web cluster（翻译键
+  // 两侧同值同名）；此处仅保留 lane 内转发的公开入口。
+
+function numOr0(x) { return pinvouSharedweb().numOr0(x); }
+
+
+  function clearMonitorBaseline() {
+    monitorBaseline = null;
+    try { localStorage.removeItem(MONITOR_BASELINE_KEY); } catch { /* ignore when localStorage is unavailable */ }
+  }
+
+  // 把当前 counter 快照存为基准点 → 监控页「后 4 项」从此刻起重新计。
+  // 自测计数(TTFT/TPS/tokens/usage-cache)+ vLLM prefix_cache(供本地 KV 分支)一起存。
+  function clearMonitorStats() {
+    const sp = state.monitor && state.monitor.self_perf;
+    if (!sp) return false;
+    const v = (state.monitor && state.monitor.vllm) || {};
+    monitorBaseline = {
+      ttft_sum_s: numOr0(sp.ttft_sum_s),
+      ttft_count: numOr0(sp.ttft_count),
+      tps_tokens: numOr0(sp.tps_tokens),
+      tps_time_s: numOr0(sp.tps_time_s),
+      gen_tokens: numOr0(sp.gen_tokens_total),
+      prompt_tokens: numOr0(sp.prompt_tokens_total),
+      cache_hit: numOr0(sp.cache_hit_tokens),
+      cache_miss: numOr0(sp.cache_miss_tokens),
+      pc_hits: numOr0(v.prefix_cache_hits),
+      pc_queries: numOr0(v.prefix_cache_queries),
+      at: Date.now(),  // 记录清除时刻，供「统计自 HH:MM 起」状态文字
+    };
+    try { localStorage.setItem(MONITOR_BASELINE_KEY, JSON.stringify(monitorBaseline)); } catch { /* ignore when localStorage is unavailable */ }
+    pollMonitor();  // 立即刷新显示，无需等下一个轮询周期
+    return true;
+  }
+
+async function pollMonitor() { return pinvouSharedweb().pollMonitor(); }
+
+function startMonitorPolling() { return pinvouSharedweb().startMonitorPolling(); }
+function stopMonitorPolling() { return pinvouSharedweb().stopMonitorPolling(); }
+
+  // ── Backend status (live dot) ────────────────────────────────────
+  let backendStatusPollInFlight = false;
+  async function pollBackendStatus() {
+    if (backendStatusPollInFlight) return;
+    backendStatusPollInFlight = true;
+    try {
+      const s = await invoke("get_backend_status");
+      state.backendOnline = !!s.vllm_online;
+      // 修 token 分母时机 bug：不再依赖用户打开监控页才拿到真实 max_model_len
+      if (s.max_model_len) {
+        state.tokens.max = s.max_model_len;
+      }
+    } catch {
+      state.backendOnline = false;
+    } finally {
+      backendStatusPollInFlight = false;
+    }
+    notify();
+  }
+
+  // ── Settings ─────────────────────────────────────────────────────
+
+async function loadSettings() { return pinvouSharedweb().loadSettings(); }
+  // Builtin feature switches (docs/builtin-toolset-contract.md §3.3): the web
+  // client proxies to the same desktop host, so the registry read is exposed
+  // here too (access-policy allowlists list_builtin_features; the write side
+  // stays desktop-only). Without it the session-mention gate would be stuck
+  // fail-open in the browser while the host already removed read_session.
+  async function listBuiltinFeatures() {
+    return invoke("list_builtin_features");
+  }
+async function loadSelectedPet() { return pinvouSharedweb().loadSelectedPet(); }
+async function setSelectedPet(id) { return pinvouSharedweb().setSelectedPet(id); }
+async function loadEffectiveModelConfig(...args) { return pinvouSharedweb().loadEffectiveModelConfig.apply(null, args); }
+  let settingsWriteQueue = Promise.resolve();
+function enqueueSettingsWrite(write) { return pinvouSharedweb().enqueueSettingsWrite(write); }
+  async function saveSettings(patch) {
+    return enqueueSettingsWrite(async function () {
+      try {
+        state.settings = await invoke("web_access_update_settings", { patch });
+        await loadEffectiveModelConfig();
+        notify();
+        return true;
+      } catch (e) {
+        console.warn("save settings failed", e);
+        return false;
+      }
+    });
+  }
+  async function saveSearchSettings(search) {
+    return enqueueSettingsWrite(async function () {
+      try {
+        if (IS_WEB) {
+          state.settings = await invoke("web_access_update_settings", { patch: { search } });
+        } else {
+          state.settings = await invoke("update_search_settings", { search });
+        }
+        await loadEffectiveModelConfig();
+        notify();
+        return true;
+      } catch (e) {
+        console.warn("save search settings failed", e);
+        return false;
+      }
+    });
+  }
+async function submitFeedback(request) { return pinvouSharedweb().submitFeedback(request); }
+
+  // 当前有效模型的图片输入能力(普通会话选图即时警告用);后端按会话模型绑定解析。
+async function getImageInputCapability(...args) { return pinvouSharedweb().getImageInputCapability(...args); }
+
+  // ── 模型列表(「添加模型」方案)─────────────────────────────────
+  // 整表覆盖加载：保存/删除/切换链式 loadModels 并发时旧列表不得覆盖新列表
+  // （审计 b）。请求序号后发者胜（与 tauri settings 侧一致）。
+  let modelsLoadSeq = 0;
+async function loadModels() { return pinvouSharedweb().loadModels(); }
+  // model 对象字段须是 snake_case(SavedModel serde):
+  // {id,name,preset,context_window_tokens,max_output_tokens,reasoning_effort,model,base_url,api_key,credential_action,provider_kind,vendor,endpoint_mode,auth_mode,image_capability_override,vision_model_id,alias}
+  // （round-7 review：这 17 个是保存载荷的字段集——credential_ref /
+  // credential_state / has_secret 由后端按 credential_action 派生，前端不发送。）
+ async function saveModel(model, options) {
+   // options.deferRefresh (round-1 review M9, same semantics as the tauri
+   // lane): the batch add-all loop skips the per-row reload tail and the
+   // caller refreshes once via reloadSavedModels(). Default keeps the
+   // save-then-refresh chain single-row callers rely on.
+   await invoke("save_model", { model });
+   if (options && options.deferRefresh) return;
+   await loadModels();
+   await loadEffectiveModelConfig();
+ }
+// Post-batch refresh twin of saveModel's reload tail (round-1 review M9):
+// the web save chain reloads models + effective config, so the batch refresh
+// runs exactly those two loaders once for the whole confirmed add-all batch.
+async function reloadSavedModels() {
+  await loadModels();
+  await loadEffectiveModelConfig();
+}
+async function revealModelApiKey(id) { return pinvouSharedweb().revealModelApiKey(id); }
+ async function deleteModel(id) {
+   await invoke("delete_model", { id });
+   await loadModels();
+   await loadEffectiveModelConfig();
+  }
+  async function setActiveModel(id) {
+    await invoke("set_active_model", { id });
+    await loadModels();
+    await loadSettings();
+    await loadEffectiveModelConfig();
+  }
+  // 读某会话当前绑定的模型 id(切会话时刷新 chip)。
+  async function loadSessionModel(sessionId) {
+    const requestedSessionId = sessionId || null;
+    let modelId = null;
+    let config = null;
+    try {
+      const results = await Promise.all([
+        requestedSessionId
+          ? invoke("get_session_model_id", { sessionId: requestedSessionId }).catch(function () { return null; })
+          : Promise.resolve(null),
+        invoke("get_effective_model_config", { sessionId: requestedSessionId }).catch(function () { return null; }),
+      ]);
+      modelId = results[0];
+      config = results[1];
+    } catch {
+      // on read failure, treat as unconfigured (null is submitted uniformly below).
+    }
+    // ChatView effect 可能并发加载相邻两个会话；只提交仍为当前会话的结果。
+    if ((state.activeSessionId || null) !== requestedSessionId) return;
+    state.currentSessionModelId = modelId;
+    state.effectiveModelConfig = config;
+    notify();
+  }
+  // 切当前会话模型(chip 热切)。无 session(草稿态)时改全局默认。
+async function switchModel(sessionId, modelId) { return pinvouSharedweb().switchModel(sessionId, modelId); }
+async function testModelConnection(baseUrl, apiKey, modelId, noAuth) { return pinvouSharedweb().testModelConnection(baseUrl, apiKey, modelId, noAuth); }
+  // 测试图片输入能力(设计 §7.3):用当前表单的 model/base_url/key 发一张内置纯色图,
+  // 仅由模型编辑弹窗主动点击触发,无任何启动/定时自动测试。
+async function testImageInputCapability(model, baseUrl, apiKey, modelId, noAuth) { return pinvouSharedweb().testImageInputCapability(model, baseUrl, apiKey, modelId, noAuth); }
+// 端点模型自动发现(冻结契约 §2.5):probe_endpoint_models。失败必须 reject
+// 穿透(web 白名单未放行/老桌面),由 SettingsView 归一为三语提示。
+async function probeEndpointModels(request) { return pinvouSharedweb().probeEndpointModels(request); }
+  async function probeLocalServerKind(baseUrl, apiKey, modelId, noAuth) {
+    // 本地/内网 OpenAI 兼容端点的服务类型探测（vllm/ollama/lmstudio/generic）。
+    // Rust 侧按 base_url TTL 缓存；命令失败（web 白名单不含该命令/老版本桌面）
+    // 在这里 reject，由消费方 catch 降级为「未知」——吞错伪造成 generic 会让 UI
+    // 误报「该端点不支持思考档位调节」（localProbeTiersForKind('generic') 为 null）。
+    // apiKey/modelId follow testModelConnection: a freshly typed form key
+    // wins, otherwise the saved credential is read — authenticated vLLM
+    // (--api-key) 401s on /v1/models, so probing without credentials
+    // misclassifies the authenticated endpoint as generic. noAuth follows the
+    // same command: the form's keyless posture suppresses both credential
+    // sources for the automatic probe (same caliber as the two test buttons).
+    return invoke("probe_local_server_kind", {
+      baseUrl,
+      apiKey: apiKey || null,
+      modelId: modelId || null,
+      noAuth: !!noAuth,
+    });
+  }
+  // ── Super permission ─────────────────────────────────────────────
+async function refreshSuperPerm() { return pinvouSharedweb().refreshSuperPerm(); }
+  async function toggleSuperPerm() { return pinvouSharedweb().toggleSuperPerm(); }
+
+  // ── Mode state ───────────────────────────────────────────────────
+  // 会话级读取：await 挂起期间用户可能已切走，响应返回后必须校验发起时的
+  // sid 仍是 active，否则把结果定向写回 sid 自己的 buffer，不污染当前显示。
+  // 另加请求序号（modeSyncSeq 声明见文件顶部）：同一会话内并发读取乱序返回时，
+  // 旧响应不得覆盖新响应（A→B→A 快速切换时 #1 的慢响应覆盖 #3 的新值，审计；
+  // tauri 版 epoch 对齐）。权威写回一律 bump 该序号，见 applyAuthoritativeModeState。
+  async function syncModeState() {
+    const sid = state.activeSessionId;
+    if (!sid) {
+      // Draft state: show the current lane's global default (two-lane
+      // semantics), no longer a constant yolo.
+      state.modeState = currentDraftModeState();
+      return;
+    }
+    const seq = ++modeSyncSeq;
+    try {
+      const ms = await invoke("get_mode_state", { sessionId: state.activeSessionId });
+      if (seq !== modeSyncSeq) return; // 已有更新的读取发起，本响应陈旧
+      if (state.activeSessionId !== sid) {
+        runSyncOnSession(sid, function () {
+          state.modeState = { mode: ms.mode || "yolo", multiAgent: !!ms.multi_agent };
+        });
+        return;
+      }
+      state.modeState = { mode: ms.mode || "yolo", multiAgent: !!ms.multi_agent };
+    } catch {
+      if (seq !== modeSyncSeq) return;
+      if (state.activeSessionId !== sid) return;
+      state.modeState = { mode: "yolo", multiAgent: false };
+    }
+  }
+
+  // ── lane global defaults (work/code split, aligned with the tauri bridge) ───────
+  // 草稿态（无 active 会话）的 modeState：取当前 lane 的全局默认，缺省 yolo。
+  function currentDraftModeState() {
+    const lane = state.modeLane === "code" ? "code" : "work";
+    const d = state.modeDefaults && state.modeDefaults[lane];
+    return { mode: d || "yolo", multiAgent: false };
+  }
+  async function refreshModeDefaults() {
+    try {
+      const defaults = await invoke("get_mode_defaults");
+      if (defaults) state.modeDefaults = defaults;
+    } catch { /* 读取失败保留旧值/缺省，不打扰交互 */ }
+    if (!state.activeSessionId) {
+      state.modeState = currentDraftModeState();
+      notify();
+    }
+  }
+  // ChatView 随 pinvouMode 传入当前 lane；草稿态立即按新 lane 默认刷新显示。
+function setModeLane(lane) { return pinvouSharedweb().setModeLane(lane); }
+  // The desktop-side companion queries for bound-workspace sessions have no
+  // web backend counterpart (web/remote sessions carry no directory binding):
+  // same-named stub methods keep the bridge API symmetric on both sides — the
+  // binding query always returns null (UI shows no binding indicator and the
+  // YOLO confirmation gate never fires), code permission prefs always read
+  // null, and the confirm write is a no-op.
+  async function getSessionWorkspaceBinding() { return null; }
+  async function getCodePermissionPrefs() { return null; }
+  async function confirmCodeYolo() { return null; }
+  // 草稿态 chip 切换：写本 lane 全局默认（不物化会话——物化时由
+  // ensureSession 把 lane 默认应用到新会话）。
+  async function setDraftMode(target) {
+    const lane = state.modeLane === "code" ? "code" : "work";
+    try {
+      const defaults = await invoke("set_mode_default", { lane, mode: target });
+      if (defaults) state.modeDefaults = defaults;
+      if (!state.activeSessionId) {
+        state.modeState = {
+          mode: target,
+          multiAgent: !!(state.modeState && state.modeState.multiAgent),
+        };
+      }
+    } catch (e) { addSystemItem(bt("switchModeFailed") + e); }
+    notify();
+  }
+
+  // ── 卡片动作辅助 ─────────────────────────────────────────────────
+function patchItemById(id, patch) { return pinvouSharedweb().patchItemById(id, patch); }
+  function pushUserEcho(text, persist) {
+    const item = { type: "user", text, time: timeStr() };
+    let message = null;
+    addChatItem(item);
+    if (persist) {
+      message = { role: "user", content: [{ type: "text", text }] };
+      state.messages.push(message);
+    }
+    return { item, message };
+  }
+
+  // ── Per-session UI 路由 ─────────────────────────────────────────
+  // 卡片动作链路有多个 await 边界,用户可能中途切 session。所有 UI 写入(chatItem 增改、
+  // pending* 标记、modeState 同步)必须落在【触发 session】的 buffer 上,不能跟着
+  // state.activeSessionId 漂走。一律 wrap 进 runSyncOnSession 是因为:sid === active
+  // 时它是 no-op 直通,sid !== active 时它 swap-load-fn-save 回 sid 的 buffer。
+function runOnSession(sid, fn) { return pinvouSharedweb().runOnSession(sid, fn); }
+function addSystemItemFor(sid, text) { return pinvouSharedweb().addSystemItemFor(sid, text); }
+function patchItemByIdFor(sid, id, patch) { return pinvouSharedweb().patchItemByIdFor(sid, id, patch); }
+
+
+
+
+function handleMemoryWrite(payload) { return pinvouSharedweb().handleMemoryWrite(payload); }
+
+function applyMemoryOverview(overview) { return pinvouSharedweb().applyMemoryOverview(overview); }
+function applyMemoryProfileState(result) { return pinvouSharedweb().applyMemoryProfileState(result); }
+function applyMemoryWriteState(result, update) { return pinvouSharedweb().applyMemoryWriteState(result, update); }
+
+function rehydratePendingMemoryCandidates(overview) { return pinvouSharedweb().rehydratePendingMemoryCandidates(overview); }
+  // 记忆面板混合两类数据：runtime 按 session 分文件，profile/preferences/
+  // pending 等为全局单文件(见后端 paths.rs)。加载仍必须带归属+序号校验
+  // (与 tauri memory.js 对齐，审计)：await 挂起期间切会话或再次加载，旧
+  // 响应不得覆盖当前显示(尤其 runtime 属于别的会话)，也不得把候选卡
+  // rehydrate 进当前对话流。
+  let memoryOverviewSeq = 0;
+async function loadMemoryOverview(options) { return pinvouSharedweb().loadMemoryOverview(options); }
+  // 守卫命中的善后：序号已被更新加载接管时由它负责收尾 loading；仅会话
+  // 变化、无人接管时(如切草稿不续发加载)必须自己清掉 loading，否则面板
+  // 永远停在"同步中"(与 tauri 对齐，审计补充)。
+  async function saveMemoryProfilePatch(patch) {
+    if (!invoke) return null;
+    // 入口捕获触发会话：invoke 往返期间切走，A 的写结果/错误不得渲染进
+    // B 的面板(与 tauri memory.js 对齐，审计补充)。
+    const sid = state.activeSessionId;
+    try {
+      const result = await invoke("update_memory_profile", { patch: patch || {}, sessionId: state.activeSessionId });
+      if (sid === state.activeSessionId) { applyMemoryProfileState(result); notify(); }
+      const overview = await loadMemoryOverview();
+      return overview || result;
+    } catch (e) {
+      if (sid === state.activeSessionId) {
+        state.memory = Object.assign({}, state.memory, { error: String(e) });
+        notify();
+      }
+      throw e;
+    }
+  }
+
+async function updateMemoryItem(kind, id, patch) { return pinvouSharedweb().updateMemoryItem(kind, id, patch); }
+async function deleteMemoryItem(kind, id) { return pinvouSharedweb().deleteMemoryItem(kind, id); }
+function resolveMemoryCandidate(command, args, chatItemId, statusLabel, errorKey) { return pinvouSharedweb().resolveMemoryCandidate(command, args, chatItemId, statusLabel, errorKey); }
+  async function confirmMemoryCandidate(memoryId, chatItemId) {
+    return resolveMemoryCandidate("confirm_pending_memory", { id: memoryId, sessionId: state.activeSessionId }, chatItemId, "已记住", "memoryWriteFailed");
+  }
+  async function ignoreMemoryCandidate(memoryId, chatItemId) {
+    return resolveMemoryCandidate("ignore_pending_memory", { id: memoryId, sessionId: state.activeSessionId }, chatItemId, "已忽略", "memoryIgnoreFailed");
+  }
+  async function neverMemoryCandidate(memoryId, chatItemId) {
+    return resolveMemoryCandidate("never_pending_memory", { id: memoryId, reason: "user_selected", sessionId: state.activeSessionId }, chatItemId, "不再提示", "memoryNeverFailed");
+  }
+  // AI organize memory ("AI 整理记忆"; same contract as tauri memory.js):
+  // operates on global memory data; the entry point still captures the session
+  // so success and failure are written back only to the originating session's
+  // panel. On success, reconcile runtime/warnings via applyMemoryWriteState and
+  // refetch the overview; the caller reads the report from the return value. On
+  // failure, rethrow: memory.error is the dedicated load-failure channel (the
+  // settings banner renders it as the generic "加载失败" (load failed) copy),
+  // so the organize failure reason is surfaced by the caller's catch and must
+  // not pollute that channel.
+  async function organizeMemory() {
+    if (!invoke) return null;
+    const sid = state.activeSessionId; // same as saveMemoryProfilePatch: after switching away, never write to B's panel
+    const result = await invoke("organize_memory");
+    if (sid === state.activeSessionId && result) applyMemoryWriteState(result);
+    // Organizing can merge/delete entries: refetch the overview to refresh the
+    // panel; return the raw payload.
+    await loadMemoryOverview();
+    return result;
+  }
+async function loadOrganizeHistory() { return pinvouSharedweb().loadOrganizeHistory(); }
+  // ── 思考指示器状态（每次阶段切换重置计时）──────────────────────
+function startThinking() { return pinvouSharedweb().startThinking(); }
+function thinkingTool(name) { return pinvouSharedweb().thinkingTool(name); }
+function thinkingIdle() { return pinvouSharedweb().thinkingIdle(); }
+function stopThinking() { return pinvouSharedweb().stopThinking(); }
+  function applyModeFromState(st) {
+    state.modeState = { mode: st.mode || "yolo", multiAgent: !!st.multi_agent };
+  }
+
+  // 权威 modeState 写回收敛点（评审 P1，与 tauri 端对齐）：任何「invoke 返回 /
+  // 事件负载」带来的权威 modeState 更新都必须走这里——bump modeSyncSeq 作废
+  // 在途 syncModeState 读取，再定向写回触发会话（await 期间用户可能已切走）。
+  // 散点直写漏 bump 一处，就重现「旧读取覆盖权威值」竞态。
+  function applyAuthoritativeModeState(sid, st) {
+    modeSyncSeq += 1;
+    runOnSession(sid, function () { applyModeFromState(st); });
+  }
+
+function isActionablePlanCard(sid, itemId, planId) { return pinvouSharedweb().isActionablePlanCard(sid, itemId, planId); }
+
+  // ── Plan/YOLO 命令 ───────────────────────────────────────────────
+  // sid 在 entry 捕获一次,thread through 所有 await —— 防用户切 session 后,
+  // 后续 UI 写入/IPC 把卡片塞到错误的 session。
+  async function acceptPlan(itemId, planMarkdown, echo, planId) {
+    const sid = state.activeSessionId;
+    if (!sid) return;
+    const planTicket = String(planId || "").trim();
+    if (!planTicket) {
+      if (itemId) patchItemByIdFor(sid, itemId, { cardState: "frozen", statusLabel: bt("planHistorical"), resolved: true });
+      addSystemItemFor(sid, bt("planTicketExpired"));
+      notify();
+      return;
+    }
+    const planBuffer = getBuffer(sid);
+    if (planBuffer && planBuffer.remoteTurnActive && !(await reconcileRemoteTurn(sid))) {
+      recordAuthoritySyncDiagnostic("remote_sync_blocked_action", Object.assign({
+        operation: "accept_plan",
+      }, authoritySyncBufferSnapshot(sid, planBuffer)));
+      runOnSession(sid, function () { addAuthoritySyncNotice(bt("turnSyncRetry")); });
+      notify();
+      return;
+    }
+    // sid 前缀省略：isActionablePlanCard 首判已校验 sid === active（审计清理）。
+    if (isBusyFor(sid) || !isActionablePlanCard(sid, itemId, planTicket)) return;
+    if (planBuffer) {
+      planBuffer.localTurnOwned = true;
+      planBuffer.remoteTurnActive = false;
+      planBuffer.remoteTerminalSeen = false;
+      planBuffer.remoteCommittedRevision = "";
+    }
+    if (itemId) patchItemByIdFor(sid, itemId, { cardState: "approved", statusLabel: bt("approved"), resolved: true });
+    let echoEntry = null;
+    const displayEcho = echo || bt("echoGo");
+    runOnSession(sid, function () {
+      echoEntry = pushUserEcho(displayEcho, true);
+      state.busy = true;
+      startThinking();
+    });
+    notify();
+    try {
+      const st = await invoke("accept_plan", {
+        sessionId: sid,
+        planMarkdown: planMarkdown || "",
+        displayMessage: displayEcho,
+        planId: planTicket,
+      });
+      // 接受计划 = 后端受理新一轮（reserve_turn + 重跑）：未提交的「打开」转正锁死。
+      try { window.PinvouToolStoreEvents.notifyChatRoundCommitted(); } catch { /* silently ignored */ }
+      if (planBuffer) planBuffer.deferredRemoteUserEvent = null;
+      applyAuthoritativeModeState(sid, st);
+    } catch (e) {
+      // accept_plan 不折叠:错误链原样携带 `accept_plan({sid}): …`,而
+      // session id 由调用方选择——按裸 `session_turn_in_progress` 匹配会把
+      // 同名会话的硬失败折成可重试 busy。锚定 reservation 段(生产者
+      // `reserve accept_plan turn: {error:#}` 独家引入,id 字符集
+      // [A-Za-z0-9_-] 无法伪造空格/冒号)。
+      const errorText = String(e && e.message ? e.message : e || "");
+      const concurrentTurn = errorText.includes("reserve accept_plan turn: session_turn_in_progress");
+      const planNotActive = errorText.includes("plan_not_active");
+      if (planBuffer) planBuffer.localTurnOwned = false;
+      if (itemId) {
+        patchItemByIdFor(sid, itemId, planNotActive
+          ? { cardState: "frozen", statusLabel: bt("planHistorical"), resolved: true }
+          : { cardState: "active", statusLabel: "", resolved: false });
+      }
+      runOnSession(sid, function () {
+        if (echoEntry) {
+          state.chatItems = state.chatItems.filter(function (item) { return item !== echoEntry.item; });
+          state.messages = state.messages.filter(function (message) { return message !== echoEntry.message; });
+        }
+        state.busy = false;
+        stopThinking();
+      });
+      const deferredApplied = applyDeferredRemoteUserMessage(sid, planBuffer);
+      if (concurrentTurn && planBuffer && !deferredApplied) {
+        markRemoteTurn(sid, planBuffer, false, "accept_plan_concurrent_turn");
+      }
+      try {
+        const currentMode = await invoke("get_mode_state", { sessionId: sid });
+        applyAuthoritativeModeState(sid, currentMode);
+      } catch { /* status re-read failure must not mask the original error */ }
+      addSystemItemFor(sid, bt("acceptPlanFailed") + e);
+    }
+    notify();
+  }
+  async function discardPlan(itemId, planId) {
+    const sid = state.activeSessionId;
+    const planTicket = String(planId || "").trim();
+    if (!sid || !isActionablePlanCard(sid, itemId, planTicket)) return;
+    patchItemByIdFor(sid, itemId, {
+      cardState: "frozen", statusLabel: bt("planDiscarded"), resolved: true,
+      planResolutionConfirmed: false,
+    });
+    // Reflect the user's decision immediately. The remote invoke may remain
+    // pending until its transport timeout when the desktop disconnects.
+    notify();
+    try {
+      const st = await invoke("discard_plan", { sessionId: sid, planId: planTicket });
+      applyAuthoritativeModeState(sid, st);
+      patchItemByIdFor(sid, itemId, { planResolutionConfirmed: true });
+    } catch (e) {
+      const errorText = String(e && e.message ? e.message : e || "");
+      const planNotActive = errorText.includes("plan_not_active");
+      runOnSession(sid, function () {
+        const card = state.chatItems.find(function (item) {
+          return item && item.id === itemId && item.type === "plan_card" &&
+            String(item.planId || "") === planTicket;
+        });
+        if (!card) return;
+        if (planNotActive) {
+          card.cardState = "frozen";
+          card.resolved = true;
+          card.statusLabel = bt("planHistorical");
+        } else if (!card.planResolutionConfirmed) {
+          card.cardState = "active";
+          card.resolved = false;
+          card.statusLabel = "";
+        }
+      });
+      if (planNotActive) {
+        try {
+          const currentMode = await invoke("get_mode_state", { sessionId: sid });
+          applyAuthoritativeModeState(sid, currentMode);
+        } catch { /* status re-read failure must not mask the original error */ }
+      }
+      addSystemItemFor(sid, bt("discardPlanFailed") + e);
+    }
+    notify();
+  }
+  async function exitPlanToYolo(targetSessionId) {
+    // The caller may pin the target session explicitly: the YOLO confirmation
+    // gate issues the switch only after several await round-trips, by which
+    // time the user may have switched away and the live active session is no
+    // longer the ruling one (same signature as the tauri bridge). No-argument
+    // calls keep the original semantics: act on the live active session at
+    // invocation time (bulb / plan-stuck card).
+    const sid = typeof targetSessionId === 'string' && targetSessionId
+      ? targetSessionId
+      : state.activeSessionId;
+    // Draft state: do not materialize a session; rewrite this lane's global
+    // default (two-lane semantics).
+    if (!sid) { await setDraftMode("yolo"); return; }
+    try {
+      // The invoke targets sid directly at issue time; after the await, the
+      // result is written back to the same sid and modeSyncSeq is bumped.
+      const st = await invoke("exit_plan_to_yolo", { sessionId: sid });
+      applyAuthoritativeModeState(sid, st);
+    } catch (e) { addSystemItemFor(sid, bt("exitPlanFailed") + e); }
+    notify();
+  }
+  // 灯泡 toggle：plan ↔ yolo
+async function setPlanModeNext() { return pinvouSharedweb().setPlanModeNext(); }
+  // plan-stuck / fallback / execution-stuck 卡片动作
+async function planStuckReplan(itemId) { return pinvouSharedweb().planStuckReplan(itemId); }
+  async function planStuckGo(itemId, targetSessionId) {
+    // Explicit target session (same contract as the tauri bridge): the
+    // plan-stuck card's session is adjudicated in ChatView; no-arg legacy
+    // calls keep targeting live-active at invoke time.
+    const sid = typeof targetSessionId === 'string' && targetSessionId
+      ? targetSessionId
+      : state.activeSessionId;
+    if (!sid) return;
+    patchItemById(itemId, { resolved: true }); notify();
+    await exitPlanToYolo(sid);
+    // 补充指令必须发往触发会话：await exitPlanToYolo 期间用户可能已切走，
+    // 直接 sendMessage 会把"继续执行"发到切换后的会话（审计遗漏补修）。
+    // sendMessageToSession 校验失败（会话已删/对账中）会 throw，必须接住并
+    // 定向提示，否则成为 React onClick 上的 unhandled rejection，用户无感知。
+    try {
+      await sendMessageToSession(sid, bt("planStuckGoPrompt"));
+    } catch (e) { addSystemItemFor(sid, bt("planContinueFailed") + e); notify(); }
+  }
+
+  // ── 用户交互卡 ───────────────────────────────────────────────────
+  // 卡片动作链路有 await 边界：entry 先捕获触发会话 sid，invoke 与后续全部 UI 写入
+  // 都定向到 sid（runOnSession / patchItemByIdFor），避免用户提交期间切会话导致
+  // echo/restoredAnswers 漏写触发会话或污染当前会话（与 acceptPlan 同一约定）。
+async function submitUserInput(itemId, toolCallId, answers, questions) { return pinvouSharedweb().submitUserInput(itemId, toolCallId, answers, questions); }
+  async function cancelUserInput(itemId, toolCallId) {
+    const sid = state.activeSessionId;
+    if (!sid) return;
+    try { await invoke("cancel_user_input", { toolCallId, sessionId: sid }); } catch { /* on cancel failure, wait for the backend timeout to reclaim it */ }
+    patchItemByIdFor(sid, itemId, { resolved: true, cardState: "cancelled" });
+    notify();
+  }
+
+  // ── 编辑上一轮 / 手动压缩 ─────────────────────────────────────────
+  async function editLastTurn(newText) {
+    if (state.busy || !state.activeSessionId) return;
+    newText = (newText || "").trim();
+    if (!newText) return;
+    const sid = state.activeSessionId;
+    const editBuffer = getBuffer(sid);
+    if (editBuffer && editBuffer.remoteTurnActive && !(await reconcileRemoteTurn(sid))) {
+      recordAuthoritySyncDiagnostic("remote_sync_blocked_action", Object.assign({
+        operation: "edit_last_turn",
+      }, authoritySyncBufferSnapshot(sid, editBuffer)));
+      // 对账失败通知定向触发会话：await 期间切走后不得落进当前显示（与 acceptPlan 同）。
+      runOnSession(sid, function () { addAuthoritySyncNotice(bt("turnSyncRetry")); });
+      notify();
+      return;
+    }
+    // Re-check after the asynchronous reconciliation: the user may have
+    // switched Session or another turn may have started in the meantime.
+    if (state.activeSessionId !== sid || state.busy) return;
+    const previous = {
+      messages: [...state.messages],
+      chatItems: [...state.chatItems],
+      busy: state.busy,
+      thinking: Object.assign({}, state.thinking),
+      currentStreamText,
+      currentStreamId,
+      pendingAssistantText,
+      pendingAssistantBlocks: [...pendingAssistantBlocks],
+    };
+    if (editBuffer) {
+      editBuffer.localTurnOwned = true;
+      editBuffer.remoteTurnActive = false;
+      editBuffer.remoteTerminalSeen = false;
+      editBuffer.remoteCommittedRevision = "";
+    }
+    // Remove the latest displayable user turn and everything after it, then
+    // append the replacement. Tool results and internal runtime envelopes also
+    // use role="user", so a bare role scan would cut at the wrong boundary.
+    let cut = -1;
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const editCandidate = state.messages[i];
+      if (editCandidate.role === "user" && userMessageDisplayText(editCandidate.content)) { cut = i; break; }
+    }
+    if (cut >= 0) state.messages.splice(cut);
+    state.messages.push({ role: "user", content: [{ type: "text", text: newText }] });
+    resetPendingAssistant();
+    state.chatItems = [];
+    rerenderFromMessages();
+    state.busy = true;
+    startThinking();
+    currentStreamText = "";
+    currentStreamId = ++itemIdSeq;
+    state.chatItems.push({ id: currentStreamId, type: "assistant", text: "", html: "", time: timeStr(), streaming: true });
+    if (editBuffer) saveWorkingSetTo(editBuffer);
+    notify();
+    turnUsageDirty[sid] = false; // 编辑重跑=新一轮，同 doSendFor 重置口径保护
+    emitPetEvent();
+    // Optimistic concurrency: submit the committed revision this view holds.
+    // A desktop turn that landed after this view was loaded makes the backend
+    // refuse with session_revision_conflict instead of truncating its newer
+    // transcript. Empty (older desktop without revisions) keeps old behavior.
+    const expectedRevision = editBuffer ? String(editBuffer.sessionRevision || "") : "";
+    try {
+      await invoke("edit_last_turn", {
+        newMessage: newText,
+        sessionId: sid,
+        expectedTranscriptRevision: expectedRevision || null,
+      });
+      // 编辑重跑 = 后端受理新一轮：未提交的「打开」转正锁死（同 doSendFor）。
+      try { window.PinvouToolStoreEvents.notifyChatRoundCommitted(); } catch { /* silently ignored */ }
+      if (editBuffer) editBuffer.deferredRemoteUserEvent = null;
+    } catch (e) {
+      // edit_last_turn 同 accept_plan:不折叠的原始链 + 调用方可选的
+      // session id,锚定 reservation 段防同名会话把硬失败折成 busy。
+      const errorText = String(e && e.message ? e.message : e || "");
+      const concurrentTurn = errorText.includes("reserve edit_last_turn: session_turn_in_progress");
+      emitPetEvent();
+      if (editBuffer) editBuffer.localTurnOwned = false;
+      runSyncOnSession(sid, function () {
+        state.messages = previous.messages;
+        state.chatItems = previous.chatItems;
+        state.busy = previous.busy;
+        state.thinking = previous.thinking;
+        currentStreamText = previous.currentStreamText;
+        currentStreamId = previous.currentStreamId;
+        pendingAssistantText = previous.pendingAssistantText;
+        pendingAssistantBlocks = previous.pendingAssistantBlocks;
+      });
+      if (state.activeSessionId === sid && editBuffer) saveWorkingSetTo(editBuffer);
+      const deferredApplied = applyDeferredRemoteUserMessage(sid, editBuffer);
+      if (concurrentTurn && editBuffer && !deferredApplied) {
+        markRemoteTurn(sid, editBuffer, false, "edit_last_turn_concurrent_turn");
+      }
+      runSyncOnSession(sid, function () { addSystemItem("⚠️ " + displayTurnError(e)); });
+      notify();
+      flushQueued(sid);
+    }
+  }
+
+  // ── 产物面板 ─────────────────────────────────────────────────────
+  function invokeArtifact(nativeCommand, webCommand, path, sessionId, extra) {
+    const args = Object.assign({ path }, extra || {});
+    if (IS_WEB) {
+      args.sessionId = sessionId || state.activeSessionId;
+      return invoke(webCommand, args);
+    }
+    return invoke(nativeCommand, args);
+  }
+  function artifactInfo(path, sessionId) {
+    return invokeArtifact("artifact_info", "web_access_artifact_info", path, sessionId);
+  }
+  function readArtifactText(path, sessionId) {
+    return invokeArtifact("read_artifact_text", "web_access_read_artifact_text", path, sessionId);
+  }
+  function writeArtifactText(path, content, sessionId) {
+    return invokeArtifact("write_artifact_text", "web_access_write_artifact_text", path, sessionId, { content });
+  }
+  function readArtifactImageB64(path, sessionId) {
+    return invokeArtifact("read_artifact_image_b64", "web_access_read_artifact_image_b64", path, sessionId);
+  }
+  // pptx 封面缩略图：读 docProps/thumbnail.jpeg → data URL（无则 null）。本地数据、无外链。
+  function readArtifactThumbnail(path, sessionId) {
+    return invokeArtifact("read_artifact_thumbnail", "web_access_read_artifact_thumbnail", path, sessionId).catch(function () { return null; });
+  }
+  function renderArtifactVisual(path, sessionId) {
+    return invokeArtifact("render_artifact_visual", "web_access_render_artifact_visual", path, sessionId);
+  }
+function openContainingFolder(path) { return pinvouSharedweb().openContainingFolder(path); }
+function revealSessionFolder(sessionId) { return pinvouSharedweb().revealSessionFolder(sessionId); }
+function openScheduledTaskFolder(automationId) { return pinvouSharedweb().openScheduledTaskFolder(automationId); }
+  function openUserExternalUrl(url) {
+    try {
+      const rawUrl = String(url || "").trim();
+      if (!/^https?:\/\/[^/\\\s]/i.test(rawUrl)) {
+        return Promise.reject(new Error("only credential-free HTTP(S) links are supported"));
+      }
+      const parsed = new URL(rawUrl);
+      if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || !parsed.hostname || parsed.username || parsed.password) {
+        return Promise.reject(new Error("only credential-free HTTP(S) links are supported"));
+      }
+      if (IS_WEB) {
+        const opened = window.open(parsed.href, "_blank", "noopener,noreferrer");
+        return Promise.resolve(!!opened);
+      }
+      return invoke("open_user_external_url", { url: parsed.href }).catch(function (e) { addSystemItem(wireLaneError(e, "openFailed")); });
+    } catch {
+      return Promise.reject(new Error("invalid external link"));
+    }
+  }
+  // 跨会话产出物索引:磁盘 session JSON 为主,再合并当前内存工作集。
+  // 新产物在 chat:done/save_session_artifacts 前也能立刻出现在「产出物」一级入口。
+  async function listDeliverableIndex() { return pinvouSharedweb().listDeliverableIndex(); }
+  // 外部打开产物：HTML 走 Tauri 独立窗口（绕沙箱），其他走系统应用。
+  // sessionId = 卡片携带的产物所属 session。后端 resolve_artifact_path 用它(而非全局
+  // active_id)解析相对路径 —— 切回「有 buffer」的会话后端 active 不更新,只有卡片自带
+  // session 才解析得准(否则相对路径被拼到错的 workspace 报 not a file)。绝对路径无视它。
+  function openArtifactExternal(path, sessionId) {
+    if (IS_WEB) return downloadArtifact(path, sessionId);
+    const ext = (String(path).split(".").pop() || "").toLowerCase();
+    const cmd = (ext === "html" || ext === "htm") ? "open_artifact_window" : "open_in_system";
+    return invoke(cmd, { path, sessionId: sessionId || null }).catch(function (e) { addSystemItem(wireLaneError(e, "openFailed")); });
+  }
+
+  const MAX_WEB_ARTIFACT_DOWNLOAD_BYTES = 256 * 1024 * 1024;
+  function webArtifactDownloadLimitError(size) {
+    const suffix = Number.isSafeInteger(size) && size >= 0
+      ? bt("downloadLimitSuffix")((size / (1024 * 1024)).toFixed(1))
+      : "";
+    return new Error(bt("downloadLimitError")(suffix));
+  }
+
+  // F-XT7-7：分块 base64 下载管线（artifact 与会话附件两条流共用一个实现）。
+  // 统一采用 artifact 变体的更严边界（每个分片都做 maxBytes 越界复核；attachment
+  // 变体原本只有 total 上限复核——防御深度差异，不是可利用缺口）。expectedSize
+  // 传 null 即为「首片协商大小」的附件模式；errKeys 为两族错误键的参数化。
+  async function streamBase64PartsToBlob(readPart, expectedSize, maxBytes, errKeys, initialFilename) {
+    let offset = 0;
+    const chunks = [];
+    let filename = initialFilename;
+    let negotiatedSize = expectedSize;
+    while (true) {
+      const part = await readPart(offset);
+      if (!part) throw new Error(bt(errKeys.noData));
+      const partOffset = Number(part.offset);
+      const partSize = Number(part.size);
+      if (!Number.isSafeInteger(partOffset) || partOffset !== offset ||
+          !Number.isSafeInteger(partSize) || partSize < 0) {
+        throw new Error(bt(errKeys.chunkInvalid));
+      }
+      if (partSize > maxBytes) {
+        throw webArtifactDownloadLimitError(partSize);
+      }
+      if (negotiatedSize === null) {
+        negotiatedSize = partSize;
+        if (negotiatedSize > maxBytes) {
+          throw webArtifactDownloadLimitError(negotiatedSize);
+        }
+      } else if (partSize !== negotiatedSize) {
+        throw new Error(bt(errKeys.changed));
+      }
+      filename = part.name || filename;
+      const encoded = String(part.data_base64 || part.dataBase64 || "");
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+// binary is a single-byte Latin-1 string produced by atob; charCode is the byte value. codePointAt is equivalent here but gains nothing.
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i); // eslint-disable-line unicorn/prefer-code-point
+      if (!bytes.length && !part.eof) throw new Error(bt(errKeys.noProgress));
+      if (bytes.length > maxBytes - offset) {
+        throw webArtifactDownloadLimitError(offset + bytes.length);
+      }
+      if (offset + bytes.length > negotiatedSize) {
+        throw new Error(bt(errKeys.overflow));
+      }
+      chunks.push(bytes);
+      offset += bytes.length;
+      if (part.eof) {
+        if (offset !== negotiatedSize) throw new Error(bt(errKeys.incomplete));
+        break;
+      }
+    }
+    const blob = new Blob(chunks, { type: "application/octet-stream" });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    anchor.style.display = "none";
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(function () { URL.revokeObjectURL(objectUrl); }, 30000);
+    return true;
+  }
+
+  async function downloadArtifact(path, sessionId) {
+    if (IS_WEB && !hasCapability("artifactDownload")) {
+      addSystemItem(bt("downloadUnsupported"));
+      return false;
+    }
+    try {
+      return await downloadArtifactRaw(path, sessionId);
+    } catch (e) {
+      // Stable wire codes fold to trilingual copy here too, so the download
+      // path does not render raw machine codes (the turn-error lane maps the
+      // same table via displayTurnError). Unmapped text goes through the
+      // same redaction as the turn lane instead of rendering raw codes or
+      // backend-language admission copy (round-9 review: the raw `code`
+      // fallback also leaked zh-only admission completions on EN/JA phones).
+      addSystemItem(bt("downloadFailed") + displayTurnError(e));
+      return false;
+    }
+  }
+
+  async function downloadArtifactRaw(path, sessionId) {
+    if (!hasCapability("artifactDownload")) {
+      throw new Error(bt("downloadNotEnabled"));
+    }
+    const resolvedSessionId = sessionId || state.activeSessionId || null;
+    const info = await artifactInfo(path, resolvedSessionId);
+    if (!info || info.exists === false) throw new Error(bt("artifactMissing"));
+    const expectedSize = Number(info.size);
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) {
+      throw new Error(bt("artifactSizeInvalid"));
+    }
+    if (expectedSize > MAX_WEB_ARTIFACT_DOWNLOAD_BYTES) {
+      throw webArtifactDownloadLimitError(expectedSize);
+    }
+    return streamBase64PartsToBlob(function (offset) {
+      return invoke("web_access_read_artifact_chunk", {
+        path,
+        sessionId: resolvedSessionId,
+        offset,
+        limit: 262144,
+      });
+    }, expectedSize, MAX_WEB_ARTIFACT_DOWNLOAD_BYTES, {
+      noData: "artifactNoData",
+      chunkInvalid: "artifactChunkInvalid",
+      changed: "artifactChanged",
+      noProgress: "artifactNoProgress",
+      overflow: "artifactOverflow",
+      incomplete: "artifactIncomplete",
+    }, basename(path) || "artifact");
+  }
+
+  // ── 附件 ────────────────────────────────────────────────────────
+function conversationAttachmentArgs(reference) { return pinvouSharedweb().conversationAttachmentArgs(reference); }
+  // The web host has no local filesystem path for a conversation attachment, so this
+  // rejects for every reference; the parameter is intentionally not read.
+  function resolveConversationAttachment() {
+    return Promise.reject(new Error(bt("attachPathUnavailable")));
+  }
+  async function downloadConversationAttachment(reference) {
+    if (!hasCapability("artifactDownload")) {
+      throw new Error(bt("attachDownloadUnsupported"));
+    }
+    const args = conversationAttachmentArgs(reference);
+    return streamBase64PartsToBlob(function (offset) {
+      return invoke("web_access_read_conversation_attachment_chunk", Object.assign({
+        offset,
+        limit: 262144,
+      }, args));
+    }, null, MAX_WEB_ARTIFACT_DOWNLOAD_BYTES, {
+      noData: "attachNoData",
+      chunkInvalid: "attachChunkInvalid",
+      changed: "attachChanged",
+      noProgress: "attachNoProgress",
+      overflow: "attachOverflow",
+      incomplete: "attachIncomplete",
+    }, args.basename || "attachment");
+  }
+  async function openConversationAttachment(reference) {
+    try {
+      return await downloadConversationAttachment(reference);
+    } catch (e) {
+      addSystemItem(wireLaneError(e, "openFailed"));
+      return false;
+    }
+  }
+  async function revealConversationAttachment(reference) {
+    if (IS_WEB) return false;
+    try {
+      await invoke("reveal_conversation_attachment", conversationAttachmentArgs(reference));
+      return true;
+    } catch (e) {
+      addSystemItem(wireLaneError(e, "openFailed"));
+      return false;
+    }
+  }
+
+  async function addAttachmentByPath(path) {
+    const id = ++attachIdSeq;
+    const att = { id, basename: basename(path), status: "parsing", result: null, error: null };
+    state.attachments.push(att); notify();
+    try {
+      const result = await invoke("web_access_ingest_file", { path });
+      att.status = "ready"; att.result = result;
+    } catch (e) {
+      // Limit failures (oversize, parsed-result cache overflow) arrive as
+      // stable wire codes; map them so the chip shows localized copy
+      // instead of raw single-language desktop text.
+      const limitError = attachmentLimitDisplayError(e, att.basename);
+      att.status = "error"; att.error = limitError ? limitError.code : String(e);
+    }
+    notify();
+  }
+
+  function attachmentLimitDisplayError(error, fileName) {
+    const raw = String(error && error.message ? error.message : error);
+    if ((error && error.code === "device_upload_too_large") || raw === "attachment_file_too_large") {
+      return { code: "attachment_file_too_large", message: bt("deviceUploadTooLarge")(fileName) };
+    }
+    if (raw === "web_attachment_parsed_cache_too_large") {
+      return { code: raw, message: bt("deviceParsedTooLarge") };
+    }
+    if (raw === "web_attachment_cache_full") {
+      return { code: raw, message: bt("deviceCacheFull") };
+    }
+    if (raw === "attachment_archive_too_many_entries") {
+      return { code: raw, message: bt("archiveTooManyEntries") };
+    }
+    if (raw === "attachment_archive_expanded_too_large") {
+      return { code: raw, message: bt("archiveExpandedTooLarge") };
+    }
+    if (raw === "attachment_archive_unsafe_entry") {
+      return { code: raw, message: bt("archiveUnsafeEntry") };
+    }
+    return null;
+  }
+
+  function deviceUploadDisplayError(error, fileName) {
+    const limitError = attachmentLimitDisplayError(error, fileName);
+    if (limitError) return limitError;
+    const rawUploadError = String(error && error.message ? error.message : error);
+    if (error && error.code === "device_upload_empty") {
+      // Store the stable wire code on the chip too — the localized sentence
+      // is rendered from bt() where needed, never frozen into the code field.
+      return { code: error.code, message: bt("deviceUploadEmpty")(fileName) };
+    }
+    if (rawUploadError === "web_attachment_digest_invalid") {
+      return { code: rawUploadError, message: bt("deviceUploadDigestInvalid") };
+    }
+    if (rawUploadError === "web_attachment_integrity_mismatch") {
+      return { code: rawUploadError, message: bt("deviceUploadIntegrityMismatch") };
+    }
+    if (rawUploadError === "web_attachment_upload_cache_full") {
+      return { code: rawUploadError, message: bt("deviceUploadCacheFull") };
+    }
+    return { code: rawUploadError, message: rawUploadError };
+  }
+  async function addPasteImage(filename, bytes) {
+    try {
+      const path = await invoke("save_paste_image", { filename, bytes });
+      await addAttachmentByPath(path);
+    } catch (e) {
+      const limitError = attachmentLimitDisplayError(e, filename);
+      addSystemItem(limitError ? limitError.message : bt("pasteImageFailed") + e);
+    }
+  }
+  function releaseAttachmentOnDesktop(attachment) {
+    // Accepts a composer attachment ({ result, uploadId }) or a bare
+    // WebAttachmentSummary ({ handle }) carried by a queued message.
+    const handle = attachment
+      && (attachment.result ? attachment.result.handle : attachment.handle);
+    if (handle && canInvoke("web_access_discard_attachment")) {
+      invoke("web_access_discard_attachment", { handle }).catch(function () {});
+      return;
+    }
+    if (attachment && attachment.uploadId && canInvoke("web_access_abort_attachment_upload")) {
+      invoke("web_access_abort_attachment_upload", { uploadId: attachment.uploadId }).catch(function () {});
+    }
+  }
+  function removeAttachment(id) {
+    const removed = state.attachments.find(function (attachment) { return attachment.id === id; });
+    state.attachments = state.attachments.filter(function (a) { return a.id !== id; });
+    releaseAttachmentOnDesktop(removed);
+    notify();
+  }
+  // 打开系统文件选择器并摄入为附件
+async function pickAndAttach() { return pinvouSharedweb().pickAndAttach(); }
+
+  // ── 浏览器本机文件上传 ──────────────────────────────────────────
+  // 「从此设备上传」入口:文件按 256KB 分块经 Relay 转发(Relay 只转发不保存),
+  // 桌面端最后一块落盘 + ingest 后返回与桌面文件附件相同的 WebAttachmentSummary。
+  async function uploadDeviceFile(file) {
+    const uploader = window.PinvouChunkedFileUpload;
+    const id = ++attachIdSeq;
+    const uploadId = uploader && typeof uploader.uploadId === "function"
+      ? uploader.uploadId("webatt")
+      // eslint-disable-next-line sonarjs/pseudo-random -- not security-sensitive: temporary attachment upload ID; the sequence prefix already guarantees uniqueness
+      : "webatt_" + id + "_" + Math.random().toString(36).slice(2, 12);
+    const att = {
+      id, uploadId, basename: file.name,
+      status: "uploading", progress: 0, result: null, error: null,
+    };
+    state.attachments.push(att); notify();
+    try {
+      if (!uploader || typeof uploader.uploadFile !== "function") {
+        throw new Error("chunked attachment uploader is unavailable");
+      }
+      const completed = await uploader.uploadFile({
+        file,
+        uploadId,
+        isCancelled: function () { return !state.attachments.includes(att); },
+        sendChunk: function (chunk) {
+          return invoke("web_access_upload_attachment_chunk", {
+            uploadId: chunk.uploadId,
+            fileName: chunk.fileName,
+            offset: chunk.offset,
+            total: chunk.total,
+            dataBase64: chunk.dataBase64,
+            commit: chunk.commit,
+            ...(chunk.sha256 ? { sha256: chunk.sha256 } : {}),
+          });
+        },
+        onProgress: function (progress) { att.progress = progress; notify(); },
+        validateResult: function (result) { return Boolean(result && result.handle); },
+        cleanup: function (upload) {
+          if (upload.result && upload.result.handle && canInvoke("web_access_discard_attachment")) {
+            return invoke("web_access_discard_attachment", { handle: upload.result.handle });
+          }
+          return invoke("web_access_abort_attachment_upload", { uploadId: upload.uploadId });
+        },
+      });
+      const summary = completed.result;
+      att.status = "ready"; att.progress = 100; att.result = summary;
+      att.basename = summary.basename || att.basename;
+    } catch (e) {
+      if (!e || e.code !== "device_upload_cancelled") {
+        att.status = "error";
+        // Desktop preflight and integrity failures come back as stable wire
+        // codes. Keep limit codes on the chip so React can translate them when
+        // the active language changes; system notices are translated here.
+        const displayError = deviceUploadDisplayError(e, file.name);
+        att.error = displayError.code;
+        addSystemItem(bt("deviceUploadFailed") + displayError.message);
+      }
+    }
+    notify();
+  }
+
+  // 顺序处理选中的多个文件;桌面端另有并发缓冲与总量上限兜底。
+  async function uploadDeviceFiles(files) {
+    const list = Array.prototype.slice.call(files || []).filter(Boolean);
+    for (let i = 0; i < list.length; i++) await uploadDeviceFile(list[i]);
+  }
+
+
+  // ── 卡片池: 专家面具加持 ─────────────────────────────────────────
+  // 懒加载全部专家卡(1078 张),前端缓存供 facet/搜索。只拉一次。
+async function loadPersonas() { return pinvouSharedweb().loadPersonas(); }
+
+  // ── 用户自创卡 CRUD(写盘后刷新缓存) ──
+async function createPersona(input) { return pinvouSharedweb().createPersona(input); }
+async function updatePersona(personaId, input) { return pinvouSharedweb().updatePersona(personaId, input); }
+async function deletePersona(personaId) { return pinvouSharedweb().deletePersona(personaId); }
+  // 给当前 session 加持一张专家面具。后端存 persona_id + 每 turn 注入人设;
+  // 前端记 activePersona(挂件) + 发一条系统消息播报。
+  // 取专家显示名(兼容 Side A 的 cn_name / Side B 的 name)。
+function personaName(p) { return pinvouSharedweb().personaName(p); }
+  // 记一条卡牌事件到时间线 sidecar(pos=当前 messages 数),并落盘。重载历史时按 pos 插回。
+function recordPersonaEvent(ev) { return pinvouSharedweb().recordPersonaEvent(ev); }
+async function equipPersona(personaId) { return pinvouSharedweb().equipPersona(personaId); }
+  // 摘下当前 session 的专家面具。
+  async function unequipPersona() {
+    if (!state.activeSessionId) return;
+    // 入口捕获触发会话：await 期间切走，卸下播报不得写进别的会话（与 tauri 对齐，审计）。
+    const sid = state.activeSessionId;
+    try { await invoke("unequip_persona", { sessionId: state.activeSessionId }); } catch { /* 忽略,前端照样摘 */ }
+    if (sid !== state.activeSessionId) return; // 已切走：不写当前显示
+    personaSyncSeq++; // 权威写前 bump：作废在途 syncActivePersona 的旧快照(与 tauri 对齐，审计补充)
+    // 旧专家同样在写点复核：await 窗口内若已被 equip 换成新卡,播报新卡,
+    // 入口捕获的陈旧值会重复播报早已卸下的旧卡(与 tauri 对齐,二审补充)。
+    const prev = state.activePersona;
+    state.activePersona = null;
+    if (prev) { addChatItem({ type: "system", text: bt("personaUnequipped") + personaName(prev), time: timeStr() }); recordPersonaEvent({ kind: "unequip", name: personaName(prev) }); }
+    notify();
+  }
+  // 挂件还原的请求序号 + 最近成功加持的目标会话(与 tauri personas.js 对齐)：
+  // - syncActivePersona 仅 sid 校验挡不住 A→B→A 的 ABA 与同会话乱序(慢响应
+  // 返回 null 会把刚加持的挂件覆盖掉,且无人再纠正)。序号在每次 sync 发起
+  // 与 equip/unequip 权威写时递增,旧快照一律作废(审计补充)。
+  // - lastEquippedSid 供 equip 后紧随的播报(如卡牌制造者引导卡)定向回
+  //   发起会话——equip 的 await 窗口用户可能已切走。
+  const deletedPersonaIds = new Set();
+  let personaSyncSeq = 0;
+  let lastEquippedSid = null;
+  // 切换/重载 session 后,从后端拉该 session 的加持状态还原挂件(backend 是真相)。
+  async function syncActivePersona() {
+    if (!state.activeSessionId) { state.activePersona = null; return; }
+    const sid = state.activeSessionId;
+    const seq = ++personaSyncSeq;
+    try {
+      const persona = await invoke("get_active_persona", { sessionId: state.activeSessionId }) || null;
+      if (sid !== state.activeSessionId || seq !== personaSyncSeq) return; // 已切走或被权威写/新 sync 作废
+      state.activePersona = persona && !deletedPersonaIds.has(persona.id) ? persona : null;
+    } catch { /* 旧 session 无加持,忽略 */ }
+  }
+  // 在【指定 session】追加卡牌制造者引导卡并落 sidecar(持久化,重载按 pos 插回)。
+  // 默认定向最近一次成功 equip 的目标会话：AI 造卡链路 equip→intro 之间用户
+  // 切走时,intro 必须仍落在发起(已加持)会话,而不是写进切走后的当前显示
+  // (错误会话被插卡是持久化污染,不可自愈)。显式传 sid 可覆盖(与 tauri 对齐，
+  // 审计补充)。
+function postCardCreatorIntro(sid) { return pinvouSharedweb().postCardCreatorIntro(sid); }
+
+
+function applyMountedCollections(value) { return pinvouSharedweb().applyMountedCollections(value); }
+  let mountedCollectionUpdate = Promise.resolve();
+  let mountedCollectionDraftTarget = null;
+
+function updateMountedCollections(command, args) { return pinvouSharedweb().updateMountedCollections(command, args); }
+  // 添加知识集；已挂载但停用时重新启用，不覆盖其他挂载项。
+async function mountCollection(collectionId) { return pinvouSharedweb().mountCollection(collectionId); }
+async function setCollectionEnabled(collectionId, enabled) { return pinvouSharedweb().setCollectionEnabled(collectionId, enabled); }
+async function removeCollection(collectionId) { return pinvouSharedweb().removeCollection(collectionId); }
+  // 兼容旧入口：摘下当前对话的全部知识集挂载。
+  async function unmountCollection() {
+    if (!state.activeSessionId) { applyMountedCollections([]); notify(); return; }
+    return updateMountedCollections("session_unmount_collection", null);
+  }
+  // 切换/重载 session 后从后端还原挂载状态(backend 是真相;仅驻内存,重启后为 null)。
+  async function syncMountedCollection() {
+    if (!state.activeSessionId) { applyMountedCollections([]); return; }
+    const sessionId = state.activeSessionId;
+    try {
+      const snapshot = await invoke("session_mounted_collections_snapshot", { sessionId });
+      if (state.activeSessionId !== sessionId) return;
+      if (snapshot && Array.isArray(snapshot.collections)) { applyMountedCollections(snapshot); return; }
+      const mounted = await invoke("session_mounted_collections", { sessionId });
+      if (state.activeSessionId !== sessionId) return;
+      if (Array.isArray(mounted)) { applyMountedCollections(mounted); return; }
+      const legacy = await invoke("session_mounted_collection", { sessionId });
+      if (state.activeSessionId !== sessionId) return;
+      applyMountedCollections(legacy == null ? [] : [legacy]);
+    } catch {
+      try {
+        const cid = await invoke("session_mounted_collection", { sessionId });
+        if (state.activeSessionId !== sessionId) return;
+        applyMountedCollections(cid == null ? [] : [cid]);
+      } catch { if (state.activeSessionId === sessionId) applyMountedCollections([]); }
+    }
+  }
+
+  // ── 应用内升级 ───────────────────────────────────────────────────
+  // On the web only the version-number read is live: the appUpdate capability is always false in browser deployments,
+  // the check/download/install/restart command family is not in the access-policy allowlist,
+  // and the corresponding desktop upgrade surface is provided only by the desktop bridge.
+  async function loadAppVersion() {
+    try {
+      state.appVersion = await invoke("get_app_version");
+    } catch { /* version read failure: leaving it empty is fine */ }
+  }
+
+  // ── 依赖体检 ─────────────────────────────────────────────────────
+  // 实时检测各文件解析能力(PDF/Office/OCR/压缩包/邮件)的系统依赖是否齐全,
+  // the settings page lists the missing items. The backend's check_dependencies bypasses the cache, so it can be re-checked after installs;
+  // one-click install (install_dependencies) is provided only by the desktop bridge.
+  async function checkDependencies() { return pinvouSharedweb().checkDependencies(); }
+
+  // ── 语音输入（WebView one-shot 录音 → 本地 SenseVoice/FunASR ASR；Linux webview 录音授权见 lib.rs setup）──────────────
+  let activeVoiceInput = null;
+
+function setVoiceInputStatus(status, patch) { return pinvouSharedweb().setVoiceInputStatus(status, patch); }
+
+function emitVoiceDiagnostic(stage, level, message, userMessage, category) { return pinvouSharedweb().emitVoiceDiagnostic(stage, level, message, userMessage, category); }
+
+  // error carrier for the voice flow: an Error instance plus category/stage extra fields, classified by normalizeVoiceError.
+function voiceFlowError(category, stage, message) { return pinvouSharedweb().voiceFlowError(category, stage, message); }
+  // Same as the tauri lane: stable error codes of the Rust remote-control voice commands →
+  // trilingual copy keys, codes take precedence over rawMessage (Chinese engineering prose
+  // goes to diagnostics only).
+  const VOICE_ERROR_CODE_KEYS = {
+    asr_timeout: "voiceTimeout",
+    asr_no_speech: "voiceEmptyResult",
+    asr_engine_missing: "voiceRecognitionFailed",
+    asr_engine_start_failed: "voiceRecognitionFailed",
+    asr_engine_error: "voiceRecognitionFailed",
+    asr_runtime_error: "voiceRecognitionFailed",
+    asr_cli_failed: "voiceRecognitionFailed",
+    asr_parse_failed: "voiceRecognitionFailed",
+    asr_join_failed: "voiceInputFailed",
+    recording_too_long: "voiceRecordingTooLong",
+    audio_invalid: "voiceAudioInvalid",
+    audio_empty: "voiceAudioInvalid",
+    temp_file_unavailable: "voiceInputFailed",
+    temp_file_write_failed: "voiceInputFailed",
+    session_mismatch: "voiceContextMismatch",
+    session_load_failed: "voiceContextMismatch",
+  };
+
+  function normalizeVoiceError(err, fallbackStage) {
+    const name = String((err && err.name) || "");
+    const rawCategory = (err && err.category) || "";
+    const rawStage = (err && err.stage) || fallbackStage || "recording";
+    const rawMessage = String((err && (err.message || err.toString && err.toString())) || err || "");
+    const constraint = String((err && err.constraint) || "");
+    const emptyResultLike = /ASR empty result|empty result|backend returned no usable|no usable result|failed \(exit 6\)|exit 6/i.test(rawMessage);
+    const codeKey = (err && err.code && VOICE_ERROR_CODE_KEYS[err.code]) || "";
+    if (name === "NotAllowedError" || name === "SecurityError" || rawCategory === "permission_denied") {
+      return { category: "permission_denied", stage: "permission", message: bt("voicePermissionDenied") };
+    }
+    if (rawCategory === "device_unavailable") {
+      // device_unavailable with a custom message (e.g. probe timeout) shows the original first, matching the tauri lane.
+      return { category: "device_unavailable", stage: "device", message: rawMessage || bt("voiceNoDevice") };
+    }
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      // Browser DOMException messages are always non-empty and unlocalized; same policy as
+      // the tauri lane: always use the trilingual guidance copy, not the browser text.
+      return { category: "device_unavailable", stage: "device", message: bt("voiceNoDevice") };
+    }
+    // Chrome reports "microphone busy with another app" as NotReadableError / TrackStartError,
+    // distinct from "no device"; the browser message is English, so map it to dedicated
+    // trilingual copy.
+    if (name === "NotReadableError" || name === "TrackStartError") {
+      return { category: "device_unavailable", stage: "device", message: bt("voiceMicUnavailable") };
+    }
+    // WebKitGTK 可能把不支持的音频约束报为 OverconstrainedError / "Invalid constraint"。
+    // 这和没有录音设备不同：设备可能存在，只是不支持 channelCount、降噪等配置。
+    if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError" || /invalid constraint/i.test(rawMessage)) {
+      return {
+        category: "constraint_unsupported",
+        stage: "device",
+        message: bt("voiceConstraintUnsupported"),
+        diagnostic: constraint ? "unsupported media constraint: " + constraint : "unsupported media constraint",
+      };
+    }
+    if (rawCategory === "empty_result" || emptyResultLike) {
+      return {
+        category: "empty_result",
+        stage: rawStage,
+        message: bt("voiceEmptyResult"),
+        diagnostic: rawMessage || "",
+      };
+    }
+    if (rawCategory === "context_mismatch") {
+      return { category: "context_mismatch", stage: "writeback", message: bt("voiceContextMismatch") };
+    }
+    if (rawCategory === "timeout") {
+      return { category: "timeout", stage: "recording", message: bt("voiceTimeout") };
+    }
+    if (rawCategory === "recognition_failed") {
+      if (codeKey) {
+        return { category: rawCategory, stage: rawStage, message: bt(codeKey), diagnostic: rawMessage };
+      }
+      return { category: rawCategory, stage: rawStage, message: rawMessage || bt("voiceRecognitionFailed") };
+    }
+    // Remote-control RPC errors rebuilt by bootstrap carry code/category but may not match
+    // any category branch above; with a stable error code, map to trilingual copy by code and
+    // demote the Chinese original to diagnostics (same policy as the tauri lane's tail branch).
+    if (codeKey) {
+      return { category: rawCategory || "recording_failed", stage: rawStage, message: bt(codeKey), diagnostic: rawMessage };
+    }
+    return {
+      category: rawCategory || "recording_failed",
+      stage: rawStage,
+      message: rawMessage || bt("voiceInputFailed"),
+    };
+  }
+
+  function stopMediaTracks(stream) {
+    if (!stream) return;
+    stream.getTracks().forEach(function (track) { try { track.stop(); } catch { /* already-stopped tracks need no handling */ } });
+  }
+
+  function cleanupVoiceInputSession(session) {
+    if (!session) return;
+    if (session.timeoutId) clearTimeout(session.timeoutId);
+    if (session.permissionTimeoutId) clearTimeout(session.permissionTimeoutId);
+    session.permissionTimeoutId = null;
+    if (session.cancelPermissionRequest) {
+      const cancelPermissionRequest = session.cancelPermissionRequest;
+      session.cancelPermissionRequest = null;
+      try { cancelPermissionRequest(); } catch { /* permission request already settled */ }
+    }
+    // 先摘掉音频回调：webkit2gtk 的 WebAudio 是 GStreamer 后端，ScriptProcessorNode 的
+    // onaudioprocess 跑在音频线程，若在 disconnect/close 期间再触发一次、访问已释放的
+    // 缓冲，会让 WebProcess 段错误（表现为「识别出文字后 app 崩溃」）。务必先置 null。
+    try { if (session.processor) session.processor.onaudioprocess = null; } catch { /* release failure only affects this page's audio */ }
+    try { if (session.processor) session.processor.disconnect(); } catch { /* release failure only affects this page's audio */ }
+    try { if (session.source) session.source.disconnect(); } catch { /* release failure only affects this page's audio */ }
+    try { if (session.zeroGain) session.zeroGain.disconnect(); } catch { /* release failure only affects this page's audio */ }
+    stopMediaTracks(session.stream);
+    session.processor = null;
+    session.source = null;
+    session.zeroGain = null;
+    session.stream = null;
+    // close() 触发 GStreamer 管线异步拆解，与上面的 disconnect/track.stop 在同一拍里竞争最易崩；
+    // 摘干净节点后挪到下一个事件循环再关，并吞掉 close 的异常。
+    const ctx = session.audioContext;
+    session.audioContext = null;
+    if (ctx && ctx.state !== "closed") {
+      setTimeout(function () { try { ctx.close().catch(function () {}); } catch { /* audio context already closed */ } }, 0);
+    }
+  }
+
+  // The remote-control lane has two 1MiB gates: first an envelope pre-check on serialized
+  // inputs in the RPC dispatch layer (manager/mod.rs MAX_RPC_REQUEST_BYTES), then the
+  // post-decode validation in remote_control.rs. After base64's 4/3 expansion, a 30s WAV
+  // (0.92MiB → ~1.22MiB as characters) is always rejected by the first gate
+  // (request_too_large); 20s ≈ 0.64MiB → ~0.85MiB of characters, leaving enough envelope
+  // headroom, so this lane caps at 20s (the desktop lane has no relay limit and keeps 60s).
+  const VOICE_RECORDING_MAX_DURATION_MS = 20000;
+  const VOICE_DEVICE_REQUEST_TIMEOUT_MS = 8000;
+
+  // Opaque token for voice sessions and operations (keeps ids unique per
+  // in-flight attempt for ownership dedup and queued terminal events).
+  function webVoiceToken(prefix) {
+    // eslint-disable-next-line sonarjs/pseudo-random -- not security-sensitive: only dedup/ownership ids; collisions just fail a claim
+    return prefix + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 14);
+  }
+
+  // Operation ownership outlives the recording/UI, shared by async writeback and
+  // first-turn admission (same rules as the desktop lane in tauri/bridge/voice.js).
+  // Voice keeps only web_asr_only recording: no model organize entry and no
+  // auto task entry on the web lane.
+  const voiceOperations = new Map();
+
+function trackVoiceTerminal(eventName, operation, fields) { return pinvouSharedweb().trackVoiceTerminal(eventName, operation, fields); }
+function rememberVoiceOperation(session) { return pinvouSharedweb().rememberVoiceOperation(session); }
+function getVoiceOperationId(sessionId, ownerKind) { return pinvouSharedweb().getVoiceOperationId(sessionId, ownerKind); }
+function beginVoiceSubmission(operationId, sessionId) { return pinvouSharedweb().beginVoiceSubmission(operationId, sessionId); }
+function voiceOperationSessionId(operationId) { return pinvouSharedweb().voiceOperationSessionId(operationId); }
+function hasVoiceSubmissionPending() { return pinvouSharedweb().hasVoiceSubmissionPending(); }
+function rebindVoiceOperationToDraft(operationId, toEpoch) { return pinvouSharedweb().rebindVoiceOperationToDraft(operationId, toEpoch); }
+function completeVoiceSubmission(operationId, sessionId, accepted) { return pinvouSharedweb().completeVoiceSubmission(operationId, sessionId, accepted); }
+
+  function dismissVoiceInput() {
+    if (activeVoiceInput && !activeVoiceInput.voiceResultReady) {
+      clearVoiceInput();
+      return;
+    }
+    // Mark the dismissal so the next recording start can sweep a never-sent
+    // dismissal; until then the operation stays adoptable by a manual send.
+    const operation = voiceOperations.get((state.voiceInput || {}).operationId);
+    if (operation && !operation.telemetryTerminal && !operation.pendingSubmission) {
+      operation.dismissed = true;
+    }
+    setVoiceInputStatus("idle", { message: "", operationId: null });
+  }
+
+  function abandonCompletedVoiceResult(stage) {
+    const current = state.voiceInput || {};
+    const operation = voiceOperations.get(current.operationId);
+    if (!operation || operation.telemetryTerminal) return;
+    // Clearing the viewed session's composer must not terminate a result
+    // recorded for another materialized session: its notice and adoption
+    // provenance would silently vanish on return.
+    if (operation.sessionId && operation.sessionId !== state.activeSessionId) return;
+    trackVoiceTerminal("voice_cancelled", operation, { stage: stage || "recognition" });
+    state.voiceInput = Object.assign({}, current, {
+      telemetryTerminal: operation.telemetryTerminal,
+      operationId: operation.pendingSubmission ? operation.operationId : null,
+    });
+  }
+
+  function abandonVoiceResult(operationId) {
+    const operation = voiceOperations.get(operationId || getVoiceOperationId(state.activeSessionId, "chat"));
+    if (operation) trackVoiceTerminal("voice_cancelled", operation, { stage: "recognition" });
+    if (!operationId) abandonCompletedVoiceResult("recognition");
+  }
+
+
+function requestVoiceMedia(session, constraints, timeoutMs) { return pinvouSharedweb().requestVoiceMedia(session, constraints, timeoutMs); }
+
+function mergeFloatChunks(chunks) { return pinvouSharedweb().mergeFloatChunks(chunks); }
+
+function downsamplePcm(samples, sourceRate, targetRate) { return pinvouSharedweb().downsamplePcm(samples, sourceRate, targetRate); }
+
+function encodeWav(samples, sampleRate) { return pinvouSharedweb().encodeWav(samples, sampleRate); }
+
+  async function finishVoiceInput(cancelled, timedOut) {
+    const session = activeVoiceInput;
+    if (!session) return;
+    if (cancelled) {
+      trackVoiceTerminal("voice_cancelled", session, {
+        stage: state.voiceInput && state.voiceInput.stage === "permission" ? "permission" : "recording",
+      });
+      // Detach the audio callback first (cleanup nulls onaudioprocess), then
+      // release the PCM: the audio thread must never observe a nulled chunks
+      // array. The operation record keeps provenance, not the audio buffers.
+      cleanupVoiceInputSession(session);
+      session.chunks = null;
+      activeVoiceInput = null;
+      setVoiceInputStatus("cancelled", { message: bt("voiceCancelled"), completedAt: Date.now() });
+      emitVoiceDiagnostic("recording", "info", "voice input cancelled", "已取消语音输入", "cancelled");
+      return;
+    }
+
+    let mode = normalizeVoiceMode(session.mode);
+    // Defense in depth: the mode was already downgraded at session creation (edit rewritten
+    // to dictation on the start side); keep this fallback so uncorrected raw ASR text cannot
+    // overwrite the draft through the replace preview.
+    if (mode === "edit") mode = "dictation";
+    setVoiceInputStatus("transcribing", { message: bt("voiceTranscribing"), stage: "transcribing", mode });
+    cleanupVoiceInputSession(session);
+
+    try {
+      if (timedOut) {
+        emitVoiceDiagnostic("recording", "warn", "recording reached max duration", "", "timeout");
+      }
+      const raw = mergeFloatChunks(session.chunks);
+      // The merged buffer carries everything transcription needs; the PCM
+      // chunks must not stay pinned on the operation record for the rest of
+      // the app session (provenance keeps the record, not the audio).
+      session.chunks = null;
+      const durationMs = raw.length / Math.max(1, session.sampleRate) * 1000;
+      if (durationMs < 300) {
+        throw voiceFlowError("recording_failed", "recording", bt("voiceTooShort"));
+      }
+      const pcm = downsamplePcm(raw, session.sampleRate, 16000);
+      const wav = encodeWav(pcm, 16000);
+      const wavBytes = new Uint8Array(wav);
+      // This file is loaded only on the web remote-control lane; the backend's
+      // transcribe_voice_audio now takes a base64 input and the old audio_bytes JSON array
+      // branch was removed from the backend contract, so no dead branch is kept here.
+      const res = await invoke("web_access_transcribe_voice_audio", {
+        audioBase64: encodeBase64Bytes(wavBytes),
+        sessionId: session.sessionId,
+      });
+      if (activeVoiceInput !== session) {
+        // Superseded mid-transcription (a new recording owns the composer now,
+        // so this continuation can never deliver): end the operation here, or
+        // it sits non-terminal, unadoptable and unswept forever.
+        trackVoiceTerminal("voice_cancelled", session);
+        return;
+      }
+      const text = String((res && res.text) || "").trim();
+      if (!text) throw voiceFlowError("empty_result", "transcribing", "未识别到语音内容");
+      if (session.ownerKind === "chat" && state.activeSessionId !== session.sessionId) {
+        throw voiceFlowError("context_mismatch", "writeback", "voice result discarded because active session changed");
+      }
+      if (session.telemetryTerminal) {
+        // Abandoned mid-pipeline (the composer draft was cleared): the result
+        // must neither land in the cleared draft nor leave the UI stuck on an
+        // active status until the next recording.
+        setVoiceInputStatus("idle", { message: "", operationId: null });
+        return;
+      }
+      session.voiceResultReady = true;
+      if (typeof session.writeback === "function") {
+        await session.writeback(text, session.draftBeforeStart, {
+          mode,
+          operationId: session.operationId,
+          rawText: text,
+          diagnostic: {
+            mode,
+            normalize_strategy: "web_asr_only",
+            // Same as desktop: persist only metadata such as lengths in diagnostics, never the full transcript.
+            raw_text_length: text.length,
+            final_text_length: text.length,
+            // The web lane has no local high-risk term list or LLM post-processing
+            // (web_asr_only), so the desktop's task_send_blocked high-risk gate cannot be
+            // computed; hardcoding false here only keeps the diagnostic field shape aligned
+            // with desktop. Note: the current caller writeback chain only blocks multi-agent
+            // read-only and over-length truncation, with no high-risk term screening — a
+            // latent divergence from the desktop lane. Today no UI entry reaches web voice in
+            // task mode (the mic button is fixed to dictation and gesture auto-upgrade stops
+            // at edit), so the divergence is unreachable; if a web task entry is opened later,
+            // first copy the desktop's
+            // VOICE_SUSPICIOUS_ASR_TERMS/hasVoiceHighRiskResidual into this bridge (classic
+            // scripts cannot share modules) and compute task_send_blocked from their result.
+            task_send_blocked: false,
+          },
+        });
+        // Same policy as the desktop lane: the user may have cancelled during the writeback
+        // await window (cancel clears activeVoiceInput and sets cancelled); never overwrite
+        // that terminal cancelled state with completed.
+        if (activeVoiceInput !== session) return;
+      }
+      // Same as desktop: an operation terminalized during the writeback await
+      // (e.g. accepted through another lane's settle) must not have its idle
+      // reset overwritten by the completed notice.
+      if (session.telemetryTerminal) {
+        setVoiceInputStatus("idle", { message: "", operationId: null });
+        return;
+      }
+      setVoiceInputStatus("completed", {
+        message: mode === "task" ? (bt("voiceTaskSent") || bt("voiceWritten")) : bt("voiceWritten"),
+        completedAt: Date.now(),
+        mode,
+      });
+      emitVoiceDiagnostic("writeback", "info", "voice text written back", "语音已写入输入框", "");
+    } catch (err) {
+      const normalized = normalizeVoiceError(err, "transcribing");
+      if (!session.voiceResultReady) trackVoiceTerminal("voice_recognition_failed", session);
+      setVoiceInputStatus("failed", {
+        message: normalized.message,
+        error: normalized.message,
+        category: normalized.category,
+        stage: normalized.stage,
+        completedAt: Date.now(),
+      });
+      emitVoiceDiagnostic(normalized.stage, "error", normalized.diagnostic || normalized.category, normalized.message, normalized.category);
+    } finally {
+      if (activeVoiceInput === session) activeVoiceInput = null;
+    }
+  }
+
+function closeVoiceAsrSetup() { return pinvouSharedweb().closeVoiceAsrSetup(); }
+
+  // The web lane has no local ASR model download (startVoiceInput fails fast with
+  // dependency_unavailable when missing; the install_voice_asr command is not on
+  // the web access-policy allowlist either), so there is no interruptible install
+  // process; keep a same-named cancel entry as desktop that just collapses the
+  // install dialog and resolves, avoiding a TypeError when ChatView calls it on web.
+  async function cancelVoiceAsrSetup() {
+    closeVoiceAsrSetup();
+  }
+
+  // Same as desktop: invoke the beforePermission callback before requesting the microphone
+  // (shortcut-intro first-use gate). Returns true to continue recording; false means the
+  // gate refused (session cleaned up and reset to idle) or the session was already cancelled.
+  async function passVoiceBeforePermissionGate(session, options) {
+    if (!options || typeof options.beforePermission !== "function") return true;
+    const shouldContinue = await options.beforePermission({
+      mode: session.mode,
+      sessionId: session.sessionId,
+      draftBeforeStart: session.draftBeforeStart,
+    });
+    if (activeVoiceInput !== session) return false;
+    if (shouldContinue !== false) return true;
+    // The gate refused before anything started: still end the remembered
+    // operation so it cannot sit unswept alongside the next one.
+    trackVoiceTerminal("voice_cancelled", session, { stage: "recognition" });
+    cleanupVoiceInputSession(session);
+    activeVoiceInput = null;
+    setVoiceInputStatus("idle", { message: "", stage: null, sessionId: null });
+    return false;
+  }
+
+  // eslint-disable-next-line sonarjs/cognitive-complexity -- single entry covering permission/recording/mode branches (mirrors the desktop lane); split tracked separately
+  async function startVoiceInput(draftText, writeback, options) {
+    if (activeVoiceInput && state.voiceInput.status === "recording") {
+      finishVoiceInput(false, false);
+      return;
+    }
+    if (activeVoiceInput) {
+      finishVoiceInput(true, false);
+      return;
+    }
+    // The remote-control lane backend requires an explicit sessionId for that command
+    // (rpc.rs Required("sessionId")); recording from the welcome page (no session yet) would
+    // always fail with untranslated English. Fail fast with trilingual copy before opening
+    // the mic instead of recording for nothing.
+    if (!state.activeSessionId) {
+      setVoiceInputStatus("failed", {
+        message: bt("voiceNeedSession"),
+        error: "session_required",
+        category: "session_unavailable",
+        stage: "permission",
+        completedAt: Date.now(),
+      });
+      return;
+    }
+
+    // iOS/WebKit 只允许在用户点击的同步调用栈里启动 AudioContext。Web 端先在任何
+    // await 之前创建并 resume，后续依赖检测和麦克风授权完成后复用这个 context。
+    const AudioCtor = window.AudioContext || window.webkitAudioContext; // eslint-disable-line compat/compat -- Safari 14.0 ships webkitAudioContext; the || fallback above selects it
+    let primedAudioContext = null;
+    let primedAudioResume = null;
+    if (IS_WEB && AudioCtor) {
+      try {
+        primedAudioContext = new AudioCtor();
+        primedAudioResume = primedAudioContext.state === "suspended"
+          ? primedAudioContext.resume().catch(function () {})
+          : Promise.resolve();
+      } catch {
+        primedAudioContext = null;
+        primedAudioResume = null;
+      }
+    }
+
+    // 首次/缺组件：先检测本地语音识别依赖，缺则弹安装框、不进录音。
+    try {
+      const asrStatus = await invoke("voice_asr_status");
+      // The Rust VoiceAsrStatus carries an installable field (the tauri lane uses
+      // it to decide whether a local install can be offered); the web lane never
+      // installs locally, so it only branches on ready and fails with
+      // "needs desktop" guidance.
+      if (asrStatus && !asrStatus.ready) {
+        if (IS_WEB) {
+          if (primedAudioContext) primedAudioContext.close().catch(function () {});
+          setVoiceInputStatus("failed", {
+            message: bt("voiceNeedDesktopAsr"),
+            error: "voice_asr_not_ready",
+            category: "dependency_unavailable",
+            stage: "dependency",
+            completedAt: Date.now(),
+          });
+          return;
+        }
+        state.voiceAsrSetup = { open: true, status: asrStatus, installing: false, progress: null, error: null };
+        notify();
+        return;
+      }
+    } catch {
+      // 检测失败（如 mock 环境/旧后端）不阻塞，继续走原录音路径（环境变量/兜底引擎）
+    }
+
+    // The web lane has no LLM post-processing (web_asr_only), so edit instructions cannot be
+    // executed: downgrade to dictation at session creation (status display and writeback path
+    // stay consistent end to end) instead of waiting until the finish side after the user
+    // recorded a whole clip expecting "voice edit".
+    const sessionMode = normalizeVoiceMode(options && options.mode);
+    // Opening a new recording abandons the previous unsent operation and the
+    // completed-but-dismissed result still owned by the composer.
+    const previousOperationId = getVoiceOperationId(
+      options && Object.prototype.hasOwnProperty.call(options, "sessionId") ? options.sessionId : state.activeSessionId,
+      (options && options.ownerKind) || "chat"
+    );
+    if (previousOperationId) abandonVoiceResult(previousOperationId);
+    abandonCompletedVoiceResult("recognition");
+    const session = {
+      id: webVoiceToken("voice_"),
+      operationId: webVoiceToken("voiceop_"),
+      // Same as the desktop lane: the caller's lane identity wins, so a
+      // non-chat composer is not booked under the chat lane's active session
+      // (adoption keys and the chat context guard depend on it).
+      sessionId: options && Object.prototype.hasOwnProperty.call(options, "sessionId")
+        ? options.sessionId
+        : state.activeSessionId || null,
+      ownerKind: (options && options.ownerKind) || "chat",
+      draftBeforeStart: String(draftText || ""),
+      writeback,
+      mode: sessionMode === "edit" ? "dictation" : sessionMode,
+      chunks: [],
+      sampleRate: 16000,
+      startedAt: Date.now(),
+      audioContext: primedAudioContext,
+      permissionRecorded: false,
+    };
+    rememberVoiceOperation(session);
+    state.voiceInput = Object.assign({}, state.voiceInput, { operationId: session.operationId });
+    state.voiceInput.ownershipToken = session.id;
+    activeVoiceInput = session;
+    if (!await passVoiceBeforePermissionGate(session, options)) return;
+    setVoiceInputStatus("requesting_permission", {
+      message: bt("voiceRequestingPermission"),
+      sessionId: session.sessionId,
+      startedAt: session.startedAt,
+      stage: "permission",
+      mode: session.mode,
+    });
+    emitVoiceDiagnostic("permission", "info", "requesting microphone permission", "", "");
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw voiceFlowError("device_unavailable", "device", bt("voiceNoMicCapture"));
+      }
+      if (!AudioCtor) {
+        throw voiceFlowError("recording_failed", "recording", bt("voiceNoAudioRecording"));
+      }
+      session.stream = await requestVoiceMedia(session, {
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      if (activeVoiceInput !== session) {
+        cleanupVoiceInputSession(session);
+        return;
+      }
+      session.permissionRecorded = true;
+      session.audioContext = session.audioContext || new AudioCtor();
+      if (primedAudioResume) await primedAudioResume;
+      if (session.audioContext.state === "suspended") await session.audioContext.resume();
+      if (session.audioContext.state !== "running") {
+        throw voiceFlowError("recording_failed", "recording", bt("voiceAudioStartBlocked"));
+      }
+      session.sampleRate = session.audioContext.sampleRate || 16000;
+      session.source = session.audioContext.createMediaStreamSource(session.stream);
+      session.processor = session.audioContext.createScriptProcessor(4096, 1, 1);
+      session.zeroGain = session.audioContext.createGain();
+      session.zeroGain.gain.value = 0;
+      session.processor.onaudioprocess = function (event) {
+        if (activeVoiceInput !== session) return;
+        const input = event.inputBuffer.getChannelData(0);
+        session.chunks.push(new Float32Array(input));
+      };
+      session.source.connect(session.processor);
+      session.processor.connect(session.zeroGain);
+      session.zeroGain.connect(session.audioContext.destination);
+      session.timeoutId = setTimeout(function () { finishVoiceInput(false, true); }, VOICE_RECORDING_MAX_DURATION_MS);
+      // Unplugging / device disconnect ends the track (stop() does not fire onended, so no
+      // recursive teardown); same as the desktop lane: finish immediately with what was
+      // recorded instead of idling until the duration cap.
+      session.stream.getTracks().forEach(function (track) {
+        track.onended = function () {
+          if (activeVoiceInput === session) finishVoiceInput(false);
+        };
+      });
+      setVoiceInputStatus("recording", { message: bt("voiceRecording"), stage: "recording", mode: session.mode });
+      emitVoiceDiagnostic("recording", "info", "recording started", "", "");
+    } catch (err) {
+      cleanupVoiceInputSession(session);
+      // The teardown above detached the audio callback first; release the PCM
+      // now so the terminal operation record never pins partial audio.
+      session.chunks = null;
+      // finishVoiceInput(cancelled) has already torn the session down as cancelled and cleared
+      // activeVoiceInput; when the user cancels while permission is pending, this catch arrives
+      // afterwards, and an early return without the session check would overwrite the
+      // cancellation with failed.
+      if (activeVoiceInput !== session) return;
+      activeVoiceInput = null;
+      const normalized = normalizeVoiceError(err, "recording");
+      // Same terminal taxonomy as the desktop start catch: the operation must
+      // not sit non-terminal after a failed start (permission / cancellation
+      // / recognition failure), or it lingers unswept.
+      if (!session.permissionRecorded && normalized.category !== "cancelled") {
+        session.permissionRecorded = true;
+        trackVoiceTerminal("voice_permission_result", session);
+      } else if (normalized.category === "cancelled") {
+        trackVoiceTerminal("voice_cancelled", session);
+      } else {
+        trackVoiceTerminal("voice_recognition_failed", session);
+      }
+      setVoiceInputStatus("failed", {
+        message: normalized.message,
+        error: normalized.message,
+        category: normalized.category,
+        stage: normalized.stage,
+        completedAt: Date.now(),
+      });
+      emitVoiceDiagnostic(normalized.stage, "error", normalized.diagnostic || normalized.category, normalized.message, normalized.category);
+    }
+  }
+
+function cancelVoiceInput() { return pinvouSharedweb().cancelVoiceInput(); }
+
+  // Local override (mirrors the desktop lane): the shared helper only resets
+  // the status. Clearing the input on the idle notice is the user abandoning
+  // the unsent result, so that ends the operation here too — otherwise the
+  // cleared result would stay adoptable by a later manual send and only get
+  // reaped by the next recording (a pending submission keeps its admission
+  // outcome instead).
+  function clearVoiceInput() {
+    if (activeVoiceInput) {
+      finishVoiceInput(true, false);
+      return;
+    }
+    abandonCompletedVoiceResult("recognition");
+    setVoiceInputStatus("idle", {
+      message: "",
+      error: null,
+      category: null,
+      stage: null,
+      sessionId: null,
+    });
+  }
+
+function appendVoiceText(base, text) { return pinvouSharedweb().appendVoiceText(base, text); }
+
+  async function pickFiles() {
+    if (!dialogOpen) { addSystemItem(bt("filePickUnavailable")); return []; }
+    const selected = await dialogOpen({ multiple: true });
+    if (!selected) return [];
+    return Array.isArray(selected) ? selected : [selected];
+  }
+  // 知识库「添加文件夹」：host-file-picker 目录模式返回单个目录路径，
+  // 包成数组交给后端 kb_collection_add_sources（在桌面进程用 WalkDir 递归展开）。
+  async function pickFolders() {
+    if (!dialogOpen) { addSystemItem(bt("filePickUnavailable")); return []; }
+    const selected = await dialogOpen({ directory: true, multiple: false, title: bt("kbPickFolderTitle") });
+    if (!selected) return [];
+    const p = Array.isArray(selected) ? selected[0] : selected;
+    return p ? [p] : [];
+  }
+  // Dedicated picker for directory rebind (broken-link repair): single
+  // selection with a title that matches the rebind semantics; same surface as
+  // the desktop bridge (review #463 Minor 6).
+  async function pickRebindFolder() {
+    if (!dialogOpen) { addSystemItem(bt("filePickUnavailable")); return null; }
+    const selected = await dialogOpen({ directory: true, multiple: false, title: bt("rebindPickFolderTitle") });
+    if (!selected) return null;
+    return Array.isArray(selected) ? (selected[0] || null) : selected;
+  }
+  // Round-35 M4: the workspace channels' dedicated single-select pickers,
+  // same surface as the desktop bridge.
+  async function pickManageFolder() {
+    if (!dialogOpen) { addSystemItem(bt("filePickUnavailable")); return null; }
+    const selected = await dialogOpen({ directory: true, multiple: false, title: bt("manageAddFolderTitle") });
+    if (!selected) return null;
+    return Array.isArray(selected) ? (selected[0] || null) : selected;
+  }
+  async function pickWorkspaceFolder() {
+    if (!dialogOpen) { addSystemItem(bt("filePickUnavailable")); return null; }
+    const selected = await dialogOpen({ directory: true, multiple: false, title: bt("workspacePickFolderTitle") });
+    if (!selected) return null;
+    return Array.isArray(selected) ? (selected[0] || null) : selected;
+  }
+  async function pickFeedbackFiles() {
+    if (!dialogOpen) return [];
+    const selected = await dialogOpen({
+      multiple: true,
+      filters: [
+        { name: bt("fileMediaFilterName"), extensions: ["png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "webm"] },
+      ],
+    });
+    if (!selected) return [];
+    return Array.isArray(selected) ? selected : [selected];
+  }
+  // ── Init ─────────────────────────────────────────────────────────
+  function disarmWebInitRetry() {
+    if (!webInitRetryArmed || !webInitRetryHandler) return;
+    window.removeEventListener("pinvou:web-connection", webInitRetryHandler);
+    webInitRetryArmed = false;
+    webInitRetryHandler = null;
+  }
+
+  function armWebInitRetry() {
+    if (webInitRetryArmed) return;
+    webInitRetryArmed = true;
+    webInitRetryHandler = function (event) {
+      const status = event && event.detail && event.detail.status;
+      if (status !== "connected") return;
+      disarmWebInitRetry();
+      window.setTimeout(function () {
+        init().catch(function (error) {
+          console.warn("[TauriBridge] Web init retry failed", error);
+        });
+      }, 0);
+    };
+    window.addEventListener("pinvou:web-connection", webInitRetryHandler);
+  }
+
+  async function init() {
+    if (initPromise) return initPromise;
+    const attempt = (async function () {
+    // 会话根在 init() 完成前就订阅桥,启动加载各自写互不重叠的状态片、彼此无
+    // 数据依赖(每个 loader 自吞 invoke 错误并落兜底值),串行 await 会把多个
+    // RPC 往返叠进首屏延迟——并行后往返宽度收敛为 1。enterDraft/markStateReady
+    // 必须等本组完成后才走(durable state 未就绪前不得放行桌面事件重放,这是
+    // web 重试契约的前提)。与 tauri 桥同口径:启动窗口内抑制 notify(状态照
+    // 写),try/finally 结束后发布一个连贯快照并把通知恢复为立即发布。
+    startupNotificationBatching = true;
+    let initFailure;
+    try {
+    const parallelLoads = [
+      loadSettings(),
+      hasCapability("pet") ? loadSelectedPet() : Promise.resolve(),
+      loadEffectiveModelConfig(),
+      loadAppVersion(),
+      loadModels(),
+      refreshHistoryList()
+    ];
+    await Promise.all(parallelLoads);
+    // Populate the global Scheduled unread summary without requiring the user
+    // to visit the Scheduled page first.
+    loadScheduledTasks().catch(function () {}).then(function () {
+      loadScheduledTaskRecentRuns().catch(function () {});
+    });
+    enterDraft(); // 启动落空白草稿页(lazy session:不自动选/建会话)
+    // Browser readiness is two-phase: the first barrier negotiates installed
+    // desktop capabilities so these RPCs can run; only after the durable
+    // Session index is loaded may the desktop replay live turn events.
+    if (IS_WEB && window.PinvouWebClient && typeof window.PinvouWebClient.markStateReady === "function") {
+      window.PinvouWebClient.markStateReady();
+    }
+    if (hasCapability("superPermission")) await refreshSuperPerm();
+    // The per-lane global defaults (work/code) are the source of truth for the
+    // draft-state mode chip; fetched at startup.
+    refreshModeDefaults().catch(function () {});
+    loadPersonas(); // 预载卡池(让聊天里草稿"已存入"判定能查到同名自制卡), fire-and-forget
+    pollBackendStatus();
+    setInterval(pollBackendStatus, 10000);
+    } catch (initError) {
+      initFailure = initError;
+    } finally {
+      // finally 而非仅成功路径:即使启动中途抛错,也必须恢复立即发布,
+      // 否则抑制位会永久吞掉此后所有通知(下文 loadScheduledTasks 等
+      // fire-and-forget 仍需照常发布)。
+      startupNotificationBatching = false;
+    }
+    // 连贯快照在 finally 之外发布:notify() 会原样上抛订阅者回调的异常,
+    // 而 finally 内抛出的异常会顶替进行中的 init 错误。失败路径照常发布,
+    // 但只让真正的 init 错误向外传播;成功路径上发布失败仍按原样使 init
+    // 失败。此段同步执行,标志复位与发布之间不会插入其他通知。
+    try {
+      notify();
+    } catch (notifyError) {
+      if (!initFailure) throw notifyError;
+    }
+    if (initFailure) throw initFailure;
+    })();
+    initPromise = attempt.then(function (result) {
+      disarmWebInitRetry();
+      return result;
+    }, function (error) {
+      // A rejected Promise must not permanently poison every later init call.
+      // Keep replay closed and retry only after the browser observes a fresh
+      // connected transition; durable state must succeed before state_ready.
+      const client = IS_WEB && window.PinvouWebClient;
+      if (client && !client.stateReady) {
+        initPromise = null;
+        armWebInitRetry();
+      }
+      throw error;
+    });
+    return initPromise;
+  }
+
+  // ── Expose API ───────────────────────────────────────────────────
+  window.TauriBridge = {
+    available: true,
+    subscribe,
+    getState: function () { return snapshotState(); },
+    init,
+    sendMessage,
+    sendMessageToSession,
+    auxChatEnsure,
+    auxChatSend,
+    auxChatSnapshot,
+    auxChatReset,
+    onSessionDeleted,
+    getComposerDraft: function () { return readComposerDraftWithRecovery(); },
+    setComposerDraft,
+    retryFirstTurn,
+    prefillComposer,
+    restoreTaskDraft,
+    removeQueued,
+    prioritizeQueued,
+    editQueued,
+    startVoiceInput,
+    cancelVoiceAsrSetup,
+    closeVoiceAsrSetup,
+    cancelVoiceInput,
+    clearVoiceInput,
+    abandonVoiceResult,
+    getVoiceOperationId,
+    beginVoiceSubmission,
+    completeVoiceSubmission,
+    dismissVoiceInput,
+    hasVoiceSubmissionPending,
+    appendVoiceText,
+    loadScheduledTasks,
+    loadScheduledTaskRecentRuns,
+    selectScheduledTask,
+    refreshScheduledTaskData,
+    dismissScheduledTaskError,
+    createScheduledTask,
+    updateScheduledTask,
+    pauseScheduledTask,
+    resumeScheduledTask,
+    deleteScheduledTask,
+    runScheduledTaskNow,
+    startScheduledTaskChat,
+    cancelGeneration,
+    cancelShellTask,
+    createNewSession,
+    switchToSession,
+    openScheduledRunChat,
+    exitScheduledRunChat,
+    deleteSession,
+    renameSession,
+    toggleSessionPinned,
+    archiveSession,
+    restoreArchivedSession,
+    startMonitorPolling,
+    stopMonitorPolling,
+    clearMonitorStats,
+    setSelectedPet,
+    listBuiltinFeatures,
+    saveSettings,
+    saveSearchSettings,
+    submitFeedback,
+   saveModel,
+   reloadSavedModels,
+   revealModelApiKey,
+   deleteModel,
+    getImageInputCapability,
+    testImageInputCapability,
+    setActiveModel,
+    loadSessionModel,
+    switchModel,
+    testModelConnection,
+    probeEndpointModels,
+    probeLocalServerKind,
+    toggleSuperPerm,
+    renderMarkdown,
+    // modeState 权威读取（评审 P1 后纳入公开面，与 tauri 端对齐）
+    syncModeState,
+    // Plan/YOLO
+    acceptPlan,
+    discardPlan,
+    exitPlanToYolo,
+    setPlanModeNext,
+    setModeLane,
+    // Web stubs for desktop-only capabilities (bound-workspace sessions / YOLO
+    // confirmation gate; API symmetric on both sides)
+    getSessionWorkspaceBinding,
+    getCodePermissionPrefs,
+    confirmCodeYolo,
+    planStuckReplan,
+    planStuckGo,
+    // 用户交互
+    submitUserInput,
+    cancelUserInput,
+    summonPinvou,
+    inspectPinvou,
+    resolvePinvouReview,
+    dismissPinvouReview,
+    // 编辑/压缩
+    editLastTurn,
+    // 产物
+    artifactInfo,
+    readArtifactText,
+    writeArtifactText,
+    readArtifactImageB64,
+    readArtifactThumbnail,
+    renderArtifactVisual,
+    openContainingFolder,
+    revealSessionFolder,
+    openScheduledTaskFolder,
+    openArtifactExternal,
+    downloadArtifact,
+    listDeliverableIndex,
+    openUserExternalUrl,
+    // 附件
+    addAttachmentByPath,
+    addPasteImage,
+    removeAttachment,
+    pickAndAttach,
+    uploadDeviceFiles,
+    resolveConversationAttachment,
+    openConversationAttachment,
+    revealConversationAttachment,
+    // 通用宿主文件选择器（知识库、反馈等功能继续复用）。
+    pickFiles,
+    pickFolders,
+    pickManageFolder,
+    pickRebindFolder,
+    pickWorkspaceFolder,
+    pickFeedbackFiles,
+    // 卡片池: 专家面具
+    loadPersonas,
+    getPersonas: function () { return personaPoolCache; }, // 返回引用(只读),不进 notify 快照
+    readPersonaBody: function (id) { return invoke("read_persona_body", { personaId: id }); }, // Side B: 详情拉完整正文
+    equipPersona,
+    unequipPersona,
+    // 知识库挂载(会话级)
+    mountCollection,
+    setCollectionEnabled,
+    removeCollection,
+    unmountCollection,
+    listCollections: function () { return invoke("kb_collection_list"); }, // 挂载选择器用
+    kbModelStatus: function () { return invoke("kb_model_status"); }, // 挂载选择器门控:模型未装则不可选
+    // 取消进行中的模型下载(桌面同一命令);web 宿主的 access-policy 未放行
+    // kb_model_cancel 时 invoke 被拒,catch 静默(同 checkDependencies 约定)。
+    cancelKbModel: function () { return invoke("kb_model_cancel").catch(function () {}); },
+    loadMemoryOverview,
+    saveMemoryProfilePatch,
+    updateMemoryItem,
+    deleteMemoryItem,
+    confirmMemoryCandidate,
+    ignoreMemoryCandidate,
+    neverMemoryCandidate,
+    organizeMemory,
+    loadOrganizeHistory,
+    // AI 造卡开场引导卡:落一条展示气泡 + 记一条 persona 事件(随会话持久化)。
+    // 走 personaEvents 时间线,冷重载时 rerenderFromMessages 按 pos 还原 → 切会话/重启不丢。
+    postCardCreatorIntro,
+    // 用户自创卡
+    createPersona,
+    updatePersona,
+    deletePersona,
+    // Dependency health check (one-click install is provided only by the desktop bridge)
+    checkDependencies,
+  };
+
+  function retryWebAuthoritySynchronization() {
+    Object.keys(sessionStates).forEach(function (sid) {
+      const buf = sessionStates[sid];
+      if (!buf) return;
+      if (buf.remoteTerminalSeen || (buf.remoteTurnActive && !buf.busy)) {
+        reconcileRemoteTurn(sid).then(function (ready) {
+          if (ready) flushQueued(sid);
+        }).catch(function () {});
+      } else if (!buf.busy && buf.queued && buf.queued.length) {
+        flushQueued(sid);
+      }
+    });
+  }
+  if (IS_WEB) {
+    window.addEventListener("pinvou:web-connection", function (event) {
+      if (!event || !event.detail || event.detail.status !== "connected") return;
+      scheduleAbandonedSessionDownloadCleanup();
+      retryWebAuthoritySynchronization();
+    });
+    window.addEventListener("pinvou:web-capabilities", function () {
+      if (!webInvokeCapabilitiesReady()) return;
+      scheduleAbandonedSessionDownloadCleanup();
+      retryCapabilityBlockedSessionSwitch();
+      retryWebAuthoritySynchronization();
+    });
+  }
+
+  if (IS_WEB && window.PinvouWebClient && typeof window.PinvouWebClient.markFrontendReady === "function") {
+    window.PinvouWebClient.markFrontendReady();
+  }
+
+  // Auto-init after DOM ready
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    setTimeout(init, 0);
+  }
+})();

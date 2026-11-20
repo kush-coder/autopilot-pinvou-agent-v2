@@ -1,0 +1,77 @@
+pub mod assistant;
+pub(crate) mod browser;
+// `pub` (not `pub(crate)`) only because of the `count_user_turns_in_json`
+// re-export below: the stacked CLI families PR (#507) counts user turns for
+// `code checkpoints rewind` through that exact predicate, and a crate-private
+// module would make the re-export unreachable. No in-tree caller exists yet —
+// an ahead-of-consumer surface, disclosed in PR #602.
+pub mod code_checkpoints;
+// The other `pub` modules below (`codex_acp`, `dependencies`, `knowledge`,
+// `monitor`, `projects`, `remote_knowledge`, `shared_knowledge_host`,
+// `voice`) are opened for the stacked headless CLI (#507 family), which
+// calls them across the `pinvou3_lib` path dependency; like
+// `code_checkpoints`, some of that surface is ahead of its first in-tree
+// consumer.
+pub mod codex_acp;
+pub(crate) mod computer_use;
+pub(crate) mod connectors;
+// Crate-boundary re-exports for the headless CLI's `connectors ensure-cli`
+// lane (same shape as the `count_user_turns_in_json` re-export below: the
+// module stays crate-private, four items cross): the install-log appender, so
+// the CLI's npm attempts append to — never truncate — the shared log and
+// mark the mirror retry, plus the log's size-bound rotator (the CLI
+// redirects npm stdio into the same log directly and must enforce the same
+// 8 MiB bound `run_with_timeout` enforces); the managed license writer, so
+// the CLI's native-lane install records the same license side file the GUI
+// writer records; and the acceleration-prefix env name, so the CLI's
+// download chain consumes the app's constant instead of a drifting copy.
+pub use connectors::{
+    GITHUB_ASSET_MIRROR_PREFIX_ENV, append_cli_install_log, rotate_cli_install_log_if_oversized,
+    write_managed_license,
+};
+// Round-51 review: the per-connector semantic-version floors are
+// single-sourced — the CLI's connectors family imports these instead of
+// re-declaring them, so a GUI-side raise to a lock baseline moves the
+// CLI's `upgrade_required` gates with it (the feishu floor is the live
+// one: round-49 raised it for the skill pack's command surface).
+pub use connectors::feishu::LARK_MIN_VERSION;
+pub use connectors::tmeet::{TMEET_MIN_VERSION, TMEET_NPM_SPEC};
+pub use connectors::wecom::WECOM_MIN_VERSION;
+// The CLI's connectors ima lanes and the plugins readiness table consume the
+// app's status computation instead of re-deriving it (the CLI keeps only its
+// documented credential-store degrade wrapper): the skill id and the
+// store-parameterized status read were crate-private, which forced a hand
+// mirror of both the constant and the readiness predicate.
+pub use connectors::ima::{IMA_SKILL_ID, IMA_SKILL_VERSION, status_with_store};
+// `pub` for the headless CLI (`pinvou artifacts list`): the shared
+// `deliverable_index` fn (with its `DeliverableIndex`/`DeliverableItem`
+// result types) is the CLI-consumed surface — one implementation shared
+// with the GUI instead of the drifting hand-copy the CLI carried before
+// the consolidation.
+pub mod deliverables;
+pub mod dependencies;
+pub mod feedback;
+pub mod files;
+pub(crate) mod global_shortcut;
+pub mod knowledge;
+pub mod marketplace;
+pub mod memory;
+pub(crate) mod messaging;
+pub mod monitor;
+pub mod multiagent;
+pub mod personas;
+pub(crate) mod pet;
+pub mod projects;
+pub(crate) mod remote_control;
+pub mod remote_knowledge;
+pub(crate) mod retirement;
+pub(crate) mod review;
+pub(crate) mod runtime_bundle;
+pub mod scheduled;
+pub(crate) mod session_creation;
+pub mod sessions;
+pub mod shared_knowledge_host;
+pub(crate) mod system_tray;
+pub(crate) mod updater;
+pub mod voice;
+pub(crate) mod voice_shortcut;

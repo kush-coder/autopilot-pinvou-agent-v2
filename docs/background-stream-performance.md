@@ -1,0 +1,327 @@
+# Native background stream preview performance
+
+## Behavior
+
+The native Tauri chat adapter keeps authoritative messages, raw deltas, tool execution, model requests and persistence unchanged. Only presentation work is scheduled differently:
+
+- Foreground Markdown previews retain their 180ms trailing budget; the first visible bubble is still immediate.
+- Background session previews use a 1000ms budget. Raw text continues to accumulate on every event.
+- One bounded animation-frame publication covers pending streams across sessions. Each session retains cancellation for deletion/eviction, and timer-only hosts retain the 32ms publication fallback.
+- Before subscribers capture a newly activated session, the native host synchronously refreshes its current preview and cancels the older background timer. Same-session notifications do not bypass the foreground budget.
+- A WeakMap keyed by the actual message bubble records its last successfully rendered text. Activating a current preview skips parsing, including repeated switches between stalled large streams. Failed renders do not update this record or retain the previous foreground ID.
+- Input requests, errors, tool boundaries, completion, failure and interruption retain synchronous semantic handling and final preview flushes.
+
+The preview observer runs only after the native host's background-working-set and startup-publication guards. It does not publish recursively. An activation render failure is logged without rejecting session activation; raw text remains available with the previous HTML until rendering succeeds on a later publication. Returning to the previous session also retries its pending refresh.
+
+This change concerns inactive **sessions**, not OS window visibility. Web transport and ACP projection are outside its scope. Web scheduling parity remains a separate follow-up.
+
+## Before/after measurement
+
+Measured on 2026-10-19 on Windows, Intel Core i7-8700 @ 3.20GHz, Node v24.13.0. Baseline: `fcb700f853a32b2900af73451814589af8e9fe79`, after safely synchronizing main and its submodules.
+
+Each configuration has five warm-ups and thirty measured runs, alternating before/after order. Each session receives the same 200 Markdown chunks at 20ms virtual intervals; exactly one session is visible. Both variants execute the actual event handler, shared router, host notification function and marked parser. Setup and virtual waiting are excluded from timings; trailing preview work is included. Complete final raw text and HTML are asserted for every session.
+
+The timing columns use the emitted report's `cases[].wall.p50Ms` and `cases[].wall.p95Ms`, measuring elapsed local processing time rather than parser-only or CPU time.
+
+| Sessions | Wall P50 before | P50 after | P50 time saved | P50 reduction | Wall P95 before | P95 after | P95 reduction |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 14.81ms | 14.82ms | -0.01ms | -0.1% | 16.19ms | 15.78ms | 2.5% |
+| 5 | 79.89ms | 32.14ms | 47.75ms | 59.8% | 91.66ms | 40.77ms | 55.5% |
+| 10 | 164.26ms | 53.03ms | 111.23ms | 67.7% | 229.79ms | 119.54ms | 48.0% |
+
+Rounded values come from the same run; saved time and percentages use unrounded samples. Single-session work counts are unchanged and timings vary between runs, so no meaningful single-session improvement is claimed.
+
+| Sessions | Markdown parses before → after | Notification calls before → after |
+| --- | --- | --- |
+| 1 | 24 → 24 | 223 → 223 |
+| 5 | 120 → 44 | 1115 → 225 |
+| 10 | 240 → 69 | 2230 → 225 |
+
+An activation diagnostic sends a background chunk at 0ms, another at 40ms, then activates that session at 50ms. The baseline first snapshot has stale HTML and its timer catches up 130ms later. The final implementation's first snapshot already has current HTML: **0ms timer catch-up**. This resolves the 950ms catch-up observed with the earlier timer-only prototype.
+
+These numbers measure local handler/parser/lightweight-subscriber work during a synthetic replay. They do **not** measure Tauri/WebView2 input latency, model throughput, network/tool execution, total task completion time, full-process memory or CPU utilization. Notification calls are not React commits. The isolated session buffers and storage substitutes do not establish durable persistence correctness. Native end-to-end resource measurements remain unverified.
+
+## Reproduction
+
+From `pinvou3-app/`, after installing the locked development dependencies:
+
+```powershell
+npm run perf:native-stream -- --baseline-ref fcb700f853a32b2900af73451814589af8e9fe79 --output tmp/native-stream-performance.json
+```
+
+`--samples` accepts 5 through 200 samples per configuration (default 30). Output paths are relative to the repository root. The baseline defaults to the pinned commit above, even on a feature checkout; `--baseline-ref` explicitly overrides it. The script obtains immutable baseline sources from that local Git commit and compares them with working-tree sources. It records source hashes, environment, all samples, nearest-rank P50/P95, activation correctness and a staggered-arrival count check. Run performance measurements separately from builds and test suites. Repeat these checks after renderer or parser dependency changes, including the marked upgrade in PR #699; this run uses the current locked marked 14 dependency.
+
+The local run's complete samples are in `tmp/native-stream-review-performance.json`; this generated/private-workspace directory is not part of the change. The committed script makes the comparison reproducible without that file.
+
+## Verification and limits
+
+- Regression tests first failed against the baseline for background parse frequency, activation HTML and cross-session publication counts. The implementation makes these checks pass.
+- All 25 native scheduling tests pass, covering activation, unchanged-preview reuse, cross-session render isolation, draft return, rendering failure/retry and return to the previous session, the unchanged immediate foreground publication at 180ms, same-session budget, no-timer fallback, cross-session publication, reentrant and throwing subscribers, input/error handling, tool boundary, completion/failure/interruption, background storage attribution, eviction and frame fallback. Together with one detached-window lifecycle test and one bridge-domain protocol test, the focused run passes all 27 checks.
+- Mutation checks confirm that removing background publication fails two tests, changing its budget from 1000ms to 5000ms fails three tests, and removing activation publication cancellation fails one test. Still-background tests assert no new publication through 999ms, current HTML at 1000ms, and publication at 1016ms (animation frame) or 1032ms (timer fallback).
+- The real browser UI smoke passes all 55 checks, including a new assertion that the first subscription snapshot after activating a background stream contains current HTML and that the output becomes visible. It exercises the real frontend/bridge with mocked Tauri services, not a native Rust host.
+- The detached-window startup fixture models the preview observer as synchronous and non-publishing, preventing its generic mock from recursively calling `notify` for the new `refresh*` method.
+- Desktop and Web UI builds, Safari 14 compatibility audit, architecture guard, protocol contracts, affected lifecycle tests, all five frontend lint commands and changed Node-file lint pass. UI lint reports zero errors and pre-existing documentation warnings in unrelated files.
+- The original implementation full Node run was not green (the review follow-up reruns the focused checks above): 1172 checks, 1159 passed, 11 failed and 2 skipped. Seven static contract failures (auxiliary chat, browser surface, connector, sidecar and build gates) reproduce in a clean archive of the synchronized baseline with checkout-equivalent line endings. Four failures involve unchanged Windows browser-wrapper tests; three pass on isolated rerun and the cancellation/deadline failure also reproduces on the clean baseline. No new failure attributable to this change was found. This is not a claim of a clean full-suite run or native device validation.
+- Independent follow-up review found no remaining blockers after the failed-activation return path was fixed and covered by a red/green test.
+
+No application UI text, configuration format, network endpoint, runtime dependency, permission policy or CodeWhale behavior changes.
+
+## Native tool-output publication
+
+Native `chat:tool_delta` events use the terminal feature's existing 50ms host timer
+for both foreground and background sessions. The event router skips its extra
+immediate background publication for these deltas. Output accumulation, split
+ANSI parsing, stdout/stderr handling and the bounded live tail still update
+synchronously on every chunk; the completed tool result remains authoritative.
+
+For tool-delta-driven notifications, the existing 50ms timer is a throttle: later
+chunks do not postpone its first deadline. Tool start/end, user-input requests,
+gate decisions, failures and interrupted turn completion retain their existing
+synchronous handling. Session activation reads accumulated output immediately.
+A pending host timer publishes the current working set after a switch or
+deletion and does not capture or recreate the former session. Web and ACP
+transports are unchanged. Event/invoke wire shapes are unchanged; the protocol
+test's listener-body digest is updated for the deliberate scheduling change.
+
+Pull-on-notify consumers such as the auxiliary chat panel can observe ordinary
+tool output up to 50ms later. The notification-derived `sessionBusy` refresh can
+also wait for this timer; turn/tool start still updates authoritative busy state
+synchronously. Subscriber exceptions now surface from the timer callback rather
+than the delta listener. Existing exception/reentrancy tests cover recovery.
+
+### Separate shell poll publisher and follow-up
+
+`applyShellSnapshots` still calls `notify()` when an invisible session's shell
+snapshot changes. Its 250ms polling path is independent of `chat:tool_delta` and
+is unchanged by this PR. The native shell output producer also uses a 250ms poll
+interval. Therefore a private 10ms burst benchmark's large reduction does not
+establish a production-wide reduction of the same size or a single 50ms window
+for all background progress.
+
+Committed deterministic tests reproduce this limitation with one running shell
+job in an inactive session and an empty foreground timeline:
+
+| Three seconds of virtual input | Publications before | After |
+| --- | ---: | ---: |
+| Changing shell snapshots only, no tool deltas | 12 | 12 |
+| Twelve tool deltas at 250ms intervals plus changing shell snapshots | 36 | 24 |
+
+Both variants preserve identical final chat state in the combined case. The
+one-third reduction is a fixture-specific notification count, not a measurement
+of production wall time, React commits or native input latency. Initial session
+setup and final activation are outside the count. Faster bursts still eliminate
+per-chunk router publications, but their gains depend on event cadence and other
+publishers. No general tool-output elapsed-time benchmark is committed here;
+`perf:native-stream` above measures assistant text previews instead.
+
+Follow-up: evaluate visibility-aware publication or coalescing for the trailing
+`applyShellSnapshots` notification, with separate regressions for active/inactive
+sessions, terminal transitions and activation. That publisher is intentionally
+left for a separate change; suppressing it blindly could hide other state changes.
+
+### Regression reproduction and scope
+
+From the repository root, after installing the locked app dependencies:
+
+```sh
+node --test pinvou3-app/tests/native_tool_output_scheduling.test.mjs
+node --test pinvou3-app/tests/bridge_domain_protocol.test.mjs
+```
+
+The scheduling harness loads the selected actual bridge/router/terminal scripts
+in index order and uses real immutable subscriptions under synthetic IPC and a
+controlled clock. It does not run bridge `init` or load the complete application.
+Its 18 tests exercise bursts, first-deadline throttling, foreground control,
+changing shell polls, ANSI/tail equivalence, switching, deletion, semantic
+completion and interruption, cancellation/retry, input/gate events and subscriber
+exception/reentrancy. The protocol contract is a separate nineteenth check.
+These tests do not execute a real Engine, native tool process, permission dialog
+or packaged WebView2.
+
+The review follow-up passed 81 related tests, changed-test lint and the
+architecture guard. The local Windows full run is not green: 1,299 passed,
+23 failed and two skipped. Clean-main checks also reproduce static-contract and
+browser-wrapper lifecycle failures; the latter are timing-sensitive and vary
+between runs. This is not a claim that the full local suite passes. Remote CI
+must validate the updated protocol pin and the combined test suite.
+
+## Consuming redundant native shell timers
+
+Native shell polls continue to publish synchronously. After a successful ordinary
+output update for an already bound, inactive running job, that publication can
+consume an existing 50ms tool-output timer: the global notification has already
+delivered those buffers to its subscribers, including auxiliary chat observers.
+It cancels the captured timer only if both its identity and the output-request
+revision are unchanged after callbacks. Every scheduling request increments the
+revision, even when it reuses a pending timer.
+
+A throwing subscriber retains the timer and the original poll catch, retry budget
+and cadence. Reentrant output retains the first deadline. Foreground updates,
+new cards or bindings, status changes, terminal results and mixed terminal/running
+batches retain their existing immediate publication and pending timer. The shared
+Web implementation has no injected native policy and keeps its existing behavior.
+Polling, output accumulation, authoritative final results, interruption and retry
+handlers, IPC shapes and CodeWhale are unchanged. This consumes redundant output
+publications; it does not batch poll-only publications across sessions.
+
+### Actual bridge-path A/B, 2026-10-22
+
+The baseline is immutable main `349569ac66efcae3aa812eb245c4f105feccdea1`.
+The browser probe loads 24 actual native bridge/router/terminal scripts in index
+order, the real Markdown/DOMPurify renderer, immutable domain subscriptions and
+the actual auxiliary chat controller bound to a background session. A foreground
+history has 50 or 2,000 turns with five tool calls per turn. One, five or ten
+background sessions receive four deltas at 250ms intervals with independently
+mixed, deterministic phase offsets. Changing shell polls use the real poll
+handler with synthetic IPC, a 5ms virtual IPC delay and its unchanged 250ms
+completion-anchored retry interval.
+
+Each case has three warmups and 31 alternating before/after pairs. P50/P95 use
+the lower empirical quantile, sorted index `floor((n - 1) * q)`; this differs
+from the nearest-rank convention in the earlier assistant-stream benchmark.
+Every pair
+compares complete final foreground, auxiliary panel and producer snapshots,
+including timestamps, plus the exact poll counts and event trace. All match.
+Timed work includes poll continuations, notifications, reconciliation, subscriber
+callbacks and trailing timers. Fixture construction, initial hydration, result
+inspection, cleanup and virtual waiting are excluded. Values are the sum of
+measured browser work segments per 1.1 seconds of virtual input, not end-to-end
+elapsed time or a production throughput estimate.
+
+| Foreground turns | Background sessions | Before P50 / P95 (ms) | After P50 / P95 (ms) | P50 reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 1 | 5.7 / 7.5 | 6.0 / 7.8 | -5.3% |
+| 50 | 5 | 23.8 / 31.7 | 16.4 / 23.0 | 31.1% |
+| 50 | 10 | 45.5 / 68.0 | 31.8 / 48.7 | 30.1% |
+| 2,000 | 1 | 222.7 / 263.3 | 213.3 / 274.8 | 4.2% |
+| 2,000 | 5 | 916.4 / 1,053.0 | 637.0 / 751.2 | 30.5% |
+| 2,000 | 10 | 1,572.3 / 1,736.1 | 1,162.3 / 1,471.5 | 26.1% |
+
+Mean publications fall from 32.84 to 22.97 with five background sessions and
+57.87 to 43 with ten. One session falls only from 8 to 7.19 on average; its timing
+does not establish a stable gain, and its long-history P95 increases. Gains depend
+on overlapping producers and existing foreground reconciliation cost.
+
+A separate 31-pair control run uses the same exact source snapshots, preloads
+background buffers and then hydrates each newly created foreground session once.
+These are fresh-buffer hydration controls in reused browser pages, not a cold
+application startup benchmark.
+The actual auxiliary controller remains bound during the publication trace.
+The three fixed-phase controls use zero virtual IPC delay.
+
+| Control | Before / after P50 (ms) | Publications before / after |
+| --- | ---: | ---: |
+| Foreground output, 50 turns, no background tasks | 3.5 / 3.5 | 5 / 5 |
+| Foreground output, 2,000 turns, no background tasks | 139.4 / 136.4 | 5 / 5 |
+| Polls only, 50 turns, one background task | 2.8 / 2.8 | 4 / 4 |
+| Polls only, 2,000 turns, five background tasks | 696.3 / 687.9 | 22 / 22 |
+| Quiet polls, 2,000 turns, five background tasks | 0.3 / 0.3 | 0 / 0 |
+| Fixed phase 0ms, 50 turns, one background task | 5.7 / 5.8 | 8 / 8 |
+| Overlapping poll/delta, 50 turns, one background task | 5.6 / 2.9 | 8 / 4 |
+| Non-overlapping poll/delta, 50 turns, one background task | 5.6 / 5.5 | 8 / 8 |
+
+Fresh foreground hydration without background tasks is 8.6 to 8.8ms at 50 turns
+and 323.2 to 322.2ms at 2,000 turns. With five background tasks, 2,000-turn
+hydration medians vary from 379.8 to 393.7ms for changing polls and 358.6 to
+364.6ms for quiet polls; tail timings have mixed directions. These controls do
+not establish a startup improvement or zero overhead. All complete final values
+and poll traces match in all eight control cases. The control runner hash is
+`1ca4b5a91fb2028e1de99fb935d84d1b12c0cbff9473a7061f9cb761660fd967`.
+
+An independent single-background-session confirmation uses 101 pairs for each
+foreground size. It gives 50-turn
+processing P50/P95 of 8.7/12.3 to 8.8/12.0ms, and 2,000-turn processing of
+330.5/381.2 to 267.0/394.5ms. Long-history hydration is 488.7 to 489.7ms
+(+0.2%). Its candidate mean is 7.33 publications versus 8 before. Absolute
+timings belong to this separate cohort; they must not be compared to the earlier
+31-pair cohort as a before/after result. The single-session long-history tail
+still increases, so this does not establish a consistent single-session tail
+improvement. Its runner hash is
+`d5e83f813f3407f05fdb3993a5d3f27995bf650bf6dca98d3eb147efb7c812ee`.
+
+A dedicated 101-pair fresh-buffer hydration confirmation with five running
+background sessions gives 321.1 to 322.1ms P50 (+0.3%) and 375.3 to 391.8ms
+P95. A 5,000-draw paired bootstrap of the median ratio gives a 95% interval of
+-1.69% to +1.90%; the earlier +3.7% median increase is not reproduced. It captures
+the same background setup but omits the subsequent publication trace and removes
+the foreground first during untimed cleanup. This is not evidence of identical
+tail latency or cold application startup. Its runner hash is
+`a277f1f206f48b34d1e36f80c8a9f94c6bf15e7ab0bdd5f2c3aa61e81d1f07c8`.
+All 737 measured pairs across the main, control and confirmation cohorts have
+matching complete final values and poll traces.
+
+The selected-script baseline/candidate SHA-256 hashes are
+`aaaedd6d47a18c9f58ca514451a5c4551626788cae22094d8704c9a0c2dc51cf` /
+`6df2a7924ce7676a7d0f358a0f0bc79380fad78200c6300249db0e8a90fcfb19`.
+They cover serialized path/source maps, including checkout line endings.
+The mixed-phase runner hash is
+`5d011a52680c9f8b2945182dc27ee17fa7b5b03b6224488cdfc83c69427ec3d5`.
+These identify the private local probe receipts; they are not a committed
+general-purpose benchmark command. The probe does not run bridge initialization,
+React rendering, a real Engine or Shell process, storage I/O or packaged WebView2.
+It measures the changed frontend publication path, not Shell command duration.
+
+### Compatibility checks
+
+`native_shell_poll_publication.test.mjs` covers timer consumption, per-job
+classification, foreground and shared/Web fallbacks, synchronous subscriber
+exceptions, reentrant requests, timer replacement, first deadlines, deferred IPC,
+retry-budget exhaustion and successful recovery after IPC/formatting errors.
+Actual native bridge tests additionally cover auxiliary pulls for multiple pending
+buffers, LRU retention through 40 switches, cancellation/interruption followed by
+retry, immutable snapshots, activation and deletion without buffer resurrection.
+Four negative mutations confirm that the revision, exception, foreground and
+per-job guards are observable regression protections.
+
+The original implementation passed 151 affected tests, Desktop and Web UI builds,
+Safari 14 compatibility audit, architecture guard, changed-test lint and UI lint;
+UI lint had four existing documentation warnings and zero errors. The review
+follow-up below corrects an omitted dependency-audit pin. This is scoped
+verification, not a fresh full-suite or native device-validation claim.
+
+### Review follow-up: dependency audit and reproducible counts
+
+The first remote `frontend-test` failed because `tauriTerminal` gained the optional
+`publishShellSnapshots` dependency without updating its exact audited key set.
+The AST surface audit confirms that the only changed shared function is
+`applyShellSnapshots`, the shared-function count remains 313, and cluster exports
+and forwarders are unchanged. Its guarded `notify()` fallback makes the dependency
+optional, so only `EXPECTED_CLUSTER_KEYS.tauriTerminal` changes; `REQUIRED` and
+`FORWARDER_DEP_NAMES` stay unchanged.
+
+The regression file now has 22 tests. Additional cases pin non-string/empty job
+identities, running jobs with matching non-null exit codes, missing historical
+exit-code metadata and activation during notification (with and without a new
+output request). The strict exit-code comparison is retained: `undefined !== null`
+is true, whereas testing both values only with `!= null` would accept that metadata
+mismatch. The new regression detects that attempted simplification.
+
+Committed actual native bridge tests reproduce aligned multi-session counts with
+four output windows. All producer polls are aligned, each window's deltas arrive
+20ms before its poll, and the existing 50ms output timer is still pending:
+
+| Background sessions | Timer consumption disabled | Enabled |
+| ---: | ---: | ---: |
+| 1 | 8 | 4 |
+| 5 | 24 | 20 |
+| 10 | 44 | 40 |
+
+The enabled assertions execute the actual native poll/router/subscription path.
+An in-memory disabled-consumption mutation produces the left column and fails
+all three assertions. These are notification counts, not timing measurements.
+The phase topology determines the magnitude: this aligned setup saves one shared
+output timer per window, so five/ten sessions reduce counts by only 16.7%/9.1%.
+The earlier staggered-poll/mixed-output cohort has more overlapping timers and
+gives the larger headline gains; other topologies can yield much smaller gains.
+
+Run the dependency pin and publication regressions from the repository root:
+
+```sh
+node pinvou3-app/tests/bridge_lane_deps.test.mjs
+node --test pinvou3-app/tests/native_shell_poll_publication.test.mjs
+```
+
+The expanded affected native/shared/dependency/protocol/identity/auxiliary/session/
+lifecycle set passes 158 tests. Six additional in-memory mutations fail for the
+intended guard/count assertions. Production sources remain byte-identical to
+`36e44b750`; the original A/B source snapshots and measurements still apply.

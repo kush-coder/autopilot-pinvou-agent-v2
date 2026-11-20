@@ -1,0 +1,1500 @@
+//! 主页“代码”模式使用的 Codex ACP Tauri 命令。
+//!
+//! 这里只保留传输边界与会话元数据编排；Codex 进程、ACP 协议、权限和事件适配
+//! 均由 `features::codex_acp` 领域模块负责。
+
+use anyhow::Context;
+use deepseek_tui::session_manager::SessionMetadata;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use tauri::State;
+
+use crate::features::assistant::engine_pool::EnginePool;
+use crate::features::codex_acp::reader_window::{self, ReaderOpenRequest};
+use crate::features::codex_acp::workspace::{
+    self, WorkspaceBranches, WorkspaceChanges, WorkspaceDiff, WorkspaceEntry, WorkspaceListing,
+    WorkspacePreview,
+};
+use crate::features::codex_acp::{
+    AcpAgentDescriptor, AcpEventEnvelope, AcpPool, AgentBackend, CodexAcpPendingElicitation,
+    CodexAcpPendingPermission, CodexAcpSessionInfo, CodexAcpStatus, CodexAcpWorkspaceInfo,
+    CodexWorkspaceKind, SessionAgentStore, acp_session_model_name, on_blocking_labeled,
+    validate_codex_project_workspace,
+};
+use crate::features::projects::ProjectStore;
+use crate::features::sessions::{SessionKind, SessionStore};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexAcpSessionListItem {
+    #[serde(flatten)]
+    pub metadata: SessionMetadata,
+    pub pinned: bool,
+    pub pinned_at: Option<String>,
+    #[serde(flatten)]
+    pub workspace: CodexAcpWorkspaceInfo,
+    /// Keychain snapshot (§6): projected from the codex-acp authoritative
+    /// store (session-agents record; native code and ACP sessions written via
+    /// `bind_code_native_session` / `set_acp_workspace`; the plain
+    /// SessionStore's workspace-binding.json sidecar as fallback — same
+    /// retrieval order as the resolver lib.rs injects into the engine). The
+    /// copy in metadata is written only by the fork's native snapshot stream.
+    /// Empty = single-root semantics (cwd only); the web projection degrades
+    /// it to the last directory name, same host-path discipline as
+    /// workspace.workspace_path.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workspace_roots: Vec<String>,
+    pub agent_id: String,
+    pub agent_name: String,
+}
+
+fn ensure_codex_workspace_root(
+    kind: CodexWorkspaceKind,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    if kind == CodexWorkspaceKind::Temporary {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("创建 Codex 临时工作目录失败: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) type WorkspaceBindingVerifier<'a> =
+    dyn Fn(&Path) -> Result<(), String> + Send + Sync + 'a;
+
+fn verify_workspace_binding(
+    project_workspace: Option<&Path>,
+    verifier: Option<&WorkspaceBindingVerifier<'_>>,
+) -> Result<(), String> {
+    let Some(verifier) = verifier else {
+        return Ok(());
+    };
+    let workspace = project_workspace
+        .ok_or_else(|| "Authorized workspace binding requires a project directory".to_string())?;
+    verifier(workspace)
+}
+
+/// Rollback for a half-created code session: drop the just-written
+/// session-agents binding, then the session record. Round-50 review: both
+/// mutators can poll cross-process locks (the session-agents section lock
+/// up to `SECTION_LOCK_TIMEOUT`; the sessions store its mutation guard), so
+/// the rollback joins on a blocking worker like the happy-path binds above
+/// — the async runtime workers here also drive the engine session pumps,
+/// and every caller sits on one. Owned handles are cloned from the
+/// references at the top so the closure is `'static`; both stores are cheap
+/// Arc-field clones.
+async fn rollback_created_code_session(
+    session_id: &str,
+    store: &SessionStore,
+    agents: &SessionAgentStore,
+) {
+    let session_id = session_id.to_string();
+    let store = store.clone();
+    let agents = agents.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = agents.remove(&session_id) {
+            log::warn!("[codex_acp] rollback Session Agent binding {session_id} failed: {error:#}");
+        }
+        if let Err(error) = store.delete(&session_id) {
+            log::warn!("[codex_acp] rollback Session {session_id} failed: {error:#}");
+        }
+    })
+    .await;
+    if let Err(error) = joined {
+        // The rollback itself is best-effort cleanup on an already-failing
+        // creation; a dead runtime must not turn it into a panic on the
+        // caller's error path.
+        log::warn!("[codex_acp] rollback task join failed: {error}");
+    }
+}
+
+#[tauri::command]
+pub async fn list_acp_agents() -> Result<Vec<AcpAgentDescriptor>, String> {
+    list_acp_agents_for_pool().await
+}
+
+/// The agent catalog is static; the pool handle is no longer consulted.
+pub(crate) async fn list_acp_agents_for_pool() -> Result<Vec<AcpAgentDescriptor>, String> {
+    Ok(AcpPool::agent_catalog())
+}
+
+#[tauri::command]
+pub async fn get_acp_agent_status(
+    agent_id: String,
+    recheck: Option<bool>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpStatus, String> {
+    get_acp_agent_status_for_pool(agent_id, recheck, &acp_pool).await
+}
+
+pub(crate) async fn get_acp_agent_status_for_pool(
+    agent_id: String,
+    recheck: Option<bool>,
+    acp_pool: &AcpPool,
+) -> Result<CodexAcpStatus, String> {
+    // recheck=true 时忽略探测缓存强制重探测：用户在 App 外手动安装/升级
+    // CLI 后点击「重新检测」必须拿到最新状态。轮询调用不传，保持读缓存。
+    if recheck.unwrap_or(false) {
+        let pool = acp_pool.clone();
+        return pool
+            .recheck_agent_status(&agent_id)
+            .await
+            .map_err(|error| format!("重新检测 ACP Agent 状态失败: {error:#}"));
+    }
+    acp_pool
+        .status_for_agent(&agent_id)
+        .await
+        .map_err(|error| format!("读取 ACP Agent 状态失败: {error:#}"))
+}
+
+/// 统一的 ACP Agent 安装入口：按 status.install_action 分派（官方脚本或原来源
+/// brew/npm 升级），完成后返回最新状态。action 提供时经合法性校验后优先。
+#[tauri::command]
+pub async fn install_acp_agent(
+    agent: String,
+    action: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpStatus, String> {
+    acp_pool
+        .install_agent(&agent, action.as_deref())
+        .await
+        .map_err(|error| format!("安装 ACP Agent 失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn login_acp_agent(
+    agent_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpStatus, String> {
+    acp_pool
+        .login_agent(&agent_id)
+        .await
+        .map_err(|error| format!("登录 ACP Agent 失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn switch_acp_agent_account(
+    agent_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpStatus, String> {
+    acp_pool
+        .switch_agent_account(&agent_id)
+        .await
+        .map_err(|error| format!("切换 ACP Agent 账号失败: {error:#}"))
+}
+
+#[tauri::command]
+pub fn open_acp_agent_login_url(
+    agent_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    acp_pool
+        .open_agent_login_url(&agent_id)
+        .map_err(|error| format!("打开 ACP Agent 授权页面失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn submit_acp_agent_login_code(
+    agent_id: String,
+    code: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    acp_pool
+        .submit_agent_login_code(&agent_id, &code)
+        .await
+        .map_err(|error| format!("提交 ACP Agent 授权码失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn get_codex_acp_session_info(
+    session_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpSessionInfo, String> {
+    acp_pool
+        .session_info(&session_id)
+        .await
+        .map_err(|error| format!("读取 Codex ACP 会话信息失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn set_codex_acp_model(
+    session_id: String,
+    model_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpSessionInfo, String> {
+    acp_pool
+        .set_model(&session_id, &model_id)
+        .await
+        .map_err(|error| format!("切换 Codex 模型失败: {error:#}"))
+}
+
+/// 发送未经 Pinvou skill、persona 或知识库 prompt 注入的原始用户消息。
+#[tauri::command]
+pub async fn codex_acp_prompt(
+    session_id: String,
+    message: String,
+    attachments: Option<Vec<crate::features::files::file_ingest::IngestResult>>,
+    workspace_references: Option<Vec<String>>,
+    store: State<'_, SessionStore>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    codex_acp_prompt_with_attachments(
+        session_id,
+        message,
+        attachments.unwrap_or_default(),
+        workspace_references.unwrap_or_default(),
+        &store,
+        &acp_pool,
+    )
+    .await
+}
+
+pub(crate) async fn codex_acp_prompt_with_attachments(
+    session_id: String,
+    message: String,
+    attachments: Vec<crate::features::files::file_ingest::IngestResult>,
+    workspace_references: Vec<String>,
+    store: &SessionStore,
+    acp_pool: &AcpPool,
+) -> Result<(), String> {
+    let message = message.trim().to_string();
+    if message.is_empty() && attachments.is_empty() && workspace_references.is_empty() {
+        return Err("empty message".to_string());
+    }
+    if !acp_pool.is_acp(&session_id) {
+        return Err("当前会话不是 ACP 会话".to_string());
+    }
+    // The ACP composer and web remote control can carry a pasted
+    // session-mention block; first_send_title_source strips it before the
+    // fallback branch (round-5 minor 5 + round-9): a refs-only + attachment
+    // first send still titles after the attachment.
+    // No fallback when there is nothing to fall back to: a refs-only first
+    // send with no attachments keeps 「新对话」, mirroring the native chat
+    // path's None semantics (round-15 m6 removed the unconditional "附件"
+    // floor, which was unreachable dead code for attachment-less sends but
+    // inconsistent with the native path by construction).
+    let title_source = super::sessions::first_send_title_source(
+        &message,
+        attachments
+            .first()
+            .map(|attachment| attachment.basename.as_str())
+            .or_else(|| workspace_references.first().map(String::as_str)),
+    );
+    super::sessions::apply_default_session_title(store, &session_id, title_source)?;
+    // Timing registration lives inside `AcpPool::send_message`, after busy
+    // admission succeeds but before the prompt task is spawned: the spawned
+    // turn can complete before `send_message` returns, so registering here
+    // (after the await) would race that finish and drop the completion.
+    acp_pool
+        .send_message(&session_id, message, attachments, workspace_references)
+        .await
+        .map_err(|error| format!("ACP Agent send failed: {error:#}"))?;
+    Ok(())
+}
+
+// 会话内浏览走 session_id（解析会话工作区并校验可用性）；
+// 会话前（draft）浏览直接校验并规范化调用方给出的项目路径，无需 ACP 会话。
+fn codex_workspace_root(
+    session_id: Option<&str>,
+    workspace_path: Option<&str>,
+    acp_pool: &AcpPool,
+) -> Result<std::path::PathBuf, String> {
+    if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
+        // 原生代码会话与 ACP 会话一样可以在会话内浏览工作区（workspace_info 已支持）。
+        if !acp_pool.is_acp(session_id) && !acp_pool.agents().is_code_session(session_id) {
+            return Err("当前会话不是 ACP 会话".to_string());
+        }
+        let info = acp_pool
+            .workspace_info(session_id)
+            .map_err(|error| format!("读取 Codex 工作目录失败: {error:#}"))?;
+        if !info.workspace_available {
+            return Err(format!("Codex 工作目录不可用: {}", info.workspace_path));
+        }
+        return Ok(std::path::PathBuf::from(info.workspace_path));
+    }
+    if let Some(path) = workspace_path.filter(|path| !path.trim().is_empty()) {
+        return validate_codex_project_workspace(std::path::Path::new(path))
+            .map_err(|error| format!("Codex 工作目录不可用: {error:#}"));
+    }
+    Err("缺少会话或工作区路径".to_string())
+}
+
+#[tauri::command]
+pub async fn list_codex_workspace(
+    session_id: Option<String>,
+    relative_path: Option<String>,
+    workspace_path: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<WorkspaceListing, String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace::list_workspace(&root, relative_path.as_deref())
+            .map_err(|error| format!("读取 Codex 工作区失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("读取 Codex 工作区任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn search_codex_workspace(
+    session_id: Option<String>,
+    query: String,
+    workspace_path: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<Vec<WorkspaceEntry>, String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace::search_workspace(&root, &query)
+            .map_err(|error| format!("搜索 Codex 工作区失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("搜索 Codex 工作区任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn preview_codex_workspace_file(
+    session_id: Option<String>,
+    relative_path: String,
+    workspace_path: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<WorkspacePreview, String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace::preview_workspace_file(&root, &relative_path)
+            .map_err(|error| format!("预览 Codex 工作区文件失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("预览 Codex 工作区文件任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn open_codex_workspace_resource(
+    session_id: String,
+    resource_path: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    let root = codex_workspace_root(Some(&session_id), None, &acp_pool)?;
+    let path = workspace::resolve_workspace_resource(&root, &resource_path)
+        .map_err(|error| format!("打开 Codex 工作区资源失败: {error:#}"))?;
+    crate::platform::os::open_target(
+        crate::platform::os::external_application_path(&path),
+        "Codex 工作区资源",
+    )
+}
+
+#[tauri::command]
+pub async fn get_codex_workspace_changes(
+    session_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<WorkspaceChanges, String> {
+    let root = codex_workspace_root(Some(&session_id), None, &acp_pool)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace::workspace_changes(&session_id, &root)
+            .map_err(|error| format!("读取 Codex 工作区更改失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("读取 Codex 工作区更改任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn get_codex_workspace_diff(
+    session_id: String,
+    relative_path: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<WorkspaceDiff, String> {
+    let root = codex_workspace_root(Some(&session_id), None, &acp_pool)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace::workspace_diff(&session_id, &root, &relative_path)
+            .map_err(|error| format!("读取 Codex 文件差异失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("读取 Codex 文件差异任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn list_codex_workspace_branches(
+    session_id: Option<String>,
+    workspace_path: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<WorkspaceBranches, String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace::workspace_branches(&root)
+            .map_err(|error| format!("读取 Codex 工作区分支失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("读取 Codex 工作区分支任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn checkout_codex_workspace_branch(
+    session_id: Option<String>,
+    workspace_path: Option<String>,
+    branch: String,
+    mode: String,
+    commit_message: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<WorkspaceBranches, String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    let mode = workspace::BranchSwitchMode::parse(&mode)
+        .map_err(|error| format!("切换 Codex 工作区分支失败: {error:#}"))?;
+    // Cross-session guard: reject the switch while any session bound to this
+    // workspace (including sessions other than the caller) has a turn in
+    // flight, so a running agent cannot land later edits on the wrong branch.
+    // The frontend only gates the current session; this backend check consults
+    // the shared assistant::timing in-flight registry for both ACP and native
+    // code sessions. Best-effort: a turn admitted after the in-task recheck
+    // below can still race the git commands.
+    let workspace_sessions = acp_pool.agents().code_sessions_in_workspace(&root);
+    let running = workspace_sessions
+        .iter()
+        .filter(|session_id| crate::features::assistant::timing::has_active_turn(session_id))
+        .count();
+    if running > 0 {
+        return Err(format!(
+            "该工作区有 {running} 个会话正在运行，请等待运行结束后再切换分支"
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // Recheck inside the task to narrow the admission window between the
+        // outer check and the first git mutation: a turn started in between
+        // would otherwise run concurrently with the checkout.
+        let running = workspace_sessions
+            .iter()
+            .filter(|session_id| crate::features::assistant::timing::has_active_turn(session_id))
+            .count();
+        if running > 0 {
+            return Err(format!(
+                "该工作区有 {running} 个会话正在运行，请等待运行结束后再切换分支"
+            ));
+        }
+        workspace::checkout_workspace_branch(&root, &branch, mode, commit_message.as_deref())
+            .map_err(|error| format!("切换 Codex 工作区分支失败: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("切换 Codex 工作区分支任务失败: {error}"))?
+}
+
+#[tauri::command]
+pub async fn open_codex_workspace_file(
+    session_id: Option<String>,
+    relative_path: String,
+    workspace_path: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    let path = workspace::resolve_workspace_file(&root, &relative_path)
+        .map_err(|error| format!("打开 Codex 工作区文件失败: {error:#}"))?;
+    crate::platform::os::open_target(
+        crate::platform::os::external_application_path(&path),
+        "Codex 工作区文件",
+    )
+}
+
+#[tauri::command]
+pub async fn reveal_codex_workspace_file(
+    session_id: Option<String>,
+    relative_path: String,
+    workspace_path: Option<String>,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    let path = workspace::resolve_workspace_file(&root, &relative_path)
+        .map_err(|error| format!("定位 Codex 工作区文件失败: {error:#}"))?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| format!("文件没有父目录: {}", path.display()))?;
+    crate::platform::os::open_target(
+        crate::platform::os::external_application_path(directory),
+        "Codex 工作区目录",
+    )
+}
+
+// 代码弹窗「新窗口打开」：校验工作区可读且目标文件存在，再交给单例阅读器窗口（tab 复用见 reader_window）。
+// `kind="diff"` 时打开工作区变更差异（依赖会话基线，需 sessionId；文件可能已删除，放宽存在性校验）。
+#[tauri::command]
+pub async fn open_code_reader(
+    session_id: Option<String>,
+    workspace_path: Option<String>,
+    relative_path: String,
+    kind: Option<String>,
+    app: tauri::AppHandle,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    let root = codex_workspace_root(session_id.as_deref(), workspace_path.as_deref(), &acp_pool)?;
+    if kind.as_deref() == Some("diff") {
+        if session_id.is_none() {
+            return Err("打开代码阅读器失败: 差异预览需要会话。".to_string());
+        }
+        workspace::validate_workspace_relative_path(&root, &relative_path)
+            .map_err(|error| format!("打开代码阅读器失败: {error:#}"))?;
+    } else {
+        workspace::resolve_workspace_file(&root, &relative_path)
+            .map_err(|error| format!("打开代码阅读器失败: {error:#}"))?;
+    }
+    reader_window::open_code_reader(
+        &app,
+        ReaderOpenRequest {
+            session_id,
+            workspace_path,
+            relative_path,
+            kind,
+        },
+    )
+}
+
+// ReaderApp 挂载后拉取建窗前排队的打开请求（拉模式，规避窗口加载时序竞态）。
+#[tauri::command]
+pub async fn take_code_reader_pending() -> Result<Vec<ReaderOpenRequest>, String> {
+    Ok(reader_window::take_pending_open())
+}
+
+#[tauri::command]
+pub async fn set_codex_acp_mode(
+    session_id: String,
+    mode_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpSessionInfo, String> {
+    acp_pool
+        .set_mode(&session_id, &mode_id)
+        .await
+        .map_err(|error| format!("切换 Codex 权限模式失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn set_codex_acp_config_option(
+    session_id: String,
+    config_id: String,
+    value_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<CodexAcpSessionInfo, String> {
+    acp_pool
+        .set_config_option(&session_id, &config_id, &value_id)
+        .await
+        .map_err(|error| format!("切换 Codex 配置失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn cancel_codex_acp(
+    session_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    if !acp_pool.is_acp(&session_id) {
+        return Err("当前会话不是 Codex ACP 会话".to_string());
+    }
+    acp_pool.cancel(&session_id).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_codex_acp_timeline(
+    session_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<Vec<AcpEventEnvelope>, String> {
+    acp_pool
+        .timeline(&session_id)
+        .await
+        .map_err(|error| format!("读取 Codex ACP timeline 失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn get_codex_acp_pending_permissions(
+    session_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<Vec<CodexAcpPendingPermission>, String> {
+    if !acp_pool.is_acp(&session_id) {
+        return Err("当前会话不是 Codex ACP 会话".to_string());
+    }
+    Ok(acp_pool.pending_permissions_for(&session_id).await)
+}
+
+#[tauri::command]
+pub async fn respond_codex_acp_permission(
+    session_id: String,
+    tool_call_id: String,
+    option_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    acp_pool
+        .respond_permission(&session_id, &tool_call_id, &option_id)
+        .await
+        .map_err(|error| format!("回复 Codex ACP 权限失败: {error:#}"))
+}
+
+#[tauri::command]
+pub async fn get_codex_acp_pending_elicitations(
+    session_id: String,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<Vec<CodexAcpPendingElicitation>, String> {
+    if !acp_pool.is_acp(&session_id) {
+        return Err("当前会话不是 Codex ACP 会话".to_string());
+    }
+    Ok(acp_pool.pending_elicitations_for(&session_id).await)
+}
+
+#[tauri::command]
+pub async fn respond_codex_acp_elicitation(
+    session_id: String,
+    elicitation_id: String,
+    action: String,
+    content: serde_json::Value,
+    acp_pool: State<'_, AcpPool>,
+) -> Result<(), String> {
+    acp_pool
+        .respond_elicitation(&session_id, &elicitation_id, &action, content)
+        .await
+        .map_err(|error| format!("回复 Codex ACP 输入请求失败: {error:#}"))
+}
+
+/// 列表项的 agent_id：ACP 后端使用各自 id；原生（品悟）代码会话固定为 "pinvou"。
+fn code_session_agent_id(backend: AgentBackend) -> String {
+    backend.agent_id().unwrap_or("pinvou").to_string()
+}
+
+/// 返回 Codex 会话，供主页左侧统一会话列表与代码模式共同消费。
+#[tauri::command]
+pub async fn list_codex_acp_sessions(
+    store: State<'_, SessionStore>,
+    acp_pool: State<'_, AcpPool>,
+    projects: State<'_, crate::features::projects::ProjectStore>,
+) -> Result<Vec<CodexAcpSessionListItem>, String> {
+    let mut metas = store
+        .list()
+        .map_err(|error| format!("list_codex_acp_sessions: {error:#}"))?;
+    metas.retain(|metadata| {
+        matches!(store.session_kind(&metadata.id), Ok(SessionKind::Chat))
+            && (acp_pool.is_acp_metadata(metadata)
+                || acp_pool.agents().is_code_session(&metadata.id))
+            && !store.is_hidden(&metadata.id)
+    });
+    metas
+        .into_iter()
+        .map(|metadata| {
+            let backend = acp_pool.backend(&metadata.id);
+            let workspace = acp_pool
+                .workspace_info(&metadata.id)
+                .map_err(|error| format!("读取代码会话 {} 工作目录失败: {error:#}", metadata.id))?;
+            let workspace_roots =
+                project_keychain_roots(acp_pool.agents(), &store, &projects, &metadata.id);
+            Ok(CodexAcpSessionListItem {
+                pinned: store.is_pinned(&metadata.id),
+                pinned_at: store.pinned_at(&metadata.id),
+                metadata,
+                workspace,
+                workspace_roots,
+                agent_id: code_session_agent_id(backend),
+                agent_name: backend.display_name().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Keychain projection (§6): directly reuses the `compose_workspace_roots`
+/// lib.rs injects into the engine — the same retrieval order (codex-acp
+/// authoritative store first, plain SessionStore's workspace-binding.json
+/// sidecar as fallback) **plus re-validation at delivery time** (round-21 M1:
+/// the projection previously only re-read the retrieval order, missing
+/// compose's fs-root/ancestor re-validation and the project-endorsement
+/// exemption, so lists showed wide roots the engine actually drops — the
+/// "matches what the engine actually enforces" claim was hollow). Empty =
+/// single-root semantics (temporary session / no snapshot → empty vec; the
+/// caller normalizes by cwd). A standalone function so the store→list-item
+/// wiring can be pinned by mutation tests (review #484 round-4 minor 5: a
+/// web-redaction test with hand-built roots cannot catch "the projection
+/// got emptied" regressions).
+fn project_keychain_roots(
+    agents: &SessionAgentStore,
+    store: &SessionStore,
+    projects: &crate::features::projects::ProjectStore,
+    session_id: &str,
+) -> Vec<String> {
+    crate::compose_workspace_roots(agents, store, projects, session_id)
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect()
+}
+
+/// 把主机工作区路径降级为最末一级目录名，避免向 WebUI 泄漏绝对路径。
+/// 桌面端需要完整路径（历史记录、系统打开等），故投影只在 Web 入口应用。
+pub(crate) fn redact_workspace_path_for_web(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty() && !name.ends_with(':'))
+        .unwrap_or("workspace")
+        .to_string()
+}
+
+/// Remove host-specific path components from Session metadata before it
+/// crosses the Web/Relay boundary. Native callers keep the original metadata.
+pub(crate) fn redact_session_metadata_for_web(mut metadata: SessionMetadata) -> SessionMetadata {
+    redact_session_metadata_for_web_in_place(&mut metadata);
+    metadata
+}
+
+fn redact_session_metadata_for_web_in_place(metadata: &mut SessionMetadata) {
+    metadata.workspace = std::path::PathBuf::from(redact_workspace_path_for_web(
+        &metadata.workspace.to_string_lossy(),
+    ));
+    // The foundation's attached-roots field (workspace_roots gitlink) is
+    // host-absolute paths too: degrade each root at the same choke point, or
+    // the web boundary leaks the host directory structure through the field
+    // the redaction predated (review #484 round-8 m12).
+    for root in metadata.workspace_roots.iter_mut() {
+        *root = std::path::PathBuf::from(redact_workspace_path_for_web(&root.to_string_lossy()));
+    }
+}
+
+fn redact_codex_session_list_item_for_web(item: &mut CodexAcpSessionListItem) {
+    redact_session_metadata_for_web_in_place(&mut item.metadata);
+    item.workspace.workspace_path = redact_workspace_path_for_web(&item.workspace.workspace_path);
+    // The keychain snapshot is host-absolute paths too: degrade each root to
+    // its last directory name before the web boundary (same discipline as
+    // workspace.workspace_path; the web lane does not group by it).
+    for root in item.workspace_roots.iter_mut() {
+        *root = redact_workspace_path_for_web(root);
+    }
+}
+
+/// Web 版代码会话列表：复用桌面端列表逻辑，但把工作区路径投影为目录名，
+/// 避免向浏览器暴露主机绝对路径。前端通过 `web_access_list_codex_acp_sessions`
+/// 调用，桌面端继续使用返回完整路径的 `list_codex_acp_sessions`。
+pub async fn list_codex_acp_sessions_for_web(
+    store: &SessionStore,
+    acp_pool: &AcpPool,
+    projects: &crate::features::projects::ProjectStore,
+) -> Result<Vec<CodexAcpSessionListItem>, String> {
+    let mut items: Vec<CodexAcpSessionListItem> = store
+        .list()
+        .map_err(|error| format!("list_codex_acp_sessions: {error:?}"))?
+        .into_iter()
+        .filter(|metadata| {
+            matches!(store.session_kind(&metadata.id), Ok(SessionKind::Chat))
+                && acp_pool.is_acp_metadata(metadata)
+                && !store.is_hidden(&metadata.id)
+        })
+        .map(|metadata| {
+            let backend = acp_pool.backend(&metadata.id);
+            let workspace = acp_pool
+                .workspace_info(&metadata.id)
+                .map_err(|error| format!("读取代码会话 {} 工作目录失败: {error:#}", metadata.id))?;
+            let workspace_roots =
+                project_keychain_roots(acp_pool.agents(), &store, &projects, &metadata.id);
+            Ok(CodexAcpSessionListItem {
+                pinned: store.is_pinned(&metadata.id),
+                pinned_at: store.pinned_at(&metadata.id),
+                metadata,
+                workspace,
+                workspace_roots,
+                agent_id: code_session_agent_id(backend),
+                agent_name: backend.display_name().to_string(),
+            })
+        })
+        .collect::<Result<Vec<CodexAcpSessionListItem>, String>>()?;
+    for item in &mut items {
+        redact_codex_session_list_item_for_web(item);
+    }
+    Ok(items)
+}
+
+#[tauri::command]
+pub async fn create_codex_acp_session(
+    workspace_path: Option<String>,
+    agent_id: Option<String>,
+    workspace_roots: Option<Vec<String>>,
+    project_id: Option<String>,
+    app: tauri::AppHandle,
+    store: State<'_, SessionStore>,
+    pool: State<'_, EnginePool>,
+    acp_pool: State<'_, AcpPool>,
+    projects: State<'_, ProjectStore>,
+) -> Result<SessionMetadata, String> {
+    // Round-37 M2a: the tier-1 assignment outcome is emitted BY the inner
+    // creation lanes (Written → the list-changed refresh,
+    // AssignmentFailed → the degraded notice the frontend toasts); this
+    // wrapper used to fire the success event unconditionally, masking an
+    // AssignmentFailed on the ACP lane and double-firing on the native one.
+    let _app = app;
+    create_codex_acp_session_with_workspace_binding(
+        workspace_path.map(PathBuf::from),
+        agent_id,
+        workspace_roots,
+        project_id,
+        store,
+        pool,
+        acp_pool,
+        projects,
+        None,
+        Some(&_app),
+    )
+    .await
+}
+
+/// Internal code-Session creation entry point used by Web workspace grants.
+/// The public desktop command remains path-based; only the Web bridge injects
+/// an identity verifier. The verifier is deliberately lock-free and is run
+/// before persistence, after Agent/workspace binding, and after baseline
+/// capture so a replaced directory causes the newly-created Session to be
+/// rolled back instead of becoming durable.
+pub(crate) async fn create_codex_acp_session_with_workspace_binding(
+    workspace_path: Option<PathBuf>,
+    agent_id: Option<String>,
+    workspace_roots: Option<Vec<String>>,
+    project_id: Option<String>,
+    store: State<'_, SessionStore>,
+    pool: State<'_, EnginePool>,
+    acp_pool: State<'_, AcpPool>,
+    projects: State<'_, ProjectStore>,
+    workspace_verifier: Option<&WorkspaceBindingVerifier<'_>>,
+    app: Option<&tauri::AppHandle>,
+) -> Result<SessionMetadata, String> {
+    let backend = AgentBackend::parse(agent_id.as_deref().or(Some("pinvou")))
+        .map_err(|error| format!("{error:#}"))?;
+    let project_workspace = workspace_path
+        .as_deref()
+        .map(validate_codex_project_workspace)
+        .transpose()
+        .map_err(|error| format!("{error:#}"))?;
+    // Keychain snapshot (§6): absolute paths hard-rejected; non-existent extra
+    // roots kept with a soft warning (same check as sessions::create_session).
+    let keychain = crate::features::sessions::validate_workspace_roots(
+        workspace_roots.unwrap_or_default(),
+        project_workspace.as_deref(),
+    )
+    .map_err(|error| format!("create_codex_acp_session: invalid workspace_roots: {error:#}"))?;
+    // A temporary session (no workspace_path) has no bound workspace, and the
+    // store layer force-clears its keychain snapshot (§9.1 single-root
+    // semantics). Non-empty roots are a caller contract error — the frontend
+    // only sends roots together with a path on the project lane — so reject
+    // explicitly rather than silently dropping (review #484 round-7 minor;
+    // error style aligned with sessions::create_session's workspace_path/
+    // workspace_roots validation).
+    if project_workspace.is_none() && (!keychain.is_empty() || project_id.is_some()) {
+        // Round-11 minor 1: `project_id` without a workspace used to vanish
+        // in `record_project_choice`'s zip — a lost tier-1 assignment that
+        // silently falls back to tier-② adoption. Mirror the chat lane's
+        // hard reject so the caller re-sends a complete request.
+        return Err(
+            "create_codex_acp_session: invalid workspace_roots/project_id: both require workspace_path (temporary sessions carry no keychain or assignment)"
+                .to_string(),
+        );
+    }
+    // Same rebind fence as every sibling root-accepting writer (review #484
+    // round-11 M3): both lanes commit binding writes here (the native
+    // bind_code_native_session / the ACP set_acp_workspace) plus the
+    // project-choice writes, which must not land between the rebind's
+    // candidate snapshot and its translation or the fresh binding keeps the
+    // dead `from` spelling.
+    //
+    // Round-21 M6, two corrections to the held window: (a) gate on
+    // workspace presence like the chat lane (sessions.rs) — temporary
+    // creates are provably outside rebind's translation domain
+    // (rebind_workspace_prefix skips non-Project records), yet the
+    // unconditional fence made every temporary codex create fail spuriously
+    // with REBIND_IN_PROGRESS during any rebind; (b) release before
+    // capture_baseline's spawn_blocking walk of up to 20,000 entries and
+    // re-take for record_project_choice — "keeps the window to the write
+    // itself rather than the whole command" (the fence's own documented
+    // contract, projects/store.rs).
+    let fence = project_workspace
+        .as_ref()
+        .map(|_| projects.rebind_fence())
+        .transpose()?;
+    verify_workspace_binding(project_workspace.as_deref(), workspace_verifier)?;
+    if !backend.is_acp() {
+        let metadata = create_code_native_session(
+            project_workspace.clone(),
+            keychain,
+            &pool,
+            &store,
+            &acp_pool,
+            workspace_verifier,
+            fence,
+        )
+        .await?;
+        // Project lane (§9.3): creation immediately updates the project
+        // primary-folder memory (the backend writes it within the same command,
+        // sparing a second RPC; failures are only logged and never affect
+        // creation). The write happens after the last rollback point — a failed
+        // creation must not leave a session-less project memory behind (review
+        // #484 MINOR). The helper released
+        // the fence before its baseline walk (round-21 M6); re-take it for
+        // this write so a rebind that started during the walk never sees the
+        // project-choice write land inside its window. Losing the re-take
+        // race leaves the write UNFENCED — it is not skipped (round-26
+        // minor 10 wording fix): record_project_choice still runs, safe
+        // because its two writes are individually atomic and serialized at
+        // the store level; the lost race only drops the fence guarantee for
+        // this one write. The residual actually skips is the tier-1
+        // assignment + last_primary_root memory if a rebind's translation
+        // window swallows them; tier-② re-adopts the session by workspace
+        // and the next explicit move/create re-pins the choice.
+        let record_fence = retake_record_fence(&projects, project_workspace.as_deref());
+        // Round-35 M3: surface the per-session assignment failure through
+        // the degraded event (never retried — the session falls back to
+        // tier-2 adoption), not only the log.
+        match super::projects::record_project_choice(
+            projects.inner(),
+            &metadata.id,
+            project_id.as_deref(),
+            project_workspace.as_deref(),
+        ) {
+            super::projects::ProjectChoiceRecord::Written => {
+                if let Some(app) = app {
+                    super::projects::emit_create_channel_assignment_event(app);
+                }
+            }
+            // Round-35 M3: surface the never-retried assignment failure
+            // (tier-2 fallback) instead of a bare log line.
+            super::projects::ProjectChoiceRecord::AssignmentFailed => {
+                if let Some(app) = app {
+                    super::projects::emit_create_channel_assignment_degraded(app);
+                }
+            }
+            super::projects::ProjectChoiceRecord::NotApplicable => {}
+        }
+        drop(record_fence);
+        return Ok(metadata);
+    }
+    let metadata_workspace = project_workspace
+        .clone()
+        .unwrap_or_else(|| pool.bridge.workspace.clone());
+    let session = store
+        .create_new(acp_session_model_name(backend), None, metadata_workspace)
+        .map_err(|error| format!("create_codex_acp_session: {error:#}"))?;
+    let kind = if project_workspace.is_some() {
+        CodexWorkspaceKind::Project
+    } else {
+        CodexWorkspaceKind::Temporary
+    };
+    if kind == CodexWorkspaceKind::Temporary {
+        let temporary_workspace = store
+            .session_roots(&session.metadata.id)
+            .map(|roots| roots.execution)
+            .map_err(|error| format!("解析 Codex 临时工作目录失败: {error:#}"))?;
+        if let Err(error) = ensure_codex_workspace_root(kind, &temporary_workspace) {
+            // No session-agents binding exists yet at this point, so the
+            // rollback's binding removal is a no-op; the shared helper still
+            // owns the session-record delete because it joins on a blocking
+            // worker and logs instead of discarding the error.
+            rollback_created_code_session(&session.metadata.id, store.inner(), acp_pool.agents())
+                .await;
+            return Err(format!("{error:#}"));
+        }
+    }
+    // Round-49 review: the index mutator polls the cross-process section
+    // lock (up to SECTION_LOCK_TIMEOUT) and rewrites the whole
+    // session-agents.json, so it joins on a blocking worker — the async
+    // runtime workers here also drive the engine session pumps.
+    let agents = acp_pool.agents().clone();
+    let bind_session_id = session.metadata.id.clone();
+    let bind_workspace = project_workspace.clone();
+    let bind_keychain = keychain.clone();
+    if let Err(error) = on_blocking_labeled("session store task join failed", move || {
+        agents.set_acp_workspace(
+            &bind_session_id,
+            backend,
+            kind,
+            bind_workspace,
+            bind_keychain,
+        )
+    })
+    .await
+    {
+        rollback_created_code_session(&session.metadata.id, store.inner(), acp_pool.agents()).await;
+        return Err(format!("保存 Codex ACP 会话工作目录失败: {error:#}"));
+    }
+    if let Err(error) = verify_workspace_binding(project_workspace.as_deref(), workspace_verifier) {
+        rollback_created_code_session(&session.metadata.id, store.inner(), acp_pool.agents()).await;
+        return Err(error);
+    }
+    let baseline_workspace = acp_pool.workspace_info(&session.metadata.id);
+    if baseline_workspace.is_err() {
+        rollback_created_code_session(&session.metadata.id, store.inner(), acp_pool.agents()).await;
+    }
+    let baseline_root = baseline_workspace
+        .map_err(|error| format!("读取 Codex ACP 会话工作目录失败: {error:#}"))?
+        .workspace_path;
+    // Round-21 M6: every binding write is durable — release the fence
+    // BEFORE the baseline walk instead of holding it across the
+    // spawn_blocking scan (up to 20,000 entries), per the fence's own
+    // "window to the write itself" contract.
+    drop(fence);
+    let baseline_session_id = session.metadata.id.clone();
+    if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
+        workspace::capture_baseline(&baseline_session_id, std::path::Path::new(&baseline_root))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("工作区基线任务失败: {error}"))
+    .and_then(|result| result)
+    {
+        rollback_created_code_session(&session.metadata.id, store.inner(), acp_pool.agents()).await;
+        return Err(format!("创建 Codex 工作区基线失败: {error:#}"));
+    }
+    if let Err(error) = verify_workspace_binding(project_workspace.as_deref(), workspace_verifier) {
+        rollback_created_code_session(&session.metadata.id, store.inner(), acp_pool.agents()).await;
+        return Err(error);
+    }
+    // Project lane (§9.3): same as above — project memory is written only
+    // after the last rollback point. The fence
+    // was released before the baseline walk (round-21 M6); re-take it for
+    // the project-choice write (same rationale as the native branch).
+    let record_fence = retake_record_fence(&projects, project_workspace.as_deref());
+    // Round-37 M2a: the ACP lane gets the same three-arm outcome handling
+    // the native branch has — AssignmentFailed must surface the degraded
+    // notice, not be masked by a success refresh.
+    match super::projects::record_project_choice(
+        projects.inner(),
+        &session.metadata.id,
+        project_id.as_deref(),
+        project_workspace.as_deref(),
+    ) {
+        super::projects::ProjectChoiceRecord::Written => {
+            if let Some(app) = app {
+                super::projects::emit_create_channel_assignment_event(app);
+            }
+        }
+        super::projects::ProjectChoiceRecord::AssignmentFailed => {
+            if let Some(app) = app {
+                super::projects::emit_create_channel_assignment_degraded(app);
+            }
+        }
+        super::projects::ProjectChoiceRecord::NotApplicable => {}
+    }
+    drop(record_fence);
+    Ok(session.metadata)
+}
+
+/// Round-21 M6 companion: re-take the rebind fence for the trailing
+/// project-choice write after the baseline walk released it. Temporary
+/// creates (no workspace) never re-take — record_project_choice no-ops for
+/// them and fencing the no-op would reintroduce the spurious
+/// REBIND_IN_PROGRESS failures M6 exists to remove. A lost race is a
+/// write-proceeds-unfenced outcome: the session is already durable and the
+/// write itself is store-level serialized (round-26 minor 10 — the previous
+/// wording claimed a skip that never happened).
+fn retake_record_fence(
+    projects: &tauri::State<'_, crate::features::projects::ProjectStore>,
+    project_workspace: Option<&std::path::Path>,
+) -> Option<crate::features::projects::RebindFence> {
+    if project_workspace.is_none() {
+        return None;
+    }
+    match projects.rebind_fence() {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            // Log hygiene: the marker text is a stable typed prefix, the
+            // prose after the colon is backend diagnostics only.
+            eprintln!("[codex] create: project-choice write left unfenced: {error}");
+            None
+        }
+    }
+}
+
+/// Project-lane memory (§9.2/§9.3): see the shared implementation in
+/// `super::projects::record_project_choice` (primary-folder memory + tier-1
+/// explicit assignment). Only call after the session creation has fully settled.
+
+/// 创建“代码”模块原生（品悟 Engine）会话。
+///
+/// 临时会话执行目录与 ACP 临时会话共用 `SessionStore::session_roots` 推导
+/// （两根一致，均为会话私有目录）；项目会话绑定调用方选定的目录（经
+/// `validate_codex_project_workspace` 校验），执行根由 resolver 在
+/// engine/shell 启动时解析，发消息走现有 `chat` 命令。
+async fn create_code_native_session(
+    project_workspace: Option<PathBuf>,
+    workspace_roots: Vec<PathBuf>,
+    pool: &EnginePool,
+    store: &SessionStore,
+    acp_pool: &AcpPool,
+    workspace_verifier: Option<&WorkspaceBindingVerifier<'_>>,
+    fence: Option<crate::features::projects::RebindFence>,
+) -> Result<SessionMetadata, String> {
+    let kind = if project_workspace.is_some() {
+        CodexWorkspaceKind::Project
+    } else {
+        CodexWorkspaceKind::Temporary
+    };
+    let metadata_workspace = project_workspace
+        .clone()
+        .unwrap_or_else(|| pool.bridge.workspace.clone());
+    let session = store
+        .create_new(
+            format!("{} (代码)", AgentBackend::Deepseek.display_name()),
+            None,
+            metadata_workspace,
+        )
+        .map_err(|error| format!("create_codex_acp_session: {error:#}"))?;
+    // Round-49 review: same blocking-worker discipline as the ACP session
+    // creation above — the index mutator polls the cross-process section
+    // lock and rewrites the whole session-agents.json.
+    let agents = acp_pool.agents().clone();
+    let bind_session_id = session.metadata.id.clone();
+    let bind_workspace = project_workspace.clone();
+    let bind_roots = workspace_roots.clone();
+    if let Err(error) = on_blocking_labeled("session store task join failed", move || {
+        agents.bind_code_native_session(&bind_session_id, kind, bind_workspace, bind_roots)
+    })
+    .await
+    {
+        rollback_created_code_session(&session.metadata.id, store, acp_pool.agents()).await;
+        return Err(format!("保存原生代码会话标记失败: {error:#}"));
+    }
+    // 基线根：项目会话用项目目录（capture_baseline 对 git 仓库只指纹 dirty 文件，
+    // 与 ACP 项目会话一致）；临时会话先确保私有目录存在。
+    if let Err(error) = verify_workspace_binding(project_workspace.as_deref(), workspace_verifier) {
+        rollback_created_code_session(&session.metadata.id, store, acp_pool.agents()).await;
+        return Err(error);
+    }
+    // Round-21 M6: the binding writes are durable — release the fence
+    // BEFORE the baseline walk (the helper's own spawn_blocking scan),
+    // mirroring the ACP lane; the caller re-takes for the trailing
+    // project-choice write.
+    drop(fence);
+    // Dispatch on workspace presence consistently with kind: Some is the
+    // project session baseline root; None goes to the temporary directory.
+    let baseline_root = match &project_workspace {
+        Some(root) => root.clone(),
+        None => {
+            let temporary_workspace = match store
+                .session_roots(&session.metadata.id)
+                .map(|roots| roots.execution)
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    rollback_created_code_session(&session.metadata.id, store, acp_pool.agents())
+                        .await;
+                    return Err(format!("解析原生代码会话临时工作目录失败: {error:#}"));
+                }
+            };
+            if let Err(error) =
+                ensure_codex_workspace_root(CodexWorkspaceKind::Temporary, &temporary_workspace)
+            {
+                rollback_created_code_session(&session.metadata.id, store, acp_pool.agents()).await;
+                return Err(format!("{error:#}"));
+            }
+            temporary_workspace
+        }
+    };
+    let baseline_session_id = session.metadata.id.clone();
+    if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
+        workspace::capture_baseline(&baseline_session_id, &baseline_root)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("工作区基线任务失败: {error}"))
+    .and_then(|result| result)
+    {
+        rollback_created_code_session(&session.metadata.id, store, acp_pool.agents()).await;
+        return Err(format!("创建代码工作区基线失败: {error:#}"));
+    }
+    if let Err(error) = verify_workspace_binding(project_workspace.as_deref(), workspace_verifier) {
+        rollback_created_code_session(&session.metadata.id, store, acp_pool.agents()).await;
+        return Err(error);
+    }
+    Ok(session.metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::paths::tests::ENV_LOCK;
+
+    /// Same shape as projects.rs's isolated_home_session_store (review #484
+    /// round-10 fresh-eyes M1): hold the process-wide env lock and point
+    /// PINVOU3_HOME at a dedicated directory, so `SessionStore::boot_*` never
+    /// reads (or reconciles) the developer's real `~/.pinvou3` — a real
+    /// scheduled profile made this fixture fail deterministically single-run
+    /// and silently touch user data. The home is deliberately not deleted
+    /// (records must outlive the guard, matching the sibling helper).
+    fn isolated_home_session_store() -> (SessionStore, std::sync::MutexGuard<'static, ()>) {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "pinvou3-codex-keychain-home-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held; env writes are serialized.
+        unsafe { std::env::set_var("PINVOU3_HOME", &home) };
+        let store = SessionStore::boot_with_scheduled_root(home.join("scheduled")).expect("boot");
+        (store, guard)
+    }
+
+    #[test]
+    fn workspace_binding_is_fail_closed_and_repeatable() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let checks = AtomicUsize::new(0);
+        let verifier = |path: &Path| {
+            assert_eq!(path, Path::new("workspace"));
+            let attempt = checks.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                Ok(())
+            } else {
+                Err("workspace identity changed".to_string())
+            }
+        };
+        assert!(verify_workspace_binding(Some(Path::new("workspace")), Some(&verifier)).is_ok());
+        assert!(verify_workspace_binding(Some(Path::new("workspace")), Some(&verifier)).is_ok());
+        assert_eq!(
+            verify_workspace_binding(Some(Path::new("workspace")), Some(&verifier)).unwrap_err(),
+            "workspace identity changed"
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        assert!(verify_workspace_binding(None, Some(&verifier)).is_err());
+        assert!(verify_workspace_binding(None, None).is_ok());
+    }
+
+    #[test]
+    fn code_session_agent_id_maps_native_backend_to_pinvou() {
+        assert_eq!(code_session_agent_id(AgentBackend::Deepseek), "pinvou");
+        assert_eq!(code_session_agent_id(AgentBackend::CodexAcp), "codex");
+        assert_eq!(code_session_agent_id(AgentBackend::ClaudeAcp), "claude");
+        assert_eq!(code_session_agent_id(AgentBackend::KimiAcp), "kimi");
+    }
+
+    #[test]
+    fn temporary_workspace_exists_before_baseline_capture() {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-codex-workspace-test-{}-temporary",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("session").join("workspace");
+        ensure_codex_workspace_root(CodexWorkspaceKind::Temporary, &workspace)
+            .expect("create temporary Codex workspace");
+        assert!(workspace.is_dir());
+        std::fs::remove_dir_all(root).expect("cleanup temporary Codex workspace");
+    }
+
+    #[test]
+    fn redact_workspace_path_for_web_keeps_only_directory_name() {
+        // 绝对路径只保留末级目录名，避免向 WebUI 暴露主机目录结构。
+        assert_eq!(
+            redact_workspace_path_for_web("/Users/asto/Documents/secret-project"),
+            "secret-project"
+        );
+        assert_eq!(
+            redact_workspace_path_for_web(r#"C:\Users\asto\Documents\secret-project"#),
+            "secret-project"
+        );
+        // 已是末级名称时原样返回；空串兜底为自身。
+        assert_eq!(redact_workspace_path_for_web("repo"), "repo");
+        assert_eq!(redact_workspace_path_for_web(""), "");
+        assert_eq!(redact_workspace_path_for_web("/"), "workspace");
+        assert_eq!(redact_workspace_path_for_web(r#"C:\"#), "workspace");
+    }
+
+    fn metadata_with_workspace(workspace: &str) -> SessionMetadata {
+        serde_json::from_value(serde_json::json!({
+            "id": "session-web-projection",
+            "title": "Web projection",
+            "created_at": "2026-08-17T00:00:00Z",
+            "updated_at": "2026-08-17T00:00:00Z",
+            "message_count": 0,
+            "total_tokens": 0,
+            "model": "test-model",
+            "workspace": workspace,
+            // Round-9 N5b: the fixture must carry attached roots — without
+            // them the workspace_roots redaction loop iterates zero times and
+            // deleting the loop keeps this test green.
+            "workspace_roots": [workspace, "/Users/asto/Documents/secret-extra"]
+        }))
+        .expect("valid SessionMetadata fixture")
+    }
+
+    #[test]
+    fn web_session_projection_removes_absolute_paths_from_serialized_payloads() {
+        const PRIVATE_WORKSPACE: &str = "/Users/asto/Documents/secret-project";
+        let metadata = redact_session_metadata_for_web(metadata_with_workspace(PRIVATE_WORKSPACE));
+        let metadata_json = serde_json::to_value(&metadata).expect("serialize projected metadata");
+        assert_eq!(metadata_json["workspace"], "secret-project");
+        // The metadata keychain leg: every attached root degrades to its last
+        // directory name too (this assertion is red if the loop is deleted).
+        assert_eq!(
+            metadata_json["workspace_roots"],
+            serde_json::json!(["secret-project", "secret-extra"])
+        );
+        assert!(!metadata_json.to_string().contains(PRIVATE_WORKSPACE));
+
+        let mut item = CodexAcpSessionListItem {
+            metadata: metadata_with_workspace(PRIVATE_WORKSPACE),
+            pinned: false,
+            pinned_at: None,
+            workspace: CodexAcpWorkspaceInfo {
+                workspace_kind: CodexWorkspaceKind::Project,
+                workspace_path: PRIVATE_WORKSPACE.to_string(),
+                workspace_available: true,
+            },
+            workspace_roots: vec![
+                "/Users/asto/Documents/secret-project".to_string(),
+                "/Users/asto/Documents/secret-extra".to_string(),
+            ],
+            agent_id: "codex".to_string(),
+            agent_name: "Codex".to_string(),
+        };
+        redact_codex_session_list_item_for_web(&mut item);
+        let item_json = serde_json::to_value(&item).expect("serialize projected list item");
+        assert_eq!(item_json["workspace"], "secret-project");
+        assert_eq!(item_json["workspace_path"], "secret-project");
+        assert!(!item_json.to_string().contains(PRIVATE_WORKSPACE));
+        // The keychain snapshot rides the same discipline (review #484 M2):
+        // each root degrades to its last directory name.
+        assert_eq!(
+            item_json["workspace_roots"],
+            serde_json::json!(["secret-project", "secret-extra"])
+        );
+        assert!(!item_json.to_string().contains("secret-extra/.."));
+        assert!(!item_json.to_string().contains("/Users/asto"));
+    }
+
+    #[test]
+    fn code_list_projects_the_keychain_from_the_codex_acp_store() {
+        // Mutation lock (review #484 round-4 minor 5 / round-7 M1): the web
+        // redaction test uses hand-built roots, so if the store→list-item
+        // projection got emptied (mutated straight to Vec::new()) or fell back
+        // to only reading the plain SessionStore's workspace-binding.json, it
+        // stays green. This test pins the projection wiring via the real
+        // code-session write path: the keychain snapshot goes only into the
+        // codex-acp authoritative store (set_acp_workspace /
+        // bind_code_native_session, same origin as
+        // create_codex_acp_session_with_workspace_binding), not the plain
+        // SessionStore — a wrong-store projection turns the assertions red
+        // immediately.
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-codex-keychain-projection-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("create test root");
+        // Hermetic boot (review #484 round-10 fresh-eyes M1): boot resolves
+        // the scheduled-profiles path from PINVOU3_HOME, so without the
+        // isolation the fixture walked the developer's real profiles and
+        // failed on the first foreign workspace.
+        let (store, _env_guard) = isolated_home_session_store();
+        let agents = SessionAgentStore::for_test(tmp.join("session-agents.json"));
+        // Round-21 M1: the projection now routes through
+        // compose_workspace_roots, which needs the projects store for the
+        // ancestor exemption — a scratch store with no projects keeps every
+        // recorded root delivered in these fixtures (none is an ancestor).
+        let projects =
+            crate::features::projects::ProjectStore::from_paths(tmp.join("projects.json"));
+        let primary = tmp.join("primary");
+        let extra = tmp.join("extra");
+        std::fs::create_dir_all(&primary).expect("create primary");
+        std::fs::create_dir_all(&extra).expect("create extra");
+        let keychain = vec![primary.clone(), extra.clone()];
+        let new_session = |title: &str| {
+            store
+                .create_new(title.to_string(), None, std::env::temp_dir())
+                .expect("create session")
+                .metadata
+                .id
+        };
+        let assert_keychain = |id: &str| {
+            let projected = project_keychain_roots(&agents, &store, &projects, id);
+            assert_eq!(
+                projected.len(),
+                2,
+                "the list item must project the codex-acp store's keychain"
+            );
+            assert!(
+                projected.iter().any(|root| root.ends_with("extra")),
+                "{projected:?}"
+            );
+        };
+
+        // No record (plain chat session) = empty.
+        let plain = new_session("plain");
+        assert!(
+            project_keychain_roots(&agents, &store, &projects, &plain).is_empty(),
+            "no record = empty"
+        );
+
+        // ACP lane: the production write path is set_acp_workspace.
+        let acp = new_session("acp");
+        agents
+            .set_acp_workspace(
+                &acp,
+                AgentBackend::CodexAcp,
+                CodexWorkspaceKind::Project,
+                Some(primary.clone()),
+                keychain.clone(),
+            )
+            .expect("bind ACP workspace");
+        assert_keychain(&acp);
+
+        // Native code lane: the production write path is
+        // bind_code_native_session (the snapshot also lands in the
+        // authoritative sidecar; the projection reads that same record).
+        let native = new_session("native");
+        agents
+            .bind_code_native_session(
+                &native,
+                CodexWorkspaceKind::Project,
+                Some(primary.clone()),
+                keychain.clone(),
+            )
+            .expect("bind native code session");
+        assert_keychain(&native);
+
+        // Temporary session: the write path forces an empty snapshot (§9.1),
+        // so the projection is empty.
+        let temporary = new_session("temporary");
+        agents
+            .bind_code_native_session(&temporary, CodexWorkspaceKind::Temporary, None, Vec::new())
+            .expect("bind temporary native code session");
+        assert!(
+            project_keychain_roots(&agents, &store, &projects, &temporary).is_empty(),
+            "temporary session = empty"
+        );
+
+        // Fallback order matches the lib.rs engine resolver: an empty agents
+        // record falls back to the plain SessionStore's workspace-binding sidecar.
+        store
+            .bind_session_workspace_with_roots(&plain, primary.clone(), keychain.clone())
+            .expect("bind plain session via sidecar");
+        assert_keychain(&plain);
+
+        // Priority (review #484 round-10 fresh-eyes M1 sub-finding): when both
+        // stores hold **different** non-empty snapshots for the same session,
+        // the projection must take the codex-acp authoritative record — only
+        // asserting "the fallback is readable" cannot pin the read order (each
+        // store readable alone means a swapped priority still stays green).
+        let second_extra = tmp.join("second-extra");
+        std::fs::create_dir_all(&second_extra).expect("create second extra");
+        let plain_keychain = vec![primary.clone(), second_extra.clone()];
+        store
+            .bind_session_workspace_with_roots(&acp, primary.clone(), plain_keychain.clone())
+            .expect("bind the acp session's plain sidecar with different roots");
+        let projected = project_keychain_roots(&agents, &store, &projects, &acp);
+        assert_eq!(
+            projected, keychain,
+            "the agents record wins over the plain sidecar when both carry non-empty sets"
+        );
+        assert!(
+            !projected.iter().any(|root| root.ends_with("second-extra")),
+            "{projected:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn project_workspace_is_not_created_implicitly() {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-codex-workspace-test-{}-project",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("missing-project");
+        ensure_codex_workspace_root(CodexWorkspaceKind::Project, &workspace)
+            .expect("project workspace is caller-validated");
+        assert!(!workspace.exists());
+    }
+}

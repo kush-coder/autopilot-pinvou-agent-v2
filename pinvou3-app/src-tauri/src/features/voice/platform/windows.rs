@@ -1,0 +1,197 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::super::voice_asr::{self, AsrModelSpec};
+
+pub fn engine_binary_name() -> &'static str {
+    "pinvou-asr.exe"
+}
+
+const ASR_MODEL_URL: &str = "https://www.modelscope.cn/models/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/master/sensevoice-small-q8.gguf";
+const ASR_MODEL_MIRROR_URL: &str =
+    "https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/main/sensevoice-small-q8.gguf";
+const ASR_MODEL_SIZE: u64 = 254_208_320;
+const ASR_MODEL_SHA256: &str = "4ae45c94422de949b387e2e0fb10d7e14e4c42c69db30c3444ecc7d4b844b7c5";
+
+pub fn asr_tool_path() -> PathBuf {
+    // 环境变量探测循环与 macos/linux 共用（platform::asr_tool_path_from_env）。
+    super::asr_tool_path_from_env().unwrap_or_else(|| {
+        crate::platform::os::windows::bundled_asr_tool_path()
+            .unwrap_or_else(|| PathBuf::from("pinvou-asr"))
+    })
+}
+
+pub fn asr_model_spec() -> AsrModelSpec {
+    AsrModelSpec {
+        id: "sensevoice-q8",
+        filename: "sensevoice-small-q8.gguf",
+        expected_size: ASR_MODEL_SIZE,
+        sha256: ASR_MODEL_SHA256,
+        primary_url: ASR_MODEL_URL,
+        mirror_url: ASR_MODEL_MIRROR_URL,
+    }
+}
+
+pub fn asr_model_path() -> PathBuf {
+    crate::platform::os::windows::asr_model_path()
+}
+
+pub fn asr_model_exists() -> bool {
+    voice_asr::model_available()
+}
+
+pub fn asr_tool_exists() -> bool {
+    // 就绪判定与执行路径（asr_tool_path）同判定：env 覆盖命令失效时如实报未就绪，
+    // 不落 bundled——否则面板报就绪而转写仍 spawn 失效路径（见 asr_ready_decision）。
+    super::asr_tool_exists_with_env(|| {
+        crate::platform::os::windows::bundled_asr_tool_path().is_some()
+            && crate::platform::os::windows::bundled_asr_backend_path().is_some()
+    })
+}
+
+pub fn asr_bundled_runtime_status() -> Option<bool> {
+    Some(asr_tool_exists())
+}
+
+pub fn asr_dependency_installable() -> bool {
+    asr_tool_exists()
+}
+
+pub fn asr_install_unavailable_message() -> &'static str {
+    "本地语音识别运行时缺失，请修复或重新安装 pinvou。"
+}
+
+pub async fn install_asr_runtime(app: tauri::AppHandle) -> Result<(), String> {
+    if !asr_tool_exists() {
+        return Err(asr_install_unavailable_message().to_string());
+    }
+    if !voice_asr::model_available() {
+        voice_asr::download_current_model(&app).await?;
+    }
+    Ok(())
+}
+
+pub fn asr_dependency_packages() -> &'static str {
+    "下载 SenseVoice q8 ASR 模型到用户目录"
+}
+
+pub fn asr_missing_message() -> &'static str {
+    "本地语音识别组件缺失或不可用：运行时缺失时请修复或重新安装 pinvou；仅缺 ASR 模型时可在应用内下载。"
+}
+
+/// Windows 的打包运行时是 CLI 形态，保持原有路径交给调用方启动。
+///
+/// 返回 `None` 可避免把 `pinvou-asr.exe` 误送进只支持 SenseVoice.cpp 参数协议的
+/// Rust `voice_asr::transcribe`。
+pub fn recognize_native(
+    _wav_path: &std::path::Path,
+    _locale_tag: &str,
+) -> Option<Result<String, String>> {
+    None
+}
+
+/// 原生识别后端的来源标签（用于前端展示/日志区分）。
+pub fn native_recognition_source() -> &'static str {
+    "pinvou-webview-sensevoice-local"
+}
+
+pub async fn reset_microphone_permission(webview: tauri::Webview) -> Result<bool, String> {
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_DEFAULT,
+            ICoreWebView2_13, ICoreWebView2Profile4,
+        },
+        SetPermissionStateCompletedHandler,
+    };
+    use windows_core::{HSTRING, Interface};
+
+    let origin = webview
+        .url()
+        .map_err(|error| format!("读取当前页面地址失败：{error}"))?
+        .origin()
+        .ascii_serialization();
+    if origin == "null" {
+        return Err("当前页面没有可重置的 WebView2 权限来源".to_string());
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let sender = Arc::new(Mutex::new(Some(sender)));
+    webview
+        .with_webview(move |webview| {
+            let callback_sender = Arc::clone(&sender);
+            // SAFETY: runs inside with_webview on the thread owning the WebView2,
+            // so webview.controller() is a live controller; CoreWebView2() returns
+            // an owned interface pointer, and cast() AddRef-fetches a supported
+            // interface valid for the enclosing scope; the origin HSTRING and
+            // &callback remain alive until SetPermissionState returns.
+            let schedule_result: windows_core::Result<()> = (|| unsafe {
+                let webview13 = webview
+                    .controller()
+                    .CoreWebView2()?
+                    .cast::<ICoreWebView2_13>()?;
+                let profile = webview13.Profile()?.cast::<ICoreWebView2Profile4>()?;
+                let callback = SetPermissionStateCompletedHandler::create(Box::new(
+                    move |completion_result| {
+                        if let Some(sender) = callback_sender
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take()
+                        {
+                            let _ =
+                                sender.send(completion_result.map_err(|error| error.to_string()));
+                        }
+                        Ok(())
+                    },
+                ));
+                profile.SetPermissionState(
+                    COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+                    &HSTRING::from(origin),
+                    COREWEBVIEW2_PERMISSION_STATE_DEFAULT,
+                    &callback,
+                )
+            })();
+
+            if let Err(error) = schedule_result {
+                if let Some(sender) = sender
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = sender.send(Err(error.to_string()));
+                }
+            }
+        })
+        .map_err(|error| format!("访问 Windows WebView2 失败：{error}"))?;
+
+    tokio::time::timeout(Duration::from_secs(3), receiver)
+        .await
+        .map_err(|_| "重置麦克风权限超时".to_string())?
+        .map_err(|_| "麦克风权限重置任务被取消".to_string())??;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use crate::features::voice::VoiceTempWav;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    #[test]
+    fn closed_temp_wav_can_be_reopened_when_asr_denies_write_sharing() {
+        let wav_path = VoiceTempWav::create()
+            .expect("create temporary WAV")
+            .write_and_close(b"RIFF-test-WAVE")
+            .expect("write and close temporary WAV");
+        let reopened = std::fs::OpenOptions::new()
+            .read(true)
+            // Match the bundled ASR backend: concurrent readers are allowed,
+            // but an existing write handle makes this open fail on Windows.
+            .share_mode(FILE_SHARE_READ)
+            .open(&wav_path)
+            .expect("ASR backend must be able to reopen the WAV without write sharing");
+
+        drop(reopened);
+    }
+}

@@ -1,0 +1,67 @@
+# pinvou3-app/src-tauri 的 cargo 构建配置。
+#
+# 关于链接器加速(可选,不强制):
+# 本文件**不**硬编码 linker/rustflags——硬编码 `linker = "clang"` + `-fuse-ld=lld` 会强制
+# 每台开发/CI 机器都装 clang+lld,缺失就编译失败,跨平台维护成本高。
+#
+# 想在本地用更快的链接器,请把覆盖写进 `.cargo/config.local.toml`(该文件不入版本控制),
+# 示例(Linux,mold/lld 任选其一):
+#   [target.x86_64-unknown-linux-gnu]
+#   linker = "clang"
+#   rustflags = ["-C", "link-arg=-fuse-ld=lld"]   # 或 "-C", "link-arg=-fuse-ld=mold"
+#
+#   [target.aarch64-unknown-linux-gnu]
+#   linker = "clang"
+#   rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#
+# macOS: release/artifact paths stay on Apple ld (Tauri depends on it for
+# framework handling; switching to lld/zld risks more than it wins); CI test
+# legs inject the probed ld64.lld per job since #646 (pr-check's
+# macos-rust-check; the push-only release/bundle legs keep Apple ld).
+# Windows: CI injects the probed lld-link per job (pr-check's windows-rust-test
+# since #642, release-packages' build-windows-x64 since 2026-10-02).
+# This file hardcodes neither; local overrides keep going through
+# config.local.toml.
+#
+# 未来若团队统一约定要强制(如 CI 已确认装好 clang+lld),再把这些 rustflags 从
+# config.local.toml 提升回这里,并同步更新 CI 镜像。
+
+# =============================================================================
+# 编译器自身栈大小 —— 修复 v0.9.5 升级引入的构建栈溢出(三端 2 MiB 默认栈)
+# =============================================================================
+# 背景:dev 默认对依赖开 O2 + 256 codegen-units 时,rustc/LLVM 编译
+# codewhale-tui 会在 MachineLateinstrsCleanup 递归中栈溢出(崩溃为 SIGBUS,
+# rustc 1.96/1.97 stable 稳定复现;std 线程默认栈三端均为 2 MiB,
+# macOS 已实测触发,Linux/Windows 同源风险)。
+# 处理:不降 opt-level(保证依赖正常优化),而是加大编译器自身线程栈。
+#
+# 注意:本文件**不**配置 [build] rustc-wrapper。Cargo 的 rustc-wrapper 是
+# 全局键,无法按平台条件化:Unix 需要无扩展名 shebang 脚本,Windows 需要
+# 可执行文件(.cmd 经 cmd /C 受 8191 字符命令行上限,大型 crate 的 rustc
+# 命令行会超限,故用 .exe 经 CreateProcess 直启,上限 32767)——单一 config
+# 值无法三端两全(Windows 上指向无扩展名 sh 会直接 os error 193,阻断所有
+# Cargo 命令)。
+# The wrapper is therefore injected per platform by the official Cargo entry
+# points through the RUSTC_WRAPPER environment variable (which takes
+# precedence over this file and is equally reliable on Windows):
+#   - Windows npm/Tauri entry (`npm run dev`, `npm run build*` from
+#     PowerShell or cmd): pinvou3-app/scripts/tauri/build.js compiles or
+#     reuses scripts/rustc-stack-wrapper.exe natively (no bash required) and
+#     injects it only into the Tauri CLI/Cargo child process. An explicit
+#     caller RUSTC_WRAPPER wins; a missing source or failed compile stops the
+#     build instead of silently falling back to the overflowing stack.
+#   - run-dev.sh and the rustc-wrapper-smoke CI job select the wrapper through
+#     pinvou3-app/src-tauri/scripts/rustc-stack-wrapper-select.sh (empty
+#     output = do not inject):
+#       - macOS/Linux: scripts/rustc-stack-wrapper (extensionless sh with a
+#         shebang)
+#       - Windows (Git Bash/MSYS): the selector idempotently compiles and
+#         injects scripts/rustc-stack-wrapper.exe (started via
+#         CreateProcess; an extensionless sh fails with os error 193)
+#   - CI: pr-check (rust-lint, macos-rust-check) and release-packages (Linux
+#     x64/arm64, macOS universal) inject the sh version; release-packages
+#     Windows x64 and pr-check windows-rust-test compile the .exe with rustc
+#     first and inject it.
+# 注入的 RUST_MIN_STACK=16MiB 只作用于编译期 rustc 进程;cargo run /
+# cargo test 目标进程不经过 wrapper,运行时线程栈语义(约 2 MiB)不变。
+# 与 rust-lang/rust #160535(默认栈提升到 16 MiB)同方向。

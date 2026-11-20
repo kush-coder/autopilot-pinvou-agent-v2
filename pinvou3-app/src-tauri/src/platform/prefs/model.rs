@@ -1,0 +1,604 @@
+//! 模型预设（ModelPreset）与其模板/端点事实，自 prefs 模块抽离。
+//!
+//! `ModelPreset` 决定 provider 路由 + 添加模型模板；默认 base_url/model、
+//! Coding Plan 端点识别、直连 chat/completions 的能力校验与上下文窗口兜底
+//! 都收敛在这一处，bridge / monitor / memory / review 不再各自抄一份。
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPreset {
+    /// 默认本地 vLLM：qwen36_35b_256k @ 127.0.0.1:8000/v1
+    LocalVllm,
+    /// DeepSeek 官方 API
+    Deepseek,
+    /// Kimi (Moonshot)
+    Kimi,
+    /// OpenAI 兼容 API（自托管 / 代理 / 其他 OpenAI 兼容厂商；OpenAI 官方请用 Openai）
+    OpenaiCompatible,
+    /// 通义千问 (Qwen)
+    Qwen,
+    /// 豆包 (火山方舟)
+    Doubao,
+    /// MiniMax
+    Minimax,
+    /// 智谱 GLM
+    Glm,
+    /// 小米 MiMo
+    Mimo,
+    /// OpenAI 官方 API
+    Openai,
+    /// Custom OpenAI Responses endpoints (the `/v1/responses` protocol).
+    /// Rides the foundation's named-custom route with
+    /// `wire = "responses"` (see the bridge's `engine_route_provider`) — the
+    /// third custom protocol surface beside "OpenAI Compatible" (Chat
+    /// Completions) and "Anthropic" (Messages).
+    OpenaiResponses,
+    /// Anthropic Claude（Messages 原生协议，底座内建 anthropic provider）
+    Anthropic,
+    /// Google Gemini（OpenAI 兼容端点）
+    Gemini,
+    /// xAI Grok
+    Xai,
+}
+
+pub const MODEL_PROVIDER_KIND_CODING_PLAN: &str = "coding_plan";
+pub const MODEL_PROVIDER_KIND_OFFICIAL_API: &str = "official_api";
+pub const MODEL_PROVIDER_KIND_CUSTOM: &str = "custom";
+
+pub(super) fn trim_url_tail(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+pub(crate) fn strip_chat_completions_suffix(value: &str) -> String {
+    let trimmed = trim_url_tail(value);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with("/chat/completions") {
+        trimmed[..trimmed.len() - "/chat/completions".len()].to_string()
+    } else {
+        trimmed
+    }
+}
+
+pub(super) fn migrated_minimax_base_url(value: &str) -> Option<String> {
+    const LEGACY_ORIGIN: &str = "https://api.minimax.chat";
+    const CURRENT_ORIGIN: &str = "https://api.minimaxi.com";
+
+    let trimmed = value.trim().trim_end_matches('/');
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == LEGACY_ORIGIN {
+        return Some(CURRENT_ORIGIN.to_string());
+    }
+    lower.strip_prefix(LEGACY_ORIGIN).and_then(|suffix| {
+        suffix
+            .starts_with('/')
+            .then(|| format!("{CURRENT_ORIGIN}{}", &trimmed[LEGACY_ORIGIN.len()..]))
+    })
+}
+
+/// Identifies known Coding Plan/Token Plan endpoints as (vendor, canonical
+/// base_url). The two Tencent Cloud subscription tiers (re-checked against
+/// the official docs 2026-11-03; previously 2026-08):
+/// - Coding Plan /coding/v3: overview 1823/130092 (updated 2026-10-15),
+///   OpenAI-compatible on api.lkeap.cloud.tencent.com; the same page also
+///   offers an Anthropic-compatible /coding/anthropic endpoint (not used by
+///   this repo);
+/// - Token Plan /plan/v3: docs 1823/130119 + 130060 (both updated
+///   2026-10-22) — the platform migrated off the lkeap domain per announce
+///   101147 and now documents only https://tokenhub.tencentmaas.com/plan/v3
+///   (plus Anthropic /plan/anthropic and Responses /plan/v3/responses
+///   surfaces, unused by this repo). The tokenhub host is the canonical
+///   identity for new saves; the legacy lkeap URL keeps its own arm so
+///   stored configs classify unchanged on reload (whether the old host
+///   still serves is unannounced). A different subscription from Coding
+///   Plan with a different model lineup.
+/// Both tiers go through the generic OpenAI route: identify only backfills
+/// vendor/coding_plan metadata and does not take part in wire routing;
+/// dropping either arm makes stored configs lose separate reasoning-field
+/// parsing.
+/// The Volcengine Ark Coding Plan (coding-plan-personal-get-started,
+/// re-checked 2026-11-03) and the Alibaba Model Studio Coding Plan
+/// (help.aliyun.com/zh/model-studio/coding-plan) are modeled the
+/// same way; both have dedicated /api/coding hosts distinct from their
+/// pay-as-you-go endpoints. The China Alibaba host is canonical; the intl
+/// host (coding-intl) and the overseas Kimi host (api.kimi.ai) are separate
+/// subscriptions and are identified as their own canonical URLs — never
+/// rewritten to the China hosts, so saved configs keep coding_plan
+/// classification on reload instead of being re-derived to
+/// official_api/custom.
+pub(super) fn identify_coding_plan_endpoint(
+    base_url: &str,
+) -> Option<(&'static str, &'static str)> {
+    let base = strip_chat_completions_suffix(base_url);
+    let normalized = base.to_ascii_lowercase();
+    match normalized.as_str() {
+        "https://open.bigmodel.cn/api/coding/paas/v4" => {
+            Some(("glm", "https://open.bigmodel.cn/api/coding/paas/v4"))
+        }
+        "https://api.z.ai/api/coding/paas/v4" => {
+            Some(("glm", "https://api.z.ai/api/coding/paas/v4"))
+        }
+        "https://api.kimi.com/coding/v1" => Some(("kimi", "https://api.kimi.com/coding/v1")),
+        "https://api.lkeap.cloud.tencent.com/coding/v3" => {
+            Some(("tencent", "https://api.lkeap.cloud.tencent.com/coding/v3"))
+        }
+        // Token Plan canonical host since the 2026-10 platform migration
+        // (announce 101147); see the doc comment above for the legacy arm.
+        "https://tokenhub.tencentmaas.com/plan/v3" => {
+            Some(("tencent", "https://tokenhub.tencentmaas.com/plan/v3"))
+        }
+        // Legacy Token Plan host (kept for stored configs saved before the
+        // migration; the frontend registers it as an endpoint alias).
+        "https://api.lkeap.cloud.tencent.com/plan/v3" => {
+            Some(("tencent", "https://api.lkeap.cloud.tencent.com/plan/v3"))
+        }
+        "https://ark.cn-beijing.volces.com/api/coding/v3" => {
+            Some(("doubao", "https://ark.cn-beijing.volces.com/api/coding/v3"))
+        }
+        "https://coding.dashscope.aliyuncs.com/v1" => {
+            Some(("qwen", "https://coding.dashscope.aliyuncs.com/v1"))
+        }
+        // Separate-subscription hosts registered as frontend endpointAliases:
+        // identity-canonical, so the kind survives normalize_provider_metadata
+        // on reload.
+        "https://api.kimi.ai/coding/v1" => Some(("kimi", "https://api.kimi.ai/coding/v1")),
+        "https://coding-intl.dashscope.aliyuncs.com/v1" => {
+            Some(("qwen", "https://coding-intl.dashscope.aliyuncs.com/v1"))
+        }
+        _ => None,
+    }
+}
+
+impl Default for ModelPreset {
+    /// 平台感知默认预设:macOS/Windows 无本地 vLLM 支持(相关后端命令已 cfg 掉),
+    /// 默认到 DeepSeek 远程 API,否则新用户首启即落在 127.0.0.1:8000 永远连不上。
+    /// Linux 保持 LocalVllm(麒麟环境默认有本地大模型)。
+    fn default() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            ModelPreset::LocalVllm
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ModelPreset::Deepseek
+        }
+    }
+}
+impl ModelPreset {
+    /// 与前端 preset key、settings.json 序列化值一致的稳定串(snake_case)。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModelPreset::LocalVllm => "local_vllm",
+            ModelPreset::Deepseek => "deepseek",
+            ModelPreset::Kimi => "kimi",
+            ModelPreset::OpenaiCompatible => "openai_compatible",
+            ModelPreset::Qwen => "qwen",
+            ModelPreset::Doubao => "doubao",
+            ModelPreset::Minimax => "minimax",
+            ModelPreset::Glm => "glm",
+            ModelPreset::Mimo => "mimo",
+            ModelPreset::Openai => "openai",
+            ModelPreset::OpenaiResponses => "openai_responses",
+            ModelPreset::Anthropic => "anthropic",
+            ModelPreset::Gemini => "gemini",
+            ModelPreset::Xai => "xai",
+        }
+    }
+    /// 各预设默认 base_url(bridge `default_base_url_for_preset` 委托到这里;迁移/添加模型模板兜底)。
+    /// LocalVllm 用 127.0.0.1 让 .deb 装到任何机器都默认连本机 vLLM(全量包 install.sh
+    /// 起 systemd 容器 --network host 绑 0.0.0.0:8000);vLLM 与应用同机,
+    /// 用 loopback 免疫 DHCP 换 IP,别再写具体内网 IP。
+    pub fn default_base_url(&self) -> &'static str {
+        match self {
+            ModelPreset::LocalVllm => "http://127.0.0.1:8000/v1",
+            ModelPreset::Deepseek => "https://api.deepseek.com",
+            ModelPreset::Kimi => "https://api.moonshot.cn/v1",
+            ModelPreset::OpenaiCompatible => "https://api.openai.com/v1",
+            ModelPreset::Qwen => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ModelPreset::Doubao => "https://ark.cn-beijing.volces.com/api/v3",
+            ModelPreset::Minimax => "https://api.minimaxi.com/v1",
+            ModelPreset::Glm => "https://open.bigmodel.cn/api/paas/v4",
+            ModelPreset::Mimo => "https://api.xiaomimimo.com/v1",
+            ModelPreset::Openai => "https://api.openai.com/v1",
+            ModelPreset::OpenaiResponses => "https://api.openai.com/v1",
+            ModelPreset::Anthropic => "https://api.anthropic.com/v1",
+            ModelPreset::Gemini => "https://generativelanguage.googleapis.com/v1beta/openai",
+            ModelPreset::Xai => "https://api.x.ai/v1",
+        }
+    }
+    /// 各预设默认模型名(bridge `default_model_for_preset` 委托到这里)。
+    /// LocalVllm 的 `qwen36_35b_256k` 在 vLLM 里是 passthrough 字符串(不走 alias):
+    /// 后缀 `_256k` 由 fork B1 (`context_window_for_model` 的 `_Nk` hint) 识别,
+    /// 让底座为本地 Qwen 派生 256K 窗口 → context_input_budget / capacity ratio /
+    /// compaction 派生路径全部能算对。若改名为无后缀,底座立刻退化到 `None`,
+    /// preflight + emergency recovery 默认不生效。回归测试
+    /// `bridge::tests::default_model_window_recognized` 锁住这个不变量。
+    /// ⚠️ ops 同步要求:vLLM 启动也要带 `--served-model-name qwen36_35b_256k`,
+    /// 否则 OpenAI-compat API 报 `model_not_found`。
+    ///
+    /// Checked against the official docs on 2026-10-13 (previous full check
+    /// 2026-09-28; the 2026-11-03 catalog refresh re-verified every value
+    /// and kept them all — including kimi, which deliberately stays
+    /// kimi-k3: the K3.1 rows carry no tier control, so the historical
+    /// ladder/400 blocker no longer applies and the default flip is a
+    /// deliberate product decision deferred to a re-verified change; synced
+    /// in the same batch as the frontend model-catalog.js
+    /// MODEL_PRESET_DEFS). This table is the only hand-written Rust-side
+    /// mirror, locked by `default_model_matches_vendor_docs_2026_10_13`.
+    pub fn default_model(&self) -> &'static str {
+        match self {
+            ModelPreset::LocalVllm => "qwen36_35b_256k",
+            // V4.1-Flash is still the mainline; the 09-10 v4-pro phase-out
+            // news was superseded the same day by the changelog decision to
+            // keep serving v4-pro with unchanged billing (re-verified
+            // 2026-09-28).
+            ModelPreset::Deepseek => "deepseek-flash",
+            ModelPreset::Kimi => "kimi-k3",
+            ModelPreset::OpenaiCompatible => "gpt-5.6-terra",
+            ModelPreset::Qwen => "qwen3.8-max",
+            ModelPreset::Doubao => "doubao-seed-evolving",
+            ModelPreset::Minimax => "MiniMax-M3",
+            // API enum default shared by both Zhipu endpoints.
+            ModelPreset::Glm => "glm-5.3",
+            // The V2.6 series (2026-09-22) replaces the default: from
+            // 2026-10-14 18:00 (UTC+8) v2.5 requests auto-route to their
+            // v2.6 successors (v2.5-pro → v2.6-pro, v2.5 → v2.6-flash), and
+            // the old ids hard-fail from 2026-10-21 10:00 (UTC+8)
+            // (mimo.mi.com deprecation page, re-checked 2026-10-13).
+            ModelPreset::Mimo => "mimo-v2.6-pro",
+            // gpt-6.1-sol is the default (model data 2026-09-29, announced
+            // in OpenAI's "Introducing GPT-6.1 Sol" DevDay post the same
+            // day): the whole
+            // preset still rides the OpenAI Responses wire (see bridge
+            // `engine_route_provider`), and the id keeps the existing
+            // `gpt-6` prefix of `openai_responses_wire_model`. Per the Azure
+            // Foundry capability table (learn.microsoft.com Azure OpenAI
+            // models page, ms.date 2026-09-21 / updated 2026-10-29 — the
+            // round-8 drift fix reached the other mirrors but missed this
+            // one; corrected round-9) it serves 1,050,000 context /
+            // 128,000 max output with function calling on the Responses API
+            // only, and OpenAI's latest-model reference ranks it
+            // "Near-Astra performance for complex work at a lower cost" — the
+            // balanced-flagship slot moves up from gpt-6-sol. Before
+            // changing the default again, confirm the new id
+            // supports function calling on the Responses wire and is
+            // recognized by the core::model_context resolution chain (see the
+            // monitor `preset_default_models_resolve_engine_context_window`
+            // test).
+            ModelPreset::Openai => "gpt-6.1-sol",
+            // Migration fallback for custom Responses endpoints: prefills the
+            // official default like the frontend template (the protocol
+            // matches the official endpoint, so prefilling the official
+            // flagship works out of the box, and users aiming at an
+            // aggregator change the model together with the base_url anyway).
+            ModelPreset::OpenaiResponses => "gpt-6.1-sol",
+            // claude-opus-5-5 (2026-09-22) per the official models overview
+            // "start with Claude Opus 5.5 for most workloads".
+            ModelPreset::Anthropic => "claude-opus-5-5",
+            // Released 2026-09-02.
+            ModelPreset::Gemini => "gemini-3.8-flash",
+            // xAI's official coding/agent recommended slot since September
+            // 2026 ("For everything else, including code, use Grok 4.7");
+            // grok-4.6 demotes to previous generation.
+            ModelPreset::Xai => "grok-4.7",
+        }
+    }
+}
+
+impl ModelPreset {
+    /// 底座 catalog 与 pinvou 补充表（core::model_context）都无法识别模型时的
+    /// 供应商预设上下文窗口兜底（自 monitor `infer_context_window` 归位）。
+    pub fn context_window_fallback(self, model: Option<&str>) -> Option<u32> {
+        match self {
+            ModelPreset::LocalVllm => Some(262_144),
+            ModelPreset::Deepseek => Some(131_072),
+            ModelPreset::Kimi => Some(262_144),
+            ModelPreset::OpenaiCompatible => Some(131_072),
+            ModelPreset::Qwen => Some(131_072),
+            ModelPreset::Doubao => Some(262_144),
+            ModelPreset::Minimax => Some(204_800),
+            ModelPreset::Glm => Some(131_072),
+            ModelPreset::Mimo => Some(1_000_000),
+            // OpenAI 官方口径：gpt-5.4-mini / gpt-5.3-codex 为 400K，其余现役旗舰 1.05M。
+            ModelPreset::Openai => match model.map(str::to_ascii_lowercase) {
+                Some(m) if m.contains("gpt-5.4-mini") || m.contains("gpt-5.3-codex") => {
+                    Some(400_000)
+                }
+                _ => Some(1_050_000),
+            },
+            // Custom Responses endpoints: the endpoint identity is unknown,
+            // so take the same conservative 131072 as OpenaiCompatible
+            // (known models on official endpoints resolve earlier via the
+            // base catalog / core::model_context; this fallback only catches
+            // what they miss).
+            ModelPreset::OpenaiResponses => Some(131_072),
+            // Anthropic 官方口径：4.x 代 haiku 200K，opus/sonnet/fable 1M
+            // （5.5 代全系——含 claude-haiku-5-5——官方 1M，由 model_context 的
+            // PINVOU_OVERRIDES 先行钉住；此处兜底只承接底座不认识的旧命名）。
+            ModelPreset::Anthropic => match model.map(str::to_ascii_lowercase) {
+                Some(m) if m.contains("haiku") => Some(200_000),
+                _ => Some(1_000_000),
+            },
+            // Gemini 全系标称 1M。
+            ModelPreset::Gemini => Some(1_048_576),
+            // xAI official figures (re-checked 2026-09-28): the grok-4.20
+            // family is 1M (grok-4.20-0309-* is corrected first by the
+            // core::model_context override table; this fallback only carries
+            // other 4.20 spellings the base does not know), grok-4.3 is 1M,
+            // grok-4.7 / grok-4.6 / grok-4.5 are 500K, grok-build-0.1 is
+            // 256K (the base known table has a separate stale 512K row for
+            // bare "grok-build"; the actual wire id grok-build-0.1 resolves
+            // before this fallback via the core::model_context override at
+            // the same 256K, so this arm only carries ids the resolution
+            // chain misses).
+            ModelPreset::Xai => match model.map(str::to_ascii_lowercase) {
+                Some(m) if m.contains("grok-4.20") => Some(1_000_000),
+                Some(m) if m.contains("grok-4.3") => Some(1_000_000),
+                Some(m)
+                    if m.contains("grok-4.7")
+                        || m.contains("grok-4.6")
+                        || m.contains("grok-4.5") =>
+                {
+                    Some(500_000)
+                }
+                Some(m) if m.contains("grok-build") => Some(256_000),
+                _ => Some(256_000),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Per-preset default model assertions: this table is mirrored by the
+    /// frontend model-catalog.js / main.jsx, so any change on either side must
+    /// explicitly pass through here, preventing another long-lived drift of
+    /// the qwen default.
+    #[test]
+    fn default_model_matches_vendor_docs_2026_10_13() {
+        let cases: &[(ModelPreset, &str)] = &[
+            (ModelPreset::LocalVllm, "qwen36_35b_256k"),
+            (ModelPreset::Deepseek, "deepseek-flash"),
+            (ModelPreset::Kimi, "kimi-k3"),
+            (ModelPreset::OpenaiCompatible, "gpt-5.6-terra"),
+            (ModelPreset::Qwen, "qwen3.8-max"),
+            (ModelPreset::Doubao, "doubao-seed-evolving"),
+            (ModelPreset::Minimax, "MiniMax-M3"),
+            (ModelPreset::Glm, "glm-5.3"),
+            (ModelPreset::Mimo, "mimo-v2.6-pro"),
+            (ModelPreset::Openai, "gpt-6.1-sol"),
+            (ModelPreset::OpenaiResponses, "gpt-6.1-sol"),
+            (ModelPreset::Anthropic, "claude-opus-5-5"),
+            (ModelPreset::Gemini, "gemini-3.8-flash"),
+            (ModelPreset::Xai, "grok-4.7"),
+        ];
+        for (preset, expected) in cases {
+            assert_eq!(
+                preset.default_model(),
+                *expected,
+                "{preset:?} default model drift"
+            );
+        }
+    }
+
+    /// Round-trip serialization against stored settings.json: every variant
+    /// must serialize to the exact `as_str()` spelling and parse back
+    /// unchanged. rename_all=snake_case is an implicit contract — one
+    /// misspelled letter and tiers written by older versions would be
+    /// silently dropped at load.
+    #[test]
+    fn model_preset_serialization_round_trips_through_settings_json() {
+        for preset in [
+            ModelPreset::LocalVllm,
+            ModelPreset::Deepseek,
+            ModelPreset::Kimi,
+            ModelPreset::OpenaiCompatible,
+            ModelPreset::Qwen,
+            ModelPreset::Doubao,
+            ModelPreset::Minimax,
+            ModelPreset::Glm,
+            ModelPreset::Mimo,
+            ModelPreset::Openai,
+            ModelPreset::OpenaiResponses,
+            ModelPreset::Anthropic,
+            ModelPreset::Gemini,
+            ModelPreset::Xai,
+        ] {
+            let serialized = serde_json::to_string(&preset).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", preset.as_str()));
+            let parsed: ModelPreset = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed, preset);
+        }
+        // The JS-side cross-checks parse as_str() tables for defaults; this
+        // pins the serde spelling itself for the variant this PR introduces.
+        let openai_responses_json =
+            r#"{"preset":"openai_responses","model":"my-aggregator-model"}"#;
+        #[derive(serde::Deserialize)]
+        struct SavedPresetProbe {
+            preset: ModelPreset,
+        }
+        let probe: SavedPresetProbe = serde_json::from_str(openai_responses_json).unwrap();
+        assert_eq!(probe.preset, ModelPreset::OpenaiResponses);
+    }
+
+    /// 预设上下文窗口兜底：各厂商官方口径与未知型号的缺省值。
+    #[test]
+    fn context_window_fallback_matches_vendor_defaults() {
+        let cases: &[(ModelPreset, Option<&str>, u32)] = &[
+            // OpenAI 预设兜底：gpt-5.4-mini / gpt-5.3-codex 400K，其余 1.05M
+            (ModelPreset::Openai, Some("gpt-5.4-mini"), 400_000),
+            (ModelPreset::Openai, Some("gpt-5.3-codex"), 400_000),
+            (ModelPreset::Openai, Some("gpt-5.6-sol"), 1_050_000),
+            (ModelPreset::Openai, None, 1_050_000),
+            // Custom Responses endpoints take the same 131072 fallback as
+            // OpenaiCompatible (sample id deliberately uncatalogued)
+            (ModelPreset::OpenaiResponses, Some("gpt-6.2"), 131_072),
+            (ModelPreset::OpenaiResponses, None, 131_072),
+            // Anthropic：haiku 200K；底座不认识的非 claude 命名模型兜底 1M
+            (
+                ModelPreset::Anthropic,
+                Some("anthropic-future-model"),
+                1_000_000,
+            ),
+            (ModelPreset::Anthropic, None, 1_000_000),
+            // Gemini 全系标称 1M
+            (ModelPreset::Gemini, Some("gemini-3.6-flash"), 1_048_576),
+            // xAI preset fallback: grok-4.20 family 1M, grok-4.3 1M,
+            // grok-4.7 / grok-4.5 / grok-4.6 500K, grok-build 256K
+            (
+                ModelPreset::Xai,
+                Some("grok-4.20-0309-reasoning"),
+                1_000_000,
+            ),
+            (ModelPreset::Xai, Some("grok-4.3"), 1_000_000),
+            (ModelPreset::Xai, Some("grok-4.7"), 500_000),
+            (ModelPreset::Xai, Some("grok-4.5"), 500_000),
+            (ModelPreset::Xai, Some("grok-4.6"), 500_000),
+            (ModelPreset::Xai, Some("grok-build-0.1"), 256_000),
+            (ModelPreset::Xai, Some("grok-future-x"), 256_000),
+            (ModelPreset::Xai, None, 256_000),
+            // 其余预设的固定兜底
+            (ModelPreset::Deepseek, Some("my-custom-finetune"), 131_072),
+            (ModelPreset::Minimax, Some("minimax-future-x"), 204_800),
+            (ModelPreset::Mimo, Some("mimo-future-x"), 1_000_000),
+            (ModelPreset::Kimi, None, 262_144),
+        ];
+        for (preset, model, expected) in cases {
+            assert_eq!(
+                preset.context_window_fallback(*model),
+                Some(*expected),
+                "{preset:?}/{model:?} 上下文窗口兜底错误"
+            );
+        }
+    }
+
+    /// Coding-plan endpoint identification regression: every catalog endpoint
+    /// (including both Tencent tiers) must resolve to (vendor, canonical
+    /// base_url); off-catalog compatible endpoints must return None. Losing an
+    /// identification makes stored configs lose coding_plan metadata and
+    /// separate reasoning-field parsing in normalize_provider_metadata
+    /// (see the PR #155 review).
+    #[test]
+    fn identify_coding_plan_endpoint_matches_catalog() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "glm",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+            ),
+            (
+                "https://api.z.ai/api/coding/paas/v4",
+                "glm",
+                "https://api.z.ai/api/coding/paas/v4",
+            ),
+            (
+                "https://api.kimi.com/coding/v1",
+                "kimi",
+                "https://api.kimi.com/coding/v1",
+            ),
+            (
+                "https://api.lkeap.cloud.tencent.com/coding/v3",
+                "tencent",
+                "https://api.lkeap.cloud.tencent.com/coding/v3",
+            ),
+            (
+                "https://api.lkeap.cloud.tencent.com/plan/v3",
+                "tencent",
+                "https://api.lkeap.cloud.tencent.com/plan/v3",
+            ),
+            // Token Plan canonical host since the 2026-10 platform migration
+            // (announce 101147): identified as its own canonical URL so new
+            // saves persist the tokenhub identity while legacy lkeap configs
+            // keep classifying through the arm above.
+            (
+                "https://tokenhub.tencentmaas.com/plan/v3",
+                "tencent",
+                "https://tokenhub.tencentmaas.com/plan/v3",
+            ),
+            (
+                "https://ark.cn-beijing.volces.com/api/coding/v3",
+                "doubao",
+                "https://ark.cn-beijing.volces.com/api/coding/v3",
+            ),
+            (
+                "https://coding.dashscope.aliyuncs.com/v1",
+                "qwen",
+                "https://coding.dashscope.aliyuncs.com/v1",
+            ),
+        ];
+        for (input, expected_vendor, expected_base) in cases {
+            let (vendor, base) = identify_coding_plan_endpoint(input)
+                .unwrap_or_else(|| panic!("{input} must be identified as a coding-plan endpoint"));
+            assert_eq!(vendor, *expected_vendor, "{input}");
+            assert_eq!(base, *expected_base, "{input}");
+        }
+        assert_eq!(
+            identify_coding_plan_endpoint("https://api.deepseek.com"),
+            None
+        );
+        // The intl Alibaba / overseas Kimi coding hosts are separate
+        // subscriptions: identified as their own canonical URLs (kind kept
+        // on reload) and never rewritten to the China endpoints.
+        assert_eq!(
+            identify_coding_plan_endpoint("https://coding-intl.dashscope.aliyuncs.com/v1"),
+            Some(("qwen", "https://coding-intl.dashscope.aliyuncs.com/v1")),
+        );
+        assert_eq!(
+            identify_coding_plan_endpoint("https://api.kimi.ai/coding/v1"),
+            Some(("kimi", "https://api.kimi.ai/coding/v1")),
+        );
+        assert_eq!(
+            identify_coding_plan_endpoint("https://coding-intl.dashscope.aliyuncs.com/other"),
+            None,
+            "only the exact intl coding path is identified"
+        );
+        assert_eq!(
+            identify_coding_plan_endpoint("https://api.lkeap.cloud.tencent.com/other/v3"),
+            None,
+            "unlisted lkeap path must not be identified"
+        );
+        // The tokenhub arm is exact-match, so look-alike hosts and paths
+        // must not classify (structural spoof-host pins for the newest
+        // arm, 2026-11-04 fix pass).
+        assert_eq!(
+            identify_coding_plan_endpoint("https://tokenhub.tencentmaas.com.evil.example/plan/v3"),
+            None,
+            "spoofed host suffix must not classify as the tokenhub host"
+        );
+        assert_eq!(
+            identify_coding_plan_endpoint("https://tokenhub.tencentmaas.com/plan/v2"),
+            None,
+            "a different path on the tokenhub host must not classify"
+        );
+        assert_eq!(
+            identify_coding_plan_endpoint("https://tokenhub.tencentmaas.com/plan/v3/extra"),
+            None,
+            "a trailing path segment must not classify"
+        );
+        // Host case is folded before matching (to_ascii_lowercase), the
+        // same rule the frontend endpoint lookup applies since the
+        // 2026-11-04 fix pass; the canonical identity stays lowercase.
+        assert_eq!(
+            identify_coding_plan_endpoint("https://TOKENHUB.TencentMaas.com/plan/v3"),
+            Some(("tencent", "https://tokenhub.tencentmaas.com/plan/v3")),
+            "uppercase-host input must fold to the canonical lowercase identity"
+        );
+    }
+
+    /// When a user pastes a full chat/completions URL or variants with a
+    /// trailing slash/uppercase/outer whitespace, normalization must run
+    /// before identification; the canonical base_url is what gets persisted
+    /// and read back.
+    #[test]
+    fn identify_coding_plan_endpoint_normalizes_user_input() {
+        let (vendor, base) = identify_coding_plan_endpoint(
+            " HTTPS://API.LKEAP.CLOUD.TENCENT.COM/coding/v3/chat/completions/ ",
+        )
+        .expect("normalized tencent coding-plan endpoint must be identified");
+        assert_eq!(vendor, "tencent");
+        assert_eq!(base, "https://api.lkeap.cloud.tencent.com/coding/v3");
+    }
+}

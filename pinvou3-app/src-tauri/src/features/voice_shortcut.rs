@@ -1,0 +1,1490 @@
+use serde::Serialize;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+
+/// Which physical Alt key started the current gesture. The state machine
+/// treats both sides identically; the platform layer only reads this when
+/// replaying a swallowed combo, so the injected modifier keeps the identity of
+/// the key the user actually held (right-Alt combos surface as AltGr rather
+/// than being rewritten to left Alt — see `alt_side_vk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AltSide {
+    #[default]
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceShortcutKey {
+    Alt(AltSide),
+    Space,
+    Escape,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceShortcutEvent {
+    TriggerDictation,
+}
+
+/// Gesture state for the global Alt voice shortcut (written only by the
+/// Windows low-level hook).
+///
+/// Alt down is swallowed immediately (tap-hold): if a combo key follows, the
+/// platform layer replays a synthetic Alt down (`inject_alt_down`) to restore
+/// system/WebView Alt+combo behavior; if it was a bare tap, the up is
+/// swallowed and dictation triggers. The WebView sees either a full down/up
+/// pair or neither, and no "Alt still held" modifier state is left behind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VoiceShortcutState {
+    alt_down: bool,
+    /// Alt went down while Shift/Ctrl/Win was already held: the whole Alt
+    /// press belongs to a system chord (e.g. Shift+Alt input switching,
+    /// Ctrl+Alt+key) and passes through untouched until its Alt-up.
+    alt_passthrough: bool,
+    alt_pending: bool,
+    /// Which physical Alt key started the current gesture (meaningful only
+    /// while `alt_down`); the platform layer reads it at combo replay time.
+    /// If the other side is pressed while held, it is swallowed as a repeat
+    /// and the recorded side stays the arming one, so a combo is replayed
+    /// with the side that started the gesture, not the most recent press.
+    alt_side: AltSide,
+    /// The [Alt↓, combo↓] ordered replay has been issued for a combo key (the
+    /// platform layer sets this whenever at least the Alt down was injected,
+    /// complete or partial); the real Alt up must be let through to pair with
+    /// the injected down, so no synthetic modifier state is left behind.
+    alt_forwarded: bool,
+    /// Space down was swallowed within this gesture; its up must be swallowed
+    /// in pairs only, never the up of a Space that was already held before Alt
+    /// went down (otherwise the system-level VK_SPACE gets stuck pressed).
+    space_swallowed: bool,
+    /// Foreground window handle at Alt down (0 = unknown); compared at Alt up
+    /// so releasing Alt after alt-tabbing to another window does not misfire.
+    alt_hwnd: isize,
+    /// KBDLLHOOKSTRUCT.time of the previous event (millisecond tick; 0 = no
+    /// event yet), used as the stale-gesture fallback (state stuck after
+    /// UAC/lock-screen eats a keyup).
+    last_event_ms: u32,
+}
+
+/// An inter-event gap above this threshold means the previous gesture is dead
+/// (UAC/lock-screen swallowed the keyup) and the whole state resets. While
+/// held normally, OS auto-repeat keeps refreshing the event stream and never
+/// trips it; with accessibility settings that disable auto-repeat, a held
+/// press longer than 2s no longer triggers (an accepted fallback cost).
+const STALE_GESTURE_MS: u32 = 2000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VoiceShortcutDecision {
+    event: Option<VoiceShortcutEvent>,
+    suppress: bool,
+    /// The current combo down was swallowed: the platform layer must replay
+    /// [Alt↓, combo↓] in order with a single SendInput (confirming
+    /// alt_forwarded whenever at least the Alt down was injected — a partial
+    /// injection still leaves a synthetic Alt down that the real Alt up must
+    /// pair with), otherwise the system never sees the combo because Alt down
+    /// was swallowed (Alt+Tab / Alt+F4 break).
+    inject_alt_down: bool,
+}
+
+impl VoiceShortcutDecision {
+    const fn pass() -> Self {
+        Self {
+            event: None,
+            suppress: false,
+            inject_alt_down: false,
+        }
+    }
+
+    const fn suppress(event: Option<VoiceShortcutEvent>) -> Self {
+        Self {
+            event,
+            suppress: true,
+            inject_alt_down: false,
+        }
+    }
+
+    /// Swallow the current combo down and let the platform layer replay it in
+    /// order.
+    const fn forward_combo() -> Self {
+        Self {
+            event: None,
+            suppress: true,
+            inject_alt_down: true,
+        }
+    }
+}
+
+/// `active` = this keystroke belongs to the shortcut gesture (switch on and
+/// the foreground window is one of this process's target windows).
+/// `foreground_hwnd` is the current foreground window handle (0 = none).
+/// `time_ms` is KBDLLHOOKSTRUCT.time (millisecond tick, wrap-around allowed).
+fn handle_voice_shortcut_key(
+    state: &mut VoiceShortcutState,
+    key: VoiceShortcutKey,
+    key_down: bool,
+    active: bool,
+    foreground_hwnd: isize,
+    time_ms: u32,
+) -> VoiceShortcutDecision {
+    // Stale-gesture fallback: a lost keyup (UAC/lock-screen etc.) can leave
+    // alt_down stuck, so the first event of the next gesture would be
+    // misread as a long-press repeat or ghost trigger. A gap above the
+    // threshold resets everything and the event is then handled as fresh
+    // (tick wrap-around handled with wrapping_sub).
+    if state.last_event_ms != 0 && time_ms.wrapping_sub(state.last_event_ms) > STALE_GESTURE_MS {
+        *state = VoiceShortcutState::default();
+    }
+    state.last_event_ms = time_ms;
+
+    if !active {
+        // Gesture landed on a non-target window: swallow nothing, only reset
+        // on Alt up so state cannot leak into the next gesture.
+        if matches!(key, VoiceShortcutKey::Alt(_)) && !key_down {
+            *state = VoiceShortcutState::default();
+        }
+        return VoiceShortcutDecision::pass();
+    }
+
+    match (key, key_down) {
+        (VoiceShortcutKey::Alt(side), true) => {
+            if state.alt_down {
+                // Long-press auto-repeat: keep swallowing when not forwarded,
+                // let through when forwarded (consistent with the synthetic
+                // down). Covers the other Alt side too: both downs are
+                // swallowed and the first up resolves the gesture — releasing
+                // the arming side fires dictation while the other side is
+                // still held, whose auto-repeat re-arms and fires once more
+                // on its own release. Holding both Alts is exotic enough that
+                // this double trigger is accepted over per-side tracking.
+                return if state.alt_forwarded {
+                    VoiceShortcutDecision::pass()
+                } else {
+                    VoiceShortcutDecision::suppress(None)
+                };
+            }
+            state.alt_down = true;
+            state.alt_pending = true;
+            state.alt_side = side;
+            state.alt_forwarded = false;
+            state.alt_hwnd = foreground_hwnd;
+            VoiceShortcutDecision::suppress(None)
+        }
+        (VoiceShortcutKey::Alt(_), false) => {
+            if !state.alt_down {
+                return VoiceShortcutDecision::pass();
+            }
+            let hwnd_mismatch =
+                state.alt_hwnd != 0 && foreground_hwnd != 0 && state.alt_hwnd != foreground_hwnd;
+            let trigger = state.alt_pending && !hwnd_mismatch;
+            let forwarded = state.alt_forwarded;
+            *state = VoiceShortcutState::default();
+            if forwarded {
+                // Combo path: the real up is let through to pair with the
+                // synthetic down; pending was cleared by the combo, so no
+                // trigger.
+                VoiceShortcutDecision::pass()
+            } else {
+                // Bare tap (or a combo of Space only): down was swallowed, so
+                // swallow the up in pairs and trigger.
+                VoiceShortcutDecision::suppress(
+                    trigger.then_some(VoiceShortcutEvent::TriggerDictation),
+                )
+            }
+        }
+        (VoiceShortcutKey::Space, true) if state.alt_down => {
+            // Alt+Space opens the window system menu: swallow down/up as a
+            // pair and do not inject an Alt down for it.
+            state.alt_pending = false;
+            state.space_swallowed = true;
+            VoiceShortcutDecision::suppress(None)
+        }
+        // Only swallow the Space up whose down was already swallowed; for a
+        // Space held before Alt went down, its down was already let through,
+        // so the up must be let through too or the system-level key sticks.
+        (VoiceShortcutKey::Space, false) if state.alt_down && state.space_swallowed => {
+            state.alt_pending = false;
+            VoiceShortcutDecision::suppress(None)
+        }
+        // Alt+Esc (system window cycling) is treated the same as a regular
+        // combo: without the replay a bare Esc leaks into the WebView, and
+        // leftover pending would mis-trigger dictation at Alt up.
+        (VoiceShortcutKey::Other | VoiceShortcutKey::Escape, true) if state.alt_down => {
+            if state.alt_pending {
+                state.alt_pending = false;
+                if !state.alt_forwarded {
+                    // alt_forwarded is confirmed by the platform layer whenever
+                    // the replay injected at least the Alt down (partial
+                    // included — the injected down must stay paired with the
+                    // real Alt up); only a zero-injection replay failure leaves
+                    // it unforwarded, the real Alt up is wrapped up along the
+                    // unforwarded path, and no state is left behind.
+                    return VoiceShortcutDecision::forward_combo();
+                }
+            }
+            VoiceShortcutDecision::pass()
+        }
+        _ => VoiceShortcutDecision::pass(),
+    }
+}
+
+/// Hook entry point: `other_modifier_down` reports whether Shift, Ctrl or Win
+/// was already held when this key event arrived. A modifier pressed before
+/// Alt belongs to a system chord, not a bare tap, so that Alt press is never
+/// armed, swallowed or replayed; its Alt-up also passes through, keeping the
+/// system's own down/up pairing intact. Everything else is delegated to
+/// `handle_voice_shortcut_key`.
+fn handle_voice_shortcut_with_modifiers(
+    state: &mut VoiceShortcutState,
+    key: VoiceShortcutKey,
+    key_down: bool,
+    active: bool,
+    foreground_hwnd: isize,
+    time_ms: u32,
+    other_modifier_down: bool,
+) -> VoiceShortcutDecision {
+    if matches!(key, VoiceShortcutKey::Alt(_)) && state.alt_passthrough {
+        if !key_down {
+            state.alt_passthrough = false;
+        }
+        return VoiceShortcutDecision::pass();
+    }
+    if matches!(key, VoiceShortcutKey::Alt(_)) && key_down && !state.alt_down && other_modifier_down
+    {
+        state.alt_passthrough = true;
+        return VoiceShortcutDecision::pass();
+    }
+    handle_voice_shortcut_key(state, key, key_down, active, foreground_hwnd, time_ms)
+}
+
+#[derive(Clone, Serialize)]
+struct VoiceShortcutTriggerPayload {
+    /// Target window label (a window mounting VoiceShortcutRouter); the
+    /// frontend consumes it only after checking it matches its own window.
+    window_label: String,
+    /// Ownership token bound to the current recording claim (present only
+    /// on the "recording" route); the frontend uses it to reject events
+    /// from a stale claim.
+    recording_token: Option<String>,
+    /// Routing basis: "recording" (the targeted recording window, used for
+    /// stop/mutual exclusion) or "focused" (the focused window, a normal
+    /// trigger). The frontend uses this to spot a stale recording-window
+    /// registration ("routed as the recording window but no longer has an
+    /// active session" — the JS session is rebuilt after a WebView reload
+    /// while the native registration was not cleared), clear it, and drop the
+    /// event instead of ghost-opening the microphone in the background.
+    route: &'static str,
+}
+
+/// Recording claim: the (window, operation token) pair that currently owns
+/// the microphone (synced by the frontend via a command when recording
+/// starts/ends/fails, atomically claimed before the mic is opened).
+/// Used for cross-window recording mutual exclusion: while window A records,
+/// window B's Alt gesture is routed to A (to stop it) and never opens a
+/// second session; another window or an older operation cannot steal or
+/// clear the current claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RecordingOwner {
+    pub(super) label: String,
+    pub(super) token: String,
+}
+
+static RECORDING_OWNER: Mutex<Option<RecordingOwner>> = Mutex::new(None);
+
+/// Command-layer token shape check, kept ahead of every claim so a malformed
+/// token can never reach the owner state.
+fn validate_recording_token(token: &str) -> Result<(), String> {
+    if token.trim().is_empty() || token.len() > 128 {
+        log::debug!(
+            "invalid voice recording owner token (length {})",
+            token.len()
+        );
+        return Err("invalid voice recording owner token".to_string());
+    }
+    Ok(())
+}
+
+/// Called by the `set_voice_shortcut_recording` command; the frontend claims
+/// this window's label (bound to the operation token) before opening the
+/// microphone, and releases it when recording ends/fails.
+/// `claim` false releases the claim, but only when (label, token) still
+/// matches the recorded owner, so a stale teardown cannot wipe a newer
+/// session's claim.
+/// A claim also cannot resurrect a destroyed window's entry: sync commands
+/// and window events serialize on the main thread, and a destroyed webview's
+/// pending IPC dies with it, so `forget_recording_window` (window destroy)
+/// always lands before any later claim from the same label.
+pub(crate) fn set_recording_owner(label: &str, token: &str, claim: bool) -> Result<bool, String> {
+    // A release is a harmless no-op for any token shape from any window kind:
+    // the JS releases fire-and-forget, so an Err here would surface as an
+    // unhandled rejection, and a malformed token can never match a stored
+    // owner (claims always validate), so the exact-match release below
+    // already refuses it. Only a claim from a non-router window is invalid —
+    // a misbehaving renderer worth logging.
+    if !claim {
+        if !is_voice_shortcut_router_window(label) {
+            return Ok(false);
+        }
+    } else {
+        validate_recording_token(token)?;
+        if !is_voice_shortcut_router_window(label) {
+            log::warn!("voice recording claim from non-router window {label}");
+            return Err("voice recording claim from a non-router window".to_string());
+        }
+    }
+    let mut owner = RECORDING_OWNER.lock().map_err(|err| {
+        log::warn!("voice recording owner mutex poisoned: {err}");
+        "voice recording owner unavailable".to_string()
+    })?;
+    let landed = update_recording_owner(&mut owner, label, token, claim);
+    if !landed {
+        log::debug!(
+            "voice recording {} rejected for window {label} (stale token, or another window owns the recording)",
+            if claim { "claim" } else { "release" }
+        );
+    }
+    Ok(landed)
+}
+
+/// Pure state transition so the claim/release/steal rules stay testable
+/// without a global: a claim from another window fails, but a claim from the
+/// owning window itself replaces the recorded token — the JS keeps at most
+/// one live recording per window, so a same-window re-claim can only be a
+/// recovery from a start that failed after claiming (releasing on that path
+/// is best-effort); without the steal, one leaked claim would lock the
+/// microphone in every window until the owning window is destroyed. A
+/// release only lands on the exact matching owner.
+fn update_recording_owner(
+    owner: &mut Option<RecordingOwner>,
+    label: &str,
+    token: &str,
+    claim: bool,
+) -> bool {
+    if claim {
+        if owner.as_ref().is_some_and(|current| current.label != label) {
+            return false;
+        }
+        *owner = Some(RecordingOwner {
+            label: label.to_string(),
+            token: token.to_string(),
+        });
+        true
+    } else {
+        // Field borrows instead of building the expected owner first: a
+        // release that no-ops (stale token) must not allocate.
+        let matches = owner
+            .as_ref()
+            .is_some_and(|current| current.label == label && current.token == token);
+        if matches {
+            *owner = None;
+        }
+        matches
+    }
+}
+
+pub(super) fn recording_owner() -> Option<RecordingOwner> {
+    RECORDING_OWNER.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// Deregister proactively when a window is destroyed: if a recording window is
+/// closed outright, the frontend never gets to run the finishVoiceInput
+/// teardown. If the claim is not released, the native hook keeps routing Alt
+/// gestures into the destroyed window (emit does not error on a destroyed
+/// window and the failure fallback never fires — effectively a global
+/// swallow-keys black hole).
+pub(crate) fn forget_recording_window(label: &str) {
+    if let Ok(mut owner) = RECORDING_OWNER.lock() {
+        forget_owner_window(&mut owner, label);
+    }
+}
+
+fn forget_owner_window(owner: &mut Option<RecordingOwner>, label: &str) {
+    if owner.as_ref().is_some_and(|current| current.label == label) {
+        *owner = None;
+    }
+}
+
+/// Only the main window and detached windows (DetachedShell) mount
+/// VoiceShortcutRouter and can consume shortcut events; pet, code-reader,
+/// artifact and similar windows are not whitelisted: no swallowing, no emit.
+fn is_voice_shortcut_router_window(label: &str) -> bool {
+    label == "main" || label.starts_with("detached-")
+}
+
+/// Merge the router HWND cache entries from the single-WebView enumeration
+/// and the native main-window handle (issue #840: the enumeration drops the
+/// main window while any browser-tab child WebView is attached to it). The
+/// main entry always comes from the native `Window` handle and a stale
+/// "main" entry left in the enumeration (no tab open) is ignored; hwnd-less
+/// windows never join, and the label re-check is the policy owner: non-router
+/// windows (browser tabs, pet, reader, artifacts) never join the cache even
+/// if fed. The Windows caller pre-filters the same labels only to skip
+/// wasted `hwnd()` round trips.
+fn router_hwnd_entries(
+    webview_windows: impl IntoIterator<Item = Option<(isize, String)>>,
+    main_window: Option<(isize, String)>,
+) -> Vec<(isize, String)> {
+    let mut windows: Vec<(isize, String)> = webview_windows
+        .into_iter()
+        .flatten()
+        .filter(|(_, label)| *label != "main" && is_voice_shortcut_router_window(label))
+        .collect();
+    if let Some(main_window) = main_window {
+        windows.push(main_window);
+    }
+    windows
+}
+
+/// Routing for a bare Alt tap: the recording window wins (targeted stop,
+/// cross-window mutual exclusion), otherwise the gesture targets the focused
+/// whitelisted window; with neither, returns None (no swallowing, no emit).
+/// The return value carries the routing basis so the frontend can tell apart a
+/// stale recording-window registration (see payload.route).
+fn resolve_trigger_target(
+    recording_label: Option<&str>,
+    focused_router_label: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if let Some(label) = recording_label {
+        return Some((label.to_string(), "recording"));
+    }
+    focused_router_label.map(|label| (label.to_string(), "focused"))
+}
+
+/// A "recording"-routed emit is only valid while the current owner still
+/// matches (same window and token); a stale registration must drop the
+/// gesture instead of ghost-targeting. Pure so the production guard itself —
+/// not just the claim state machine — stays tested.
+fn recording_route_is_current(
+    owner: Option<&RecordingOwner>,
+    window_label: &str,
+    recording_token: Option<&str>,
+) -> bool {
+    owner.is_some_and(|owner| {
+        owner.label == window_label && Some(owner.token.as_str()) == recording_token
+    })
+}
+
+mod platform;
+
+pub(crate) fn install(app: AppHandle) {
+    platform::install(app);
+}
+
+pub(crate) fn set_enabled(enabled: bool) {
+    platform::set_enabled(enabled);
+}
+
+/// Targeted emit: send only to the target window; silently dropped when there
+/// is no focused/target window (no more broadcast to all windows).
+/// A "recording"-routed event is only emitted while the current owner still
+/// matches (same window and token); otherwise the claim is stale and the
+/// gesture is dropped instead of ghost-targeting an unrelated window.
+fn emit_shortcut_event(
+    app: &AppHandle,
+    event: VoiceShortcutEvent,
+    window_label: &str,
+    route: &'static str,
+    recording_token: Option<String>,
+) {
+    if route == "recording"
+        && !recording_route_is_current(
+            recording_owner().as_ref(),
+            window_label,
+            recording_token.as_deref(),
+        )
+    {
+        return;
+    }
+    match event {
+        VoiceShortcutEvent::TriggerDictation => {
+            let result = app.emit_to(
+                window_label,
+                "voice-shortcut:trigger",
+                VoiceShortcutTriggerPayload {
+                    window_label: window_label.to_string(),
+                    recording_token: recording_token.clone(),
+                    route,
+                },
+            );
+            match result {
+                Ok(()) => {
+                    log::debug!(
+                        "voice shortcut emitted event=TriggerDictation window={}",
+                        window_label
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "voice shortcut emit failed event=TriggerDictation window={} error={}",
+                        window_label,
+                        error
+                    );
+                    // Emit failed: the target webview is most likely
+                    // mid-teardown (an already-destroyed label emits Ok and
+                    // never reaches this branch — full destroy is handled by
+                    // forget_recording_window). Release the token-matched
+                    // claim so the teardown race cannot leave gestures routed
+                    // into a dying window.
+                    if let Some(token) = recording_token.as_deref() {
+                        let _ = set_recording_owner(window_label, token, false);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HWND_A: isize = 100;
+    const HWND_B: isize = 200;
+
+    #[test]
+    fn modifiers_held_before_alt_pass_through_without_pending_or_trigger() {
+        for modifier in ["Shift", "Ctrl", "Win"] {
+            for side in [AltSide::Left, AltSide::Right] {
+                let mut state = VoiceShortcutState::default();
+                let down = handle_voice_shortcut_with_modifiers(
+                    &mut state,
+                    VoiceShortcutKey::Alt(side),
+                    true,
+                    true,
+                    HWND_A,
+                    100,
+                    true,
+                );
+                assert_eq!(down, VoiceShortcutDecision::pass(), "{modifier} {side:?}");
+                assert!(!state.alt_pending);
+                let repeat = handle_voice_shortcut_with_modifiers(
+                    &mut state,
+                    VoiceShortcutKey::Alt(side),
+                    true,
+                    true,
+                    HWND_A,
+                    150,
+                    false,
+                );
+                assert_eq!(repeat, VoiceShortcutDecision::pass(), "{modifier} {side:?}");
+                // Even if the other modifier is released before Alt-up, no tap was armed.
+                let up = handle_voice_shortcut_with_modifiers(
+                    &mut state,
+                    VoiceShortcutKey::Alt(side),
+                    false,
+                    true,
+                    HWND_A,
+                    200,
+                    false,
+                );
+                assert_eq!(up, VoiceShortcutDecision::pass(), "{modifier} {side:?}");
+                assert!(!state.alt_down);
+                assert!(!state.alt_passthrough);
+            }
+        }
+    }
+
+    #[test]
+    fn bare_alt_tap_without_other_modifiers_still_triggers() {
+        let mut state = VoiceShortcutState::default();
+        let key = VoiceShortcutKey::Alt(AltSide::Left);
+        let down =
+            handle_voice_shortcut_with_modifiers(&mut state, key, true, true, HWND_A, 100, false);
+        assert!(down.suppress);
+        let up =
+            handle_voice_shortcut_with_modifiers(&mut state, key, false, true, HWND_A, 150, false);
+        assert!(up.suppress);
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+    }
+
+    #[test]
+    fn latched_passthrough_survives_a_missed_alt_up_and_recovers() {
+        // The Alt-up that would clear the latch is lost (hook gap). The next
+        // bare Alt-down still passes through with the latch retained, and its
+        // Alt-up clears the latch, so the latch can cost at most one
+        // sacrificed tap — never a dead shortcut.
+        let mut state = VoiceShortcutState::default();
+        let key = VoiceShortcutKey::Alt(AltSide::Left);
+        let chord_down =
+            handle_voice_shortcut_with_modifiers(&mut state, key, true, true, HWND_A, 100, true);
+        assert_eq!(chord_down, VoiceShortcutDecision::pass());
+        // Lost Alt-up: nothing recorded. The orphan bare Alt-down passes too.
+        let orphan_down =
+            handle_voice_shortcut_with_modifiers(&mut state, key, true, true, HWND_A, 500, false);
+        assert_eq!(orphan_down, VoiceShortcutDecision::pass());
+        assert!(state.alt_passthrough);
+        assert!(!state.alt_down);
+        let orphan_up =
+            handle_voice_shortcut_with_modifiers(&mut state, key, false, true, HWND_A, 550, false);
+        assert_eq!(orphan_up, VoiceShortcutDecision::pass());
+        assert!(!state.alt_passthrough);
+        // And the shortcut works again in full.
+        let bare_down =
+            handle_voice_shortcut_with_modifiers(&mut state, key, true, true, HWND_A, 600, false);
+        assert!(bare_down.suppress);
+        let bare_up =
+            handle_voice_shortcut_with_modifiers(&mut state, key, false, true, HWND_A, 650, false);
+        assert_eq!(bare_up.event, Some(VoiceShortcutEvent::TriggerDictation));
+    }
+
+    #[test]
+    fn stale_reset_clears_a_latched_passthrough() {
+        // A latched chord whose Alt-up is lost is also covered by the
+        // stale-gesture fallback: a non-Alt keystroke after the threshold
+        // resets the whole state, latch included.
+        let mut state = VoiceShortcutState::default();
+        // A non-Alt event starts the clock (the latched Alt-down below never
+        // reaches the gesture handler, so nothing else refreshes it).
+        assert_eq!(
+            handle_voice_shortcut_key(
+                &mut state,
+                VoiceShortcutKey::Other,
+                true,
+                true,
+                HWND_A,
+                1000,
+            ),
+            VoiceShortcutDecision::pass()
+        );
+        let chord_down = handle_voice_shortcut_with_modifiers(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            true,
+            true,
+            HWND_A,
+            1500,
+            true,
+        );
+        assert_eq!(chord_down, VoiceShortcutDecision::pass());
+        assert!(state.alt_passthrough);
+        // Lost Alt-up; a non-Alt keystroke after the stale threshold resets.
+        let later = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Other,
+            true,
+            true,
+            HWND_A,
+            1000 + STALE_GESTURE_MS + 1000,
+        );
+        assert_eq!(later, VoiceShortcutDecision::pass());
+        assert!(!state.alt_passthrough);
+        assert!(!state.alt_down);
+        // And the next bare tap triggers normally.
+        let bare_down = handle_voice_shortcut_with_modifiers(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            true,
+            true,
+            HWND_A,
+            1000 + STALE_GESTURE_MS + 1200,
+            false,
+        );
+        assert!(bare_down.suppress);
+    }
+
+    #[test]
+    fn recording_claim_release_and_window_destroy_preserve_authority() {
+        // A claim is atomic: another window cannot steal it, a tokenless or
+        // mismatched release cannot clear it, and window destruction only
+        // clears the claim of the window that still owns it.
+        let mut owner = None;
+        assert!(update_recording_owner(&mut owner, "main", "a1", true));
+        assert!(!update_recording_owner(
+            &mut owner,
+            "detached-b",
+            "b1",
+            true
+        ));
+        assert!(!update_recording_owner(&mut owner, "main", "a0", false));
+        assert!(!update_recording_owner(
+            &mut owner,
+            "detached-b",
+            "a1",
+            false
+        ));
+        assert_eq!(
+            resolve_trigger_target(owner.as_ref().map(|o| o.label.as_str()), Some("detached-b")),
+            Some(("main".to_string(), "recording"))
+        );
+        forget_owner_window(&mut owner, "detached-b");
+        assert!(owner.is_some());
+        assert!(update_recording_owner(&mut owner, "main", "a1", false));
+        assert!(update_recording_owner(&mut owner, "detached-b", "b1", true));
+        assert!(!update_recording_owner(&mut owner, "main", "a1", false));
+        forget_owner_window(&mut owner, "main");
+        assert_eq!(
+            resolve_trigger_target(owner.as_ref().map(|o| o.label.as_str()), Some("main")),
+            Some(("detached-b".to_string(), "recording"))
+        );
+        forget_owner_window(&mut owner, "detached-b");
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn recording_owner_command_rejects_invalid_claims_but_non_router_release_is_a_no_op() {
+        // Command-layer validation: a claim from a non-router window fails,
+        // while a release from one is a harmless no-op (the JS releases
+        // fire-and-forget and must not surface an unhandled rejection). Only
+        // the non-router and malformed-token *claim* branches return before
+        // taking the global; the router-label releases below do lock it,
+        // which stays deterministic because no other test writes the global.
+        assert!(set_recording_owner("pet", "tok", true).is_err());
+        assert_eq!(set_recording_owner("pet", "tok", false), Ok(false));
+        // A malformed token must not turn the no-op release into an Err
+        // either: the fire-and-forget JS release never surfaces one.
+        assert_eq!(set_recording_owner("pet", "   ", false), Ok(false));
+        assert!(set_recording_owner("main", "   ", true).is_err());
+        // Router releases are equally no-ops for any token shape: the stored
+        // owner only ever holds validated tokens, so a malformed release can
+        // only miss — an Err would just risk an unhandled rejection.
+        assert_eq!(set_recording_owner("main", "   ", false), Ok(false));
+        assert_eq!(set_recording_owner("main", "", false), Ok(false));
+    }
+
+    #[test]
+    fn recording_claim_same_window_replaces_a_leaked_token() {
+        // The JS keeps at most one live recording per window, so a
+        // same-window re-claim with a fresh token can only be the recovery
+        // path for a start that failed after claiming: it must heal instead
+        // of locking every window out of the microphone. Another window's
+        // claim still fails, and the replaced token no longer releases
+        // anything.
+        let mut owner = None;
+        assert!(update_recording_owner(&mut owner, "main", "a1", true));
+        assert!(update_recording_owner(&mut owner, "main", "a2", true));
+        assert_eq!(
+            owner.as_ref().map(|o| o.token.as_str()),
+            Some("a2"),
+            "the owning window replaces the stale token"
+        );
+        assert!(!update_recording_owner(&mut owner, "main", "a1", false));
+        assert!(owner.is_some(), "the replaced token must not release");
+        assert!(!update_recording_owner(
+            &mut owner,
+            "detached-b",
+            "b1",
+            true
+        ));
+        assert!(update_recording_owner(&mut owner, "main", "a2", false));
+        assert!(owner.is_none());
+    }
+
+    #[test]
+    fn recording_route_emits_only_while_the_owner_still_matches() {
+        // The emit-time guard (defense in depth for the check-to-emit gap):
+        // the current owner passes; a stale token, a stale label, or no
+        // owner at all drops the gesture.
+        let owner = Some(RecordingOwner {
+            label: "main".to_string(),
+            token: "a1".to_string(),
+        });
+        assert!(recording_route_is_current(
+            owner.as_ref(),
+            "main",
+            Some("a1")
+        ));
+        assert!(!recording_route_is_current(
+            owner.as_ref(),
+            "main",
+            Some("a0")
+        ));
+        assert!(!recording_route_is_current(
+            owner.as_ref(),
+            "detached-b",
+            Some("a1")
+        ));
+        assert!(!recording_route_is_current(None, "main", Some("a1")));
+    }
+
+    #[test]
+    fn alt_tap_swallows_down_and_up_symmetrically_and_triggers() {
+        let mut state = VoiceShortcutState::default();
+        let down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(down.event, None);
+        assert!(down.suppress);
+        assert!(!down.inject_alt_down);
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+        assert!(up.suppress);
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn alt_autorepeat_stays_swallowed_and_triggers_once() {
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        let repeat = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(repeat, VoiceShortcutDecision::suppress(None));
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+
+        let stray = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(stray, VoiceShortcutDecision::pass());
+    }
+
+    #[test]
+    fn alt_combo_injects_alt_down_once_and_forwards_real_up() {
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+
+        let combo =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Other, true, true, HWND_A, 0);
+        assert_eq!(combo, VoiceShortcutDecision::forward_combo());
+        assert!(combo.suppress);
+
+        // The platform layer confirms alt_forwarded after SendInput succeeds
+        // (the [Alt↓, combo↓] replay is complete).
+        state.alt_forwarded = true;
+
+        // A second key during the same combo must not inject again.
+        let combo2 =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Other, true, true, HWND_A, 0);
+        assert_eq!(combo2, VoiceShortcutDecision::pass());
+
+        // Alt auto-repeat down after a combo is let through, consistent with
+        // the synthetic down.
+        let repeat = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(repeat, VoiceShortcutDecision::pass());
+
+        // The real up is let through to pair with the synthetic down; no
+        // dictation trigger.
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up, VoiceShortcutDecision::pass());
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn alt_escape_combo_forwards_alt_down_once_and_never_triggers() {
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+
+        // Alt+Esc is treated like a regular combo: swallow and replay
+        // [Alt↓, Esc↓] in order, so Esc does not leak through bare.
+        let escape =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Escape, true, true, HWND_A, 0);
+        assert_eq!(escape, VoiceShortcutDecision::forward_combo());
+        state.alt_forwarded = true;
+
+        // The real Alt up is let through to pair with the synthetic down; no
+        // dictation trigger.
+        let alt_up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(alt_up, VoiceShortcutDecision::pass());
+        assert!(!alt_up.suppress);
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn combo_replay_failure_leaves_no_residue() {
+        // SendInput failure: alt_forwarded was never confirmed by the platform
+        // layer and the combo is lost; the real Alt up is wrapped up along the
+        // unforwarded path — no trigger, state reset, no "Alt still held"
+        // residue.
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        let combo =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Other, true, true, HWND_A, 0);
+        assert_eq!(combo, VoiceShortcutDecision::forward_combo());
+        // (the platform-layer confirmation is not simulated)
+
+        let combo_up =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Other, false, true, HWND_A, 0);
+        assert_eq!(combo_up, VoiceShortcutDecision::pass());
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up, VoiceShortcutDecision::suppress(None));
+        assert_eq!(up.event, None);
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn stale_gesture_resets_after_lost_keyup() {
+        // UAC/lock-screen swallowed the keyup: the gap to the previous event
+        // far exceeds the threshold, so everything resets.
+        // A later Alt up no longer ghost-triggers dictation, and the next
+        // gesture works in full.
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            1000,
+        );
+
+        let ghost_up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            90000,
+        );
+        assert_eq!(ghost_up, VoiceShortcutDecision::pass());
+        // Gesture state is reset (last_event_ms keeps the current tick for
+        // later gap checks).
+        assert!(!state.alt_down);
+        assert!(!state.alt_pending);
+        assert!(!state.alt_forwarded);
+
+        // New gesture: down swallowed, up triggers — identical to the first
+        // time.
+        let down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            90500,
+        );
+        assert!(down.suppress);
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            90620,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+    }
+
+    #[test]
+    fn alt_repeat_within_gesture_does_not_trip_stale_reset() {
+        // Held normally: OS auto-repeat keeps refreshing the event stream with
+        // gaps far below the threshold, so no reset is triggered.
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            1000,
+        );
+        let repeat = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            1600,
+        );
+        assert_eq!(repeat, VoiceShortcutDecision::suppress(None));
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            1630,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+    }
+
+    #[test]
+    fn right_alt_tap_triggers_like_left_alt() {
+        let mut state = VoiceShortcutState::default();
+        let down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        assert!(down.suppress);
+        assert!(!down.inject_alt_down);
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+        assert!(up.suppress);
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn right_alt_combo_records_side_for_platform_replay() {
+        // The state machine treats both sides identically, but the platform
+        // layer must replay the swallowed combo with the VK of the Alt the
+        // user actually held, so the recorded side must survive until the
+        // combo down arrives.
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        let combo =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Other, true, true, HWND_A, 0);
+        assert_eq!(combo, VoiceShortcutDecision::forward_combo());
+        assert_eq!(state.alt_side, AltSide::Right);
+    }
+
+    #[test]
+    fn cross_side_hold_resolves_on_first_up_and_rearms_on_repeat() {
+        // Documented cross-side hold: both downs are swallowed (the other side
+        // is a repeat and the arming side sticks), the first up resolves the
+        // gesture and fires once, and the still-held side's auto-repeat
+        // re-arms, so its eventual release fires a second time. Per-side
+        // tracking was deliberately rejected as not worth complicating the
+        // main gesture path — this pins the accepted behavior.
+        let mut state = VoiceShortcutState::default();
+        let left_down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            1000,
+        );
+        assert!(left_down.suppress);
+
+        let right_down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            true,
+            true,
+            HWND_A,
+            1100,
+        );
+        assert_eq!(right_down, VoiceShortcutDecision::suppress(None));
+        assert_eq!(state.alt_side, AltSide::Left);
+        assert!(state.alt_pending);
+
+        let left_up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            1200,
+        );
+        assert_eq!(left_up.event, Some(VoiceShortcutEvent::TriggerDictation));
+        assert_eq!(state, VoiceShortcutState::default());
+
+        let right_repeat = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            true,
+            true,
+            HWND_A,
+            1300,
+        );
+        assert!(right_repeat.suppress);
+        assert_eq!(state.alt_side, AltSide::Right);
+        let right_up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Right),
+            false,
+            true,
+            HWND_A,
+            1400,
+        );
+        assert_eq!(right_up.event, Some(VoiceShortcutEvent::TriggerDictation));
+    }
+
+    #[test]
+    fn alt_space_suppresses_pair_and_never_triggers_or_injects() {
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+
+        let space_down =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, true, true, HWND_A, 0);
+        assert_eq!(space_down, VoiceShortcutDecision::suppress(None));
+
+        let space_up =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, false, true, HWND_A, 0);
+        assert_eq!(space_up, VoiceShortcutDecision::suppress(None));
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up, VoiceShortcutDecision::suppress(None));
+        assert_eq!(up.event, None);
+    }
+
+    #[test]
+    fn space_up_pressed_before_alt_is_not_swallowed() {
+        // Space pressed before Alt: its down was already let through (the hook
+        // only swallows Alt+Space), so while Alt is held the Space up must be
+        // let through too, or the system-level VK_SPACE sticks pressed.
+        let mut state = VoiceShortcutState::default();
+        let space_down =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, true, true, HWND_A, 0);
+        assert_eq!(space_down, VoiceShortcutDecision::pass());
+
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+
+        let space_up =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, false, true, HWND_A, 0);
+        assert_eq!(space_up, VoiceShortcutDecision::pass());
+
+        // A genuine Alt+Space pressed later within the same gesture is still
+        // swallowed as a pair.
+        let pair_down =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, true, true, HWND_A, 0);
+        assert_eq!(pair_down, VoiceShortcutDecision::suppress(None));
+        let pair_up =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, false, true, HWND_A, 0);
+        assert_eq!(pair_up, VoiceShortcutDecision::suppress(None));
+    }
+
+    #[test]
+    fn space_then_alt_uses_plain_alt_only() {
+        let mut state = VoiceShortcutState::default();
+        let space =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Space, true, true, HWND_A, 0);
+        assert_eq!(space, VoiceShortcutDecision::pass());
+
+        let alt = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(alt, VoiceShortcutDecision::suppress(None));
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+        assert!(up.suppress);
+    }
+
+    #[test]
+    fn alt_up_in_another_app_window_does_not_trigger() {
+        let mut state = VoiceShortcutState::default();
+        let down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        assert!(down.suppress);
+
+        // Hold Alt, switch to another window of the same process, release: no
+        // trigger; the down was swallowed, so the up is swallowed in pairs.
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            HWND_B,
+            0,
+        );
+        assert_eq!(up.event, None);
+        assert!(up.suppress);
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn unknown_foreground_hwnd_still_allows_trigger() {
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            0,
+            0,
+        );
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            true,
+            0,
+            0,
+        );
+        assert_eq!(up.event, Some(VoiceShortcutEvent::TriggerDictation));
+    }
+
+    #[test]
+    fn shortcuts_are_ignored_when_no_target_window() {
+        let mut state = VoiceShortcutState::default();
+        let down = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            false,
+            HWND_A,
+            0,
+        );
+        assert_eq!(down, VoiceShortcutDecision::pass());
+        assert_eq!(state, VoiceShortcutState::default());
+
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            false,
+            HWND_A,
+            0,
+        );
+        assert_eq!(up, VoiceShortcutDecision::pass());
+    }
+
+    #[test]
+    fn gesture_state_resets_when_focus_leaves_target_mid_hold() {
+        let mut state = VoiceShortcutState::default();
+        handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            true,
+            true,
+            HWND_A,
+            0,
+        );
+        // Hold Alt while focus leaves the target window: keys in between are
+        // all let through, and state resets at Alt up.
+        let other =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Other, true, false, HWND_B, 0);
+        assert_eq!(other, VoiceShortcutDecision::pass());
+        let up = handle_voice_shortcut_key(
+            &mut state,
+            VoiceShortcutKey::Alt(AltSide::Left),
+            false,
+            false,
+            HWND_B,
+            0,
+        );
+        assert_eq!(up, VoiceShortcutDecision::pass());
+        assert_eq!(state, VoiceShortcutState::default());
+    }
+
+    #[test]
+    fn escape_is_not_emitted_without_frontend_state() {
+        let mut state = VoiceShortcutState::default();
+        let escape =
+            handle_voice_shortcut_key(&mut state, VoiceShortcutKey::Escape, true, true, HWND_A, 0);
+        assert_eq!(escape, VoiceShortcutDecision::pass());
+    }
+
+    #[test]
+    fn router_window_whitelist_only_covers_main_and_detached() {
+        assert!(is_voice_shortcut_router_window("main"));
+        assert!(is_voice_shortcut_router_window(
+            "detached-session-0123456789abcdef"
+        ));
+        assert!(is_voice_shortcut_router_window(
+            "detached-persona-fedcba9876543210"
+        ));
+        assert!(!is_voice_shortcut_router_window("pet"));
+        assert!(!is_voice_shortcut_router_window("code-reader"));
+        assert!(!is_voice_shortcut_router_window(
+            "artifact-0123456789abcdef"
+        ));
+        assert!(!is_voice_shortcut_router_window(""));
+    }
+
+    #[test]
+    fn without_recording_routes_to_focused_router_window() {
+        assert_eq!(
+            resolve_trigger_target(None, Some("detached-session-0123456789abcdef")),
+            Some(("detached-session-0123456789abcdef".to_string(), "focused"))
+        );
+    }
+
+    #[test]
+    fn no_recording_and_no_focused_router_window_means_no_emit() {
+        assert_eq!(resolve_trigger_target(None, None), None);
+    }
+
+    /// Issue #840: while a browser tab is open the single-WebView enumeration
+    /// drops the main window, so the cache entry must come from the native
+    /// main handle; browser-tab labels and hwnd-less windows never join.
+    #[test]
+    fn router_hwnd_entries_resolve_main_from_the_native_window_handle() {
+        let entries = router_hwnd_entries(
+            [
+                Some((11, "agent-browser-tab1".to_string())),
+                Some((22, "detached-notes-abc".to_string())),
+                None,
+            ],
+            Some((7, "main".to_string())),
+        );
+        assert_eq!(
+            entries,
+            vec![
+                (22, "detached-notes-abc".to_string()),
+                (7, "main".to_string()),
+            ]
+        );
+    }
+
+    /// Without any tab the enumeration itself carries main; the duplicate is
+    /// dropped so the cache never holds the window twice (the hook matches by
+    /// hwnd, but a doubled entry would make future label-aware consumers see
+    /// the window twice).
+    #[test]
+    fn router_hwnd_entries_ignore_a_stale_enumeration_main() {
+        let entries = router_hwnd_entries(
+            [
+                Some((7, "main".to_string())),
+                Some((22, "detached-notes-abc".to_string())),
+            ],
+            Some((7, "main".to_string())),
+        );
+        assert_eq!(
+            entries,
+            vec![
+                (22, "detached-notes-abc".to_string()),
+                (7, "main".to_string()),
+            ]
+        );
+    }
+
+    /// A missing main window (mid-teardown) leaves only the detached shells
+    /// instead of poisoning the cache with a half entry.
+    #[test]
+    fn router_hwnd_entries_tolerate_a_missing_main_window() {
+        let entries = router_hwnd_entries([Some((22, "detached-notes-abc".to_string()))], None);
+        assert_eq!(entries, vec![(22, "detached-notes-abc".to_string())]);
+    }
+
+    /// Non-router windows (pet, reader, artifacts) are dropped even though
+    /// the enumeration carries them; only main/detached stay routable.
+    #[test]
+    fn router_hwnd_entries_drop_non_router_windows() {
+        let entries = router_hwnd_entries(
+            [
+                Some((31, "pet".to_string())),
+                Some((32, "code-reader".to_string())),
+                Some((33, "artifact-deadbeef".to_string())),
+            ],
+            Some((7, "main".to_string())),
+        );
+        assert_eq!(entries, vec![(7, "main".to_string())]);
+    }
+}

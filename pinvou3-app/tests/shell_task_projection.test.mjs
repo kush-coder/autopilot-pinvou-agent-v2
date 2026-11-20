@@ -1,0 +1,596 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
+
+const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const terminalPath = path.join(appRoot, 'src', 'platform', 'tauri', 'bridge', 'terminal.js');
+const terminalSource = fs.readFileSync(terminalPath, 'utf8');
+
+function createTerminal(initialItems = [], runtime = 'tauri') {
+  const chatItems = structuredClone(initialItems);
+  const windowObject = {
+    __PINVOU_TAURI_BRIDGE_FEATURES__: {},
+    setTimeout,
+  };
+  const scriptContext = vm.createContext({
+    window: windowObject,
+    TextEncoder,
+    console,
+    setTimeout,
+    clearTimeout,
+  });
+  vm.runInContext(fs.readFileSync(path.join(appRoot, 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8'), scriptContext, { filename: 'src/shared/bridge-shared-helpers.js' });
+  vm.runInContext(terminalSource, scriptContext, { filename: terminalPath });
+
+  let notifications = 0;
+  const context = {
+    state: { chatItems, activeSessionId: 'session-current' },
+    notify() { notifications += 1; },
+    invoke: async () => [],
+    bt(key) {
+      if (key === 'shellOutputOmitted') return kind => `${kind} omitted`;
+      if (key === 'shellTaskFinished') return code => `finished: ${code}`;
+      if (key === 'shellUnknownExit') return 'unknown';
+      throw new Error(`unexpected translation key: ${key}`);
+    },
+    runSyncOnSession(_sessionId, callback) { callback(); },
+    addChatItem(item) { chatItems.push(item); },
+  };
+  let terminal;
+  if (runtime === 'web') {
+    const webSource = fs.readFileSync(path.join(appRoot, 'src', 'platform', 'web', 'bridge.js'), 'utf8');
+    const start = webSource.indexOf('  const SHELL_TOOL_NAMES =');
+    // scheduleShellPoll 已随 dedup 移入共享 payload，lane 侧转发函数无缩进
+    let end = webSource.indexOf('  function scheduleShellPoll(', start);
+    if (end === -1) end = webSource.indexOf('\nfunction scheduleShellPoll(', start);
+    assert.ok(start >= 0 && end > start, 'Web shell projection helpers must be present');
+    // shell 投影的实现已随 dead-code dedup 合并进共享 payload 的 sharedBridgeBase（单一共享实现）；
+    // 追加 base 内的函数声明（同名覆盖 lane 转发器），保持被测行为为线上真实代码。
+    // 切片止于 FORWARDER_DEP_NAMES 段之前：该段引用 deps，而本 harness 以自由变量注入依赖。
+    const helpersSrc = fs.readFileSync(path.join(appRoot, 'src', 'shared', 'bridge-shared-helpers.js'), 'utf8');
+    const clusterStart = helpersSrc.indexOf('function sharedBridgeBase(deps)');
+    const clusterEnd = helpersSrc.indexOf('const nestedInterruptedDisplayRange', clusterStart);
+    const clusterBody = helpersSrc.slice(clusterStart, clusterEnd);
+    const fnStart = clusterBody.search(/\n {2}(?:async )?function /);
+    const fnEnd = clusterBody.indexOf('\n  // lane 转发优先');
+    assert.ok(fnStart >= 0 && fnEnd > fnStart, 'payload shared base must contain function bodies');
+    Object.assign(scriptContext, context);
+    // SHELL_TOOL_NAMES 在 payload cluster 内为惰性单元格（body 读 .value），
+    // 这里把 lane 的数组字面量包装成同构的 getter 单元格。
+    // bt 的文案表 BT_TABLE 仍定义在 web/bridge.js 顶层（未参与 dedup），需一并注入。
+  const btStart = webSource.indexOf('  const BT_TABLE = {');
+  assert.ok(btStart !== -1, 'BT_TABLE must exist in web bridge');
+  let btDecl = '';
+  {
+    let depth = 0;
+    let i = webSource.indexOf('{', btStart);
+    while (i < webSource.length) {
+      const ch = webSource[i];
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const q = ch; i++;
+        while (i < webSource.length) { if (webSource[i] === '\\') { i += 2; continue; } if (webSource[i] === q) break; i++; }
+        i++; continue;
+      }
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { btDecl = webSource.slice(btStart, i + 1) + ';'; break; } }
+      i++;
+    }
+    // payload cluster 内 BT_TABLE 以惰性单元格传入（body 读 .value），
+    // 这里把提取出的对象字面量包装成同构的 getter 单元格。
+    const btObj = btDecl.slice(0, -1); // strip trailing ';'
+    btDecl = 'const BT_TABLE = { value: ' + btObj.slice(btObj.indexOf('=') + 1).trim() + ' };';
+  }
+  const extsDecl = webSource.slice(start, end).replace(
+      /^(\s*const\s+SHELL_TOOL_NAMES\s*=\s*)\[([\s\S]*?)\];\s*$/m,
+      (m0, head, body) => `${head}{ value: [${body}] };`,
+    );
+    vm.runInContext(`${btDecl}\n${extsDecl}\n${clusterBody.slice(fnStart, fnEnd)}\nthis.webTerminal = { applyShellSnapshots };`, scriptContext);
+    terminal = scriptContext.webTerminal;
+  } else {
+    terminal = windowObject.__PINVOU_TAURI_BRIDGE_FEATURES__.terminal(context);
+  }
+
+  return { chatItems, terminal, notifications: () => notifications };
+}
+
+function snapshot(overrides = {}) {
+  return {
+    id: 'shell-old',
+    command: 'winget search "BaiduNetdisk"',
+    status: 'failed',
+    exit_code: 1,
+    elapsed_ms: 300,
+    stdout_len: 0,
+    stderr_len: 16,
+    stdout_tail: '',
+    stderr_tail: 'old task failed',
+    ...overrides,
+  };
+}
+
+test('completed historical shell jobs are not inserted into the current timeline', () => {
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'current-wait',
+    name: 'exec_shell_wait',
+    state: 'done',
+    output: '13',
+  }]);
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot()]);
+
+  assert.equal(running, false);
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.notifications(), 0);
+  assert.equal(harness.chatItems.some(item => item.toolId === 'shell-task:shell-old'), false);
+});
+
+test('running detached shell jobs still receive a synthetic status card', () => {
+  const harness = createTerminal();
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    id: 'shell-current',
+    command: '1..100',
+    status: 'running',
+    exit_code: null,
+    stdout_len: 2,
+    stderr_len: 0,
+    stdout_tail: '13',
+    stderr_tail: '',
+  })]);
+
+  assert.equal(running, true);
+  assert.equal(harness.notifications(), 1);
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.chatItems[0].toolId, 'shell-task:shell-current');
+  assert.equal(harness.chatItems[0].taskId, 'shell-current');
+  assert.equal(harness.chatItems[0].state, 'running');
+  assert.equal(harness.chatItems[0].output, '13');
+});
+
+test('completed shell jobs still update their explicitly linked tool card', () => {
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'tool-old',
+    taskId: 'shell-old',
+    name: 'bash',
+    state: 'running',
+    args: { command: 'winget search "BaiduNetdisk"' },
+    output: null,
+  }]);
+
+  harness.terminal.applyShellSnapshots('session-current', [snapshot()]);
+
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.chatItems[0].state, 'failed');
+  assert.equal(harness.chatItems[0].success, false);
+  assert.match(harness.chatItems[0].output, /old task failed/);
+  assert.equal(harness.notifications(), 1);
+});
+
+test('a fast detached job can still appear after its start tool', () => {
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'start-fast-detached',
+    name: 'bash',
+    state: 'done',
+    output: 'running in background',
+  }]);
+
+  harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    id: 'shell-fast-detached',
+    command: 'fast-detached',
+    status: 'completed',
+    exit_code: 0,
+    stdout_tail: 'done fast',
+    stderr_tail: '',
+  })]);
+
+  assert.equal(harness.chatItems.length, 2);
+  assert.equal(harness.chatItems[1].toolId, 'shell-task:shell-fast-detached');
+  assert.equal(harness.chatItems[1].state, 'done');
+  assert.match(harness.chatItems[1].output, /done fast/);
+});
+
+test('the guard is not disarmed by a running job projected in the same poll', () => {
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'current-wait',
+    name: 'exec_shell_wait',
+    state: 'done',
+    output: '13',
+  }]);
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [
+    snapshot({
+      id: 'shell-live',
+      command: 'long task',
+      status: 'running',
+      exit_code: null,
+      stdout_len: 0,
+      stderr_len: 0,
+      stdout_tail: '',
+      stderr_tail: '',
+    }),
+    snapshot(),
+  ]);
+
+  assert.equal(running, true);
+  assert.equal(harness.chatItems.length, 2);
+  assert.equal(harness.chatItems[1].toolId, 'shell-task:shell-live');
+  assert.equal(harness.chatItems[1].state, 'running');
+  assert.equal(harness.chatItems.some(item => item.toolId === 'shell-task:shell-old'), false);
+  assert.equal(harness.notifications(), 1);
+});
+
+test('a replayed legacy Bash action=wait card still arms the guard', () => {
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'bash-wait',
+    name: 'Bash',
+    state: 'done',
+    args: { action: 'wait', task_id: 'task-1' },
+    output: '13',
+  }]);
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot()]);
+
+  assert.equal(running, false);
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.notifications(), 0);
+  assert.equal(harness.chatItems.some(item => item.toolId === 'shell-task:shell-old'), false);
+});
+
+test('a replayed legacy Bash action=run card is a start tool and does not arm the guard', () => {
+  // Accepted limit: the guard stays off behind a start tool, so a very short
+  // detached job whose first snapshot is terminal still gets its card.
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'bash-run',
+    name: 'Bash',
+    state: 'done',
+    args: { action: 'run', command: 'fast-detached' },
+    output: 'running in background',
+  }]);
+
+  harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    id: 'shell-fast-after-run',
+    command: 'fast-detached',
+    status: 'completed',
+    exit_code: 0,
+    stdout_tail: 'done fast',
+    stderr_tail: '',
+  })]);
+
+  assert.equal(harness.chatItems.length, 2);
+  assert.equal(harness.chatItems[1].toolId, 'shell-task:shell-fast-after-run');
+});
+
+test('a brand-new subagent job first seen terminal after an older wait card is conservatively hidden', () => {
+  // The wait-observer guard cannot tell this terminal-first snapshot apart
+  // from retained older work, and the job's own origin card has not rendered
+  // yet, so it stays hidden until that card lands.
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'old-wait',
+    name: 'exec_shell_wait',
+    state: 'done',
+    output: 'ok',
+  }]);
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    id: 'shell-fast-subagent',
+    command: 'echo hi',
+    status: 'completed',
+    exit_code: 0,
+    stdout_tail: 'hi',
+    stderr_tail: '',
+    owner_agent_id: 'agent-secondary',
+  })]);
+
+  assert.equal(running, false);
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.chatItems[0].toolId, 'old-wait');
+  assert.equal(harness.notifications(), 0);
+});
+
+test('runtime origin identity reconciles a completed job at its original tool card', () => {
+  const harness = createTerminal([{
+    type: 'tool',
+    toolId: 'tool-old',
+    name: 'exec_shell',
+    state: 'done',
+    args: { command: 'different rendered command' },
+    output: 'starting',
+  }, {
+    type: 'tool',
+    toolId: 'current-wait',
+    name: 'exec_shell_wait',
+    state: 'done',
+    output: '13',
+  }]);
+
+  harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    origin_tool_call_id: 'tool-old',
+    origin_turn_id: 'turn-old',
+  })]);
+
+  assert.equal(harness.chatItems.length, 2);
+  assert.equal(harness.chatItems[0].taskId, 'shell-old');
+  assert.equal(harness.chatItems[0].originToolCallId, 'tool-old');
+  assert.equal(harness.chatItems[0].originTurnId, 'turn-old');
+  assert.match(harness.chatItems[0].output, /old task failed/);
+  assert.equal(harness.chatItems[1].output, '13');
+});
+
+test('identified running root jobs stay visible when their origin card is not loaded', () => {
+  const harness = createTerminal();
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    status: 'running',
+    exit_code: null,
+    origin_tool_call_id: 'tool-before-compaction',
+    origin_turn_id: 'turn-old',
+  })]);
+
+  assert.equal(running, true);
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.chatItems[0].toolId, 'shell-task:shell-old');
+  assert.equal(harness.chatItems[0].state, 'running');
+  assert.equal(harness.notifications(), 1);
+});
+
+test('identified completed root jobs without their origin card stay out of the current tail', () => {
+  const harness = createTerminal();
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    origin_tool_call_id: 'tool-before-compaction',
+    origin_turn_id: 'turn-old',
+  })]);
+
+  assert.equal(running, false);
+  assert.equal(harness.chatItems.length, 0);
+  assert.equal(harness.notifications(), 0);
+});
+
+test('identified completed subagent jobs without their origin card stay visible', () => {
+  // The origin suppression targets root jobs only: a subagent-owned job with
+  // a missing origin card must keep a live status card like an origin-less
+  // job, because the monitor emission handlers only update existing cards.
+  const harness = createTerminal();
+
+  const running = harness.terminal.applyShellSnapshots('session-current', [snapshot({
+    origin_tool_call_id: 'tool-before-compaction',
+    origin_turn_id: 'turn-old',
+    owner_agent_id: 'agent-secondary',
+  })]);
+
+  assert.equal(running, false);
+  assert.equal(harness.chatItems.length, 1);
+  assert.equal(harness.chatItems[0].toolId, 'shell-task:shell-old');
+  assert.equal(harness.chatItems[0].state, 'failed');
+  assert.equal(harness.chatItems[0].shellStatus, 'failed');
+  assert.equal(harness.notifications(), 1);
+});
+
+for (const runtime of ['tauri', 'web']) {
+  for (const observer of [
+    { name: 'exec_shell_wait' },
+    { name: 'Bash', args: { action: 'wait', task_id: 'observed-task' } },
+  ]) {
+    test(`${runtime}: ${observer.name} wait observer suppresses an unmatched terminal snapshot`, () => {
+      // Include a preceding start card: overlooking the trailing legacy wait
+      // name would incorrectly leave the guard disarmed on the Web bridge.
+      const items = [{
+        type: 'tool', toolId: 'start', name: 'Bash', state: 'done',
+        args: { action: 'run', command: 'different command' }, output: 'started',
+      }, {
+        type: 'tool', toolId: 'wait', state: 'done', output: 'observed', ...observer,
+      }];
+      const harness = createTerminal(items, runtime);
+      assert.equal(harness.terminal.applyShellSnapshots('session-current', [snapshot()]), false);
+      assert.deepEqual(harness.chatItems, items);
+      assert.equal(harness.notifications(), 0);
+    });
+  }
+
+  test(`${runtime}: an existing task binding takes precedence over another origin card`, () => {
+    const origin = {
+      type: 'tool', toolId: 'origin-call', name: 'Bash', state: 'done',
+      args: { action: 'run', command: 'same command' }, output: 'origin output',
+    };
+    const harness = createTerminal([{
+      type: 'tool', toolId: 'bound-call', taskId: 'shell-old', name: 'Bash',
+      state: 'running', args: { action: 'run', command: 'same command' }, output: '',
+    }, origin], runtime);
+    harness.terminal.applyShellSnapshots('session-current', [snapshot({
+      origin_tool_call_id: 'origin-call', command: 'same command',
+    })]);
+    assert.equal(harness.chatItems.length, 2);
+    assert.equal(harness.chatItems[0].toolId, 'bound-call');
+    assert.equal(harness.chatItems[0].state, 'failed');
+    assert.match(harness.chatItems[0].output, /old task failed/);
+    assert.deepEqual(harness.chatItems[1], origin);
+    assert.equal(harness.notifications(), 1);
+  });
+
+  test(`${runtime}: an identified running root job updates its origin card live`, () => {
+    const origin = {
+      type: 'tool', toolId: 'origin-call', name: 'exec_shell', state: 'running',
+      args: { command: 'echo live' }, output: '',
+    };
+    const harness = createTerminal([origin], runtime);
+    const stillRunning = harness.terminal.applyShellSnapshots('session-current', [snapshot({
+      status: 'running', exit_code: null, origin_tool_call_id: 'origin-call',
+      stdout_tail: 'partial output', stderr_tail: '', stdout_len: 14, stderr_len: 0,
+    })]);
+
+    assert.equal(stillRunning, true);
+    assert.equal(harness.chatItems.length, 1);
+    assert.equal(harness.chatItems[0].toolId, 'origin-call');
+    assert.equal(harness.chatItems[0].taskId, 'shell-old');
+    assert.equal(harness.chatItems[0].state, 'running');
+    assert.match(harness.chatItems[0].output, /partial output/);
+    assert.equal(harness.notifications(), 1);
+  });
+
+  test(`${runtime}: a shared origin cannot steal a card bound to another job`, () => {
+    const wrapper = {
+      type: 'tool', toolId: 'wrapper-call', name: 'multi_tool_use.parallel',
+      state: 'running', args: {}, output: '',
+    };
+    const harness = createTerminal([wrapper], runtime);
+    const stillRunning = harness.terminal.applyShellSnapshots('session-current', [
+      snapshot({
+        status: 'running', exit_code: null, origin_tool_call_id: 'wrapper-call',
+        stdout_tail: 'A partial', stderr_tail: '', stdout_len: 9, stderr_len: 0,
+      }),
+      snapshot({ id: 'job-done', origin_tool_call_id: 'wrapper-call', stdout_tail: 'B done', stdout_len: 6 }),
+    ]);
+
+    assert.equal(stillRunning, true);
+    assert.equal(harness.chatItems.length, 1);
+    assert.equal(harness.chatItems[0].taskId, 'shell-old');
+    assert.equal(harness.chatItems[0].state, 'running');
+    assert.match(harness.chatItems[0].output, /A partial/);
+    assert.equal(harness.notifications(), 1);
+  });
+
+  test(`${runtime}: a missing origin cannot adopt a same-command running card`, () => {
+    const current = {
+      type: 'tool', toolId: 'new-call', name: 'exec_shell', state: 'running',
+      args: { command: 'echo repeated' }, output: 'new output',
+    };
+    const harness = createTerminal([current], runtime);
+    const job = snapshot({
+      command: 'echo repeated', status: 'running', exit_code: null,
+      origin_tool_call_id: 'compacted-call', stdout_tail: 'old output', stderr_tail: '',
+      stdout_len: 10, stderr_len: 0,
+    });
+
+    assert.equal(harness.terminal.applyShellSnapshots('session-current', [job]), true);
+    assert.deepEqual(harness.chatItems[0], current);
+    assert.equal(harness.chatItems.length, 2);
+    assert.equal(harness.chatItems[1].toolId, 'shell-task:shell-old');
+
+    harness.terminal.applyShellSnapshots('session-current', [{ ...job, status: 'completed', exit_code: 0 }]);
+    assert.deepEqual(harness.chatItems[0], current);
+    assert.equal(harness.chatItems.length, 2);
+    assert.equal(harness.chatItems[1].state, 'done');
+  });
+
+  test(`${runtime}: a missing origin cannot adopt identical completed output`, () => {
+    const current = {
+      type: 'tool', toolId: 'new-call', name: 'exec_shell', state: 'done',
+      args: { command: 'echo repeated' }, output: 'same output',
+    };
+    const harness = createTerminal([current], runtime);
+    harness.terminal.applyShellSnapshots('session-current', [snapshot({
+      command: 'echo repeated', status: 'completed', exit_code: 0,
+      origin_tool_call_id: 'compacted-call', stdout_tail: 'same output', stderr_tail: '',
+      stdout_len: 11, stderr_len: 0,
+    })]);
+
+    assert.deepEqual(harness.chatItems, [current]);
+    assert.equal(harness.notifications(), 0);
+  });
+
+  test(`${runtime}: origin-less jobs retain running and terminal matching`, () => {
+    for (const status of ['running', 'completed']) {
+      const harness = createTerminal([{
+        type: 'tool', toolId: 'legacy-call', name: 'exec_shell',
+        state: status === 'running' ? 'running' : 'done',
+        args: { command: 'echo repeated' }, output: 'same output',
+      }], runtime);
+      harness.terminal.applyShellSnapshots('session-current', [snapshot({
+        command: 'echo repeated', status, exit_code: status === 'running' ? null : 0,
+        stdout_tail: 'same output', stderr_tail: '',
+        stdout_len: 11, stderr_len: 0,
+      })]);
+
+      assert.equal(harness.chatItems.length, 1);
+      assert.equal(harness.chatItems[0].toolId, 'legacy-call');
+      assert.equal(harness.chatItems[0].taskId, 'shell-old');
+      assert.equal(harness.notifications(), 1);
+    }
+  });
+}
+
+test('the web bridge keeps the same stale-completion guard', () => {
+  // guard 主体已随 dedup 合并进共享 payload 的 sharedBridgeBase（SHELL_TOOL_NAMES /
+  // SHELL_WAIT_TOOL_NAMES 常量仍留在 lane），两侧拼接后与线上行为一致。
+  const helpersWebSrc = fs.readFileSync(
+    path.join(appRoot, 'src', 'shared', 'bridge-shared-helpers.js'),
+    'utf8',
+  );
+  const webBridge = fs.readFileSync(
+    path.join(appRoot, 'src', 'platform', 'web', 'bridge.js'),
+    'utf8',
+  ) + helpersWebSrc.slice(
+    helpersWebSrc.indexOf('function sharedBridgeBase(deps)'),
+    helpersWebSrc.indexOf('"tauriMain"'),
+  );
+  assert.match(
+    webBridge,
+    /if \(!item && !running && suppressUnmatchedTerminal\) return;/,
+  );
+  // The web helper's SHELL_TOOL_NAMES is pinned identical to the shared
+  // shell-tools set (see the parity test below); the explicit union clause
+  // keeps the wait names recognized next to the legacy Bash action=wait lane.
+  assert.match(
+    webBridge,
+    /\(isShellExecutionTool\(item\.name\) \|\| SHELL_WAIT_TOOL_NAMES\.includes\(item\.name\)\)/,
+  );
+  assert.match(
+    webBridge,
+    /const suppressUnmatchedTerminal = latestShellToolIsWaitObserver\(\);/,
+  );
+  // Legacy Bash action=wait recognition must exist on both bridges.
+  assert.match(
+    webBridge,
+    /item\.name === "Bash" && item\.args != null && item\.args\.action === "wait"/,
+  );
+  assert.match(webBridge, /const SHELL_TOOL_NAMES = \["bash",/);
+  assert.match(
+    webBridge,
+    /if \(!item && !running && job\.origin_tool_call_id && !job\.owner_agent_id\) return;/,
+  );
+});
+
+test('the classic bridge copies match shared/shell-tools.mjs', () => {
+  // Both platform bridges ship as verbatim classic <script src> bundles and
+  // cannot import the ESM module, so each keeps a literal copy of the shell
+  // tool-name set. The copies drifted once already (the wait names went
+  // missing from toolSummary); this pins them to the module.
+  const parseLiteral = (source, label) => {
+    const match = source.match(/const SHELL_TOOL_NAMES = \[([^\]]*)\]/);
+    assert.ok(match, `${label} carries a classic SHELL_TOOL_NAMES literal`);
+    return new Set(
+      match[1]
+        .split(',')
+        .map((name) => name.trim().replace(/^["']|["']$/g, ''))
+        .filter(Boolean),
+    );
+  };
+  const moduleSource = fs.readFileSync(
+    path.join(appRoot, 'src', 'shared', 'shell-tools.mjs'),
+    'utf8',
+  );
+  const moduleMatch = moduleSource.match(/SHELL_TOOL_NAMES = new Set\(\[([^\]]*)\]\)/);
+  assert.ok(moduleMatch, 'shared shell-tools carries the canonical literal');
+  const moduleNames = new Set(
+    moduleMatch[1]
+      .split(',')
+      .map((name) => name.trim().replace(/^["']|["']$/g, ''))
+      .filter(Boolean),
+  );
+  const webBridge = fs.readFileSync(
+    path.join(appRoot, 'src', 'platform', 'web', 'bridge.js'),
+    'utf8',
+  );
+  assert.deepEqual(parseLiteral(terminalSource, 'tauri terminal.js'), moduleNames);
+  assert.deepEqual(parseLiteral(webBridge, 'web bridge.js'), moduleNames);
+});

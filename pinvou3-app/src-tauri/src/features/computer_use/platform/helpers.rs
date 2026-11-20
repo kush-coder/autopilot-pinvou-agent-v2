@@ -1,0 +1,1109 @@
+//! Pure helpers shared by the per-OS backends (hoisted in the ninth review
+//! round: the per-platform copies had drifted — Linux truncated names in a
+//! different order, macOS scroll did not clamp, and drag interpolation was
+//! inlined twice). No OS handles here: everything is a plain function so it
+//! stays unit-testable on every target.
+
+use super::super::guard::{self, for_each_folded_window};
+use super::super::types::{ComputerUseError, Key, ScrollDirection};
+use enigo::{Direction, Enigo, Keyboard};
+
+/// Overflow guard on scroll clicks per call: enigo multiplies the click
+/// count by `WHEEL_DELTA` (120) internally, so an unclamped count overflows
+/// i32 (debug panic / release wrap-around). Aliases the tool layer's
+/// `MAX_SCROLL_AMOUNT` parse cap (single value source) — this one only
+/// bounds the backend math. Windows used to clamp here; macOS did not
+/// clamp at all — both go through this now.
+pub(crate) const MAX_SCROLL_CLICKS: u32 = crate::features::computer_use::tool::MAX_SCROLL_AMOUNT;
+
+/// Display bound for a single-line element/node name: one shared cap for the
+/// tool layer's consent labels, the `ui_tree` writers, and the Linux display
+/// names, all feeding [`sanitize_name`].
+pub(crate) const MAX_NAME_CHARS: usize = 80;
+
+/// Per-session cap on apps a virtual-display session may launch through
+/// `open`: launches past the cap are refused with a count-only error on
+/// every stack. The Linux stack counts its live (identity-verified) child
+/// records and prunes dead/unverifiable ones before the gate, so the cap
+/// there applies to LIVE apps only; the Windows and macOS stacks count
+/// total launches this session (their opened apps are not tracked the same
+/// way — Windows hands them to the kill-on-close job, macOS deliberately
+/// lets them outlive the session), so the cap there bounds the session's
+/// whole launch budget.
+pub(crate) const MAX_OPEN_CHILDREN: usize = 32;
+
+/// Wait before a click so the previous move has settled (the target process
+/// consumes mouse move events).
+pub(crate) const CLICK_SETTLE_MS: u64 = 30;
+/// Interval between adjacent clicks of a double/triple click (far below the
+/// system 500ms double-click threshold; enigo maintains clickState
+/// internally and double/triple clicks are recognized from it).
+pub(crate) const MULTI_CLICK_INTERVAL_MS: u64 = 40;
+/// Pause after the drag press and before movement starts, giving the target
+/// window time to enter drag-recognition state.
+pub(crate) const DRAG_PRESS_SETTLE_MS: u64 = 60;
+/// Number of interpolated steps along the drag path (some apps only
+/// recognize a drag after receiving enough motion events).
+pub(crate) const DRAG_STEPS: usize = 8;
+/// Interval between adjacent drag waypoints.
+pub(crate) const DRAG_STEP_DELAY_MS: u64 = 12;
+/// Pause between pressing all keys and releasing them in reverse, improving
+/// the hit rate of modifier chords (cmd/alt+Tab etc.).
+pub(crate) const CHORD_HOLD_MS: u64 = 20;
+/// Granularity of the hold_key sleep: a stop/timeout cancel flag is polled
+/// at least this often, so an abandoned hold stops within this window
+/// instead of the full hold duration.
+pub(crate) const HOLD_CANCEL_POLL_MS: u64 = 100;
+
+/// `ui_tree` defaults/caps: depth and node count (prevents giant trees from
+/// overwhelming the worker thread and the text budget).
+pub(crate) const DEFAULT_TREE_MAX_DEPTH: u32 = 8;
+pub(crate) const DEFAULT_TREE_MAX_NODES: u32 = 400;
+pub(crate) const MAX_TREE_DEPTH: u32 = 24;
+pub(crate) const MAX_TREE_NODES: u32 = 2000;
+
+/// Shared `xcap` error mapping (screenshot/monitor probes on macOS and
+/// Windows): plain `{context}: {err}` wrapping.
+pub(crate) fn map_xcap_err(context: &str, err: xcap::XCapError) -> ComputerUseError {
+    ComputerUseError::failed(format!("{context}: {err}"))
+}
+
+/// Monitor to capture: the one holding the cursor (`Monitor::from_point`);
+/// falls back to the primary monitor, then to the first monitor.
+pub(crate) fn pick_monitor(cursor: Option<(i32, i32)>) -> Result<xcap::Monitor, ComputerUseError> {
+    if let Some((x, y)) = cursor {
+        if let Ok(monitor) = xcap::Monitor::from_point(x, y) {
+            return Ok(monitor);
+        }
+    }
+    let mut monitors =
+        xcap::Monitor::all().map_err(|err| map_xcap_err("cannot enumerate monitors", err))?;
+    if let Some(primary) = monitors
+        .iter()
+        .position(|m| m.is_primary().unwrap_or(false))
+    {
+        return Ok(monitors.swap_remove(primary));
+    }
+    monitors
+        .drain(..)
+        .next()
+        .ok_or_else(|| ComputerUseError::unavailable("no monitor available for screen capture"))
+}
+
+/// Release the pressed keys in reverse; even on a mid-way error, best-effort
+/// release everything and return the first error.
+pub(crate) fn release_reverse(
+    pressed: &[enigo::Key],
+    enigo: &mut Enigo,
+) -> Result<(), enigo::InputError> {
+    let mut first_err = None;
+    for key in pressed.iter().rev() {
+        if let Err(err) = enigo.key(*key, Direction::Release) {
+            if first_err.is_none() {
+                first_err = Some(err);
+            }
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Merge the interpolated-move and button-release results of `drag`. The
+/// release always runs, but `Result::and` kept only the first error: when the
+/// release failed too, callers never learned that the mouse button may still
+/// be pressed. Single-failure cases keep the ORIGINAL error kind: a release
+/// blocked by TCC/UIPI is `unavailable` — the kind drives the `unavailable: `
+/// vs `failed: ` prefix the model reads, so it must survive the
+/// stranded-button annotation (this was a per-platform copy that had drifted:
+/// macOS re-wrapped everything as `failed`, Linux omitted the stranded-button
+/// note in the release-only branch).
+pub(crate) fn combine_drag_errors(
+    move_result: Result<(), ComputerUseError>,
+    release_result: Result<(), ComputerUseError>,
+) -> Result<(), ComputerUseError> {
+    match (move_result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        // Only the path move failed and the release succeeded: report the
+        // move error unchanged.
+        (Err(move_error), Ok(())) => Err(move_error),
+        // The step label is written here rather than assumed to live inside the inner
+        // error: the Windows and Linux backends tag their release errors ("drag
+        // release", "portal NotifyPointerButton"), but the macOS release path returns
+        // bare accessibility/CGEvent errors, so without this the caller cannot tell
+        // which half of the drag failed.
+        (Ok(()), Err(release)) => Err(release.same_kind(format!(
+            "drag release failed ({release}); the mouse button may still be pressed"
+        ))),
+        (Err(move_error), Err(release)) => Err(move_error.same_kind(format!(
+            "drag move failed ({move_error}); its release also failed ({release}); \
+             the mouse button may still be pressed"
+        ))),
+    }
+}
+
+/// Merge the hold and key-release results of `hold_key` — the held-key twin
+/// of [`combine_drag_errors`] (same single-failure pass-through and
+/// kind-preservation rule). The release always runs, but a
+/// `Result::and`-style merge keeps only the FIRST error: a caller cancel plus
+/// a failed release then reported "the keys are released" while the release
+/// had actually failed — stranding keys undisclosed (the drag merge fixed the
+/// same inversion for the mouse button). THE merge for every stack since
+/// R18: the physical X11/Wayland/Windows/macOS hold paths delegate their
+/// cancel-path merge here instead of carrying four drifted inline copies
+/// ("release failed (...); the keys may still be held down").
+pub(crate) fn combine_hold_errors(
+    hold_result: Result<(), ComputerUseError>,
+    release_result: Result<(), ComputerUseError>,
+) -> Result<(), ComputerUseError> {
+    match (hold_result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        // Only the hold was interrupted (caller cancel) and the release
+        // succeeded: the cancel verdict stands, now stating the outcome.
+        (Err(hold_error), Ok(())) => {
+            Err(hold_error.same_kind(format!("{hold_error}; the keys are released")))
+        }
+        // Only the release failed: the stranded-keys warning and the step
+        // label must both surface.
+        (Ok(()), Err(release)) => Err(release.same_kind(format!(
+            "key release failed ({release}); the keys may still be held down"
+        ))),
+        // Both: the cancel fact AND the failed release surface together —
+        // never the false "the keys are released" all-clear.
+        (Err(hold_error), Err(release)) => Err(hold_error.same_kind(format!(
+            "{hold_error}; its key release also failed ({release}); \
+             the keys may still be held down"
+        ))),
+    }
+}
+
+/// Chord key press order shared by the physical macOS backend and the
+/// virtual macOS stack (previously two byte-identical private copies):
+/// modifiers lead (stable order otherwise), so a chord's modifier mask is
+/// complete before the non-modifier keys land.
+pub(crate) fn ordered_chord_keys(keys: &[Key]) -> Vec<Key> {
+    let mut ordered = keys.to_vec();
+    // The modifier set is `Key::is_modifier`'s definition — route through it
+    // so a future modifier variant updates every consumer at once.
+    ordered.sort_by_key(|key| !key.is_modifier());
+    ordered
+}
+
+/// Scroll direction → enigo (axis, signed clicks). enigo convention:
+/// Vertical positive is down / negative up, Horizontal positive is right /
+/// negative left.
+pub(crate) fn map_scroll(direction: ScrollDirection, clicks: u32) -> (enigo::Axis, i32) {
+    let clicks = i32::try_from(clicks.min(MAX_SCROLL_CLICKS)).unwrap_or(i32::MAX);
+    match direction {
+        ScrollDirection::Up => (enigo::Axis::Vertical, -clicks),
+        ScrollDirection::Down => (enigo::Axis::Vertical, clicks),
+        ScrollDirection::Left => (enigo::Axis::Horizontal, -clicks),
+        ScrollDirection::Right => (enigo::Axis::Horizontal, clicks),
+    }
+}
+
+/// Linear interpolation waypoints for a drag (includes the endpoint, excludes
+/// the start) so the target receives enough motion events even when the
+/// compositor coalesces absolute moves.
+pub(crate) fn drag_waypoints(from: (i32, i32), to: (i32, i32), steps: usize) -> Vec<(i32, i32)> {
+    let steps = steps.max(1);
+    (1..=steps)
+        .map(|i| {
+            let t = i as f64 / steps as f64;
+            let x = f64::from(from.0) + f64::from(to.0 - from.0) * t;
+            let y = f64::from(from.1) + f64::from(to.1 - from.1) * t;
+            (x.round() as i32, y.round() as i32)
+        })
+        .collect()
+}
+
+/// Sanitizer for accessible text that is shown to the user or the model:
+/// quotes are straightened, every line-breaking character (newlines, tabs,
+/// C0/C1, and the Unicode line/paragraph separators) folds to a space, bidi
+/// and zero-width formatting characters are dropped, and the result is
+/// truncated and trimmed. Mapping and dropping before truncation is what keeps
+/// the result a single clean line and keeps invisible padding from eating the
+/// display window; the Linux copy used to truncate first, which let a cut
+/// point preserve a line break.
+///
+/// The formatting characters are dropped rather than kept because this text
+/// ends up in the consent dialog's "target element" line: a right-to-left
+/// override (U+202E) in an attacker-controlled `aria-label` renders the label
+/// the user is being asked to trust in reverse, and zero-width characters let
+/// two different controls display identically.
+pub(crate) fn sanitize_name(name: &str, max_chars: usize) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !is_invisible_formatting(*c))
+        .map(|c| {
+            if is_line_breaking(c) {
+                ' '
+            } else if c == '"' {
+                '\''
+            } else {
+                c
+            }
+        })
+        .take(max_chars)
+        .collect();
+    cleaned.trim().to_string()
+}
+
+/// Whether `c` would end a line for some consumer of this text.
+///
+/// `char::is_control` is category Cc only, which misses `U+2028 LINE
+/// SEPARATOR` and `U+2029 PARAGRAPH SEPARATOR` (Zl/Zp) — literally the
+/// Unicode line and paragraph breaks. They pass straight through a Cc-only
+/// test while CSS text layout and JS line splitting both honour them, so a
+/// label carrying one could forge a second `ui_tree` node line or break the
+/// consent dialog's target line in two.
+fn is_line_breaking(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Zero-width and bidi formatting characters: invisible to the user, but they
+/// change how the surrounding text renders. `char::is_control` covers only
+/// category Cc and lets every one of these through.
+///
+/// Kept in step with the matching-side list in `guard::is_invisible_for_matching`
+/// (that one additionally folds whitespace, which display must keep). The
+/// `invisible_lists_stay_in_step` test pins the step by asserting every
+/// enumerated range below appears verbatim in the matching-side list too,
+/// so adding a range to one but not the other reddens. Both sides also
+/// enumerate the same deliberate non-default-ignorable families the matching
+/// side's doc lists (the Arabic/Kaithi/Egyptian number-and-format marks and
+/// the braille blank): they are invisible or blank in isolation, so letting
+/// them reach the consent dialog's target line shows the user a label that
+/// reads as the plain term while the matcher splits differently.
+fn is_invisible_formatting(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{034F}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08E2}'
+        | '\u{115F}'..='\u{1160}'
+        | '\u{17B4}'..='\u{17B5}'
+        | '\u{180B}'..='\u{180F}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2065}'
+        | '\u{2066}'..='\u{2069}'
+        | '\u{206A}'..='\u{206F}'
+        | '\u{2800}'
+        | '\u{3164}'
+        | '\u{2FFC}'..='\u{2FFF}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FEFF}'
+        | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFF8}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// Runs the T3 denylist over the **whole** raw accessible name, in bounded
+/// memory.
+///
+/// [`sanitize_name`] truncates to a short display line, so the denylist must
+/// not be matched against it: a label an attacker controls (an `aria-label`,
+/// a window title) can pad past that window so a consequential term never
+/// reaches the matcher. The previous screening copy raised that window to
+/// 1024 characters and shaped anything longer as head…tail, which left the
+/// evasion intact for the price of ~512 characters of padding on each side of
+/// the term.
+///
+/// This walks the raw text in fixed chunks instead, folding each chunk with
+/// [`fold_for_matching`] and carrying [`T3_MATCH_WINDOW_CHARS`] - 1 folded
+/// characters across the boundary so a term straddling two chunks is still
+/// found. Length therefore no longer buys an evasion, while peak memory stays
+/// proportional to the chunk rather than to the label.
+/// The walk itself is [`guard::for_each_folded_window`], shared with the
+/// password-role screen so a hostile multi-megabyte role buys no
+/// proportional fold there either.
+pub(crate) fn screening_hit(raw: &str) -> bool {
+    for_each_folded_window(raw, guard::matches_t3_denylist_folded)
+}
+
+/// Normalize CR/CRLF line breaks to `'\n'` for typed text, shared by the
+/// per-OS backends (the per-platform copies had drifted: Windows normalized,
+/// Linux folded, macOS injected the raw CR verbatim — where
+/// CGEventKeyboardSetUnicodeString renders it as a line break, so CRLF text
+/// double-broke/double-submitted). Borrowed when there is nothing to
+/// normalize.
+pub(crate) fn normalize_typed_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// The chunk granularity of type injection (in characters): single-event backends (Windows
+/// SendInput batch, macOS CGEvent batch) have no between-event cancellation checkpoint, and
+/// a whole-text `enigo.text()` can legitimately exceed the call budget under low-level
+/// keyboard hooks (AV/anti-keylogger products process each event synchronously) — chunking
+/// plus between-chunk cancellation checks shrink the upper bound of zombie injection after
+/// a caller timeout from the whole text to one chunk (round-12 review M5). A 64-character
+/// chunk is roughly 6s under the slowest reasonable 50ms/event hook, negligible against the
+/// 700s budget.
+pub(crate) const TYPE_CHUNK_CHARS: usize = 64;
+
+/// One segment of a split type request (review finding, Windows: enigo's
+/// `text()` queues BOTH a Return/Tab key click and the Unicode control
+/// character for `'\n'`/`'\t'`, so multi-line text double-injected
+/// newlines on targets that handle both). Newlines and tabs become real key
+/// clicks; everything else stays Unicode text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TypeRun {
+    /// Unicode text (already chunked).
+    Text(String),
+    /// A real Return key click for `'\n'`.
+    Return,
+    /// A real Tab key click for `'\t'`.
+    Tab,
+}
+
+/// Appends the buffered text run to `runs`, chunked into [`TypeRun::Text`] pieces
+/// (shared by the `'\n'`/`'\t'` arms and the trailing flush of [`split_type_runs`]).
+fn push_text_runs(runs: &mut Vec<TypeRun>, buf: &str, chunk_chars: usize) {
+    runs.extend(
+        char_chunks(buf, chunk_chars)
+            .into_iter()
+            .map(|chunk| TypeRun::Text(chunk.to_string())),
+    );
+}
+
+/// Splits a type request into chunked text runs and explicit Return/Tab key
+/// clicks. Chunking applies per text run, so a text with many newlines keeps
+/// the between-run cancellation granularity.
+pub(crate) fn split_type_runs(text: &str, chunk_chars: usize) -> Vec<TypeRun> {
+    debug_assert!(chunk_chars > 0);
+    let mut runs = Vec::new();
+    let mut buf = String::new();
+    for ch in text.chars() {
+        match ch {
+            '\n' => {
+                if !buf.is_empty() {
+                    push_text_runs(&mut runs, &buf, chunk_chars);
+                    buf.clear();
+                }
+                runs.push(TypeRun::Return);
+            }
+            '\t' => {
+                if !buf.is_empty() {
+                    push_text_runs(&mut runs, &buf, chunk_chars);
+                    buf.clear()
+                }
+                runs.push(TypeRun::Tab);
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.is_empty() {
+        push_text_runs(&mut runs, &buf, chunk_chars);
+    }
+    runs
+}
+
+/// The UTF-16 unit budget assumed for one `CGEventKeyboardSetUnicodeString`
+/// call.
+///
+/// Apple documents no length limit, and the event object itself provably
+/// stores far more than 20 units, so the truncation happens somewhere below
+/// the setter and its unit is not specified anywhere. The 20 comes from
+/// enigo's macOS backend, which chunks by `char` for enigo#68 ("truncates
+/// strings down to 20 characters… undocumented").
+///
+/// Counting the budget in UTF-16 units rather than characters is therefore the
+/// conservative reading of an underspecified limit, not a documented fact: a
+/// chunk of ≤20 UTF-16 units is also ≤20 characters, so it satisfies enigo's
+/// bound either way, while a `char`-counted chunk does *not* satisfy a
+/// unit-counted one — 20 emoji are 40 units, and if the real cap is in units
+/// the OS keeps half and can cut inside a surrogate pair, with `type` still
+/// returning `Ok`.
+///
+/// Note this bounds truncation only. Chunking still splits grapheme clusters:
+/// a ZWJ sequence, a flag or a combining mark straddling a chunk boundary
+/// arrives as two separate events and can render differently from what was
+/// requested.
+#[cfg(target_os = "macos")]
+pub(crate) const MACOS_UNICODE_STRING_UTF16_UNITS: usize = 20;
+
+/// Splits `text` so every chunk fits in `max_units` UTF-16 units, cutting only
+/// on character boundaries.
+///
+/// Because a chunk of at most `max_units` UTF-16 units also has at most
+/// `max_units` characters, a consumer that re-chunks by `char` at the same
+/// bound (as enigo does) emits each chunk whole.
+#[cfg(target_os = "macos")]
+pub(crate) fn utf16_chunks(text: &str, max_units: usize) -> Vec<&str> {
+    debug_assert!(max_units >= 2, "a single character can be two UTF-16 units");
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut units = 0usize;
+    for (index, character) in text.char_indices() {
+        let width = character.len_utf16();
+        if units + width > max_units && index > start {
+            chunks.push(&text[start..index]);
+            start = index;
+            units = 0;
+        }
+        units += width;
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
+pub(crate) fn char_chunks(text: &str, chunk_chars: usize) -> Vec<&str> {
+    debug_assert!(chunk_chars > 0);
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut count = 0usize;
+    for (index, _) in text.char_indices() {
+        if count == chunk_chars {
+            chunks.push(&text[start..index]);
+            start = index;
+            count = 0;
+        }
+        count += 1;
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
+/// Debug-escape model-supplied text for a log line (the redaction
+/// contract): a control character in the text — a `\n` above all — would
+/// otherwise forge subsequent log lines. `{:?}` on `&str` escapes exactly
+/// that class. Every log site that renders a model-supplied or recorded
+/// program name routes through this helper so the property has one
+/// audited home; each stack's test module additionally pins its own
+/// source against a plain-format revert (R11 M2: the R9/R10 `{:?}` sites
+/// had no pin at all, so the revert passed the whole suite).
+pub(crate) fn logged_program(text: &str) -> String {
+    format!("{text:?}")
+}
+
+/// The `open` capacity decision shared by all three stacks: `true` when a
+/// session at `count` recorded/launched apps must refuse the next launch.
+/// Extracted (R11) so the cap semantic has one pinned home — the Linux
+/// gate prunes dead records before the count, the Windows/macOS gates
+/// count lifetime launches, and both feed the same decision here.
+pub(crate) fn open_capacity_rejected(count: usize) -> bool {
+    count >= MAX_OPEN_CHILDREN
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use guard::FOLD_CHUNK_CHARS;
+
+    /// A move-failure sample for [`combine_drag_errors`].
+    fn failed_move() -> ComputerUseError {
+        ComputerUseError::failed("move aborted")
+    }
+
+    /// A release-failure sample for [`combine_drag_errors`] (map_input_err-style context).
+    fn failed_release() -> ComputerUseError {
+        ComputerUseError::failed("drag release: injected 0/1 events")
+    }
+
+    /// Lives here rather than in `windows.rs` so every target runs it: the merge is
+    /// shared by all three backends, and the kind-preservation contract below is
+    /// specifically about the macOS path (accessibility revoked mid-drag).
+    #[test]
+    fn drag_error_merging_surfaces_stranded_button() {
+        // Both succeed: nothing to merge.
+        assert!(combine_drag_errors(Ok(()), Ok(())).is_ok());
+        // Only the move failed: the move error passes through unchanged.
+        assert_eq!(
+            combine_drag_errors(Err(failed_move()), Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "failed: move aborted"
+        );
+        // Only the release failed: the stranded-button warning and the step label
+        // must both surface, so the caller can tell which half of the drag failed.
+        let only_release = combine_drag_errors(Ok(()), Err(failed_release()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            only_release.contains("the mouse button may still be pressed"),
+            "{only_release}"
+        );
+        assert!(
+            only_release.contains("drag release failed"),
+            "{only_release}"
+        );
+        // Both fail: the move failure AND the stranded-button warning must both be
+        // present (`result.and(release)` used to drop the latter).
+        let both = combine_drag_errors(Err(failed_move()), Err(failed_release()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            both.contains("drag move failed (failed: move aborted)"),
+            "{both}"
+        );
+        assert!(both.contains("its release also failed"), "{both}");
+        assert!(
+            both.contains("the mouse button may still be pressed"),
+            "{both}"
+        );
+    }
+
+    /// The reason the per-platform copies were unified: macOS re-wrapped every
+    /// teardown failure as `failed`, destroying the `Unavailable` classification that
+    /// "regrant accessibility / run elevated" handling keys on. Annotating the
+    /// stranded button must not change the error kind.
+    #[test]
+    fn drag_error_merging_preserves_the_unavailable_kind() {
+        let denied = || ComputerUseError::unavailable("accessibility_denied");
+
+        let release_only = combine_drag_errors(Ok(()), Err(denied())).unwrap_err();
+        assert!(
+            matches!(release_only, ComputerUseError::Unavailable { .. }),
+            "a release blocked by TCC/UIPI must stay Unavailable, got {release_only}"
+        );
+        assert!(
+            release_only
+                .to_string()
+                .contains("the mouse button may still be pressed"),
+            "{release_only}"
+        );
+
+        // Both failed: the merged error takes the MOVE error's kind.
+        let both = combine_drag_errors(Err(denied()), Err(failed_release())).unwrap_err();
+        assert!(
+            matches!(both, ComputerUseError::Unavailable { .. }),
+            "the merged error must keep the move error's kind, got {both}"
+        );
+
+        // A move-only failure is returned verbatim, kind included.
+        let move_only = combine_drag_errors(Err(denied()), Ok(())).unwrap_err();
+        assert!(matches!(move_only, ComputerUseError::Unavailable { .. }));
+    }
+
+    /// A hold-interrupt (caller cancel) sample for [`combine_hold_errors`].
+    fn cancelled_hold() -> ComputerUseError {
+        ComputerUseError::unavailable("hold_key was cancelled (caller timeout or stop)")
+    }
+
+    /// A key-release-failure sample for [`combine_hold_errors`].
+    fn failed_key_release() -> ComputerUseError {
+        ComputerUseError::failed("keyup: injected 0/1 events")
+    }
+
+    /// Lives here rather than in one backend so every target runs it (same
+    /// rule as the drag merge pin): a `Result::and` merge kept the FIRST
+    /// error, so a cancel plus a failed release reported "the keys are
+    /// released" and swallowed the release failure — keys could stay held
+    /// down undisclosed. Precedence pin: BOTH facts surface, and the false
+    /// all-clear never does.
+    #[test]
+    fn hold_error_merging_surfaces_stranded_keys() {
+        // Both succeed: nothing to merge.
+        assert!(combine_hold_errors(Ok(()), Ok(())).is_ok());
+        // Cancel + clean release: the cancel verdict now states the outcome.
+        let cancelled = combine_hold_errors(Err(cancelled_hold()), Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(cancelled.contains("hold_key was cancelled"), "{cancelled}");
+        assert!(cancelled.contains("the keys are released"), "{cancelled}");
+        // Release-only failure: the stranded-keys warning and the step label
+        // must both surface.
+        let release_only = combine_hold_errors(Ok(()), Err(failed_key_release()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            release_only.contains("key release failed"),
+            "{release_only}"
+        );
+        assert!(
+            release_only.contains("the keys may still be held down"),
+            "{release_only}"
+        );
+        // Both fail: the cancel fact AND the failed release surface together.
+        let both = combine_hold_errors(Err(cancelled_hold()), Err(failed_key_release()))
+            .unwrap_err()
+            .to_string();
+        assert!(both.contains("hold_key was cancelled"), "{both}");
+        assert!(both.contains("its key release also failed"), "{both}");
+        assert!(both.contains("the keys may still be held down"), "{both}");
+        assert!(
+            !both.contains("the keys are released"),
+            "the false all-clear must not appear when the release failed: {both}"
+        );
+    }
+
+    /// Kind preservation for the held-key merge (the cancel verdict is
+    /// `Unavailable` — category-based upstream handling keys on it; a release
+    /// failure carries its own kind through untouched).
+    #[test]
+    fn hold_error_merging_preserves_the_unavailable_kind() {
+        let merged =
+            combine_hold_errors(Err(cancelled_hold()), Err(failed_key_release())).unwrap_err();
+        assert!(
+            matches!(merged, ComputerUseError::Unavailable { .. }),
+            "the merged error must keep the cancel verdict's kind, got {merged}"
+        );
+        let release_only =
+            combine_hold_errors(Ok(()), Err(ComputerUseError::unavailable("portal died")))
+                .unwrap_err();
+        assert!(
+            matches!(release_only, ComputerUseError::Unavailable { .. }),
+            "a release failure's own kind must survive, got {release_only}"
+        );
+        assert!(
+            release_only
+                .to_string()
+                .contains("the keys may still be held down"),
+            "{release_only}"
+        );
+    }
+
+    #[test]
+    fn drag_waypoints_interpolates_and_excludes_start() {
+        let pts = drag_waypoints((0, 0), (100, 50), 4);
+        assert_eq!(pts, vec![(25, 13), (50, 25), (75, 38), (100, 50)]);
+        assert_eq!(drag_waypoints((7, 7), (9, 9), 0).len(), 1);
+        assert_eq!(drag_waypoints((7, 7), (9, 9), 0)[0], (9, 9));
+    }
+
+    #[test]
+    fn map_scroll_clamps_and_signs() {
+        assert_eq!(
+            map_scroll(ScrollDirection::Up, 3),
+            (enigo::Axis::Vertical, -3)
+        );
+        assert_eq!(
+            map_scroll(ScrollDirection::Right, 3),
+            (enigo::Axis::Horizontal, 3)
+        );
+        assert_eq!(
+            map_scroll(ScrollDirection::Down, 1_000),
+            (enigo::Axis::Vertical, MAX_SCROLL_CLICKS as i32)
+        );
+    }
+
+    #[test]
+    fn sanitize_name_folds_controls_and_trims() {
+        assert_eq!(sanitize_name("a\"b\nc\td\u{1}e ", 20), "a'b c d e");
+        assert_eq!(sanitize_name("abcdef", 3), "abc");
+        assert_eq!(sanitize_name("  \n x", 10), "x");
+    }
+
+    #[test]
+    fn split_type_runs_extracts_real_keys_and_chunks_text() {
+        use TypeRun::*;
+        assert!(split_type_runs("", 4).is_empty());
+        assert_eq!(split_type_runs("abc", 4), vec![Text("abc".into())]);
+        // Multi-line: each newline becomes a Return click; text around it is
+        // preserved (an empty trailing segment adds nothing, so "a\n" still
+        // submits the "a" line).
+        assert_eq!(
+            split_type_runs("a\nb\n", 8),
+            vec![Text("a".into()), Return, Text("b".into()), Return]
+        );
+        // Tabs split too.
+        assert_eq!(
+            split_type_runs("x\ty", 8),
+            vec![Text("x".into()), Tab, Text("y".into())]
+        );
+        // Chunking applies per run, not across key clicks.
+        assert_eq!(
+            split_type_runs("abcd\nef", 2),
+            vec![
+                Text("ab".into()),
+                Text("cd".into()),
+                Return,
+                Text("ef".into())
+            ]
+        );
+        // Unicode content survives the split on char boundaries.
+        assert_eq!(
+            split_type_runs("中文\n测试", 2),
+            vec![Text("中文".into()), Return, Text("测试".into())]
+        );
+    }
+
+    #[test]
+    fn normalize_typed_newlines_maps_cr_and_crlf() {
+        // Borrowed when there is no CR.
+        let plain = "abc";
+        let borrowed = normalize_typed_newlines(plain);
+        assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(borrowed.as_ref(), "abc");
+        // CRLF collapses to one '\n' (not two).
+        assert_eq!(normalize_typed_newlines("a\r\nb").as_ref(), "a\nb");
+        // Lone CR maps too.
+        assert_eq!(normalize_typed_newlines("a\rb").as_ref(), "a\nb");
+        // Mixed forms all normalize.
+        assert_eq!(
+            normalize_typed_newlines("a\r\nb\rc\nd").as_ref(),
+            "a\nb\nc\nd"
+        );
+    }
+
+    #[test]
+    fn char_chunks_splits_on_char_boundaries() {
+        assert!(char_chunks("", 4).is_empty());
+        assert_eq!(char_chunks("ab", 4), vec!["ab"]);
+        assert_eq!(char_chunks("abcd", 2), vec!["ab", "cd"]);
+        assert_eq!(char_chunks("abcde", 2), vec!["ab", "cd", "e"]);
+        // Multi-byte characters must not be split: a 3-character chunk is equally safe for
+        // 4-byte CJK.
+        assert_eq!(char_chunks("中文测试", 3), vec!["中文测", "试"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn utf16_chunks_bound_the_unicode_string_budget() {
+        // BMP text: identical to character chunking.
+        assert_eq!(utf16_chunks("abcd", 2), vec!["ab", "cd"]);
+        assert!(utf16_chunks("", 20).is_empty());
+        // Non-BMP: each emoji is two UTF-16 units, so a 20-unit budget takes
+        // ten of them per chunk — the case that used to lose half the text.
+        let emoji = "\u{1F600}".repeat(25);
+        let chunks = utf16_chunks(&emoji, MACOS_UNICODE_STRING_UTF16_UNITS);
+        assert_eq!(chunks.len(), 3);
+        for chunk in &chunks {
+            let units: usize = chunk.chars().map(char::len_utf16).sum();
+            assert!(
+                units <= MACOS_UNICODE_STRING_UTF16_UNITS,
+                "chunk over budget: {units}"
+            );
+            // A chunk within the UTF-16 budget is also within the character
+            // budget, so a consumer re-chunking by char emits it whole.
+            assert!(chunk.chars().count() <= MACOS_UNICODE_STRING_UTF16_UNITS);
+        }
+        assert_eq!(chunks.concat(), emoji, "no character may be dropped");
+        // Mixed content still splits only on character boundaries.
+        let mixed = "ab\u{1F600}cd\u{1F600}";
+        assert_eq!(utf16_chunks(mixed, 4).concat(), mixed);
+    }
+
+    #[test]
+    fn sanitize_name_drops_bidi_and_zero_width_characters() {
+        // These survive `char::is_control` (category Cc only) and reach the
+        // consent dialog's target line, where a right-to-left override
+        // reverses the very label the user is being asked to trust.
+        assert_eq!(
+            sanitize_name("Cancel \u{202E}drawhtiw", 80),
+            "Cancel drawhtiw"
+        );
+        assert_eq!(sanitize_name("De\u{200B}lete", 80), "Delete");
+        assert_eq!(sanitize_name("D\u{00AD}elete", 80), "Delete");
+        // The rest of the default-ignorable families: all render as nothing,
+        // all used to survive. The Tag block in particular is the canonical
+        // invisible-text carrier. The U+206A/U+FFF0-class and U+070F
+        // members are pinned behaviorally here (not only by the source-level
+        // step test) because the round-3 mutation check showed the sanitize
+        // suite stayed green under a display-side range removal.
+        for invisible in [
+            '\u{034F}',
+            '\u{070F}',
+            '\u{0600}',
+            '\u{06DD}',
+            '\u{0890}',
+            '\u{0891}',
+            '\u{08E2}',
+            '\u{110BD}',
+            '\u{110CD}',
+            '\u{13430}',
+            '\u{2800}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{180B}',
+            '\u{2065}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{FFA0}',
+            '\u{FFF0}',
+            '\u{FFF8}',
+            '\u{FFF9}',
+            '\u{1BCA0}',
+            '\u{1D173}',
+            '\u{E0001}',
+            '\u{E0041}',
+        ] {
+            assert_eq!(
+                sanitize_name(&format!("De{invisible}lete"), 80),
+                "Delete",
+                "U+{:04X} must not survive into a consent label",
+                invisible as u32
+            );
+        }
+        // U+2028/U+2029 are Zl/Zp, not Cc, so `char::is_control` misses them —
+        // yet they are the Unicode line and paragraph breaks and would split
+        // the one-node-per-line tree format and the dialog's target line.
+        assert_eq!(sanitize_name("a\u{2028}b", 80), "a b");
+        assert_eq!(sanitize_name("a\u{2029}b", 80), "a b");
+        // Invisible padding must not consume the display window either: the
+        // drop happens before the truncation.
+        assert_eq!(
+            sanitize_name(&format!("{}Pay now", "\u{200B}".repeat(500)), 80),
+            "Pay now"
+        );
+        // Ordinary text and the existing control folding are unchanged.
+        assert_eq!(sanitize_name("a\0b\tc", 80), "a b c");
+        assert_eq!(sanitize_name("say \"hi\"", 80), "say 'hi'");
+    }
+
+    #[test]
+    fn screening_hit_decides_short_names() {
+        assert!(screening_hit("Pay now"));
+        assert!(screening_hit("  Buy\nnow "));
+        assert!(!screening_hit("Open settings"));
+        assert!(!screening_hit(""));
+    }
+
+    #[test]
+    fn greek_rho_gamma_words_are_the_accepted_false_positive_cost() {
+        // The ρ→p and γ→y arms are both UTS#39-required (paγ/buγ must not
+        // screen Clear), and together they fold common παραγ- / πραγ-
+        // stems onto `pay`. That cost is accepted and disclosed at the
+        // fold (same class as the Cyrillic `Раунд` note): this pin holds
+        // the class visible, so an arm change that silently removes it —
+        // or an arm added without checking it — surfaces here.
+        for label in [
+            "αναπαραγωγή", // playback — the standard media Play button
+            "παραγγελία",  // order
+            "παραγωγή",    // production / output
+        ] {
+            assert!(
+                screening_hit(label),
+                "{label} is the disclosed Greek false-positive class"
+            );
+        }
+        // The nearby Greek vocabulary that must stay Clear: an accented ά
+        // between the ρ and the γ decomposes to α + a combining mark that
+        // splits the reconstructed `pay` (πράγμα), and the stems without a
+        // rho-gamma adjacency never build a term.
+        assert!(!screening_hit("αποδοχή"));
+        assert!(!screening_hit("ακύρωση"));
+        assert!(!screening_hit("πράγμα"));
+    }
+
+    #[test]
+    fn screening_hit_survives_display_truncation_padding() {
+        // The attack shape: an attacker-controlled label pads past the
+        // 80-char display window so a consequential term never reaches the
+        // matcher ("AAAA…A Pay now").
+        let raw = format!("{} Pay now", "A".repeat(200));
+        let display = sanitize_name(&raw, 80);
+        assert_eq!(display.chars().count(), 80);
+        assert!(
+            !display.contains("Pay now"),
+            "display must truncate: {display}"
+        );
+        assert!(screening_hit(&raw), "the raw label must still be screened");
+    }
+
+    #[test]
+    fn screening_hit_ignores_label_length() {
+        // The evasion the previous head…tail screening copy left open: with
+        // ~512 characters of padding on each side, the term fell into the
+        // elided middle and the label screened Clear. Length must buy nothing.
+        for pad in [600usize, 4000, 20_000] {
+            let raw = format!("{}Delete{}", "x".repeat(pad), "y".repeat(pad));
+            assert!(screening_hit(&raw), "padding {pad} must not hide the term");
+        }
+    }
+
+    #[test]
+    fn screening_hit_finds_terms_across_chunk_boundaries() {
+        // The streaming matcher folds [`FOLD_CHUNK_CHARS`] raw characters at a
+        // time; a term straddling that boundary is only found because the
+        // carry keeps the tail of the previous chunk. The shared constant
+        // keeps this probe pinned to the real chunk size.
+        for offset in 0.."Delete".len() {
+            let raw = format!("{}Delete", "x".repeat(FOLD_CHUNK_CHARS - offset));
+            assert!(screening_hit(&raw), "term split at offset {offset}");
+        }
+        // Just past the first boundary, at the carry edge: the term must
+        // still be found through the second window.
+        let raw = format!("{}Delete", "x".repeat(FOLD_CHUNK_CHARS + 20));
+        assert!(screening_hit(&raw), "term in the second window");
+        // The same boundary with the LONGEST shipped term, at its deepest
+        // legal straddle: term_len - 1 of its chars land in the previous
+        // chunk, which is exactly the carry the window constant must cover
+        // (`T3_MATCH_WINDOW_CHARS - 1 >= longest - 1`). A short probe cannot
+        // see the constant shrink (every "Delete" straddle fits a 7-char
+        // carry too), while this one reddens the moment the carry drops
+        // below the longest term.
+        let longest = guard::T3_DENYLIST
+            .iter()
+            .max_by_key(|term| term.chars().count())
+            .expect("the denylist is non-empty");
+        let longest_len = longest.chars().count();
+        let raw = format!(
+            "{}{longest}",
+            "x".repeat(FOLD_CHUNK_CHARS - (longest_len - 1))
+        );
+        assert!(
+            screening_hit(&raw),
+            "longest term split at its deepest straddle"
+        );
+    }
+
+    #[test]
+    fn screening_hit_composes_across_the_chunk_boundary() {
+        // NFC composition is applied per chunk, so a base character and the
+        // mark that completes it must not be separated by the
+        // [`FOLD_CHUNK_CHARS`] split: ゴ is the only denylist-term character
+        // with a multi-char decomposition, and only the exact straddle used
+        // to miss it — the seam landing between ｺ and its voiced mark —
+        // while both neighbors hit. The walker re-feeds the previous chunk's
+        // raw tail so the pair composes.
+        let build = |filler_chars: usize| {
+            let mut raw = "a".repeat(filler_chars);
+            raw.push('ｺ');
+            raw.push('\u{FF9E}');
+            raw.push_str("ミ箱");
+            raw
+        };
+        for filler_chars in [FOLD_CHUNK_CHARS - 1, FOLD_CHUNK_CHARS, FOLD_CHUNK_CHARS + 1] {
+            assert!(
+                screening_hit(&build(filler_chars)),
+                "ｺ+U+FF9E must compose to ゴ across the seam at {filler_chars}"
+            );
+        }
+        // The precomposed-pair variant: コ + U+3099 composes the same way.
+        let mut raw = "a".repeat(FOLD_CHUNK_CHARS - 1);
+        raw.push('コ');
+        raw.push('\u{3099}');
+        raw.push_str("ミ箱");
+        assert!(
+            screening_hit(&raw),
+            "コ+U+3099 must compose across the seam"
+        );
+    }
+
+    #[test]
+    fn screening_hit_composes_across_an_invisible_gap() {
+        // The seam composition pair is adjacent in the FOLDED stream, so the
+        // raw characters between the starter (ｺ) and its voiced mark fold
+        // away — a pure invisible run of any length. A verbatim raw tail
+        // holds invisible padding instead of the starter once the run pushes
+        // ｺ past the re-fed window, and the whole-string fold still composes
+        // ゴミ箱: the smallest divergence is exactly one invisible character
+        // more than the tail holds. The seam must reach past the run.
+        for tail_back in [8usize, 9, 12, 30] {
+            for (gap, label) in [
+                ("\u{200B}".repeat(tail_back), "zero-width"),
+                (" ".repeat(tail_back), "whitespace"),
+            ] {
+                let mut raw = "a".repeat(FOLD_CHUNK_CHARS - 1 - tail_back);
+                raw.push('ｺ');
+                raw.push_str(&gap);
+                raw.push('\u{FF9E}');
+                raw.push_str("ミ箱");
+                assert!(
+                    screening_hit(&raw),
+                    "ｺ {tail_back} back with a {label} gap spanning the boundary must compose"
+                );
+            }
+        }
+        // The starter one whole chunk before the mark: an all-invisible
+        // middle chunk must not evict the tail (the pair still composes).
+        let mut raw = "a".repeat(FOLD_CHUNK_CHARS - 1);
+        raw.push('ｺ');
+        raw.push_str(&"\u{200B}".repeat(FOLD_CHUNK_CHARS));
+        raw.push('\u{FF9E}');
+        raw.push_str("ミ箱");
+        assert!(
+            screening_hit(&raw),
+            "ｺ + all-invisible chunk + ﾞミ箱 must compose across two boundaries"
+        );
+    }
+
+    #[test]
+    fn screening_hit_composes_when_the_mark_closes_its_own_chunk() {
+        // The invisible run ends AT a chunk boundary and the voiced mark is
+        // the only fold-kept character of its chunk, so the mark itself
+        // becomes the tail — the round-10 no-evict guard does not fire (the
+        // chunk is not empty), and the term's continuation sits in the NEXT
+        // chunk. The boundary after the mark re-folds `mark | ミ箱`, so the
+        // tail must still hold the starter from two chunks back: whole-string
+        // fold composes ゴミ箱 while a per-chunk tail folds
+        // コ | ﾞ | ﾞミ箱 and no window ever holds the pair together with the
+        // continuation.
+        for shift in [0usize, 1, 7] {
+            let mut raw = "a".repeat(FOLD_CHUNK_CHARS - 1 - shift);
+            raw.push('ｺ');
+            raw.push_str(&"\u{200B}".repeat(FOLD_CHUNK_CHARS - 1 + shift));
+            raw.push('\u{FF9E}');
+            raw.push_str("ミ箱");
+            assert!(
+                screening_hit(&raw),
+                "ｺ closing the previous chunk with ﾞ closing its own must compose (shift {shift})"
+            );
+        }
+    }
+
+    #[test]
+    fn screening_hit_sees_through_invisible_and_confusable_characters() {
+        // Every one of these rendered identically to the user and screened
+        // Clear under the previous plain `to_lowercase().contains()` match.
+        assert!(screening_hit("De\u{200B}lete"), "zero-width space");
+        assert!(screening_hit("D\u{00AD}elete"), "soft hyphen");
+        assert!(screening_hit("\u{202E}Delete"), "bidi override");
+        assert!(screening_hit("Ｄｅｌｅｔｅ"), "fullwidth");
+        assert!(screening_hit("Pаy now"), "Cyrillic a");
+        assert!(screening_hit("支 付"), "space-split CJK");
+        // The inverse hole: folding a C0 character to a space used to split a
+        // term that the matcher would otherwise have found.
+        assert!(screening_hit("D\u{0001}elete"), "C0 inside the term");
+    }
+
+    /// Mutation pin (R11 M2): `logged_program` is the ONE rendering path
+    /// for model-supplied/recorded program names in the logs — a plain
+    /// `{}` (or any unescaped rendering) would let a control character in
+    /// the name forge subsequent log lines. Reverting the helper's `{:?}`
+    /// to `{}` must fail here.
+    #[test]
+    fn logged_program_escapes_log_forgery_characters() {
+        let hostile = "p\n[computer_use] virtual display: swept orphan session dir /tmp/x";
+        let rendered = logged_program(hostile);
+        assert!(
+            !rendered.contains('\n'),
+            "a newline must never render raw in a log line: {rendered:?}"
+        );
+        assert_eq!(
+            rendered, "\"p\\n[computer_use] virtual display: swept orphan session dir /tmp/x\"",
+            "the escaping must be the Debug shape every call site has shipped"
+        );
+        // The plain shape (the mutation target) renders the raw text — the
+        // helper's output must differ from it for a control-character name.
+        assert_ne!(rendered, hostile);
+    }
+
+    /// Mutation pin (R11 minor): the `open` capacity semantic has one home.
+    /// The boundary is inclusive at the cap (the 32nd launch is accepted,
+    /// the 33rd refused — the Linux fixture and the Windows/macOS gates all
+    /// lean on this exact shape), so an off-by-one or a silently raised cap
+    /// must fail here.
+    #[test]
+    fn open_capacity_rejects_at_the_cap_and_passes_below() {
+        assert!(!open_capacity_rejected(0));
+        assert!(!open_capacity_rejected(MAX_OPEN_CHILDREN - 1));
+        assert!(open_capacity_rejected(MAX_OPEN_CHILDREN));
+        assert!(open_capacity_rejected(MAX_OPEN_CHILDREN + 1));
+    }
+}

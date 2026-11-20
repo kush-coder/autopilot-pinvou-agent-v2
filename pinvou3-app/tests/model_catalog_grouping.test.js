@@ -1,0 +1,1767 @@
+#!/usr/bin/env node
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const srcPath = path.join(__dirname, '..', 'src', 'features', 'settings', 'model-catalog.js');
+let code = fs.readFileSync(srcPath, 'utf8');
+// 剥离 ESM 关键字(与 composer_tool_menu_logic.test.js 同款)
+code = code.replace(/\bexport\s+\{[^}]+\};?/g, '').replace(/\bexport\s+/g, '');
+// 剥离 asset 导入(SVG/PNG)与副作用导入(Node 无法解析,函数体不依赖它们)
+code = code.replace(/import\s+[^;]*from\s+['"][^'"]*\/brand-icons\/[^'"]+['"];?/g, '');
+code = code.replace(/import\s+['"]\.\/settings-i18n\.js['"];?/g, '');
+// 剥离模块级图标映射(BRAND_ICON_BY_PRESET/VENDOR):其 import 已剥离,但对象字面量仍在模块顶层
+// 引用这些标识符,会在 vm 求值时抛 "deepseekIcon is not defined"。被测函数不依赖图标映射。
+code = code.replace(/const\s+BRAND_ICON_BY_(?:PRESET|VENDOR)\s*=\s*\{[\s\S]*?\};?/g, '');
+
+const ctx = { console, URL };
+vm.createContext(ctx);
+vm.runInContext(
+  `${code}\n` +
+  `this.isPresetModel = isPresetModel;\n` +
+  `this.catalogItemMatchesModel = catalogItemMatchesModel;\n` +
+  `this.groupModelsForSelector = groupModelsForSelector;\n` +
+  `this.localUserNamed = localUserNamed;\n` +
+  `this.selectorMainLabel = selectorMainLabel;\n` +
+  `this.selectorSubLabel = selectorSubLabel;\n` +
+  `this.MODEL_CATALOG = MODEL_CATALOG;\n` +
+  `this.MODEL_PRESET_DEFS = MODEL_PRESET_DEFS;\n` +
+  `this.findCloudProviderForModel = findCloudProviderForModel;\n` +
+  `this.providerLabelForModel = providerLabelForModel;\n` +
+  `this.reasoningEffortTiersForModel = reasoningEffortTiersForModel;\n` +
+  `this.defaultReasoningEffortForModel = defaultReasoningEffortForModel;\n` +
+  `this.reasoningEffortForModelSwitch = reasoningEffortForModelSwitch;\n` +
+  `this.normalizeStoredReasoningEffort = normalizeStoredReasoningEffort;\n` +
+  `this.baseUrlUsesLoopback = baseUrlUsesLoopback;\n` +
+  `this.baseUrlUsesLocalOrPrivate = baseUrlUsesLocalOrPrivate;\n` +
+  `this.localProbeTiersForKind = localProbeTiersForKind;\n` +
+  `this.alwaysThinkingSpecForModel = alwaysThinkingSpecForModel;\n` +
+  `this.localReasoningTiers = localReasoningTiers;\n` +
+  `this.reasoningEffortDisplayForTiers = reasoningEffortDisplayForTiers;\n` +
+  `this.catalogImageCapableForModel = catalogImageCapableForModel;\n`,
+  ctx,
+  { filename: srcPath },
+);
+
+const { isPresetModel, catalogItemMatchesModel, MODEL_CATALOG, MODEL_PRESET_DEFS, groupModelsForSelector, localUserNamed, selectorMainLabel, selectorSubLabel, providerLabelForModel, findCloudProviderForModel, reasoningEffortTiersForModel, defaultReasoningEffortForModel, reasoningEffortForModelSwitch, normalizeStoredReasoningEffort, baseUrlUsesLoopback, baseUrlUsesLocalOrPrivate, localProbeTiersForKind, alwaysThinkingSpecForModel, localReasoningTiers, catalogImageCapableForModel, reasoningEffortDisplayForTiers } = ctx;
+
+// i18n 测试替身:复刻实际字典里会用到的字段
+const t = {
+  modelPresetOpenaiCompatible: 'OpenAI 兼容',
+  modelPresetOpenaiResponses: 'OpenAI Responses 兼容',
+  uiSettingsDetail: {
+    localModelName: name => (name ? `本地 ${name}` : '本地模型'),
+  },
+};
+const tEn = {
+  modelPresetOpenaiCompatible: 'OpenAI Compatible',
+  modelPresetOpenaiResponses: 'OpenAI Responses Compatible',
+  uiSettingsDetail: {
+    localModelName: name => (name ? `Local ${name}` : 'Local model'),
+  },
+};
+const localModelNameFn = t.uiSettingsDetail.localModelName;
+// providerLabelForModel 内部读 t.uiSettingsDetail.providerCatalog,测试中无覆盖则回退 presetProviderLabel
+// selectorSubLabel 的「目录命中」分支依赖 findCloudProviderForModel + providerLabelForModel;后者无覆盖时回退 provider.title/presetProviderLabel。
+
+function mk(partial) { return Object.assign({ id: 'm1', name: '', preset: 'openai_compatible', model: '', base_url: '', provider_kind: null, vendor: null }, partial); }
+
+let pass = 0, fail = 0;
+function test(name, fn) { try { fn(); pass++; console.log('  ok - ' + name); } catch (e) { fail++; console.log('  FAIL - ' + name + '\n    ' + e.message); } }
+
+// --- isPresetModel ---
+test('OpenAI Compatible 未知 ID -> 自定义', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'custom', model: 'meta-llama/llama-4-scout' })), false);
+});
+test('OpenAI Compatible 命中目录 ID 仍为自定义', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'custom', base_url: 'https://openrouter.ai/api/v1', model: 'deepseek-v4-pro' })), false);
+});
+test('OpenAI Responses 自定义行 -> 自定义，sub-label 按自身 preset 归属', () => {
+  const responsesCustom = mk({ preset: 'openai_responses', provider_kind: 'custom', base_url: 'https://gw.example.com/v1', model: 'my-aggregator-model' });
+  assert.strictEqual(isPresetModel(responsesCustom), false);
+  // Aggregator URLs match no catalog group: the sub-label must attribute to
+  // the openai_responses preset itself (the presetProviderLabel fallback)
+  // instead of hard-coding a fall-back to the Chat-compatible group.
+  assert.strictEqual(selectorSubLabel(responsesCustom, t), 'OpenAI Responses 兼容');
+  assert.strictEqual(selectorSubLabel(responsesCustom, tEn), 'OpenAI Responses Compatible');
+});
+test('自定义组 URL 匹配必须同 preset:openai_compatible 记录不会被 openai_responses 组收编', () => {
+  // The openai_responses group is the first custom-kind group with a real
+  // default URL (api.openai.com/v1). URL-only matching would adopt a valid
+  // `openai_compatible` record at the official endpoint, mislabel it in the
+  // edit form, and re-stamp its preset — a silent Chat→Responses wire
+  // switch — on the next save.
+  const chatCompatible = mk({ preset: 'openai_compatible', provider_kind: 'custom', base_url: 'https://api.openai.com/v1', model: 'gpt-6-sol' });
+  assert.strictEqual(findCloudProviderForModel(chatCompatible), null);
+  // Same preset matches its own group (positive pin).
+  const responsesRecord = mk({ preset: 'openai_responses', provider_kind: 'custom', base_url: 'https://api.openai.com/v1', model: 'gpt-6-sol' });
+  const matched = findCloudProviderForModel(responsesRecord);
+  assert.notStrictEqual(matched, null);
+  assert.strictEqual(matched.key, 'openai_responses');
+  // And an openai_responses record at an aggregator still matches nothing.
+  assert.strictEqual(findCloudProviderForModel(mk({ preset: 'openai_responses', provider_kind: 'custom', base_url: 'https://gw.example.com/v1', model: 'my-aggregator-model' })), null);
+});
+test('Coding Plan 命中目录(glm-5.2) -> 预设', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4', model: 'glm-5.2' })), true);
+});
+test('z.ai coding catalog rows move to the official lowercase spelling; legacy uppercase GLM-5.2 configs still classify as preset via legacyAliases', () => {
+  // The 2026-09 catalog rows use z.ai's official lowercase wire ids (docs.z.ai
+  // API enum); existing configs may hold the old uppercase catalog value
+  // (GLM-5.2), recognized via legacyAliases. GLM-5-Turbo was never released on
+  // z.ai; its old row is deleted and existing configs fall back to custom.
+  const mkZai = model => mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: 'https://api.z.ai/api/coding/paas/v4', model });
+  assert.strictEqual(isPresetModel(mkZai('glm-5.2')), true, 'lowercase current spelling hits exactly');
+  assert.strictEqual(isPresetModel(mkZai('GLM-5.2')), true, 'legacy uppercase config hits via legacyAliases');
+  assert.strictEqual(isPresetModel(mkZai('glm-5.3')), true);
+  assert.strictEqual(isPresetModel(mkZai('glm-5.3-flash')), true);
+  assert.strictEqual(isPresetModel(mkZai('glm-4.7')), true);
+  assert.strictEqual(isPresetModel(mkZai('glm-5-turbo')), false, 'GLM-5-Turbo row is deleted; falls back to custom');
+  // The GLM-5-Turbo row on z.ai's official paas endpoint is deleted too
+  // (absent from docs.z.ai's current overview/
+  // pricing/API enum), so existing configs likewise fall back to custom.
+  const mkZaiPaas = model => mk({ preset: 'glm', provider_kind: 'official_api', vendor: 'glm', base_url: 'https://api.z.ai/api/paas/v4', model });
+  assert.strictEqual(isPresetModel(mkZaiPaas('GLM-5-Turbo')), false, 'the z.ai paas GLM-5-Turbo row is deleted; falls back to custom');
+});
+test('Tencent Coding Plan collapses to tc-code-latest; retired ids fall back to custom (announce 2469)', () => {
+  // The live 130092 plan-model table carries only the Auto row
+  // (re-checked 2026-11-04; it previously still displayed glm-5 with its
+  // now-past-due retirement notice); announce 2469 (GLM-5 / GLM-5-Turbo /
+  // GLM-5.1 offline Beijing time 2026-10-09 00:00, Coding Plan users
+  // auto-switch to Auto) is the authoritative record, so the glm-5 row is
+  // removed and old glm-5 / glm-5-0 configs fall back to custom. kimi-k2.5
+  // was retired from this plan and removed from the catalog (it is
+  // re-mirrored on the Alibaba Coding Plan group, which serves it on its
+  // own infrastructure).
+  const base = 'https://api.lkeap.cloud.tencent.com/coding/v3';
+  const mkPlan = model => mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: base, model });
+  assert.strictEqual(isPresetModel(mkPlan('tc-code-latest')), true, 'tc-code-latest');
+  assert.strictEqual(isPresetModel(mkPlan('glm-5')), false, 'glm-5 retired 2026-10-09 (announce 2469); row removed, falls back to custom');
+  assert.strictEqual(isPresetModel(mkPlan('glm-5-0')), false, 'glm-5-0 parallel spelling is removed together with the glm-5 row');
+  assert.strictEqual(isPresetModel(mkPlan('kimi-k2.5')), false, 'kimi-k2.5 is retired platform-wide and removed from the catalog');
+  assert.strictEqual(isPresetModel(mkPlan('kimi-k-2-5')), false, 'kimi-k-2-5 parallel spelling is no longer listed either');
+  assert.strictEqual(isPresetModel(mkPlan('glm-5.2')), false, 'glm-5.2 is not in the official Coding Plan model table');
+});
+test('Tencent Token Plan is a separate catalog: distinguished from Coding Plan by base_url, no cross-group match', () => {
+  // /plan/v3 general-tier rows hit their own group (official 2026-10-13 model
+  // table re-check of the 130060 lineup, every row and every registered
+  // parallel spelling); on Coding Plan's /coding/v3 the URL does not match,
+  // and with identical vendor+provider_kind the exact comparison keeps the
+  // model custom. GLM-5 / GLM-5.1 retired 2026-10-09 (announce 2469) and
+  // their rows are removed; kimi-k2.5 was removed platform-wide (announce
+  // 2414) and is no longer a catalog row in either group. The live table's
+  // additions (deepseek/deepseek-flash, mimo-v2.6-flash) are listed. The
+  // 2026-11-03 refresh moved the group default to the migrated tokenhub
+  // host (docs 130119/130060 updated 2026-10-22, announce 101147); the
+  // legacy lkeap URL stays registered as an endpoint alias so both hosts
+  // classify the same rows.
+  const planBase = 'https://tokenhub.tencentmaas.com/plan/v3';
+  const mkTokenPlan = model => mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: planBase, model });
+  const planModels = [
+    'tc-code-latest',
+    'glm-5.3', 'glm-5-3', 'glm-5.3-flash', 'glm-5.2', 'glm-5-2',
+    'kimi-k3', 'kimi-k2.7-code',
+    'deepseek/deepseek-flash',
+    'deepseek-v4-pro-202606', 'deepseek/deepseek-v4-pro-0813', 'deepseek/deepseek-v4-pro',
+    'deepseek-v4-flash-202605', 'deepseek/deepseek-v4-flash',
+    'minimax-m3', 'minimax-m-3-0', 'minimax-m2.7', 'minimax-m-2-7',
+    'hy3', 'hy3-preview', 'hy3-202608', 'hy4', 'hy4-preview',
+    'mimo-v2.6-flash',
+  ];
+  for (const model of planModels) {
+    assert.strictEqual(isPresetModel(mkTokenPlan(model)), true, model);
+  }
+  // The legacy lkeap Token Plan host stays an endpoint alias: same rows,
+  // same classification.
+  for (const model of ['tc-code-latest', 'glm-5.3', 'deepseek/deepseek-flash']) {
+    assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: 'https://api.lkeap.cloud.tencent.com/plan/v3', model })), true, `legacy lkeap alias classifies ${model}`);
+  }
+  assert.strictEqual(isPresetModel(mkTokenPlan('glm-5')), false, 'glm-5 retired 2026-10-09 (announce 2469); row removed');
+  assert.strictEqual(isPresetModel(mkTokenPlan('glm-5-0')), false, 'glm-5-0 parallel spelling is removed together with the glm-5 row');
+  assert.strictEqual(isPresetModel(mkTokenPlan('glm-5.1')), false, 'glm-5.1 retired 2026-10-09 (announce 2469); row removed');
+  assert.strictEqual(isPresetModel(mkTokenPlan('glm-5-1')), false, 'glm-5-1 parallel spelling is removed together with the glm-5.1 row');
+  assert.strictEqual(isPresetModel(mkTokenPlan('kimi-k2.5')), false, 'kimi-k2.5 is retired; no Tencent Cloud group lists it anymore');
+  assert.strictEqual(isPresetModel(mkTokenPlan('kimi-k-2-5')), false, 'kimi-k-2-5 parallel spelling is no longer listed either');
+  assert.strictEqual(isPresetModel(mkTokenPlan('deepseek/deepseek-v4-flash-0731')), false, 'the 0731 alias went offline 2026-10-31 (announce 2496); dropped from legacyAliases');
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: 'https://api.lkeap.cloud.tencent.com/coding/v3', model: 'glm-5.2' })), false, 'Token Plan-exclusive models must not match the Coding Plan catalog');
+  assert.strictEqual(providerLabelForModel(mkTokenPlan('glm-5.2'), t), '腾讯云 Token Plan / Tencent Cloud Token Plan');
+});
+test('catalogItemMatchesModel 精确比较+legacyAliases 兼容迁移拼写', () => {
+  // SettingsView 编辑弹窗的 initialCatalogMatch/known/active 均复用此比较:
+  // The z.ai direct catalog row now uses the official lowercase glm-5.2
+  // spelling; existing uppercase GLM-5.2 configs must hit via
+  // legacyAliases and must not be misclassified as custom; everything except
+  // explicitly registered historical spellings stays exact-compare.
+  const zaiGroup = MODEL_CATALOG.cloud.find(group => group.key === 'glm_coding_plan_global');
+  const glm52 = zaiGroup.items.find(item => item.model === 'glm-5.2');
+  assert.ok(glm52, 'the z.ai direct catalog should contain the canonical lowercase glm-5.2 row');
+  assert.deepStrictEqual([...(glm52.legacyAliases || [])], ['GLM-5.2'], 'the old uppercase catalog value must be registered as a legacyAlias');
+  assert.strictEqual(catalogItemMatchesModel(glm52, 'glm-5.2'), true);
+  assert.strictEqual(catalogItemMatchesModel(glm52, 'GLM-5.2'), true);
+  assert.strictEqual(catalogItemMatchesModel(glm52, 'Glm-5.2'), false);
+  assert.strictEqual(catalogItemMatchesModel(glm52, 'glm-5.3'), false);
+  assert.strictEqual(catalogItemMatchesModel(glm52), false);
+});
+test('本地 case-only 模型 ID 仍为自定义(vLLM ID 大小写敏感)', () => {
+  // 本地 OpenAI-compatible 服务的模型 ID 是不透明字符串、可能区分大小写:
+  // 与目录默认项 qwen36_35b_256k 仅大小写不同的 ID 是另一个模型,必须保持自定义。
+  assert.strictEqual(isPresetModel(mk({ preset: 'local_vllm', model: 'QWEN36_35B_256K' })), false);
+  assert.strictEqual(isPresetModel(mk({ preset: 'local_vllm', model: 'qwen36_35b_256k' })), true);
+});
+test('云端 case-only 模型 ID 仍为自定义(无拼写迁移的目录精确比较)', () => {
+  // minimax 目录行 MiniMax-M3 从未变更过拼写,case-only 变体不是存量迁移值,
+  // 不得命中预设;同 provider 未收录 ID 也保持自定义。
+  assert.strictEqual(isPresetModel(mk({ preset: 'minimax', provider_kind: 'official_api', vendor: 'minimax', base_url: 'https://api.minimaxi.com/v1', model: 'minimax-m3' })), false);
+  assert.strictEqual(isPresetModel(mk({ preset: 'minimax', provider_kind: 'official_api', vendor: 'minimax', base_url: 'https://api.minimaxi.com/v1', model: 'MiniMax-M3' })), true);
+});
+test('Coding Plan 手填 ID -> 自定义', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4', model: 'my-custom-glm' })), false);
+});
+// deepseek-v4-pro 的 official_api 命中断言由下方 legacyAliases 测试的
+// mkDeepseek('deepseek-v4-pro') 行逐字覆盖(同输入同期望),不再单列。
+test('deepseek catalog retired spellings still classify as preset via legacyAliases; the new mainline deepseek-flash hits exactly', () => {
+  // The deepseek-v4-flash / -vision-exp rows are deleted and registered as
+  // legacyAliases of deepseek-flash: existing configs must keep being
+  // recognized as preset instead of falling back to custom.
+  const mkDeepseek = model => mk({ preset: 'deepseek', provider_kind: 'official_api', vendor: 'deepseek', base_url: 'https://api.deepseek.com', model });
+  assert.strictEqual(isPresetModel(mkDeepseek('deepseek-flash')), true, 'the new mainline spelling hits exactly');
+  assert.strictEqual(isPresetModel(mkDeepseek('deepseek-v4-flash')), true, 'the deleted-row spelling hits via legacyAliases');
+  assert.strictEqual(isPresetModel(mkDeepseek('deepseek-v4-flash-vision-exp')), true);
+  assert.strictEqual(isPresetModel(mkDeepseek('deepseek-v4-pro')), true);
+});
+test('2026-09-11 catalog additions land in their provider groups (preset recognition)', () => {
+  const mkCloud = (preset, vendor, base, model) => mk({ preset, provider_kind: 'official_api', vendor, base_url: base, model });
+  // bigmodel Coding Plan adds glm-5.3 / glm-5.3-flash (multimodal)
+  const bigmodel = 'https://open.bigmodel.cn/api/coding/paas/v4';
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: bigmodel, model: 'glm-5.3' })), true);
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: bigmodel, model: 'glm-5.3-flash' })), true);
+  // GLM open platform and z.ai add glm-5.3 / glm-5.3-flash
+  assert.strictEqual(isPresetModel(mkCloud('glm', 'glm', 'https://open.bigmodel.cn/api/paas/v4', 'glm-5.3')), true);
+  assert.strictEqual(isPresetModel(mkCloud('glm', 'glm', 'https://api.z.ai/api/paas/v4', 'glm-5.3-flash')), true);
+  // xAI adds grok-4.6; Gemini adds gemini-3.8-flash; OpenAI adds gpt-6-astra;
+  // Anthropic adds claude-fable-5-1; Doubao adds the coding-specialized preview row
+  assert.strictEqual(isPresetModel(mkCloud('xai', 'xai', 'https://api.x.ai/v1', 'grok-4.6')), true);
+  assert.strictEqual(isPresetModel(mkCloud('gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-3.8-flash')), true);
+  assert.strictEqual(isPresetModel(mkCloud('openai', 'openai', 'https://api.openai.com/v1', 'gpt-6-astra')), true);
+  assert.strictEqual(isPresetModel(mkCloud('anthropic', 'anthropic', 'https://api.anthropic.com/v1', 'claude-fable-5-1')), true);
+  assert.strictEqual(isPresetModel(mkCloud('doubao', 'doubao', 'https://ark.cn-beijing.volces.com/api/v3', 'doubao-seed-2-0-code-preview-260215')), true);
+  // the qwen international group lists qwen3.7-flash (in the international
+  // full catalog, restored on the 2026-09-11 re-check)
+  assert.strictEqual(isPresetModel(mkCloud('qwen', 'qwen', 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', 'qwen3.7-flash')), true);
+  // qwen3.8-flash enters the three pay-as-you-go qwen groups
+  // (cn / Token Plan / international); the Coding Plan group serves the
+  // official plan's exact-version list and deliberately omits it.
+  const qwenGroups = (MODEL_CATALOG.cloud || []).filter(g => (g.key || '').startsWith('qwen'));
+  assert.strictEqual(qwenGroups.length, 4, 'sync this assertion when the qwen group count changes');
+  for (const g of qwenGroups.filter(g => g.key !== 'qwen_coding_plan')) {
+    assert.ok(
+      (g.items || []).some(i => i.model === 'qwen3.8-flash'),
+      `${g.key} group should list qwen3.8-flash`,
+    );
+  }
+  const qwenCodingPlan = qwenGroups.find(g => g.key === 'qwen_coding_plan');
+  assert.ok(qwenCodingPlan, 'qwen coding plan group missing');
+  assert.ok(
+    !(qwenCodingPlan.items || []).some(i => i.model === 'qwen3.8-flash'),
+    'qwen Coding Plan serves the official exact-version list; qwen3.8-flash must not be listed',
+  );
+});
+
+test('2026-09-28 catalog refresh lands in their provider groups (preset recognition)', () => {
+  const mkCloud = (preset, vendor, base, model) => mk({ preset, provider_kind: 'official_api', vendor, base_url: base, model });
+  // GLM: the multimodal speed tier joins both standard APIs; glm-5.1 joins
+  // both coding plans as an auto-routing legacy row.
+  assert.strictEqual(isPresetModel(mkCloud('glm', 'glm', 'https://open.bigmodel.cn/api/paas/v4', 'glm-5.3-flashx')), true);
+  assert.strictEqual(isPresetModel(mkCloud('glm', 'glm', 'https://api.z.ai/api/paas/v4', 'glm-5.3-flashx')), true);
+  const bigmodelCoding = 'https://open.bigmodel.cn/api/coding/paas/v4';
+  const zaiCoding = 'https://api.z.ai/api/coding/paas/v4';
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: bigmodelCoding, model: 'glm-5.1' })), true);
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: zaiCoding, model: 'glm-5.1' })), true);
+  // MiniMax: M3.1-Flash went GA on 2026-10-19 and joins both groups (the
+  // retired "-Preview" spelling keeps classifying through the row's
+  // legacyAliases).
+  assert.strictEqual(isPresetModel(mkCloud('minimax', 'minimax', 'https://api.minimaxi.com/v1', 'MiniMax-M3.1-Flash')), true);
+  assert.strictEqual(isPresetModel(mkCloud('minimax', 'minimax', 'https://api.minimax.io/v1', 'MiniMax-M3.1-Flash')), true);
+  assert.strictEqual(isPresetModel(mkCloud('minimax', 'minimax', 'https://api.minimaxi.com/v1', 'MiniMax-M3.1-Flash-Preview')), true, 'the retired Preview spelling stays registered as a legacyAlias');
+  // MiMo: the 2026-09-22 V2.6 series leads the group; the v2.5 ids hard-fail
+  // since 2026-10-21 10:00 (UTC+8) and their rows are removed (configs fall
+  // to the custom listing, endpoint classification unaffected).
+  assert.strictEqual(isPresetModel(mkCloud('mimo', 'mimo', 'https://api.xiaomimimo.com/v1', 'mimo-v2.6-pro')), true);
+  assert.strictEqual(isPresetModel(mkCloud('mimo', 'mimo', 'https://api.xiaomimimo.com/v1', 'mimo-v2.6-flash')), true);
+  assert.strictEqual(isPresetModel(mkCloud('mimo', 'mimo', 'https://api.xiaomimimo.com/v1', 'mimo-v2.5-pro')), false, 'mimo-v2.5-pro hard-fails since 2026-10-21; row removed');
+  // Doubao: the 260915 snapshots join the official group; the new Ark
+  // Coding Plan group classifies with its auto shell model.
+  assert.strictEqual(isPresetModel(mkCloud('doubao', 'doubao', 'https://ark.cn-beijing.volces.com/api/v3', 'doubao-seed-2-1-pro-260915')), true);
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'doubao', base_url: 'https://ark.cn-beijing.volces.com/api/coding/v3', model: 'ark-code-latest' })), true);
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'doubao', base_url: 'https://ark.cn-beijing.volces.com/api/coding/v3', model: 'kimi-k2.8-preview' })), true);
+  // Alibaba Coding Plan group classifies with the plan's exact ids (intl
+  // alias host included; kimi-k2.5 was re-mirrored in the 2026-11-03
+  // refresh — the official coding-plan pages still list it and Alibaba
+  // serves the gateway on its own infrastructure, so the earlier
+  // platform-wide-retirement exclusion premise did not hold here).
+  assert.strictEqual(isPresetModel(mk({ preset: 'qwen', provider_kind: 'coding_plan', vendor: 'qwen', base_url: 'https://coding.dashscope.aliyuncs.com/v1', model: 'qwen3.7-plus' })), true);
+  assert.strictEqual(isPresetModel(mk({ preset: 'qwen', provider_kind: 'coding_plan', vendor: 'qwen', base_url: 'https://coding.dashscope.aliyuncs.com/v1', model: 'kimi-k2.5' })), true);
+  // (qwen3-coder-plus used to pin the intl alias host here; the official
+  // page dropped it in the 2026-10-10 refresh — see the 2026-10-13 test.)
+  // Aggregator groups: org-prefixed ids classify per vendor.
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'openrouter', 'https://openrouter.ai/api/v1', 'deepseek/deepseek-v4.1-flash')), true);
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'siliconflow', 'https://api.siliconflow.cn/v1', 'deepseek-ai/DeepSeek-V4-Pro')), true);
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'siliconflow', 'https://api.siliconflow.com/v1', 'Pro/zai-org/GLM-5.2')), true);
+  // Flagship refreshes: gpt-6-sol/luna, claude-opus-5-5, grok-4.7.
+  assert.strictEqual(isPresetModel(mkCloud('openai', 'openai', 'https://api.openai.com/v1', 'gpt-6-sol')), true);
+  assert.strictEqual(isPresetModel(mkCloud('openai', 'openai', 'https://api.openai.com/v1', 'gpt-6-luna')), true);
+  assert.strictEqual(isPresetModel(mkCloud('anthropic', 'anthropic', 'https://api.anthropic.com/v1', 'claude-opus-5-5')), true);
+  assert.strictEqual(isPresetModel(mkCloud('xai', 'xai', 'https://api.x.ai/v1', 'grok-4.7')), true);
+  // Reasoning tiers: since 2026-09-29 the GPT family rides the Responses
+  // wire (openai_responses ladder — off is absent, it maps to low), while
+  // grok-4.7 keeps no tier exposure until the base learns it; aggregator
+  // vendors do.
+  // gpt-6-sol here is preset-less on purpose: it pins that the vendor arm
+  // (not the preset fallback) routes vendor-only records. The
+  // "OpenAI 档位路由" responsesFamily loop rows carry preset: 'openai', so
+  // they stay green even if the vendor arm disappears (the preset case
+  // reproduces the same predicates) — only a bare-vendor row kills that.
+  assert.deepStrictEqual([...(reasoningEffortTiersForModel({ vendor: 'openai', model: 'gpt-6-sol' }) || [])], ['low', 'medium', 'high', 'max']);
+  assert.strictEqual(reasoningEffortTiersForModel({ vendor: 'xai', model: 'grok-4.7' }), null);
+  // vm-realm arrays must be spread into host arrays before deepStrictEqual
+  // (same normalization as the tier tests below).
+  assert.deepStrictEqual([...(reasoningEffortTiersForModel({ vendor: 'siliconflow', model: 'deepseek-ai/DeepSeek-V4-Pro', base_url: 'https://api.siliconflow.cn/v1' }) || [])], ['off', 'high']);
+  assert.deepStrictEqual([...(reasoningEffortTiersForModel({ vendor: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', base_url: 'https://openrouter.ai/api/v1' }) || [])], ['off', 'low', 'medium', 'high']);
+});
+
+test('2026-10-13 catalog refresh lands in their provider groups (preset recognition)', () => {
+  const mkCloud = (preset, vendor, base, model) => mk({ preset, provider_kind: 'official_api', vendor, base_url: base, model });
+  // OpenAI: gpt-6.1-sol (2026-09-29 model data, announced at DevDay the
+  // same day) joins as the new
+  // default; gpt-6-sol / gpt-6-luna stay listed and keep the Responses
+  // ladder.
+  assert.strictEqual(isPresetModel(mkCloud('openai', 'openai', 'https://api.openai.com/v1', 'gpt-6.1-sol')), true);
+  // Preset-less vendor row: see the gpt-6-sol note above — the bare-vendor
+  // pin is the only guard on the vendor arm itself (mirror of bridge.rs's
+  // vendor-first provider()).
+  assert.deepStrictEqual([...(reasoningEffortTiersForModel({ vendor: 'openai', model: 'gpt-6.1-sol' }) || [])], ['low', 'medium', 'high', 'max']);
+  // Anthropic: sonnet-5-5 (2026-09-28) and haiku-5-5 (2026-10-07) join;
+  // opus-5-5 keeps the default slot.
+  assert.strictEqual(isPresetModel(mkCloud('anthropic', 'anthropic', 'https://api.anthropic.com/v1', 'claude-sonnet-5-5')), true);
+  assert.strictEqual(isPresetModel(mkCloud('anthropic', 'anthropic', 'https://api.anthropic.com/v1', 'claude-haiku-5-5')), true);
+  assert.strictEqual(catalogImageCapableForModel('claude-sonnet-5-5'), true);
+  assert.strictEqual(catalogImageCapableForModel('claude-haiku-5-5'), true);
+  // Gemini: Gemini 4 Argon went GA 2026-10-13 as the new overall flagship
+  // and joins above the Flash rows; the preset default stays the Flash
+  // mainline (gemini-3.8-flash, locked below).
+  assert.strictEqual(isPresetModel(mkCloud('gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-4-argon')), true);
+  assert.strictEqual(catalogImageCapableForModel('gemini-4-argon'), true);
+  // Tencent Coding Plan collapses to tc-code-latest (announce 2469); the
+  // Token Plan mirrors the live table's additions. The gateway ids' FE image
+  // annotations match the Rust table (group comment): the cross-group
+  // bare-id scan resolves mimo-v2.6-flash via the mimo group's annotated
+  // row, while deepseek/deepseek-flash is exact-id only and stays
+  // unannotated (null).
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: 'https://api.lkeap.cloud.tencent.com/plan/v3', model: 'deepseek/deepseek-flash' })), true);
+  assert.strictEqual(isPresetModel(mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: 'https://api.lkeap.cloud.tencent.com/plan/v3', model: 'mimo-v2.6-flash' })), true);
+  assert.strictEqual(catalogImageCapableForModel('mimo-v2.6-flash'), true);
+  assert.strictEqual(catalogImageCapableForModel('deepseek/deepseek-flash'), null);
+  // Alibaba Coding Plan re-synced to the official 2026-10-10 page:
+  // qwen3.5-plus joins; qwen3-coder-plus / qwen3-coder-next / glm-4.7 are
+  // no longer listed and their rows are removed (configs fall to custom,
+  // endpoint classification is URL-based and unaffected). The kept rows stay
+  // pinned positive — the glm-5 row here is now the only bare glm-5 row in
+  // the whole catalog, so an accidental drop must turn red.
+  const alibabaCoding = 'https://coding.dashscope.aliyuncs.com/v1';
+  const mkAlibabaPlan = model => mk({ preset: 'qwen', provider_kind: 'coding_plan', vendor: 'qwen', base_url: alibabaCoding, model });
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('qwen3.5-plus')), true);
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('qwen3.6-plus')), true);
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('glm-5')), true, 'the only remaining bare glm-5 catalog row');
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('MiniMax-M2.5')), true);
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('qwen3-coder-plus')), false);
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('qwen3-coder-next')), false);
+  assert.strictEqual(isPresetModel(mkAlibabaPlan('glm-4.7')), false);
+  assert.strictEqual(isPresetModel(mk({ preset: 'qwen', provider_kind: 'coding_plan', vendor: 'qwen', base_url: 'https://coding-intl.dashscope.aliyuncs.com/v1', model: 'qwen3.5-plus' })), true, 'the intl alias host classifies the same rows');
+});
+
+test('2026-11-03 catalog refresh lands in their provider groups (preset recognition)', () => {
+  const mkCloud = (preset, vendor, base, model) => mk({ preset, provider_kind: 'official_api', vendor, base_url: base, model });
+  const mkPlan = (vendor, base, model) => mk({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor, base_url: base, model });
+  // Kimi: K3.1 Pro (2026-10-23) is the official flagship and joins both
+  // regional groups plus the Kimi Code lane; the preset default stays
+  // kimi-k3 (the base's tiered route only learns bare K3 ids). K3.1 is
+  // always-reasoning and the vendor rejects thinking:{type:"disabled"}, so
+  // the rows expose NO tier control until the base's exact-K3 shapers learn
+  // the spellings — the stored effort is normalized away and the vendor
+  // default applies (max on the platform base, high on the Kimi Code base
+  // per the CC docs' effort-mapping table) (2026-11-04 review: the generic
+  // off/high ladder let users persist a disable shape the vendor rejects).
+  // 2026-11-05 review 5779604267: the BARE Kimi Code rows are deferred —
+  // against the current public child the exact-route exceptions only
+  // recognize k3/k3-256k, so a tool turn on the bare ids drops the
+  // required assistant reasoning_content and the gateway answers 400.
+  // The rows (and their FE imageCapable annotation, which is row-scoped)
+  // return once the pinned child carries the replay repair (upstream
+  // Pinvou/CodeWhale#137); the prefixed platform rows are unaffected.
+  assert.strictEqual(isPresetModel(mkCloud('kimi', 'kimi', 'https://api.moonshot.cn/v1', 'kimi-k3.1-pro')), true);
+  assert.strictEqual(isPresetModel(mkCloud('kimi', 'kimi', 'https://api.moonshot.ai/v1', 'kimi-k3.1-pro-highspeed')), true);
+  assert.strictEqual(isPresetModel(mkPlan('kimi', 'https://api.kimi.com/coding/v1', 'k3.1-pro')), false, 'bare k3.1-pro preset deferred until the child replay repair lands (custom row still permits it)');
+  assert.strictEqual(isPresetModel(mkPlan('kimi', 'https://api.kimi.com/coding/v1', 'k3.1-pro-highspeed')), false, 'bare k3.1-pro-highspeed preset deferred likewise');
+  assert.strictEqual(catalogImageCapableForModel('kimi-k3.1-pro'), true);
+  assert.strictEqual(catalogImageCapableForModel('k3.1-pro'), null, 'bare-spelling annotation is row-scoped and returns with the deferred rows');
+  const k31 = (model, base) => ({ preset: 'kimi', vendor: 'kimi', model, base_url: base });
+  assert.strictEqual(reasoningEffortTiersForModel(k31('kimi-k3.1-pro', 'https://api.moonshot.cn/v1')), null, 'platform K3.1: no tier control (generic off/high carries the disable-rejected cliff)');
+  assert.strictEqual(reasoningEffortTiersForModel(k31('kimi-k3.1-pro-highspeed', 'https://api.moonshot.ai/v1')), null);
+  assert.strictEqual(reasoningEffortTiersForModel(k31('k3.1-pro', 'https://api.kimi.com/coding/v1')), null, 'Kimi Code K3.1: no tier control');
+  assert.strictEqual(reasoningEffortTiersForModel(k31('k3.1-pro-highspeed', 'https://api.kimi.com/coding/v1')), null);
+  assert.strictEqual(defaultReasoningEffortForModel(k31('kimi-k3.1-pro', 'https://api.moonshot.cn/v1')), null, 'no machine-written default effort for K3.1 rows');
+  assert.strictEqual(normalizeStoredReasoningEffort(k31('kimi-k3.1-pro', 'https://api.moonshot.cn/v1'), 'off'), null, 'a stored off normalizes to unset (field omitted on the wire; vendor default max)');
+  // The documented `[1m]` declaration forms are the same K3.1 models and
+  // ride the same no-control exit (round-4 bracket tolerance); a stored
+  // off picked through the old generic ladder must not survive on them.
+  assert.strictEqual(reasoningEffortTiersForModel(k31('k3.1-pro[1m]', 'https://api.kimi.com/coding/v1')), null, 'k3.1-pro[1m] (ACP models1m entry): no tier control');
+  assert.strictEqual(normalizeStoredReasoningEffort(k31('kimi-k3.1-pro[1m]', 'https://api.moonshot.cn/v1'), 'off'), null, 'the platform [1m] spelling normalizes to unset too');
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(k31('kimi-k3[1m]', 'https://api.moonshot.cn/v1'))], ['off', 'high'], 'kimi-k3[1m] is bare-k3 bracket form, not a K3.1 spelling');
+  // FE/Rust attachment parity (2026-11-05 review): the no-control exit
+  // attaches via the kimi/moonshot vendor stamp OR the official route —
+  // a hand-edited preset-kimi record with a cleared vendor on a custom
+  // relay keeps the generic ladder (Rust's unstamped-relay passthrough),
+  // while the same relay stamped kimi/moonshot stays no-control.
+  const k31Relay = (vendor) => ({ preset: 'kimi', vendor, model: 'kimi-k3.1-pro', base_url: 'https://relay.example/v1' });
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(k31Relay(''))], ['off', 'high'], 'unstamped relay keeps the generic ladder (Rust passthrough parity)');
+  assert.strictEqual(reasoningEffortTiersForModel(k31Relay('kimi')), null, 'vendor-stamped relay attaches the K3.1 no-control contract');
+  assert.strictEqual(reasoningEffortTiersForModel(k31Relay('moonshot')), null, 'the moonshot alias attaches too');
+  // The official-route arm in isolation (cleared vendor + official base)
+  // also attaches — pinned so a one-sided FE edit of the route arm cannot
+  // slip through (the Rust arm is pinned Rust-side; 2026-11-05 review).
+  assert.strictEqual(reasoningEffortTiersForModel({ preset: 'kimi', vendor: '', model: 'kimi-k3.1-pro', base_url: 'https://api.moonshot.cn/v1' }), null, 'cleared vendor on the official moonshot route attaches the no-control contract');
+  assert.strictEqual(normalizeStoredReasoningEffort({ preset: 'kimi', vendor: '', model: 'k3.1-pro', base_url: 'https://api.kimi.com/coding/v1' }, 'off'), null, 'cleared vendor on the official Kimi Code route normalizes the stored effort away');
+  // The exact-K3 ladder itself is untouched.
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(k31('kimi-k3', 'https://api.moonshot.cn/v1'))], ['low', 'high', 'max']);
+  // MiniMax: the GA rename carries the retired Preview spelling as a
+  // legacyAlias on both regional groups.
+  assert.strictEqual(isPresetModel(mkCloud('minimax', 'minimax', 'https://api.minimaxi.com/v1', 'MiniMax-M3.1-Flash')), true);
+  // OpenAI: gpt-6.1-terra (2026-10-26) joins; it keeps the Responses ladder
+  // through the gpt-6 prefix.
+  assert.strictEqual(isPresetModel(mkCloud('openai', 'openai', 'https://api.openai.com/v1', 'gpt-6.1-terra')), true);
+  assert.deepStrictEqual([...(reasoningEffortTiersForModel({ vendor: 'openai', model: 'gpt-6.1-terra' }) || [])], ['low', 'medium', 'high', 'max']);
+  // xAI: the multi-agent 4.20 row is deferred (2026-11-06, reviews
+  // 5797337483 / 5797506975): its native workflow needs the multi-agent
+  // guide's contract (no Chat Completions, no client-side/custom tools,
+  // no max_tokens), while the built-in xai provider is fixed Chat
+  // Completions, normal agent calls carry client tools, and the image
+  // probe posts /chat/completions with max_tokens. It returns when the
+  // base learns a compatible supported path; the custom row still
+  // permits manual ids. The base effort gate covers grok-4.6/4.5 only,
+  // and the multi-agent effort semantics differ anyway, so the id keeps
+  // no tier exposure while deferred.
+  assert.strictEqual(isPresetModel(mkCloud('xai', 'xai', 'https://api.x.ai/v1', 'grok-4.20-multi-agent-0309')), false, 'multi-agent preset deferred: built-in xai wire is Chat Completions + client tools + max_tokens, all excluded by the official multi-agent guide');
+  assert.strictEqual(reasoningEffortTiersForModel({ preset: 'xai', vendor: 'xai', model: 'grok-4.20-multi-agent-0309', base_url: 'https://api.x.ai/v1' }), null);
+  // Ark Coding Plan: the two retired rows fall to the custom listing and
+  // the economy DeepSeek row joins.
+  const arkBase = 'https://ark.cn-beijing.volces.com/api/coding/v3';
+  assert.strictEqual(isPresetModel(mkPlan('doubao', arkBase, 'kimi-k2.7-code')), false, 'kimi-k2.7-code went offline 2026-10-28 (docs 2578687 personal-plan notice, 2578680 enterprise twin); row removed');
+  assert.strictEqual(isPresetModel(mkPlan('doubao', arkBase, 'minimax-m3')), false, 'minimax-m3 went offline 2026-11-02 (docs 2578687 personal-plan notice, 2578680 enterprise twin); row removed');
+  assert.strictEqual(isPresetModel(mkPlan('doubao', arkBase, 'deepseek-v4.1-flash-economy')), true);
+  // Tencent Token Plan: the migrated tokenhub host classifies like the
+  // legacy lkeap alias (the plan table itself gained no new text rows this
+  // cycle); the retired 0731 alias is dropped above.
+  assert.strictEqual(isPresetModel(mkPlan('tencent', 'https://tokenhub.tencentmaas.com/plan/v3', 'deepseek/deepseek-flash')), true);
+  assert.strictEqual(isPresetModel(mkPlan('tencent', 'https://tokenhub.tencentmaas.com/plan/v3', 'minimax-m-2-7')), true, 'the parallel lowercase alias classifies on the new host too');
+  // New vendor groups (Mistral / Meta / Together / Groq): plain
+  // OpenAI-compatible rows classify per vendor with no tier exposure.
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'mistral', 'https://api.mistral.ai/v1', 'codestral-latest')), true);
+  assert.strictEqual(catalogImageCapableForModel('mistral-medium-latest'), true);
+  assert.strictEqual(catalogImageCapableForModel('mistral-large-latest'), true, 'annotated per models.dev in the 2026-11-04 fix pass (docs.mistral.ai unreachable)');
+  assert.strictEqual(catalogImageCapableForModel('grok-4.20-multi-agent-0309'), null, 'multi-agent row deferred 2026-11-06 (reviews 5797337483 / 5797506975): the row-scoped Text/Image annotation returns with the row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'meta', 'https://api.meta.ai/v1', 'muse-spark-1.3')), true);
+  assert.strictEqual(catalogImageCapableForModel('muse-spark-1.3'), true);
+  assert.strictEqual(catalogImageCapableForModel('muse-spark-1.1'), true, 'annotated true in the 2026-11-04 fix pass: the models page states all three Muse Spark versions take image input');
+  assert.strictEqual(catalogImageCapableForModel('muse-wonder-1.0'), true, 'wonder joined the group in the 2026-11-04 fix pass');
+  // Together (2026-11-04 review): the lineup cross-checks the live
+  // serverless catalog against the deprecations page — six ids of the
+  // previous lineup carry removal records (DeepSeek-V4-Pro 2026-08-27,
+  // Kimi-K2.6 2026-08-19, Kimi-K2.5 2026-05-21, GLM-5.1 2026-07-10,
+  // GLM-5 2026-06-22, gpt-oss-20b 2026-09-15) and were replaced by
+  // currently-served rows.
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'deepseek-ai/DeepSeek-V4-Pro-0813')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'moonshotai/Kimi-K3')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'zai-org/GLM-5.3-Flash')), true, 'live serverless catalog row');
+  // Round-4 pins: every remaining live lineup row is pinned positively —
+  // deleting gpt-oss-120b (or any row below) used to stay green because
+  // only 3 of 8 rows were recognized.
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'deepseek-ai/DeepSeek-V4.1-Flash')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'zai-org/GLM-5.3')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'Qwen/Qwen3.7-Max')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'Qwen/Qwen3.6-Plus')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'openai/gpt-oss-120b')), true, 'live serverless catalog row');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'moonshotai/Kimi-K2.6')), false, 'removed from serverless 2026-08-19 (deprecations record)');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'deepseek-ai/DeepSeek-V4-Pro')), false, 'removed from serverless 2026-08-27 (deprecations record)');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'together', 'https://api.together.xyz/v1', 'openai/gpt-oss-20b')), false, 'removed from serverless 2026-09-15 (deprecations record)');
+  assert.strictEqual(isPresetModel(mkPlan('doubao', arkBase, 'kimi-k3.1-pro')), true, 'ark plan overview names kimi-k3.1-pro (2026-11-04 fix pass)');
+  assert.strictEqual(isPresetModel(mkCloud('openai_compatible', 'groq', 'https://api.groq.com/openai/v1', 'llama-3.3-70b-versatile')), true);
+  // Round-8 lineup pins: these rows had no positive pin and deleting them
+  // stayed green (a row-scoped isPresetModel pin cannot distinguish a
+  // shared-vendor sibling from the group it names once another group keeps
+  // the same id, so the group objects are pinned directly; groq's other
+  // rows were simply unpinned).
+  const groqGroup = MODEL_CATALOG.cloud.find(group => group.key === 'groq');
+  assert.ok(groqGroup, 'groq group present');
+  for (const id of ['llama-3.1-8b-instant', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b']) {
+    assert.ok(groqGroup.items.some(item => item.model === id), `groq lineup must keep ${id} (silent deletions must stay red)`);
+  }
+  for (const key of ['kimi', 'kimi_global']) {
+    const kimiGroup = MODEL_CATALOG.cloud.find(group => group.key === key);
+    assert.ok(kimiGroup, `${key} group present`);
+    for (const id of ['kimi-k3.1-pro', 'kimi-k3.1-pro-highspeed']) {
+      assert.ok(kimiGroup.items.some(item => item.model === id), `${key} lineup must keep ${id} (silent deletions must stay red)`);
+    }
+  }
+  // Round-9 lineup pins: qwen_token_plan is official_api, so the coding-plan
+  // endpoint-set parity guard does not cover it and it had zero row/host
+  // pins — a silent row deletion or a baseUrl typo stayed green (the
+  // same shared-vendor reasoning that pinned groq and the kimi groups
+  // above).
+  const qwenTokenGroup = MODEL_CATALOG.cloud.find(group => group.key === 'qwen_token_plan');
+  assert.ok(qwenTokenGroup, 'qwen_token_plan group present');
+  assert.strictEqual(qwenTokenGroup.baseUrl, 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1', 'qwen_token_plan host must stay the official token-plan endpoint');
+  for (const id of ['deepseek-v4.1-flash-1017', 'deepseek-v4.1-flash', 'qwen3.8-max', 'qwen3.8-flash']) {
+    assert.ok(qwenTokenGroup.items.some(item => item.model === id), `qwen_token_plan lineup must keep ${id} (silent deletions must stay red)`);
+  }
+  assert.strictEqual(reasoningEffortTiersForModel({ preset: 'openai_compatible', vendor: 'mistral', model: 'codestral-latest', base_url: 'https://api.mistral.ai/v1' }), null);
+  assert.strictEqual(reasoningEffortTiersForModel({ preset: 'openai_compatible', vendor: 'meta', model: 'muse-spark-1.3', base_url: 'https://api.meta.ai/v1' }), null);
+  // DeepSeek mainline: the 1017 snapshot serves behind the unchanged
+  // deepseek-flash id, so no new official-group row exists.
+  assert.strictEqual(isPresetModel(mkCloud('deepseek', 'deepseek', 'https://api.deepseek.com', 'deepseek-flash')), true);
+});
+
+test('MODEL_PRESET_DEFS default models match the locked Rust prefs figures (default_model_matches_vendor_docs_2026_10_13)', () => {
+  // The identically named test in prefs/model.rs locks the Rust side; this
+  // test locks the frontend side, so drift on either side surfaces explicitly
+  // in the corresponding test (the qwen default once drifted for a long time
+  // unlocked).
+  const expected = {
+    local_vllm: 'qwen36_35b_256k',
+    deepseek: 'deepseek-flash',
+    kimi: 'kimi-k3',
+    openai_compatible: '',
+    qwen: 'qwen3.8-max',
+    doubao: 'doubao-seed-evolving',
+    minimax: 'MiniMax-M3',
+    glm: 'glm-5.3',
+    mimo: 'mimo-v2.6-pro',
+    openai: 'gpt-6.1-sol',
+    openai_responses: 'gpt-6.1-sol',
+    anthropic: 'claude-opus-5-5',
+    gemini: 'gemini-3.8-flash',
+    xai: 'grok-4.7',
+  };
+  for (const [key, model] of Object.entries(expected)) {
+    assert.strictEqual(MODEL_PRESET_DEFS[key] && MODEL_PRESET_DEFS[key].model, model, `${key} default model drift`);
+  }
+});
+
+test('MODEL_PRESET_DEFS and the Rust default_model table cross-check their source (cross-language guard against one side being updated without the other)', () => {
+  // Each side's own lock test only guards "changing the implementation but
+  // forgetting the test"; an intentional update (implementation + this side's
+  // test) that misses the other side drifts silently. This parses the
+  // default_model match block of prefs/model.rs for a real cross-check,
+  // eliminating the last cross-language mirror.
+  const variantToKey = {
+    LocalVllm: 'local_vllm', Deepseek: 'deepseek', Kimi: 'kimi',
+    OpenaiCompatible: 'openai_compatible', OpenaiResponses: 'openai_responses',
+    Qwen: 'qwen', Doubao: 'doubao', Minimax: 'minimax', Glm: 'glm', Mimo: 'mimo',
+    Openai: 'openai', Anthropic: 'anthropic', Gemini: 'gemini', Xai: 'xai',
+  };
+  const rustSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'platform', 'prefs', 'model.rs'), 'utf8',
+  );
+  const fnStart = rustSrc.indexOf('pub fn default_model(&self)');
+  const fnEnd = rustSrc.indexOf('pub fn context_window_fallback', fnStart);
+  assert.ok(fnStart > 0 && fnEnd > fnStart, 'prefs/model.rs should contain default_model and context_window_fallback');
+  const rustTable = {};
+  // Strip // line comments before matching (otherwise examples like
+  // ModelPreset::X => "id" in doc comments would be taken as table entries):
+  // the (?<!:) guard excludes the slashes of `https://` — naively stripping
+  // `//` in the URL table would cut the match arm off at the protocol header
+  // (same shape as the image_capability extractor, whose tables have no URLs
+  // and can use the bare rule).
+  for (const m of rustSrc.slice(fnStart, fnEnd).replace(/(?<!:)\/\/[^\n]*/g, '').matchAll(/ModelPreset::(\w+)\s*=>\s*"([^"]*)"/g)) {
+    rustTable[m[1]] = m[2];
+  }
+  assert.deepStrictEqual(
+    Object.keys(rustTable).sort((a, b) => a.localeCompare(b)),
+    Object.keys(variantToKey).sort((a, b) => a.localeCompare(b)),
+    'sync variantToKey and both lock tests when the Rust default_model variant set changes',
+  );
+  // One known, intentional difference: openai_compatible is deliberately
+  // empty on the frontend (pure custom template), while the Rust side keeps
+  // that preset's legacy migration fallback gpt-5.6-terra. The other 12
+  // presets must be equal item by item.
+  assert.strictEqual(rustTable.OpenaiCompatible, 'gpt-5.6-terra');
+  assert.strictEqual(MODEL_PRESET_DEFS.openai_compatible.model, '');
+  for (const [variant, key] of Object.entries(variantToKey)) {
+    if (variant === 'OpenaiCompatible') continue;
+    assert.strictEqual(
+      rustTable[variant], MODEL_PRESET_DEFS[key] && MODEL_PRESET_DEFS[key].model,
+      `${variant} and frontend ${key} default model drift`,
+    );
+  }
+});
+
+test('MODEL_PRESET_DEFS and the Rust default_base_url table cross-check their source (cross-language guard against baseUrl drift)', () => {
+  // Same shape as the default_model cross-check: default_model already has
+  // triple guarding, but the 13
+  // default_base_url literals previously had no cross-language check at all —
+  // changes like the minimax domain migration are the most likely to touch
+  // only one side and drift silently.
+  const variantToKey = {
+    LocalVllm: 'local_vllm', Deepseek: 'deepseek', Kimi: 'kimi',
+    OpenaiCompatible: 'openai_compatible', OpenaiResponses: 'openai_responses',
+    Qwen: 'qwen', Doubao: 'doubao', Minimax: 'minimax', Glm: 'glm', Mimo: 'mimo',
+    Openai: 'openai', Anthropic: 'anthropic', Gemini: 'gemini', Xai: 'xai',
+  };
+  const rustSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'platform', 'prefs', 'model.rs'), 'utf8',
+  );
+  const fnStart = rustSrc.indexOf('pub fn default_base_url(&self)');
+  const fnEnd = rustSrc.indexOf('pub fn default_model(&self)', fnStart);
+  assert.ok(fnStart > 0 && fnEnd > fnStart, 'prefs/model.rs should contain default_base_url and default_model');
+  const rustTable = {};
+  // Strip // line comments before matching (otherwise examples like
+  // ModelPreset::X => "id" in doc comments would be taken as table entries):
+  // the (?<!:) guard excludes the slashes of `https://` — naively stripping
+  // `//` in the URL table would cut the match arm off at the protocol header
+  // (same shape as the image_capability extractor, whose tables have no URLs
+  // and can use the bare rule).
+  for (const m of rustSrc.slice(fnStart, fnEnd).replace(/(?<!:)\/\/[^\n]*/g, '').matchAll(/ModelPreset::(\w+)\s*=>\s*"([^"]*)"/g)) {
+    rustTable[m[1]] = m[2];
+  }
+  assert.deepStrictEqual(
+    Object.keys(rustTable).sort((a, b) => a.localeCompare(b)),
+    Object.keys(variantToKey).sort((a, b) => a.localeCompare(b)),
+    'sync variantToKey when the Rust default_base_url variant set changes',
+  );
+  // One known, intentional difference: openai_compatible is deliberately
+  // empty on the frontend (pure custom template), while the Rust side keeps
+  // that preset's legacy migration fallback https://api.openai.com/v1. The
+  // other 12 presets must be equal item by item.
+  assert.strictEqual(rustTable.OpenaiCompatible, 'https://api.openai.com/v1');
+  assert.strictEqual(MODEL_PRESET_DEFS.openai_compatible.baseUrl, '');
+  for (const [variant, key] of Object.entries(variantToKey)) {
+    if (variant === 'OpenaiCompatible') continue;
+    assert.strictEqual(
+      rustTable[variant], MODEL_PRESET_DEFS[key] && MODEL_PRESET_DEFS[key].baseUrl,
+      `${variant} and frontend ${key} default baseUrl drift`,
+    );
+  }
+});
+test('官方 API 手填 ID -> 自定义', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'deepseek', provider_kind: 'official_api', vendor: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-v9-fake' })), false);
+});
+test('官方 API 仅命中其他 provider 的目录 ID -> 自定义', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'deepseek', provider_kind: 'official_api', vendor: 'deepseek', base_url: 'https://api.deepseek.com', model: 'glm-5.2' })), false);
+});
+test('本地命中目录(qwen36_35b_256k) -> 预设', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'local_vllm', model: 'qwen36_35b_256k' })), true);
+});
+test('本地手填 ID -> 自定义', () => {
+  assert.strictEqual(isPresetModel(mk({ preset: 'local_vllm', model: 'ollama/phi4' })), false);
+});
+
+// --- groupModelsForSelector ---
+test('分组保留原顺序', () => {
+  const a = mk({ id: 'a', preset: 'deepseek', provider_kind: 'official_api', vendor: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-pro' });
+  const b = mk({ id: 'b', preset: 'openai_compatible', provider_kind: 'custom', model: 'x/y' });
+  const c = mk({ id: 'c', preset: 'openai_compatible', provider_kind: 'custom', model: 'x/z' });
+  const g = groupModelsForSelector([a, b, c]);
+  // 用 join 比较:vm 沙箱内 .map() 返回的数组与外层 realm 数组原型不同,
+  // deepStrictEqual 会以 "not reference-equal" 误判;join 为原始字符串后跨 realm 稳定。
+  assert.strictEqual(g.preset.map(m => m.id).join('|'), 'a');
+  assert.strictEqual(g.custom.map(m => m.id).join('|'), 'b|c');
+});
+
+// --- localUserNamed ---
+test('本地默认名 -> 非用户命名', () => {
+  assert.strictEqual(localUserNamed(mk({ preset: 'local_vllm', name: '本地 qwen36_35b_256k', model: 'qwen36_35b_256k' }), localModelNameFn), false);
+});
+test('本地改名 -> 用户命名', () => {
+  assert.strictEqual(localUserNamed(mk({ preset: 'local_vllm', name: '我的模型', model: 'qwen36_35b_256k' }), localModelNameFn), true);
+});
+test('中文界面保存的本地默认名在英文界面仍非用户命名', () => {
+  assert.strictEqual(localUserNamed(mk({ preset: 'local_vllm', name: '本地 qwen36_35b_256k', model: 'qwen36_35b_256k' }), tEn.uiSettingsDetail.localModelName), false);
+});
+test('非本地 -> 恒 false', () => {
+  assert.strictEqual(localUserNamed(mk({ preset: 'deepseek', name: '任意', model: 'deepseek-v4-pro' }), localModelNameFn), false);
+});
+
+// --- selectorMainLabel ---
+test('预设行主标签 = name(item.title)', () => {
+  assert.strictEqual(selectorMainLabel(mk({ name: 'GLM-5.2', preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4', model: 'glm-5.2' }), t), 'GLM-5.2');
+});
+test('自定义行主标签 = 模型 ID', () => {
+  assert.strictEqual(selectorMainLabel(mk({ name: 'OpenAI 兼容', preset: 'openai_compatible', provider_kind: 'custom', model: 'meta-llama/llama-4-scout' }), t), 'meta-llama/llama-4-scout');
+});
+test('cloud model alias takes precedence in the main label', () => {
+  assert.strictEqual(selectorMainLabel(mk({ alias: 'Daily assistant', model: 'deepseek-v4-pro' }), t), 'Daily assistant');
+});
+test('blank model alias falls back to the existing label', () => {
+  assert.strictEqual(selectorMainLabel(mk({ alias: '   ', model: 'meta-llama/llama-4-scout' }), t), 'meta-llama/llama-4-scout');
+});
+test('local model alias is ignored by selector labels', () => {
+  const local = mk({ alias: 'Must not render', name: '我的模型', preset: 'local_vllm', model: 'qwen36_35b_256k' });
+  assert.strictEqual(selectorMainLabel(local, t), '我的模型');
+  assert.strictEqual(selectorSubLabel(local, t), 'qwen36_35b_256k');
+});
+test('本地已命名 -> 用 name', () => {
+  assert.strictEqual(selectorMainLabel(mk({ name: '我的模型', preset: 'local_vllm', model: 'qwen36_35b_256k' }), t), '我的模型');
+});
+test('本地预设默认名随当前界面语言显示', () => {
+  assert.strictEqual(selectorMainLabel(mk({ name: '本地 qwen36_35b_256k', preset: 'local_vllm', model: 'qwen36_35b_256k' }), tEn), 'Local qwen36_35b_256k');
+});
+test('本地自定义模型跨语言仍以模型 ID 为主标签', () => {
+  assert.strictEqual(selectorMainLabel(mk({ name: '本地 ollama/phi4', preset: 'local_vllm', model: 'ollama/phi4' }), tEn), 'ollama/phi4');
+});
+
+// --- selectorSubLabel ---
+test('预设行副标题 = provider 归属(非 model)', () => {
+  // Finding #2: 预设行副标题改为 providerLabel,主=Title-Case title,副=provider,消除 model 重复。
+  assert.strictEqual(selectorSubLabel(mk({ name: 'GLM-5.2', preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'glm', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4', model: 'glm-5.2' }), t), '智谱 Coding Plan / GLM Coding Plan');
+});
+test('OpenAI Compatible 自定义行副标题 = modelPresetOpenaiCompatible', () => {
+  assert.strictEqual(selectorSubLabel(mk({ name: 'OpenAI 兼容', preset: 'openai_compatible', provider_kind: 'custom', base_url: 'https://api.openrouter.ai/v1', model: 'meta-llama/llama-4-scout' }), t), 'OpenAI 兼容');
+});
+test('本地已命名副标题 = model', () => {
+  assert.strictEqual(selectorSubLabel(mk({ name: '我的模型', preset: 'local_vllm', model: 'qwen36_35b_256k' }), t), 'qwen36_35b_256k');
+});
+test('aliased model subtitle preserves the wire model ID', () => {
+  assert.strictEqual(selectorSubLabel(mk({ alias: 'Daily assistant', model: 'deepseek-v4-pro' }), t), 'deepseek-v4-pro');
+});
+
+// --- 回归:Finding #2 预设行 title===model 时主副不可重复 ---
+test('预设 deepseek(title===model) 主副标签不重复', () => {
+  // name 保存为 item.title,目录里 deepseek 的 title === model === 'deepseek-v4-pro'。
+  // 修复前主副均为模型 id('deepseek-v4-pro'),显示重复;修复后副标题为 provider 归属。
+  const presetModel = mk({ name: 'deepseek-v4-pro', preset: 'deepseek', provider_kind: 'official_api', vendor: 'deepseek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-pro' });
+  const main = selectorMainLabel(presetModel, t);
+  const sub = selectorSubLabel(presetModel, t);
+  assert.strictEqual(main, 'deepseek-v4-pro');
+  // 副标题改为 provider 归属(providerLabelForModel),与主标签(模型 id)不同 -> 消除重复。
+  assert.notStrictEqual(sub, main);
+  assert.strictEqual(sub, providerLabelForModel(presetModel, t));
+});
+
+// --- 空值/边界 guard ---
+test('selectorMainLabel(null) = ""', () => {
+  assert.strictEqual(selectorMainLabel(null, t), '');
+});
+test('groupModelsForSelector([]) = {preset:[], custom:[]}', () => {
+  const g = groupModelsForSelector([]);
+  assert.strictEqual(g.preset.length, 0);
+  assert.strictEqual(g.custom.length, 0);
+});
+
+// --- 回归:本次 bug 场景 ---
+test('同 provider 多自定义模型主标签各不相同', () => {
+  const m1 = mk({ id: 'm1', name: 'OpenAI 兼容', preset: 'openai_compatible', provider_kind: 'custom', model: 'meta-llama/llama-4-scout' });
+  const m2 = mk({ id: 'm2', name: 'OpenAI 兼容', preset: 'openai_compatible', provider_kind: 'custom', model: 'openai/gpt-oss-120b' });
+  assert.notStrictEqual(selectorMainLabel(m1, t), selectorMainLabel(m2, t));
+});
+test('同 provider 多个目录内自定义模型主标签仍各不相同', () => {
+  const m1 = mk({ id: 'm1', name: 'OpenAI 兼容', preset: 'openai_compatible', provider_kind: 'custom', base_url: 'https://openrouter.ai/api/v1', model: 'deepseek-v4-pro' });
+  const m2 = mk({ id: 'm2', name: 'OpenAI 兼容', preset: 'openai_compatible', provider_kind: 'custom', base_url: 'https://openrouter.ai/api/v1', model: 'glm-5.2' });
+  assert.strictEqual(selectorMainLabel(m1, t), 'deepseek-v4-pro');
+  assert.strictEqual(selectorMainLabel(m2, t), 'glm-5.2');
+});
+
+// ── 思考深度档位（reasoning effort）──
+test('reasoningEffortTiersForModel 按 provider 暴露有实际区别的档位', () => {
+  // vm context arrays live in a different realm than the host; deepStrictEqual would false-positive on prototypes, so spread into host arrays to normalize
+  const tiers = model => [...reasoningEffortTiersForModel(model) || []];
+  const deepseek = { preset: 'deepseek', vendor: 'deepseek', model: 'deepseek-v4-pro' };
+  assert.deepStrictEqual(tiers(deepseek), ['off', 'low', 'high', 'max']);
+  const moonshot = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.ai/v1' };
+  assert.deepStrictEqual(tiers(moonshot), ['low', 'high', 'max']);
+  const moonshotNonK3 = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k2.6' };
+  assert.deepStrictEqual(tiers(moonshotNonK3), ['off', 'high']);
+  const zai52 = { preset: 'glm', vendor: 'glm', model: 'GLM-5.2', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.deepStrictEqual(tiers(zai52), ['off', 'high', 'max']);
+  const zaiTurbo = { preset: 'glm', vendor: 'glm', model: 'glm-5-turbo', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.deepStrictEqual(tiers(zaiTurbo), ['off', 'high']);
+  const zai51 = { preset: 'glm', vendor: 'glm', model: 'glm-5.1', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.deepStrictEqual(tiers(zai51), ['off', 'high']);
+  // GLM-5.3 继承 GLM-5.2 的 reasoning_options，同为 tiered effort（底座 is_exact_zai_tiered_effort_route）
+  const zai53 = { preset: 'glm', vendor: 'glm', model: 'glm-5.3', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.deepStrictEqual(tiers(zai53), ['off', 'high', 'max']);
+  // GLM-5.3-Flash joins the z.ai tiered effort route too (off/high/max)
+  const zai53Flash = { preset: 'glm', vendor: 'glm', model: 'glm-5.3-flash', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.deepStrictEqual(tiers(zai53Flash), ['off', 'high', 'max']);
+  // open.bigmodel.cn/api/paas/v4 is also a first-party tiered route since base
+  // #53
+  // (the third host of is_exact_zai_chat_route, and the glm preset's default
+  // endpoint): its tiers must match
+  // api.z.ai, otherwise the engine consumes tiered effort while the UI has no
+  // switch.
+  const bigmodel53 = { preset: 'glm', vendor: 'glm', model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/paas/v4' };
+  assert.deepStrictEqual(tiers(bigmodel53), ['off', 'high', 'max']);
+  const bigmodel53Flash = { preset: 'glm', vendor: 'glm', model: 'glm-5.3-flash', base_url: 'https://open.bigmodel.cn/api/paas/v4' };
+  assert.deepStrictEqual(tiers(bigmodel53Flash), ['off', 'high', 'max']);
+  const bigmodel52 = { preset: 'glm', vendor: 'glm', model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/paas/v4' };
+  assert.deepStrictEqual(tiers(bigmodel52), ['off', 'high', 'max']);
+  // Second-order effect of the third host: glm-5.1 / glm-5-turbo get off/high
+  // on that host too (same source as api.z.ai; before base #53 they had no
+  // tiers on that host).
+  assert.deepStrictEqual(
+    tiers({ preset: 'glm', vendor: 'glm', model: 'glm-5.1', base_url: 'https://open.bigmodel.cn/api/paas/v4' }),
+    ['off', 'high'],
+  );
+  assert.deepStrictEqual(
+    tiers({ preset: 'glm', vendor: 'glm', model: 'glm-5-turbo', base_url: 'https://open.bigmodel.cn/api/paas/v4' }),
+    ['off', 'high'],
+  );
+  // the bigmodel coding host (auto-switch semantics) is explicitly excluded by
+  // the base; neither side offers tiers
+  const bigmodelCoding = { preset: 'glm', vendor: 'glm', model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/coding/paas/v4' };
+  assert.strictEqual(reasoningEffortTiersForModel(bigmodelCoding), null);
+  const kimiCodeK3 = { preset: 'openai_compatible', vendor: 'kimi', model: 'k3', base_url: 'https://api.kimi.com/coding/v1' };
+  assert.deepStrictEqual(tiers(kimiCodeK3), ['low', 'high', 'max']);
+  // the base is_exact_kimi_code_k3_route also covers k3-256k: tiered
+  // low/high/max on the Kimi Code endpoint too
+  const kimiCodeK3256k = { preset: 'openai_compatible', vendor: 'kimi', model: 'k3-256k', base_url: 'https://api.kimi.com/coding/v1' };
+  assert.deepStrictEqual(tiers(kimiCodeK3256k), ['low', 'high', 'max']);
+  const vllm = { preset: 'local_vllm', model: 'qwen36_35b_256k' };
+  assert.deepStrictEqual(tiers(vllm), ['off', 'low', 'medium', 'high']);
+  const anthropic = { preset: 'anthropic', vendor: 'anthropic', model: 'claude-sonnet-5' };
+  assert.deepStrictEqual(tiers(anthropic), ['low', 'medium', 'high', 'max']);
+  // GPT×Responses hits on openai rows take the openai_responses tier table
+  // (the Responses effort mapper has no none: off normalizes to low so it is
+  // not exposed; max sends xhigh). The per-id assertions for gpt-5.6-terra /
+  // gpt-5.5 / gpt-5.6-sol / gpt-5.4-mini are pinned with the same inputs by
+  // the "OpenAI 档位路由" test's responsesFamily loop below, so they are not
+  // repeated here.
+  // openai_responses group: any model id gets the Responses tier table.
+  const responsesCustom = { preset: 'openai_responses', model: 'my-aggregator-model' };
+  assert.deepStrictEqual(tiers(responsesCustom), ['low', 'medium', 'high', 'max']);
+  // Loopback endpoints do not switch to the local-probe tiers either:
+  // openai_responses is an explicit Responses-protocol opt-in (local
+  // Ollama/vLLM only speak Chat), a different gate from openai_compatible's
+  // local-probe path.
+  assert.deepStrictEqual(
+    tiers({ preset: 'openai_responses', model: 'my-aggregator-model', base_url: 'http://127.0.0.1:9200/v1' }),
+    ['low', 'medium', 'high', 'max'],
+  );
+  // xai: only grok-4.6 on the exact https://api.x.ai/v1 (low/medium/high/max,
+  // max sends xhigh on the wire)
+  // and grok-4.5 (low/medium/high; xhigh/max are downgraded to high so not
+  // exposed) offer tiers; Grok reasoning
+  // cannot be turned off and off is not exposed. Other models, no endpoint, or
+  // unofficial endpoints (e.g. an openrouter gateway) → null.
+  const xai46 = { preset: 'xai', vendor: 'xai', model: 'grok-4.6', base_url: 'https://api.x.ai/v1' };
+  assert.deepStrictEqual(tiers(xai46), ['low', 'medium', 'high', 'max']);
+  const xai45 = { preset: 'xai', vendor: 'xai', model: 'grok-4.5', base_url: 'https://api.x.ai/v1' };
+  assert.deepStrictEqual(tiers(xai45), ['low', 'medium', 'high']);
+  const xai43Official = { preset: 'xai', vendor: 'xai', model: 'grok-4.3', base_url: 'https://api.x.ai/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(xai43Official), null);
+  const xaiBuildOfficial = { preset: 'xai', vendor: 'grok', model: 'grok-build-0.1', base_url: 'https://api.x.ai/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(xaiBuildOfficial), null);
+  const xai46NoBase = { preset: 'xai', vendor: 'xai', model: 'grok-4.6' };
+  assert.strictEqual(reasoningEffortTiersForModel(xai46NoBase), null);
+  const xai46Gateway = { preset: 'xai', vendor: 'xai', model: 'grok-4.6', base_url: 'https://openrouter.ai/api/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(xai46Gateway), null);
+  const qwen = { preset: 'qwen', vendor: 'qwen', model: 'qwen3.8-max' };
+  assert.strictEqual(reasoningEffortTiersForModel(qwen), null);
+  const gemini = { preset: 'gemini', vendor: 'gemini', model: 'gemini-3.6-flash' };
+  assert.strictEqual(reasoningEffortTiersForModel(gemini), null);
+  const custom = { preset: 'openai_compatible', model: 'my-model' };
+  assert.strictEqual(reasoningEffortTiersForModel(custom), null);
+  // tiered effort only recognizes exact first-party endpoints: same models on
+  // compatible gateways fall back to generic tiers (fail-closed).
+  // kimi-k3 on both direct platform endpoints (international api.moonshot.ai
+  // and China api.moonshot.cn) goes through the
+  // base always-thinking K3 tiered route (low/high/max, off normalized to low).
+  const moonshotCn = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.cn/v1' };
+  assert.deepStrictEqual(tiers(moonshotCn), ['low', 'high', 'max']);
+  const k3OnDirectPlatform = { preset: 'openai_compatible', vendor: 'kimi', model: 'k3', base_url: 'https://api.moonshot.ai/v1' };
+  assert.deepStrictEqual(tiers(k3OnDirectPlatform), ['off', 'high']);
+  const k3OnGateway = { preset: 'openai_compatible', vendor: 'kimi', model: 'k3', base_url: 'https://gateway.example.com/v1' };
+  assert.deepStrictEqual(tiers(k3OnGateway), ['off', 'high']);
+  const zaiCodingPlanGlobal = { preset: 'openai_compatible', vendor: 'glm', model: 'glm-5.2', base_url: 'https://api.z.ai/api/coding/paas/v4' };
+  assert.deepStrictEqual(tiers(zaiCodingPlanGlobal), ['off', 'high', 'max']);
+  // zai: for compatible gateways / unverified models the base strips
+  // thinking/reasoning_effort → no switching offered;
+  // open.bigmodel.cn/api/paas/v4 is a first-party tiered route since #53 (see
+  // the bigmodel53 case above), no longer part of the "China endpoint has no
+  // tiers" exception.
+  const zaiGateway = { preset: 'glm', vendor: 'glm', model: 'glm-5.2', base_url: 'https://gateway.example.com/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(zaiGateway), null);
+  const zaiUnknownModel = { preset: 'glm', vendor: 'glm', model: 'glm-4.7', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.strictEqual(reasoningEffortTiersForModel(zaiUnknownModel), null);
+  // minimax：仅 first-party MiniMax-M3 提供 off/high，M2.7/M2.5 与兼容网关不提供切换
+  const minimaxM3 = { preset: 'minimax', vendor: 'minimax', model: 'MiniMax-M3', base_url: 'https://api.minimax.io/v1' };
+  assert.deepStrictEqual(tiers(minimaxM3), ['off', 'high']);
+  const minimaxM3Cn = { preset: 'minimax', vendor: 'minimax', model: 'MiniMax-M3', base_url: 'https://api.minimaxi.com/v1' };
+  assert.deepStrictEqual(tiers(minimaxM3Cn), ['off', 'high']);
+  const minimaxM27 = { preset: 'minimax', vendor: 'minimax', model: 'MiniMax-M2.7', base_url: 'https://api.minimax.io/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(minimaxM27), null);
+  const minimaxGateway = { preset: 'minimax', vendor: 'minimax', model: 'MiniMax-M3', base_url: 'https://gateway.example.com/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(minimaxGateway), null);
+  // 官方 deepseek base_url 推断：openai_compatible 且无 vendor，但 base_url 指向官方端点 → deepseek 档位
+  const deepseekByUrl = { preset: 'openai_compatible', model: 'my-deepseek', base_url: 'https://api.deepseek.com/v1' };
+  assert.deepStrictEqual(tiers(deepseekByUrl), ['off', 'low', 'high', 'max']);
+  // /beta is still the official endpoint (aligned with Rust
+  // is_official_deepseek_base_url, including the repeated-suffix
+  // stripping semantics: trim_end_matches strips consecutive /beta, /v1);
+  // api.deepseeki.com
+  // is an unofficial domain (never listed in the official documentation; the
+  // community reports it does not resolve,
+  // awesome-deepseek-agent#311) and is no longer treated as official → no
+  // deepseek four tiers.
+  const deepseekBeta = { preset: 'openai_compatible', model: 'my-deepseek', base_url: 'https://api.deepseek.com/beta' };
+  assert.deepStrictEqual(tiers(deepseekBeta), ['off', 'low', 'high', 'max']);
+  const deepseekRepeatedSuffix = { preset: 'openai_compatible', model: 'my-deepseek', base_url: 'https://api.deepseek.com/v1/beta/beta' };
+  assert.deepStrictEqual(tiers(deepseekRepeatedSuffix), ['off', 'low', 'high', 'max'], 'repeated /beta suffixes must count as the official endpoint exactly like Rust trim_end_matches');
+  const deepseeki = { preset: 'openai_compatible', model: 'my-deepseek', base_url: 'https://api.deepseeki.com' };
+  assert.strictEqual(reasoningEffortTiersForModel(deepseeki), null, 'deepseeki.com is an unofficial domain and must not fall back to the deepseek tiers');
+  // volcengine：底座把 low/medium 归一为 high，仅 off/high/max 有区别
+  const volcengine = { preset: 'doubao', vendor: 'doubao', model: 'doubao-seed-evolving' };
+  assert.deepStrictEqual(tiers(volcengine), ['off', 'high', 'max']);
+  // xiaomi-mimo：只有 thinking 开关（off/enabled），off/high 两档
+  const mimo = { preset: 'mimo', vendor: 'mimo', model: 'mimo-v2.6-pro' };
+  assert.deepStrictEqual(tiers(mimo), ['off', 'high']);
+  // 本地 loopback OpenAI 兼容端点：探测后走 Ollama think 开关 / vLLM 档位，提供四档
+  const localOllama = { preset: 'openai_compatible', model: 'qwen3:8b', base_url: 'http://127.0.0.1:11434/v1' };
+  assert.deepStrictEqual(tiers(localOllama), ['off', 'low', 'medium', 'high']);
+  const localLocalhost = { preset: 'openai_compatible', model: 'local-model', base_url: 'http://localhost:8000/v1' };
+  assert.deepStrictEqual(tiers(localLocalhost), ['off', 'low', 'medium', 'high']);
+  // 远端自定义 OpenAI 兼容端点不提供切换（无本地思考控制 wire）
+  const remoteCustom = { preset: 'openai_compatible', model: 'my-model', base_url: 'https://api.example.com/v1' };
+  assert.strictEqual(reasoningEffortTiersForModel(remoteCustom), null);
+});
+
+test('OpenAI 档位路由：Responses wire 家族切 openai_responses 表，Chat 家族保持 openai 表（含手输自定义模型）', () => {
+  const tiers = model => [...reasoningEffortTiersForModel(model) || []];
+  const openai = model => ({ preset: 'openai', vendor: 'openai', model });
+  // Responses wire family (bridge openai_responses_wire_model: the gpt-6 /
+  // gpt-5.6 / gpt-5.5 / gpt-5.4-mini prefixes, incl. date-snapshot
+  // spellings): the whole family switches to Responses with the
+  // openai_responses tier table (off normalizes to low so it is not
+  // exposed). Official OpenAI accepts hand-typed custom model ids, so the
+  // frontend must offer the switch and must not return null for "not in the
+  // catalog" (otherwise the backend injects effort with no frontend
+  // control).
+  const responsesFamily = [
+    'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra',
+    'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+    'gpt-5.5', 'gpt-5.5-pro',
+    'gpt-5.5-2026-01-01', 'gpt-5.5-pro-2026-01-01',
+    'gpt-5.5-codex', 'gpt-5.5-codex-preview', 'gpt-5.4-mini',
+    'gpt-5.4-mini-2026-01-01',
+  ];
+  responsesFamily.forEach(id => {
+    assert.deepStrictEqual(tiers(openai(id)), ['low', 'medium', 'high', 'max'], `Responses 家族应提供 openai_responses 档位: ${id}`);
+  });
+  // Chat-route codex spellings (not starting with gpt-5.5/gpt-5.6): keep the
+  // base Chat reasoning family semantics (off=none injected), i.e. the
+  // five-tier openai table.
+  const chatFamily = [
+    'gpt-5-codex', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max',
+    'gpt-5.2-codex', 'gpt-5.3-codex', 'codex-gpt-5.5', 'chatgpt-gpt-5.5',
+    'codex-gpt-5.5-preview', 'chatgpt-gpt-5.5-preview',
+  ];
+  chatFamily.forEach(id => {
+    assert.deepStrictEqual(tiers(openai(id)), ['off', 'low', 'medium', 'high', 'max'], `Chat reasoning 家族应保持 openai 档位: ${id}`);
+  });
+  // Neither the Responses wire family nor the Chat reasoning family
+  // (near-miss names the base predicate does not match) gets no switch.
+  const nonReasoning = ['gpt-4o', 'gpt-4.1', 'o3', 'o4-mini'];
+  nonReasoning.forEach(id => {
+    assert.strictEqual(reasoningEffortTiersForModel(openai(id)), null, `非 reasoning 模型应为 null: ${id}`);
+  });
+});
+
+test('reasoningEffortTiersForModel：精确路由语义对齐底座 is_exact_https_route', () => {
+  const tiers = model => [...reasoningEffortTiersForModel(model) || []];
+  const mkZai = baseUrl => ({ preset: 'glm', vendor: 'glm', model: 'glm-5.2', base_url: baseUrl });
+  // 一个尾斜杠无意义（底座 strip_suffix('/')），仍为精确端点
+  assert.deepStrictEqual(tiers(mkZai('https://api.z.ai/api/paas/v4/')), ['off', 'high', 'max']);
+  // 两个尾斜杠：底座只删一个，path 变成 api/paas/v4/，与官方 path 不等 → fail-closed
+  assert.strictEqual(reasoningEffortTiersForModel(mkZai('https://api.z.ai/api/paas/v4//')), null);
+  // path 大小写敏感：API/paas/v4 是相邻路由，不是官方端点
+  assert.strictEqual(reasoningEffortTiersForModel(mkZai('https://api.z.ai/API/paas/v4')), null);
+  // host/scheme 大小写不敏感
+  assert.deepStrictEqual(tiers(mkZai('https://API.Z.AI/api/paas/v4')), ['off', 'high', 'max']);
+  assert.deepStrictEqual(tiers(mkZai('HTTPS://api.z.ai/api/paas/v4')), ['off', 'high', 'max']);
+});
+
+test('reasoningEffortForModelSwitch：K2.6(off) → K3 重置为 high', () => {
+  const k26 = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k2.6' };
+  const k3 = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.ai/v1' };
+  // K2.6 上用户可存 off；切到 K3 后 off 不在其档位表（low/high/max）内，必须重置为 high
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(k26)], ['off', 'high']);
+  assert.ok(![...reasoningEffortTiersForModel(k3)].includes('off'));
+  assert.strictEqual(reasoningEffortForModelSwitch(k3), 'high');
+  // models without tiers switch to null (not explicitly set); vllm falls back
+  // to the local default lowest thinking tier low
+  assert.strictEqual(reasoningEffortForModelSwitch({ preset: 'xai', vendor: 'xai', model: 'grok-4.3' }), null);
+  assert.strictEqual(reasoningEffortForModelSwitch({ preset: 'local_vllm', model: 'qwen36_35b_256k' }), 'low');
+  // z.ai glm-5.2 switch defaults to high; the bigmodel paas host (tiered route
+  // since #53) is also
+  // high; glm-5.2 on a compatible gateway has no tiers → null
+  assert.strictEqual(reasoningEffortForModelSwitch({ preset: 'glm', vendor: 'glm', model: 'glm-5.2', base_url: 'https://api.z.ai/api/paas/v4' }), 'high');
+  assert.strictEqual(reasoningEffortForModelSwitch({ preset: 'glm', vendor: 'glm', model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/paas/v4' }), 'high');
+});
+
+test('baseUrlUsesLoopback 与 Rust bridge.rs 判定对齐', () => {
+  // 回环：localhost / 127.0.0.0/8 / ::1（含展开形式）
+  assert.strictEqual(baseUrlUsesLoopback('http://127.0.0.1:11434/v1'), true);
+  assert.strictEqual(baseUrlUsesLoopback('http://127.255.0.1:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLoopback('http://localhost:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLoopback('http://LOCALHOST:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLoopback('http://[::1]:11434/v1'), true);
+  assert.strictEqual(baseUrlUsesLoopback('http://[0:0:0:0:0:0:0:1]:11434/v1'), true);
+  // 去尾点：127.0.0.1. 与 localhost. 仍按回环（对齐 Rust 的 trim_end_matches('.')）
+  assert.strictEqual(baseUrlUsesLoopback('http://127.0.0.1.:11434/v1'), true);
+  // 非回环：0.0.0.0 不是 loopback（Rust IpAddr::is_loopback() 语义）、
+  // IPv4-mapped ::ffff:127.x 不是 ::1/128、公网/局域网/域名均非本地
+  assert.strictEqual(baseUrlUsesLoopback('http://0.0.0.0:11434/v1'), false);
+  assert.strictEqual(baseUrlUsesLoopback('http://[::ffff:127.0.0.1]:11434/v1'), false);
+  assert.strictEqual(baseUrlUsesLoopback('http://[2001:db8::1]:11434/v1'), false);
+  assert.strictEqual(baseUrlUsesLoopback('http://192.168.1.10:11434/v1'), false);
+  assert.strictEqual(baseUrlUsesLoopback('https://api.example.com/v1'), false);
+  assert.strictEqual(baseUrlUsesLoopback(''), false);
+  assert.strictEqual(baseUrlUsesLoopback('not-a-url'), false);
+});
+
+test('baseUrlUsesLocalOrPrivate 覆盖 loopback/RFC1918/Docker 宿主别名', () => {
+  // loopback（与 baseUrlUsesLoopback 一致）
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://127.0.0.1:11434/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://localhost:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://[::1]:11434/v1'), true);
+  // RFC1918 私网段
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://10.0.0.5:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://172.16.3.4:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://172.31.255.254:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://192.168.1.10:11434/v1'), true);
+  // 172.32 不在 172.16/12 段内
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://172.32.1.1:8000/v1'), false);
+  // Docker 宿主别名
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://host.docker.internal:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://host.lima.internal:8000/v1'), true);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('http://myapp.docker.internal:9000/v1'), true);
+  // 公网/域名非本地
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('https://api.deepseek.com/v1'), false);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('https://gateway.example.com/v1'), false);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate('https://192.168.1.10.example.com/v1'), false);
+  assert.strictEqual(baseUrlUsesLocalOrPrivate(''), false);
+});
+
+test('localProbeTiersForKind 按探测结果映射真实档位', () => {
+  // vllm → 四档；ollama → think 开关两档（避免 low/medium/high 归一误导）
+  assert.deepStrictEqual([...localProbeTiersForKind('vllm')], ['off', 'low', 'medium', 'high']);
+  assert.deepStrictEqual([...localProbeTiersForKind('ollama')], ['off', 'high']);
+  // tachyon（驭光）→ 有效档 none/low/medium/xhigh，high 是 400；最深档复用
+  // 既有 max 档位 id，bridge→底座链路映射为 wire 上的 xhigh
+  assert.deepStrictEqual([...localProbeTiersForKind('tachyon')], ['off', 'low', 'medium', 'max']);
+  // Frameworks wire-isomorphic with vLLM thinking control → same four tiers as vllm
+  for (const kind of ['sglang', 'llamacpp', 'koboldcpp', 'lmdeploy', 'dockermodelrunner']) {
+    assert.deepStrictEqual([...localProbeTiersForKind(kind)], ['off', 'low', 'medium', 'high'], kind);
+  }
+  // lmstudio/generic 底座空操作 → null（前端显示不支持提示）
+  assert.strictEqual(localProbeTiersForKind('lmstudio'), null);
+  assert.strictEqual(localProbeTiersForKind('generic'), null);
+  // 未探测/未知 → 默认四档（前端探测完成前不误报不支持）
+  assert.deepStrictEqual([...localProbeTiersForKind(null)], ['off', 'low', 'medium', 'high']);
+  assert.deepStrictEqual([...localProbeTiersForKind('unknown')], ['off', 'low', 'medium', 'high']);
+});
+
+test('alwaysThinkingSpecForModel: always-thinking model knowledge table matching', () => {
+  // vm realm objects have different prototypes from the test realm; compare via JSON structure
+  const specJson = (modelId) => JSON.stringify(alwaysThinkingSpecForModel(modelId));
+  // case-insensitive + underscores/spaces normalized to '-'
+  assert.strictEqual(specJson('kimi-k3'), '{"tiers":["low","high"]}');
+  assert.strictEqual(specJson('Kimi-K3'), '{"tiers":["low","high"]}');
+  assert.strictEqual(specJson('kimi_k3'), '{"tiers":["low","high"]}');
+  assert.strictEqual(specJson('Kimi K3 Instruct'), '{"tiers":["low","high"]}');
+  assert.strictEqual(specJson('glm-5.3'), '{"tiers":["low","high"]}');
+  assert.strictEqual(specJson('GLM-4.7'), '{"tiers":["low","high"]}');
+  assert.strictEqual(specJson('gpt-oss-120b'), '{"tiers":["low","medium","high"]}');
+  // noControl: thinking cannot be disabled and no effort tier is controllable
+  assert.strictEqual(specJson('kimi-k2-thinking'), '{"noControl":true}');
+  assert.strictEqual(specJson('Kimi-K2.5-Thinking'), '{"noControl":true}');
+  assert.strictEqual(specJson('kimi-k2.7'), '{"noControl":true}');
+  assert.strictEqual(specJson('deepseek-r1-0528'), '{"noControl":true}');
+  assert.strictEqual(specJson('MiniMax-M2'), '{"noControl":true}');
+  assert.strictEqual(specJson('Qwen3-235B-A22B-Thinking'), '{"noControl":true}');
+  // no match: plain qwen3 (no thinking), other models, empty values
+  assert.strictEqual(alwaysThinkingSpecForModel('qwen3-32b'), null);
+  assert.strictEqual(alwaysThinkingSpecForModel('qwen36_35b_256k'), null);
+  assert.strictEqual(alwaysThinkingSpecForModel('glm-5.2'), null);
+  assert.strictEqual(alwaysThinkingSpecForModel(''), null);
+  assert.strictEqual(alwaysThinkingSpecForModel(null), null);
+});
+
+test('local routes hitting the knowledge table: tiers/defaults/stored-value normalization', () => {
+  // spec.tiers model (local vllm preset): tier table replaced by the knowledge table, no off tier
+  const k3Local = { preset: 'local_vllm', model: 'kimi-k3' };
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(k3Local)], ['low', 'high']);
+  assert.strictEqual(defaultReasoningEffortForModel(k3Local), 'low');
+  // stored off is not in spec.tiers → normalized to the lowest tier low; valid high is kept as-is
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Local, 'off'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Local, 'high'), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Local, null), 'low');
+  // local loopback openai_compatible endpoints also go through the knowledge table
+  const gptOssLocal = { preset: 'openai_compatible', model: 'gpt-oss-20b', base_url: 'http://127.0.0.1:8000/v1' };
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(gptOssLocal)], ['low', 'medium', 'high']);
+  assert.strictEqual(defaultReasoningEffortForModel(gptOssLocal), 'low');
+  // noControl model → null (no switch offered, reusing the "not adjustable" semantic exit)
+  const r1Local = { preset: 'local_vllm', model: 'deepseek-r1:14b' };
+  assert.strictEqual(reasoningEffortTiersForModel(r1Local), null);
+  assert.strictEqual(normalizeStoredReasoningEffort(r1Local, 'high'), null);
+  // plain local models keep the four tiers; the default is the lowest
+  // thinking tier low (off is no longer the local default: real-world
+  // models like the Qwen3.8 family do not reliably honor it)
+  const qwenLocal = { preset: 'local_vllm', model: 'qwen3-32b' };
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(qwenLocal)], ['off', 'low', 'medium', 'high']);
+  assert.strictEqual(defaultReasoningEffortForModel(qwenLocal), 'low');
+  // tachyon（驭光）probed 的本地兼容端点：静态归一只认 vllm 四档，但存量 max
+  // 必须逐字保留（tachyon 档表含 max，wire 映射 xhigh）——静默归一成默认 low
+  // 会让设置表单重开再保存把最深档改写为最低档；别名 xhigh 归一到 max 同理。
+  // 知识表命中的本地模型（k3）维持"表外档归一到最低允许档"的既有语义。
+  const tachyonLocal = { preset: 'openai_compatible', model: 'qwen3.8', base_url: 'http://127.0.0.1:8000/v1' };
+  assert.strictEqual(normalizeStoredReasoningEffort(tachyonLocal, 'max'), 'max');
+  assert.strictEqual(normalizeStoredReasoningEffort(tachyonLocal, 'xhigh'), 'max');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Local, 'max'), 'low');
+  // 展示层：probe 出的 tachyon 档表高亮 max 正确
+  assert.strictEqual(reasoningEffortDisplayForTiers('max', [...localProbeTiersForKind('tachyon')]), 'max');
+  // exact cloud routes are unaffected: z.ai first-party glm-5.3 is still off/high/max
+  const glmCloud = { preset: 'glm', vendor: 'glm', model: 'glm-5.3', base_url: 'https://api.z.ai/api/paas/v4' };
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(glmCloud)], ['off', 'high', 'max']);
+  // direct moonshot cloud route for K3 unchanged: low/high/max
+  const k3Direct = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.ai/v1' };
+  assert.deepStrictEqual([...reasoningEffortTiersForModel(k3Direct)], ['low', 'high', 'max']);
+});
+
+test('localReasoningTiers: probed tiers overlaid with the model knowledge table', () => {
+  // spec.tiers overrides the probed tiers (even when the probe reports a four-tier framework)
+  assert.deepStrictEqual([...localReasoningTiers('kimi-k3', 'vllm')], ['low', 'high']);
+  assert.deepStrictEqual([...localReasoningTiers('gpt-oss-120b', 'sglang')], ['low', 'medium', 'high']);
+  // under the ollama route the engine wire only has boolean think, so the only meaningful exposure for an always-thinking model is high
+  assert.deepStrictEqual([...localReasoningTiers('gpt-oss-120b', 'ollama')], ['high']);
+  // noControl → null (frontend shows a "thinking is always on" notice)
+  assert.strictEqual(localReasoningTiers('deepseek-r1:14b', 'vllm'), null);
+  assert.strictEqual(localReasoningTiers('Qwen3-235B-A22B-Thinking', 'ollama'), null);
+  // lmstudio/generic: the engine's openai wire route is a no-op for reasoning_effort,
+  // and knowledge-table tiers are likewise not offered — fall back to the probe result (null), restoring the "endpoint unsupported" notice
+  assert.strictEqual(localReasoningTiers('kimi-k3', 'lmstudio'), null);
+  assert.strictEqual(localReasoningTiers('gpt-oss-120b', 'generic'), null);
+  // noControl on lmstudio/generic is likewise null (notice logic unchanged)
+  assert.strictEqual(localReasoningTiers('deepseek-r1:14b', 'generic'), null);
+  // no knowledge-table match → apply the probed tiers as-is
+  assert.deepStrictEqual([...localReasoningTiers('qwen3-32b', 'ollama')], ['off', 'high']);
+  assert.deepStrictEqual([...localReasoningTiers('qwen3-32b', 'llamacpp')], ['off', 'low', 'medium', 'high']);
+  assert.strictEqual(localReasoningTiers('qwen3-32b', 'generic'), null);
+  assert.deepStrictEqual([...localReasoningTiers('qwen3-32b', null)], ['off', 'low', 'medium', 'high']);
+});
+
+test('reasoningEffortDisplayForTiers: display fallback of stored tiers against probed tiers', () => {
+  // A stored high, or high selected before probing completes, is clamped to
+  // medium on Tachyon. Re-probing another engine preserves the original value.
+  const tachyonTiers = [...localProbeTiersForKind('tachyon')];
+  for (const preset of ['local_vllm', 'openai_compatible']) {
+    const model = { preset, model: 'qwen3.8', base_url: 'http://127.0.0.1:8000/v1' };
+    const stored = normalizeStoredReasoningEffort(model, 'high');
+    assert.strictEqual(reasoningEffortDisplayForTiers(stored, tachyonTiers), 'medium');
+    assert.strictEqual(reasoningEffortDisplayForTiers(stored, [...localProbeTiersForKind('vllm')]), 'high');
+    assert.strictEqual(stored, 'high');
+  }
+  // ollama two-tier table: stored low/medium are wire-equivalent to high
+  // (think:true); the highlight maps to the nearest tier, high
+  assert.strictEqual(reasoningEffortDisplayForTiers('low', ['off', 'high']), 'high');
+  assert.strictEqual(reasoningEffortDisplayForTiers('medium', ['off', 'high']), 'high');
+  // in-table values return unchanged
+  assert.strictEqual(reasoningEffortDisplayForTiers('off', ['off', 'high']), 'off');
+  assert.strictEqual(reasoningEffortDisplayForTiers('high', ['off', 'high']), 'high');
+  // four-tier table: no in-table tier is remapped
+  assert.strictEqual(reasoningEffortDisplayForTiers('low', ['off', 'low', 'medium', 'high']), 'low');
+  // max is not in the four-tier table: the core normalizes max to high; the highlight lands on high
+  assert.strictEqual(reasoningEffortDisplayForTiers('max', ['off', 'low', 'medium', 'high']), 'high');
+  // no high to land on (off-only table / empty table / non-array) → null (no highlight)
+  assert.strictEqual(reasoningEffortDisplayForTiers('low', ['off']), null);
+  assert.strictEqual(reasoningEffortDisplayForTiers('low', []), null);
+  assert.strictEqual(reasoningEffortDisplayForTiers('low', 42), null);
+  // no tier ever picked → null
+  assert.strictEqual(reasoningEffortDisplayForTiers(null, ['off', 'high']), null);
+});
+
+test('defaultReasoningEffortForModel: vllm→low (lowest thinking tier), other models with tiers→high, unsupported→null', () => {
+  const deepseek = { preset: 'deepseek', vendor: 'deepseek', model: 'deepseek-v4-pro' };
+  assert.strictEqual(defaultReasoningEffortForModel(deepseek), 'high');
+  const vllm = { preset: 'local_vllm', model: 'qwen36_35b_256k' };
+  assert.strictEqual(defaultReasoningEffortForModel(vllm), 'low');
+  const xai = { preset: 'xai', vendor: 'xai', model: 'grok-4.3' };
+  assert.strictEqual(defaultReasoningEffortForModel(xai), null);
+  // grok-4.6 on the xai official endpoint offers tiers and defaults to high
+  // (consistent with deepseek etc.)
+  const xai46 = { preset: 'xai', vendor: 'xai', model: 'grok-4.6', base_url: 'https://api.x.ai/v1' };
+  assert.strictEqual(defaultReasoningEffortForModel(xai46), 'high');
+  assert.strictEqual(reasoningEffortForModelSwitch(xai46), 'high');
+  // a local loopback OpenAI-compatible endpoint has the same static default,
+  // the lowest thinking tier low; when ollama is probed the runtime default
+  // is high (the think toggle only has off/on), and the static low maps to a
+  // high highlight via reasoningEffortDisplayForTiers on the ['off','high']
+  // probed tier table, consistent with the runtime
+  const localOllama = { preset: 'openai_compatible', model: 'qwen3:8b', base_url: 'http://127.0.0.1:11434/v1' };
+  assert.strictEqual(defaultReasoningEffortForModel(localOllama), 'low');
+});
+
+test('normalizeStoredReasoningEffort：存量旧值归一，无档位模型为 null', () => {
+  const deepseek = { preset: 'deepseek', vendor: 'deepseek', model: 'deepseek-v4-pro' };
+  // medium 不在 deepseek 档位表内（底座把 medium 归一为 high）→ 归一到 high；
+  // low 是底座保留的真实档位，应在档位表内原样保留。
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'medium'), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'low'), 'low');
+  // 底座别名 → 规范档位后再与档位表匹配
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'light'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'minimum'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'ultra'), 'max');
+  // 存量值已在档位表内 → 原样保留
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'off'), 'off');
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, 'max'), 'max');
+  // The third host (open.bigmodel.cn/api/paas/v4) has a tier table since base
+  // #53, so a stored medium value should normalize to high (same source as
+  // api.z.ai).
+  const bigmodelGlm = { preset: 'glm', vendor: 'glm', model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/paas/v4' };
+  assert.strictEqual(normalizeStoredReasoningEffort(bigmodelGlm, 'medium'), 'high');
+  // 无存量 → 回退默认档位
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek, null), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseek), 'high');
+  // vllm defaults to the lowest thinking tier low; an empty stored value
+  // falls back to low as well
+  const vllm = { preset: 'local_vllm', model: 'qwen36_35b_256k' };
+  assert.strictEqual(normalizeStoredReasoningEffort(vllm, null), 'low');
+  // 无档位模型（xai 底座空操作）→ null
+  const xai = { preset: 'xai', vendor: 'xai', model: 'grok-4.3' };
+  assert.strictEqual(normalizeStoredReasoningEffort(xai, 'high'), null);
+  assert.strictEqual(normalizeStoredReasoningEffort(xai, null), null);
+  // anthropic 档位表含 low/medium/high/max：存量 medium 原样保留
+  const anthropic = { preset: 'anthropic', vendor: 'anthropic', model: 'claude-sonnet-5' };
+  assert.strictEqual(normalizeStoredReasoningEffort(anthropic, 'medium'), 'medium');
+  // always-thinking K3（国际直连平台）：off 在底座 K3 路由里等价于 low，medium 等价于 high
+  const k3Direct = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.ai/v1' };
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Direct, 'off'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Direct, 'none'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Direct, 'medium'), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Direct, 'low'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Direct, 'high'), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Direct, 'max'), 'max');
+  // the China direct platform endpoint api.moonshot.cn/v1 joins the base K3
+  // tiered route too: off normalizes to low
+  const k3Cn = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.cn/v1' };
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Cn, 'off'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(k3Cn, 'medium'), 'high');
+  // xai: the grok-4.5 tier table is low/medium/high and stored max/xhigh are
+  // downgraded by the base → normalized to high;
+  // the grok-4.6 tier table includes max (wire sends xhigh), so stored xhigh
+  // normalizes to max as-is
+  const xai45 = { preset: 'xai', vendor: 'xai', model: 'grok-4.5', base_url: 'https://api.x.ai/v1' };
+  assert.strictEqual(normalizeStoredReasoningEffort(xai45, 'max'), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(xai45, 'xhigh'), 'high');
+  assert.strictEqual(normalizeStoredReasoningEffort(xai45, 'low'), 'low');
+  const xai46 = { preset: 'xai', vendor: 'xai', model: 'grok-4.6', base_url: 'https://api.x.ai/v1' };
+  assert.strictEqual(normalizeStoredReasoningEffort(xai46, 'xhigh'), 'max');
+  assert.strictEqual(normalizeStoredReasoningEffort(xai46, null), 'high');
+  // off is not in the grok-4.6 tier table: normalized to high, matching the
+  // base sending off as wire high
+  assert.strictEqual(normalizeStoredReasoningEffort(xai46, 'off'), 'high');
+  // OpenAI Responses wire (the GPT family / the openai_responses group): the
+  // foundation's Responses effort mapper has no none (off→low), so a
+  // chat-era stored off normalizes to the route's wire-true equivalent low
+  // (same rule as K3) instead of falling back to the default high and
+  // silently inverting "minimal reasoning" into "most reasoning".
+  const openaiResponsesRow = { preset: 'openai', vendor: 'openai', model: 'gpt-6-sol' };
+  assert.strictEqual(normalizeStoredReasoningEffort(openaiResponsesRow, 'off'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(openaiResponsesRow, 'disabled'), 'low');
+  assert.strictEqual(normalizeStoredReasoningEffort(openaiResponsesRow, 'none'), 'low');
+  const responsesGroup = { preset: 'openai_responses', model: 'my-aggregator-model' };
+  assert.strictEqual(normalizeStoredReasoningEffort(responsesGroup, 'off'), 'low');
+  // The openai tier table of Chat-route rows (codex spellings hitting the
+  // base Chat reasoning family) still contains off: keep it verbatim; it does
+  // not participate in the Responses off→low normalization.
+  const openaiChatRow = { preset: 'openai', vendor: 'openai', model: 'gpt-5.3-codex' };
+  assert.strictEqual(normalizeStoredReasoningEffort(openaiChatRow, 'off'), 'off');
+  // non-xai official endpoints / other Grok models have no tiers → null
+  assert.strictEqual(normalizeStoredReasoningEffort({ preset: 'xai', vendor: 'xai', model: 'grok-4.3', base_url: 'https://api.x.ai/v1' }, 'high'), null);
+});
+
+test('手输改字段（model ID / base_url）归一只修正失效值、保留有效值', () => {
+  // Kimi 非 K3 上已存 off：改自定义 ID（仍非 K3）后 off 依然合法，保留而非重置为 high
+  const moonshotCustom = { preset: 'kimi', vendor: 'kimi', model: 'custom-kimi-a' };
+  assert.strictEqual(normalizeStoredReasoningEffort(moonshotCustom, 'off'), 'off');
+  // 改 ID 为 kimi-k3（always-thinking）后 off 失效，按底座真实等价值归一为 low
+  const k3 = { preset: 'kimi', vendor: 'kimi', model: 'kimi-k3', base_url: 'https://api.moonshot.ai/v1' };
+  assert.strictEqual(normalizeStoredReasoningEffort(k3, 'off'), 'low');
+  // vLLM 上已存 high：改本地模型 ID / base_url 后 high 依然合法，保留（不误清用户选择）
+  const vllmHigh = { preset: 'local_vllm', model: 'qwen36_35b_256k' };
+  assert.strictEqual(normalizeStoredReasoningEffort(vllmHigh, 'high'), 'high');
+  // openai_compatible 改 base_url 到官方 deepseek 端点：档位从无到有，存量 null 回落默认 high
+  const deepseekByUrl = { preset: 'openai_compatible', model: 'my-model', base_url: 'https://api.deepseek.com' };
+  assert.strictEqual(normalizeStoredReasoningEffort(deepseekByUrl, null), 'high');
+});
+
+test('目录视觉能力标注(imageCapable):形状合法且查询只命中已标注条目', () => {
+  const annotatedKeys = [];
+  const annotatedIds = new Set();
+  for (const scope of ['local', 'cloud']) {
+    for (const group of MODEL_CATALOG[scope] || []) {
+      for (const item of group.items || []) {
+        if (item.imageCapable === undefined) continue;
+        assert.ok(item.imageCapable === true || item.imageCapable === false,
+          `imageCapable 只能是 true/false:${group.key}/${item.model}`);
+        assert.ok(!item.custom, `custom 条目不应标注视觉能力:${group.key}`);
+        assert.ok(item.model, `标注条目必须有模型 ID:${group.key}`);
+        // 同一模型可出现在多个 provider 组(如 MiniMax-M3 中国/国际版),按组内唯一校验。
+        annotatedKeys.push(`${group.key}/${item.model}`);
+        annotatedIds.add(item.model);
+      }
+    }
+  }
+  assert.ok(annotatedKeys.length > 0, '目录至少保留一条视觉能力标注');
+  assert.strictEqual(new Set(annotatedKeys).size, annotatedKeys.length, '同组内标注模型 ID 不得重复');
+  // 跨组同 ID(含 legacyAliases)的显式标注必须一致:查询取第一个有标注的命中项,
+  // 各组标注冲突时会静默依赖遍历序,在此提前拦截。
+  const annotatedById = new Map();
+  for (const scope of ['local', 'cloud']) {
+    for (const group of MODEL_CATALOG[scope] || []) {
+      for (const item of group.items || []) {
+        if (item.imageCapable === undefined || item.custom) continue;
+        for (const id of [item.model, ...(item.legacyAliases || [])]) {
+          const known = annotatedById.get(id);
+          assert.ok(known === undefined || known === item.imageCapable,
+            `模型 ${id} 在多个组的 imageCapable 标注冲突`);
+          if (known === undefined) annotatedById.set(id, item.imageCapable);
+        }
+      }
+    }
+  }
+  // Query: annotated ids hit their explicit value (true or false);
+  // unannotated / miss / empty fall to null (the "auto
+  // processing" chain is the fallback). false is an explicit annotation for
+  // officially text-only rows, semantically different from "unannotated".
+  for (const id of annotatedIds) {
+    const flagged = catalogImageCapableForModel(id);
+    assert.ok(flagged === true || flagged === false, `${id} should hit an annotation`);
+  }
+  // explicit true: the new deepseek mainline (V4.1-Flash); deleted-row
+  // spellings also hit via legacyAliases
+  assert.strictEqual(catalogImageCapableForModel('deepseek-flash'), true);
+  assert.strictEqual(catalogImageCapableForModel('deepseek-v4-flash'), true);
+  // explicit false: flagship rows the official docs call text-only
+  assert.strictEqual(catalogImageCapableForModel('deepseek-v4-pro'), false);
+  assert.strictEqual(catalogImageCapableForModel('glm-5.2'), false, "the glm group's glm-5.2 is explicitly annotated text-only");
+  assert.strictEqual(catalogImageCapableForModel('qwen3.7-max'), false);
+  // the glm-5.3 rows in the coding/Token Plan groups are also explicitly
+  // false, no longer relying on cross-group scan order
+  assert.strictEqual(catalogImageCapableForModel('glm-5.3'), false);
+  // Tencent lowercase wire spellings hit the same group's false annotation
+  // (a case mismatch previously could only fall to null → auto)
+  assert.strictEqual(catalogImageCapableForModel('minimax-m2.7'), false);
+  assert.strictEqual(catalogImageCapableForModel('minimax-m-2-7'), false);
+  assert.strictEqual(catalogImageCapableForModel('完全不存在的模型'), null);
+  assert.strictEqual(catalogImageCapableForModel(''), null);
+  assert.strictEqual(catalogImageCapableForModel(null), null);
+});
+
+test('imageCapable annotations cross-check the Rust builtin verified table source (frontend annotations must not diverge from backend resolution)', () => {
+  // The frontend imageCapable and the backend image_capability.rs are the last
+  // unguarded mirror pair: FE true
+  // with BE Unknown would silently degrade official-route image input (the
+  // form shows "supported" while sending resolves
+  // Unknown); FE false with a BE hit would inline images for text-only rows on
+  // send. This parses the two Rust
+  // tables (substring VERIFIED + exact EXACT), recomputes
+  // builtin_verified_supports_image on the JS side
+  // and does bidirectional parity against the explicit frontend annotations;
+  // unannotated (null) is unconstrained — both sides land on the "auto" chain.
+  const rustSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'features', 'assistant', 'image_capability.rs'), 'utf8',
+  );
+  const extractTable = prefix => {
+    const start = rustSrc.indexOf(prefix);
+    assert.ok(start > 0, `image_capability.rs should contain ${prefix} (sync this cross-check if the table layout changes)`);
+    const end = rustSrc.indexOf('];', start);
+    assert.ok(end > start, 'the Rust table is not closed properly; sync this cross-check extractor');
+    // strip comment lines inside the table before taking string literals, so
+    // example spellings in comments do not pollute the entry set.
+    return [...rustSrc.slice(start, end).replace(/\/\/[^\n]*/g, '').matchAll(/"([^"]+)"/g)].map(m => m[1]);
+  };
+  const substrings = extractTable('const VERIFIED_IMAGE_CAPABLE_MODELS');
+  const exacts = extractTable('const EXACT_VERIFIED_IMAGE_CAPABLE_MODELS');
+  assert.ok(substrings.length > 0, 'a VERIFIED table that parses to empty means format drift; fix this extractor');
+  assert.ok(exacts.length > 0, 'an EXACT table that parses to empty means format drift; fix this extractor');
+  const backendSupports = id => exacts.includes(id) || substrings.some(entry => id.includes(entry));
+  let checked = 0;
+  const backendAdmittedUnannotated = new Set();
+  const feFalseAnnotated = new Set();
+  for (const scope of ['local', 'cloud']) {
+    for (const group of MODEL_CATALOG[scope] || []) {
+      for (const item of group.items || []) {
+        if (item.custom) continue;
+        for (const id of [item.model, ...(item.legacyAliases || [])]) {
+          const fe = catalogImageCapableForModel(id);
+          const be = backendSupports(String(id).toLowerCase());
+          if (fe === true) {
+            checked += 1;
+            assert.ok(be, `frontend annotates image-capable but backend resolves Unknown: ${group.key}/${id}`);
+          } else if (fe === false) {
+            checked += 1;
+            feFalseAnnotated.add(String(id));
+            assert.ok(!be, `frontend annotates text-only but backend treats it as image-capable (images would be inlined on send): ${group.key}/${id}`);
+          } else if (be) {
+            // Unannotated rows are no longer skipped wholesale (the r1
+            // blindness complaint — the entries were fixed, the structure
+            // wasn't): an unannotated id that the backend table admits
+            // silently resolves Supported through the "auto" chain. That is
+            // fine per se (the substring/exact entries are vetted), but it
+            // must stay a conscious inventory, not an accident: every such
+            // id is pinned in UNANNOTATED_BACKEND_ADMITTED below, and any
+            // drift on either side forces a decision here.
+            backendAdmittedUnannotated.add(String(id));
+          }
+        }
+      }
+    }
+  }
+  // (The coverage gate `checked >= 60` runs once at the end of this test;
+  // a mid-test duplicate was removed in the 2026-11-04 review wave.)
+  const UNANNOTATED_BACKEND_ADMITTED = [
+    // OpenRouter/aggregator rows whose org-prefixed spelling carries a vetted
+    // substring (gpt-6 / gpt-5.6 / claude-opus-5 / qwen3.8 / glm-5.3-flash /
+    // minimax-m3 / kimi-k3 / kimi-k2.7-code / gemini-4): deployments behind
+    // the platform stay unverified one by one (the rows' own group comments),
+    // while the underlying model family is officially multimodal.
+    'Qwen/Qwen3.8-27B',
+    'anthropic/claude-opus-5.5',
+    'deepseek/deepseek-flash',
+    'doubao-seed-2.0-mini',
+    'doubao-seed-2.1-lite',
+    'doubao-seed-2.1-pro',
+    'google/gemini-4-argon',
+    'minimax/minimax-m3',
+    'minimax/minimax-m3.1-flash',
+    'moonshotai/Kimi-K2.7-Code',
+    'moonshotai/Kimi-K3',
+    'moonshotai/kimi-k2.7-code',
+    'moonshotai/kimi-k3.1-pro',
+    'openai/gpt-5.6-luna',
+    'openai/gpt-6-luna',
+    'openai/gpt-6.1-sol',
+    'openai/gpt-6.1-terra',
+    'qwen/qwen3.8-flash',
+    'z-ai/glm-5.3-flash',
+    'zai-org/GLM-5.3-Flash',
+  ];
+  const byStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  assert.deepStrictEqual(
+    [...backendAdmittedUnannotated].sort(byStr),
+    UNANNOTATED_BACKEND_ADMITTED.sort(byStr),
+    'the unannotated-but-backend-admitted inventory drifted: a new id silently resolves Supported through the auto chain (add it here consciously), or a table entry/row spelling changed',
+  );
+  assert.ok(checked >= 60, `parity check coverage is abnormally low (only ${checked} entries); the catalog annotations or alias structure appear to have drifted`);
+  // The false side of the annotation set gets the same snapshot treatment as
+  // the unannotated inventory: a `false` annotation is load-bearing (it
+  // blocks the form's image toggle on text-only rows), but dropping one does
+  // not trip any assertion above — the id merely stops being checked and the
+  // per-row loop stays green. Pin the deduped id set so a deleted (or newly
+  // added) text-only annotation forces a conscious decision here
+  // (2026-11-06 review).
+  const FALSE_ANNOTATED_INVENTORY = [
+    'GLM-5.2',
+    'MiniMax-M2.5',
+    'MiniMax-M2.5-highspeed',
+    'MiniMax-M2.7',
+    'MiniMax-M2.7-highspeed',
+    'deepseek-v4-pro',
+    'glm-5-2',
+    'glm-5-3',
+    'glm-5.2',
+    'glm-5.3',
+    'minimax-m-2-7',
+    'minimax-m2.7',
+    'qwen3.7-max',
+  ];
+  assert.deepStrictEqual(
+    [...feFalseAnnotated].sort(byStr),
+    FALSE_ANNOTATED_INVENTORY.sort(byStr),
+    'the text-only (imageCapable:false) annotation inventory drifted: a false annotation was dropped or added — a dropped one silently re-enables the image toggle for a text-only row',
+  );
+});
+
+test('coding-plan endpoint sets cross-check the Rust identify arms (frontend groups must classify where the backend stamps metadata)', () => {
+  // identify_coding_plan_endpoint backfills vendor/coding_plan metadata on
+  // the Rust side; a frontend coding_plan group whose canonical base URL is
+  // absent from the Rust arms would classify in the form but lose the
+  // separate reasoning-field parsing after save (the doc comment on the
+  // function names that failure). Both sides are otherwise hand-pinned; this
+  // is the structural set comparison (the default/baseUrl cross-checks show
+  // the same pattern), added in the 2026-11-04 fix pass.
+  const rustSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'platform', 'prefs', 'model.rs'), 'utf8',
+  );
+  const fnStart = rustSrc.indexOf('pub(super) fn identify_coding_plan_endpoint');
+  assert.ok(fnStart > 0, 'identify_coding_plan_endpoint not found; sync this cross-check');
+  const fnBody = rustSrc.slice(fnStart, rustSrc.indexOf('\n}', fnStart));
+  const rustUrls = [...fnBody.matchAll(/"(https:\/\/[^"]+)"/g)].map(m => m[1].toLowerCase());
+  assert.ok(rustUrls.length >= 8, `unexpectedly few Rust arms (${rustUrls.length}); format drift — sync this extractor`);
+  const stripChat = url => url.replace(/\/chat\/completions$/i, '');
+  let checked = 0;
+  for (const group of MODEL_CATALOG.cloud) {
+    if (group.providerKind !== 'coding_plan') continue;
+    const canonical = stripChat(group.baseUrl).toLowerCase();
+    assert.ok(rustUrls.includes(canonical), `frontend coding_plan group ${group.key} canonical base ${canonical} has no Rust identify arm (saved configs would lose vendor/coding_plan metadata)`);
+    checked += 1;
+  }
+  assert.ok(checked >= 6, `coding_plan group coverage abnormally low (${checked}); the catalog structure appears to have drifted`);
+});
+
+test('frontend endpoint classification folds URL case like the Rust identify arms', () => {
+  // URL hosts are case-insensitive (RFC 3986) and the Rust side lowercases
+  // before matching (to_ascii_lowercase), so a stored uppercase-host URL
+  // must classify into the same group here instead of getting Rust metadata
+  // with no frontend group (2026-11-04 fix pass).
+  const mk = base => ({ preset: 'openai_compatible', provider_kind: 'coding_plan', vendor: 'tencent', base_url: base, model: 'kimi-k3' });
+  assert.strictEqual(findCloudProviderForModel(mk('https://tokenhub.tencentmaas.com/plan/v3'))?.key, 'tencent_token_plan');
+  assert.strictEqual(findCloudProviderForModel(mk('https://TOKENHUB.TencentMaas.com/plan/v3'))?.key, 'tencent_token_plan', 'uppercase-host stored URL must classify identically');
+  assert.strictEqual(findCloudProviderForModel(mk('https://Api.Lkeap.Cloud.Tencent.Com/plan/v3'))?.key, 'tencent_token_plan', 'the legacy alias folds case too');
+  // The stored value keeps its original case: display/prefill must not be
+  // rewritten by a classification-only lookup.
+  const original = mk('https://TOKENHUB.TencentMaas.com/plan/v3');
+  assert.strictEqual(findCloudProviderForModel(original)?.baseUrl, 'https://tokenhub.tencentmaas.com/plan/v3', 'display keeps the canonical catalog baseUrl (no vacuous fallback)');
+  assert.strictEqual(original.base_url, 'https://TOKENHUB.TencentMaas.com/plan/v3', 'classification must not mutate the stored base_url');
+});
+
+// --- modelDescriptions i18n guardrails ---
+// SettingsView only looks up modelDescriptions for non-custom rows (custom rows
+// use the dedicated custom*Desc keys),
+// and a missing entry would fall back to showing Chinese to en/ja users. The
+// catalog and the dictionaries live in different files, and
+// ui_language_coverage only does zh key parity, which does not cover this, so
+// the sources are cross-checked directly.
+const extractModelDescriptionKeys = file => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'i18n', file), 'utf8');
+  const keys = new Set();
+  for (const m of src.matchAll(/Object\.assign\(\w+\.uiSettingsDetail\.modelDescriptions,\s*\{([\s\S]*?)\n\}\);/g)) {
+    for (const k of m[1].matchAll(/'([^']+)'\s*:/g)) keys.add(k[1]);
+  }
+  for (const m of src.matchAll(/modelDescriptions:\s*\{([^}]*)\}/g)) {
+    for (const k of m[1].matchAll(/'([^']+)'\s*:/g)) keys.add(k[1]);
+  }
+  return keys;
+};
+const collectCatalogDescs = () => {
+  const descs = new Set();
+  for (const scope of ['local', 'cloud']) {
+    for (const group of MODEL_CATALOG[scope] || []) {
+      for (const item of group.items || []) {
+        if (!item.custom && item.desc) descs.add(item.desc);
+      }
+    }
+  }
+  return descs;
+};
+
+test('modelDescriptions i18n completeness: every non-custom catalog desc has entries in en/ja', () => {
+  const en = extractModelDescriptionKeys('en.js');
+  const ja = extractModelDescriptionKeys('ja.js');
+  const descs = collectCatalogDescs();
+  assert.ok(descs.size > 0, 'should extract non-custom descs from the catalog');
+  for (const desc of descs) {
+    assert.ok(en.has(desc), `en is missing a catalog desc entry: ${desc}`);
+    assert.ok(ja.has(desc), `ja is missing a catalog desc entry: ${desc}`);
+  }
+});
+
+test('modelDescriptions has no stale keys left from the refresh (desc renames must clean up the en/ja/zh entries in sync)', () => {
+  // The 2026-09 refresh renamed many descs and en/ja once accumulated 25 dead
+  // keys. The former 6 baseline leftover keys are all cleared (the allowlist
+  // is removed); any dead key from now on turns this test red.
+  // zh is scanned too (zh's modelDescriptions is an optional override whose
+  // key set is a subset of en's,
+  // but it can accumulate dead keys the same way — the compatibility
+  // highspeed/compatible-endpoint examples once slipped through).
+  const descs = collectCatalogDescs();
+  for (const file of ['en.js', 'ja.js', 'zh.js']) {
+    const dead = [...extractModelDescriptionKeys(file)].filter(k => !descs.has(k));
+    assert.deepStrictEqual(dead, [], `${file} has unreferenced modelDescriptions dead keys: ${dead.join(', ')}`);
+  }
+});
+
+test('providerCatalog overlays and preset labels for the custom Responses group exist in every language', () => {
+  // ui_language_coverage only walks zh leaf keys, and zh's providerCatalog is
+  // deliberately {} (zh copy lives in the catalog source). Nothing else pins
+  // the en/ja providerCatalog overlays, so deleting e.g.
+  // providerCatalog.openai_responses from en.js/ja.js would serve en/ja users
+  // the raw Chinese catalog copy with a green suite (the exact regression
+  // class the round-2 review caught). Require an overlay for EVERY catalog
+  // group except the local one — 2026-11-03 widening: the refresh's four new
+  // groups previously had no pin here, so deleting providerCatalog.mistral
+  // kept the suite green (see the r1 review). A future group cannot land
+  // without its en/ja copy either.
+  const catalogKeys = Object.values(MODEL_CATALOG)
+    .flat()
+    .map(group => group.key)
+    .filter(key => key && key !== 'local');
+  assert.ok(catalogKeys.length >= 32, `unexpectedly few catalog groups: ${catalogKeys.length}`);
+  const extractProviderCatalog = file => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'i18n', file), 'utf8');
+    const start = src.indexOf('providerCatalog:{');
+    assert.notStrictEqual(start, -1, `${file} must keep a providerCatalog table`);
+    const end = src.indexOf('\n  },', start);
+    assert.notStrictEqual(end, -1, `${file} providerCatalog table appears unterminated`);
+    return src.slice(start, end);
+  };
+  for (const file of ['en.js', 'ja.js']) {
+    const block = extractProviderCatalog(file);
+    for (const group of catalogKeys) {
+      // Entries carry an optional configTitle between title and desc
+      // (custom-endpoint groups omit it).
+      const entry = block.match(
+        new RegExp(`${group}:\\{title:'([^']+)'(?:,configTitle:'([^']+)')?,desc:'([^']+)'\\}`)
+      );
+      assert.ok(entry, `${file} providerCatalog is missing the ${group} title/desc overlay`);
+      assert.ok(entry[1].trim(), `${file} ${group} overlay title must be non-empty`);
+      assert.ok(entry[3].trim(), `${file} ${group} overlay desc must be non-empty`);
+    }
+  }
+  // Reverse direction (2026-11-05 review M3): every overlay entry in en/ja
+  // must map to a live catalog group — a group removed from the catalog
+  // would otherwise leave its overlay behind as a dead key forever, which
+  // the forward scan above cannot see. `local` is allowed: the forward scan
+  // exempts it, but its overlay entry may legitimately exist.
+  const allCatalogKeys = new Set(
+    Object.values(MODEL_CATALOG)
+      .flat()
+      .map(group => group.key)
+      .filter(Boolean)
+  );
+  for (const file of ['en.js', 'ja.js']) {
+    const block = extractProviderCatalog(file);
+    const overlayKeys = [...block.matchAll(/(?:^|[,{])\s*([A-Za-z0-9_]+):\{title:'/g)].map(m => m[1]);
+    assert.ok(
+      overlayKeys.length >= catalogKeys.length,
+      `${file} overlay key count regressed: ${overlayKeys.length} (expected >= ${catalogKeys.length})`
+    );
+    // The `local` group is exempt from the forward scan (SettingsView renders
+    // its header via the preset label, not this overlay), so the scans above
+    // cannot see its entry at all: deleting providerCatalog.local would stay
+    // green until some header switches to the localized overlay for the
+    // local group (exactly what the round-4 change did for every non-local
+    // group) and silently serves zh copy to en/ja users. Pin its presence
+    // explicitly (2026-11-06 review).
+    assert.ok(
+      /(?:^|[,{])\s*local:\{title:'([^']+)',desc:'([^']+)'\}/.test(block),
+      `${file} providerCatalog must keep the local:{title,desc} overlay entry (unconsumed today, but deleting it pre-regresses the localized-header path)`
+    );
+    for (const key of overlayKeys) {
+      assert.ok(
+        allCatalogKeys.has(key),
+        `${file} providerCatalog carries the dead overlay key ${key} — no catalog group with that key exists`
+      );
+    }
+  }
+  // zh's providerCatalog is deliberately {} (zh copy lives in the catalog
+  // source) — pin the emptiness so a partial zh overlay shadowing catalog
+  // titles cannot land silently (the ui_language_coverage zh-leaf walk
+  // cannot flag paths en/ja already cover). Line endings are normalized
+  // before matching: a Windows CRLF checkout must not false-fail on the
+  // LF-only newline in the regex (review 5783312297). Determinism caveat:
+  // this reads source files directly, but tests that drive the process-wide
+  // catalog cache cannot be reset by CODEWHALE_HOME alone — an already
+  // initialized cache keeps prior state (retain that distinction when
+  // hardening further).
+  const zhSrc = fs
+    .readFileSync(path.join(__dirname, '..', 'src', 'shared', 'i18n', 'zh.js'), 'utf8')
+    .replace(/\r\n/g, '\n');
+  assert.ok(
+    /providerCatalog:\{\},?\n/.test(zhSrc),
+    'zh.js providerCatalog must stay {} — zh copy is the catalog inline copy'
+  );
+  // The preset label and customModelTitles rows must exist in all three
+  // dictionaries (the sub-label assertions above use stub dictionaries, so a
+  // simultaneous deletion from all three real dicts would otherwise stay
+  // green). customModelTitles intentionally covers a subset of groups (the
+  // rest fall back to the generic template), so the all-groups scan above
+  // does not apply to it — the 2026-11-03 groups are pinned explicitly.
+  // Round-8 reverse direction (mirrors the providerCatalog guard): every
+  // customModelTitles key must map to a live catalog group — a group
+  // removed from the catalog must not leave dead title rows behind.
+  const liveGroupKeys = new Set(
+    ['local', 'cloud'].flatMap(scope => (MODEL_CATALOG[scope] || []).map(group => group.key)),
+  );
+  for (const file of ['en.js', 'ja.js', 'zh.js']) {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'i18n', file), 'utf8');
+    assert.ok(/modelPresetOpenaiResponses:\s*'[^']+'/.test(src), `${file} is missing the modelPresetOpenaiResponses label`);
+    const titles = src.match(/customModelTitles\s*=?\s*\{([^}]*)\}/);
+    assert.ok(titles, `${file} must keep a customModelTitles table`);
+    for (const group of ['openai_responses', 'mistral', 'meta', 'together', 'groq']) {
+      assert.ok(new RegExp(`${group}:'[^']+'`).test(titles[1]), `${file} customModelTitles is missing the ${group} row`);
+    }
+    for (const keyMatch of titles[1].matchAll(/([A-Za-z0-9_]+):'/g)) {
+      assert.ok(
+        liveGroupKeys.has(keyMatch[1]),
+        `${file} customModelTitles carries the dead key ${keyMatch[1]} — no catalog group with that key exists`
+      );
+    }
+  }
+});
+
+test('K3.1 contract spellings match across the Rust prefs matcher and the frontend helper (is_moonshot_k31_route ↔ isMoonshotK31ModelName)', () => {
+  // The K3.1 no-tier contract is one contract mirrored in two languages:
+  // prefs/mod.rs gates the stored-effort drop and the bridge wire omission,
+  // model-catalog.js gates the tier control and the frontend drop. Each
+  // side's spelling list is independently pinned, but a spelling added on
+  // one side only would pass both suites while the contract splits — so
+  // extract the exact-match literals from both sources and compare them
+  // mechanically (same technique as the image-table and Responses-wire
+  // cross-language guards).
+  const rustSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'platform', 'prefs', 'mod.rs'), 'utf8',
+  );
+  const rustStart = rustSrc.indexOf('pub(crate) fn is_moonshot_k31_route(');
+  assert.notStrictEqual(rustStart, -1, 'prefs matcher moved — update this guard');
+  const rustBody = rustSrc.slice(rustStart, rustSrc.indexOf('\n}', rustStart)).replace(/\/\/[^\n]*/g, '');
+  const rustSpellings = [...rustBody.matchAll(/"([^"]*k3\.1[^"]*)"/g)].map(m => m[1]).sort((a, b) => a.localeCompare(b));
+
+  const jsSrc = fs.readFileSync(srcPath, 'utf8');
+  const jsStart = jsSrc.indexOf('function isMoonshotK31ModelName(');
+  assert.notStrictEqual(jsStart, -1, 'frontend helper moved — update this guard');
+  const jsBody = jsSrc.slice(jsStart, jsSrc.indexOf('\n}', jsStart));
+  const jsSpellings = [...jsBody.matchAll(/'([^']*k3\.1[^']*)'/g)].map(m => m[1]).sort((a, b) => a.localeCompare(b));
+
+  assert.strictEqual(rustSpellings.length, 4, `rust spellings parsed: ${rustSpellings.join(', ')}`);
+  assert.strictEqual(jsSpellings.length, 4, `js spellings parsed: ${jsSpellings.join(', ')}`);
+  assert.deepStrictEqual(jsSpellings, rustSpellings);
+});
+
+test('OpenAI Responses wire 谓词的前缀集跨语言一致（bridge.rs ↔ model-catalog.js）', () => {
+  // The frontend tier routing and the engine landing must hit the same model
+  // set: each side maintains its own starts_with prefixes, and a new family
+  // added on one side (a future gpt-7, say) would silently drift on the
+  // other — so extract the literal prefixes from both sources and compare
+  // them mechanically (same technique as the MODEL_PRESET_DEFS cross-language
+  // guard above).
+  const rustSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'src-tauri', 'src', 'features', 'assistant', 'platform', 'bridge.rs'),
+    'utf8',
+  );
+  const jsSrc = fs.readFileSync(srcPath, 'utf8');
+  const rustStart = rustSrc.indexOf('fn openai_responses_wire_model(');
+  assert.notStrictEqual(rustStart, -1, 'bridge.rs predicate moved — update this guard');
+  const rustBody = rustSrc.slice(rustStart, rustSrc.indexOf('\n}', rustStart));
+  const rustPrefixes = [...rustBody.matchAll(/starts_with\("([^"]+)"\)/g)].map(m => m[1]).sort((a, b) => a.localeCompare(b));
+
+  const jsStart = jsSrc.indexOf('function isOpenaiResponsesWireModel(');
+  assert.notStrictEqual(jsStart, -1, 'model-catalog.js predicate moved — update this guard');
+  const jsBody = jsSrc.slice(jsStart, jsSrc.indexOf('\n}', jsStart));
+  const jsPrefixes = [...jsBody.matchAll(/startsWith\('([^']+)'\)/g)].map(m => m[1]).sort((a, b) => a.localeCompare(b));
+
+  assert.ok(rustPrefixes.length >= 4, `rust prefixes parsed: ${rustPrefixes.join(', ')}`);
+  assert.deepStrictEqual(jsPrefixes, rustPrefixes);
+});
+
+console.log(`\nmodel_catalog_grouping: ${pass} passed, ${fail} failed`);
+if (fail > 0) process.exit(1);

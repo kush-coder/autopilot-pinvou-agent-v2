@@ -1,0 +1,166 @@
+// ───────────────────────────────────────────────────────────────────────────
+// Session timing 诊断读取接口(2026-07 新增)
+//
+// timing_events.jsonl 此前已有耗时数据,但没有读取接口；token usage 则只发给前端
+// 内存态进度条、不落盘。这两个命令把 sidecar 接通为内部诊断基础
+// (模型耗时/失败轮次/上下文消耗),不是顶级历史产品入口。
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 读取 session 的全部 timeline 事件(user_start / assistant_done 对 + usage),
+/// 按 timestamp 升序。空 session / 无 timing 文件返回空数组(诊断面板按空态渲染)。
+///
+/// 读面登记(ADR-0024):本命令只做字符集校验、**不做 id 类别拒绝**——辅助会话
+/// (`aux-<parent_id>`)的读取确实发生(辅助面板的水合/发送按 id 重读,桌面
+/// `chat:done` 亦做权威时间线重读;两条路径都不经排除 aux 的侧栏列表),但并非
+/// 渲染承载性(水合路径前端 try/catch 退空、`chat:done` 重读失败保留本地投影,
+/// 且辅助面板不投影 timelineEvents);规范要点是此读面不得长出 id 类别拒绝。
+#[tauri::command]
+pub async fn get_session_timeline(
+    session_id: String,
+) -> Result<Vec<crate::features::assistant::timing::TimelineEvent>, String> {
+    // 防路径穿越:timing reader 内部走 sessions_root().join(session_id),
+    // 必须先校验 session_id 字符集(只允许 [A-Za-z0-9_-]),否则可构造 ../ 越界。
+    crate::features::sessions::validate_session_id(&session_id).map_err(|e| format!("{e:#}"))?;
+    tokio::task::spawn_blocking(move || {
+        crate::features::assistant::timing::read_timeline(&session_id)
+    })
+    .await
+    .map_err(|error| format!("读取 session timeline 任务失败: {error}"))?
+    .map_err(|error| format!("读取 session timeline 失败: {error}"))
+}
+
+/// 聚合 session 级 stats:轮数 / token 累计 / cache 命中 / 成功失败数 / 首末时间。
+/// 可供后续诊断入口消费。token 来自 timing_events 的 usage 字段(2026-07 起写入);
+/// 老于此的 session 这些字段为 0。契约:sidecar 缺失时返回全零(与空 session
+/// 不可区分),超过 32MiB 上限整体报错,单行损坏的行整行跳过(不计入;
+/// 非法 UTF-8 字节无法按行读取,整体报错)。token 口径按写入者计——ACP
+/// 收口与提交前 send_error 兜底轮恒为 0,引擎正常链路的失败轮可能携带
+/// usage 并计入——逐条写入者证据见 `compute_stats` 文档,此处不重复。
+#[tauri::command]
+pub async fn get_session_stats(
+    session_id: String,
+) -> Result<crate::features::assistant::timing::SessionTimelineStats, String> {
+    // 同 get_session_timeline:校验 session_id 字符集防路径穿越。
+    crate::features::sessions::validate_session_id(&session_id).map_err(|e| format!("{e:#}"))?;
+    tokio::task::spawn_blocking(move || {
+        crate::features::assistant::timing::compute_stats(&session_id)
+    })
+    .await
+    .map_err(|error| format!("统计 session timeline 任务失败: {error}"))?
+    .map_err(|error| format!("统计 session timeline 失败: {error}"))
+}
+
+#[cfg(test)]
+// The fixture holds the process-wide ENV_LOCK (std Mutex) across the await of
+// the command under test to keep PINVOU3_HOME stable; cargo test runs test
+// threads in parallel, and the lock is only contended by other env-writing
+// tests, so it cannot deadlock.
+#[allow(clippy::await_holding_lock)]
+mod tests {
+    use crate::features::assistant::timing::{
+        TurnUsage, finish_turn, finish_turn_with_usage, start_turn,
+    };
+
+    /// ADR-0024 read-surface register, command-layer pin (round-2 m3): the
+    /// registered surface is THIS command fn, not only the timing reader
+    /// beneath it — a derived `aux-<parent>` id must pass the command's
+    /// charset validation and read back without any id-class rejection. The
+    /// store/timing leg is separately pinned in
+    /// `features/assistant/timing.rs` tests.
+    #[tokio::test]
+    async fn get_session_timeline_reads_aux_ids() {
+        // locked_env snapshots PINVOU3_HOME before the fixture overwrites it
+        // and restores that value on scope exit (panic paths included) while
+        // the lock is still held - a hand-rolled lock + set_var with no
+        // restore leaked the deleted temp root into every later
+        // env-participating test (review JensenChen28 2026-11-16 P3). The
+        // lock is deliberately held across the await below.
+        let (_env_guard, _env_restore) =
+            crate::platform::test_support::locked_env(&["PINVOU3_HOME"]);
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-timeline-cmd-aux-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held via _env_guard.
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        let sid = "aux-l5cz0m8xq2k1b";
+        start_turn(sid);
+        finish_turn(sid, "Completed", None);
+
+        let timeline = super::get_session_timeline(sid.to_string())
+            .await
+            .expect("command-layer aux timeline read");
+        assert_eq!(timeline.len(), 2, "aux timing events must stay readable");
+        assert_eq!(timeline[0].event, "user_start");
+        assert_eq!(timeline[1].event, "assistant_done");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// 命令层 pin:validate_session_id → spawn_blocking → 错误映射的整条链
+    /// 在此真实执行(仅靠 protocol_tests 的源码形状 pin 不覆盖),非法
+    /// 字符集的 id 必须在命令层被拒而不是落盘读取。
+    #[tokio::test]
+    async fn get_session_stats_aggregates_and_rejects_bad_ids() {
+        // locked_env snapshots PINVOU3_HOME before the fixture overwrites
+        // it and restores that value on scope exit (panic paths included)
+        // while the lock is still held - a hand-rolled lock + set_var with
+        // no restore leaked the deleted temp root into every later
+        // env-participating test (review JensenChen28 2026-11-16 P3).
+        let (_env_guard, _env_restore) =
+            crate::platform::test_support::locked_env(&["PINVOU3_HOME"]);
+        let tmp = std::env::temp_dir().join(format!(
+            "pinvou3-timeline-stats-cmd-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: platform::paths::tests::ENV_LOCK held via _env_guard.
+        unsafe { std::env::set_var("PINVOU3_HOME", &tmp) };
+
+        let sid = "session-stats-cmd";
+        start_turn(sid);
+        finish_turn_with_usage(
+            sid,
+            "Completed",
+            None,
+            Some(TurnUsage {
+                input_tokens: 7,
+                ..Default::default()
+            }),
+        );
+
+        let stats = super::get_session_stats(sid.to_string())
+            .await
+            .expect("command-layer stats read");
+        assert_eq!(stats.turn_count, 1);
+        assert_eq!(stats.completed_turns, 1);
+        assert_eq!(stats.total_input_tokens, 7);
+
+        assert!(
+            super::get_session_stats("bad/id".to_string())
+                .await
+                .is_err(),
+            "字符集外的 session_id 必须在命令层被拒"
+        );
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// lib.rs 的 invoke_handler 注册在 repo 级无 pin(command_protocol! 只钉
+    /// 源码形状,注册被删时所有测试仍绿,命令 404;同 global_shortcut 的
+    /// 处理),此处钉本命令的注册条目。
+    #[test]
+    fn get_session_stats_stays_registered_in_invoke_handler() {
+        let lib = include_str!("../../lib.rs");
+        assert!(
+            lib.contains("commands::timeline::get_session_stats,"),
+            "get_session_stats 必须保留在 generate_handler 注册表"
+        );
+    }
+}

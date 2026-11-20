@@ -1,0 +1,62 @@
+{
+  "id": "pptx",
+  "name": "PPT 生成",
+  "description": "本地直出可编辑 PowerPoint（.pptx）：模型产结构化大纲，渲染器套主题模板生成，真·可编辑图表，自带封面缩略图，数据不出机。",
+  "version": "1.0.0",
+  "icon": "presentation",
+  "category": "办公",
+  "mcp_tools": ["mcp_pptx_make_pptx"],
+  "command": "python",
+  "args": ["server.py"],
+  "env": {},
+  "config_fields": [],
+  "pip_dependencies": ["python-pptx", "Pillow"],
+  "python_dependencies": {
+    "schema_version": 1,
+    "targets": [
+      {
+        "platform": "windows-x64",
+        "python": "3.13",
+        "imports": ["pptx", "lxml", "PIL", "xlsxwriter"],
+        "wheels": [
+          {
+            "name": "python-pptx",
+            "version": "1.0.2",
+            "filename": "python_pptx-1.0.2-py3-none-any.whl",
+            "url": "https://files.pythonhosted.org/packages/d9/4f/00be2196329ebbff56ce564aa94efb0fbc828d00de250b1980de1a34ab49/python_pptx-1.0.2-py3-none-any.whl",
+            "sha256": "160838e0b8565a8b1f67947675886e9fea18aa5e795db7ae531606d68e785cba"
+          },
+          {
+            "name": "lxml",
+            "version": "6.1.3",
+            "filename": "lxml-6.1.3-cp313-cp313-win_amd64.whl",
+            "url": "https://files.pythonhosted.org/packages/c0/28/e46a7702bd95e9043291f7c3539b6184cba66f96cea9936f20939b284eeb/lxml-6.1.3-cp313-cp313-win_amd64.whl",
+            "sha256": "e477aca0bc0d19f3b4ae9e4f2a1cfd687c31bf772d78734910658186b40b2477"
+          },
+          {
+            "name": "typing-extensions",
+            "version": "4.16.0",
+            "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+            "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+            "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+          },
+          {
+            "name": "Pillow",
+            "version": "13.0.0",
+            "filename": "pillow-13.0.0-cp313-cp313-win_amd64.whl",
+            "url": "https://files.pythonhosted.org/packages/d7/ed/1b16fb66a37e1b9e41370b93b2c614c7da761a5b2a41dc333f7af4639962/pillow-13.0.0-cp313-cp313-win_amd64.whl",
+            "sha256": "9dda0788a9932776a75d8bcc020076edc308ce2508b51f6739a45e3158b3fc42"
+          },
+          {
+            "name": "XlsxWriter",
+            "version": "3.3.0",
+            "filename": "xlsxwriter-3.3.0-py3-none-any.whl",
+            "url": "https://files.pythonhosted.org/packages/ce/9d/3d30eaaa7e06bdb6172f938b2661d64f8d899bdca54120384ecf3759488a/xlsxwriter-3.3.0-py3-none-any.whl",
+            "sha256": "5f04772d43281da5109af66f39b65153359a203e896847c416476e709b024469"
+          }
+        ]
+      }
+    ]
+  },
+  "companion_skills": ["pptx"]
+}

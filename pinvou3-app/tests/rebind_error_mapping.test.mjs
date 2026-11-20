@@ -1,0 +1,197 @@
+// Frontend half of the rebind marker contract (review #463 round-8 minor 10):
+// nothing exercised the FE↔BE mapping before, so a marker the backend emits
+// could silently fall through to the raw-error branch and surface unlocalized
+// backend prose. These tests pin both directions — every marker classifies,
+// every marker resolves to real copy in all three languages, and no marker the
+// backend emits is missing from the classifier.
+import assert from "node:assert/strict";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import test from "node:test";
+
+import { dictEn } from "../src/shared/i18n/en.js";
+import { dictJa } from "../src/shared/i18n/ja.js";
+import { dictZh } from "../src/shared/i18n/zh.js";
+import {
+  REBIND_MARKER_MESSAGE_KEYS,
+  REBIND_SESSIONS_BUSY,
+  classifyRebindError,
+  REBIND_POST_FENCE_MARKERS,
+} from "../src/features/projects/rebindErrors.js";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+// The whole backend source tree, not a hand-picked pair of files: markers are
+// emitted wherever a rebind step runs (the busy/eviction path lives in the
+// assistant engine pool, codex/ACP carries its own rebind store), and a
+// hardcoded list goes stale the moment a new call site appears (round-7
+// should-fix).
+const backendSources = (() => {
+  const root = path.join(here, "..", "src-tauri", "src");
+  const out = [];
+  (function walk(dir) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const child = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(child);
+      else if (entry.name.endsWith(".rs")) out.push(child);
+    }
+  })(root);
+  return out;
+})();
+
+test("old-root-exists escalates instead of rendering an error", () => {
+  const classified = classifyRebindError(
+    "REBIND_OLD_ROOT_EXISTS: the original folder still exists",
+    dictEn,
+  );
+  assert.deepEqual(classified, { kind: "old-root-exists", reboundIds: [] });
+});
+
+test("the busy marker yields its session ids as data", () => {
+  const classified = classifyRebindError(`${REBIND_SESSIONS_BUSY}: a1, b2`, dictEn);
+  assert.equal(classified.kind, "sessions-busy");
+  assert.deepEqual(classified.busySessionIds, ["a1", "b2"]);
+});
+
+test("the busy marker without ids does not fabricate one", () => {
+  const classified = classifyRebindError(`${REBIND_SESSIONS_BUSY}:`, dictEn);
+  assert.deepEqual(classified, { kind: "sessions-busy", busySessionIds: [], reboundIds: [] });
+});
+
+test("every copy marker resolves to trilingual uiProjects copy", () => {
+  for (const [marker, key] of Object.entries(REBIND_MARKER_MESSAGE_KEYS)) {
+    for (const [lang, dict] of [["zh", dictZh], ["en", dictEn], ["ja", dictJa]]) {
+      const copy = dict.uiProjects[key];
+      assert.equal(
+        typeof copy,
+        "string",
+        `${key} must be a plain string in ${lang} (markers carry no arguments)`,
+      );
+      assert.ok(copy.length > 0, `${key} must be non-empty in ${lang}`);
+    }
+    const classified = classifyRebindError(`${marker}: backend prose`, dictEn);
+    assert.equal(classified.kind, "copy", `${marker} must map to copy`);
+    assert.equal(classified.message, dictEn.uiProjects[key]);
+  }
+});
+
+test("copy markers declare whether they fire past the old-root fence", () => {
+  // review #463 round-17 SF-4: the dialog consumes the strong-confirm flag
+  // only when the run actually proceeded past `require_confirm_existing`.
+  // IN_PROGRESS / TO_ROOT / TO_NESTED / TO_UNUSABLE fire BEFORE it; the
+  // roots conflicts, the persist failure, the runtime-starting fence and the
+  // legacy-table aborts fire after. A marker landing in the wrong set either
+  // rides a stale flag or burns a confirm round-trip.
+  const preFence = ['REBIND_IN_PROGRESS', 'REBIND_TO_ROOT', 'REBIND_TO_NESTED', 'REBIND_TO_UNUSABLE'];
+  for (const marker of preFence) {
+    assert.equal(
+      classifyRebindError(`${marker}: x`, dictEn).passedFence,
+      false,
+      `${marker} fires before the old-root check and must keep the flag`,
+    );
+  }
+  for (const marker of REBIND_POST_FENCE_MARKERS) {
+    assert.equal(
+      classifyRebindError(`${marker}: x`, dictEn).passedFence,
+      true,
+      `${marker} fires after the old-root check and may consume the flag`,
+    );
+  }
+});
+
+test("the destination markers are mapped and distinct", () => {
+  // A silent collision would make one marker unreachable: the classifier picks
+  // the first matching prefix.
+  assert.deepEqual(
+    [
+      classifyRebindError("REBIND_TO_ROOT:", dictEn).message,
+      classifyRebindError("REBIND_TO_NESTED:", dictEn).message,
+      classifyRebindError("REBIND_TO_UNUSABLE:", dictEn).message,
+      classifyRebindError("REBIND_ROOTS_CONFLICT:", dictEn).message,
+    ],
+    [
+      dictEn.uiProjects.rebindToRoot,
+      dictEn.uiProjects.rebindToNested,
+      dictEn.uiProjects.rebindToUnusable,
+      dictEn.uiProjects.rebindRootsConflict,
+    ],
+  );
+});
+
+test("the backend emits no marker the frontend cannot classify", () => {
+  // The Rust sources are the source of truth for the marker set: a new marker
+  // must not ship without a mapping, or it reaches the dialog as raw backend
+  // prose in every language. This is the test that would have caught
+  // REBIND_ROOTS_CONFLICT before it was mapped.
+  const markers = new Set();
+  for (const file of backendSources) {
+    for (const match of readFileSync(file, "utf8").matchAll(/"(REBIND_[A-Z_]+)/g)) {
+      markers.add(match[1]);
+    }
+  }
+  assert.ok(markers.size >= 5, `expected the backend marker set, saw ${[...markers]}`);
+  for (const marker of markers) {
+    const classified = classifyRebindError(`${marker}: payload`, dictEn);
+    assert.notEqual(
+      classified.kind,
+      "raw",
+      `${marker} is emitted by the backend but has no frontend mapping`,
+    );
+  }
+});
+
+test("an unmapped backend error stays verbatim for diagnostics", () => {
+  const classified = classifyRebindError(new Error("rebind_workspace_root: boom"), dictEn);
+  assert.deepEqual(classified, {
+    kind: "raw",
+    message: "Error: rebind_workspace_root: boom",
+    reboundIds: [],
+  });
+});
+
+test("a roots-commit failure yields its moved ids as carryover data", () => {
+  // Review #463 round-14 should-fix 1: the session lanes are already durable
+  // when the roots commit fails, so the backend appends this run's moved ids
+  // for the dialog to feed back as the post-busy carryover. The suffix is
+  // data: it classifies normally and never reaches the rendered copy.
+  const classified = classifyRebindError(
+    "REBIND_ROOTS_CONFLICT: overlap\nrebound-session-ids:a1,b2",
+    dictEn,
+  );
+  assert.equal(classified.kind, "copy");
+  assert.equal(classified.message, dictEn.uiProjects.rebindRootsConflict);
+  assert.deepEqual(classified.reboundIds, ["a1", "b2"]);
+  // A raw error carrying the suffix shows the prose without the data line.
+  const raw = classifyRebindError(
+    "rebind_workspace_root: boom\nrebound-session-ids:c3",
+    dictEn,
+  );
+  assert.deepEqual(raw, {
+    kind: "raw",
+    message: "rebind_workspace_root: boom",
+    reboundIds: ["c3"],
+  });
+  // An empty suffix list stays empty (no fabricated id).
+  const empty = classifyRebindError(
+    "REBIND_ROOTS_PERSIST: io\nrebound-session-ids:",
+    dictEn,
+  );
+  assert.equal(empty.kind, "copy");
+  assert.deepEqual(empty.reboundIds, []);
+});
+
+test("command-wrapped fork rejections classify via the embedded marker (r7 minor 1)", () => {
+  // The fork lane re-wraps the fence rejection as
+  // "fork_session: a workspace rebind … (REBIND_IN_PROGRESS: …)" — the
+  // stable marker is buried mid-string, where the dialog-era prefix match
+  // never fires and the raw diagnostic leaked into the toast.
+  // Copy-kind markers carry no parseable payload, so the embedded fallback
+  // is safe; SESSIONS_BUSY (which carries ids) stays prefix-only.
+  const wrapped =
+    "fork_session: a workspace rebind or an exclusive write is in progress; retry the fork later (REBIND_IN_PROGRESS: another workspace binding rebind or fenced writer is already running)";
+  const classified = classifyRebindError(wrapped, dictEn);
+  assert.equal(classified.kind, "copy");
+  assert.equal(classified.message, dictEn.uiProjects.rebindInProgress);
+  assert.equal(classified.passedFence, false);
+  assert.deepEqual(classified.reboundIds, []);
+});

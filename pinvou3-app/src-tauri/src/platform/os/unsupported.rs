@@ -1,0 +1,351 @@
+//! 不支持平台(linux/macos/windows 之外)的契约存根。
+//!
+//! 这些函数构成跨平台 OS trait 的「不支持」分支:当某能力在当前平台未实现时返回
+//! Err/None/false。它们在具体平台编译目标下会被 `macos`/`linux`/`windows` 模块的同名
+//! 实现通过 glob re-export 阴影,因此 clippy 在某平台下会误报为 dead code,但删除会
+//! 破坏其它平台的 `pub use` 解析。整文件豁免 dead_code。
+#![allow(dead_code)]
+
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+// macOS 侧由 `macos_system::current_system_locale` 显式实现阴影本符号,该目标下
+// unused(unused_imports=deny 会拦);其余 unsupported 平台它是唯一来源,保留。
+#[cfg(not(target_os = "macos"))]
+pub(crate) use super::locale::current_system_locale;
+
+pub fn open_target(_target: impl AsRef<OsStr>, label: &str) -> Result<(), String> {
+    Err(format!("当前平台不支持系统打开: {label}"))
+}
+
+pub fn reveal_target(target: &Path) -> Result<(), String> {
+    Err(format!(
+        "当前平台不支持文件管理器定位: {}",
+        target.display()
+    ))
+}
+
+pub fn command_exists(_command: &str) -> bool {
+    false
+}
+
+/// Windows-only (ORT_DYLIB_PATH / LibreOffice PATH prepend); this platform
+/// has no startup-window platform env writes, so this is a no-op.
+pub fn startup_platform_env() {}
+
+pub fn pandoc_tool_path() -> PathBuf {
+    PathBuf::from("pandoc")
+}
+
+pub fn configure_onnxruntime_dylib() -> Result<(), String> {
+    Ok(())
+}
+
+pub fn obsidian_config_path() -> Option<PathBuf> {
+    None
+}
+
+pub fn libreoffice_tool_path() -> PathBuf {
+    PathBuf::from("soffice")
+}
+
+pub fn ocr_tool_path() -> PathBuf {
+    PathBuf::from("tesseract")
+}
+
+pub fn ocr_tessdata_dir() -> Option<PathBuf> {
+    None
+}
+
+pub fn archive_tool_path() -> PathBuf {
+    PathBuf::from("7z")
+}
+
+pub fn pandoc_tool_exists() -> bool {
+    false
+}
+
+pub fn ocr_tool_exists() -> bool {
+    false
+}
+
+pub fn archive_tool_exists() -> bool {
+    false
+}
+
+pub fn msg_converter_required() -> bool {
+    false
+}
+
+pub fn email_tool_exists() -> bool {
+    false
+}
+
+pub fn show_pandoc_dependency_check() -> bool {
+    false
+}
+
+pub fn show_ocr_dependency_check() -> bool {
+    false
+}
+
+pub fn show_archive_dependency_check() -> bool {
+    false
+}
+
+pub fn pandoc_dependency_packages() -> &'static str {
+    ""
+}
+
+pub fn archive_dependency_packages() -> &'static str {
+    ""
+}
+
+pub fn pandoc_missing_message() -> &'static str {
+    "当前平台缺少可用的文档解析组件。"
+}
+
+pub fn libreoffice_missing_message() -> &'static str {
+    "当前平台缺少可用的 Office 文档预览组件。"
+}
+
+pub fn email_dependency_packages() -> &'static str {
+    ""
+}
+
+pub fn email_manual_hint() -> Option<&'static str> {
+    None
+}
+
+pub fn pdf_tool_path(command: &str) -> PathBuf {
+    PathBuf::from(command)
+}
+
+pub fn pdf_tool_exists(_command: &str) -> bool {
+    false
+}
+
+pub fn show_pdf_dependency_check() -> bool {
+    false
+}
+
+pub fn pdf_dependency_packages() -> &'static str {
+    ""
+}
+
+pub fn ocr_dependency_packages() -> &'static str {
+    "tesseract"
+}
+
+pub fn pdf_text_missing_message() -> &'static str {
+    "当前平台缺少可用的 PDF 文本解析组件。"
+}
+
+pub fn pdf_render_missing_message() -> &'static str {
+    "当前平台缺少可用的 PDF 渲染组件。"
+}
+
+pub fn pdf_ocr_missing_message() -> &'static str {
+    "当前平台缺少可用的 PDF OCR 组件。"
+}
+
+pub fn presentation_pdf_missing_message() -> &'static str {
+    "当前平台缺少可用的演示文稿 PDF 文本解析组件。"
+}
+
+pub fn system_default_open_supported(_path: &Path) -> bool {
+    false
+}
+
+pub fn libreoffice_open_fallback_needed(_path: &Path) -> bool {
+    false
+}
+
+pub fn nvidia_smi_candidates() -> Vec<&'static str> {
+    vec!["nvidia-smi"]
+}
+
+pub fn user_home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+}
+
+pub fn validate_upload_location(canon: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        super::posix::validate_upload_location_under_home(&user_home_dir(), canon)
+    }
+    #[cfg(not(unix))]
+    {
+        let home_raw = user_home_dir();
+        let home = platform_compat_path(
+            &std::fs::canonicalize(&home_raw)
+                .unwrap_or_else(|_| home_raw.clone())
+                .to_string_lossy(),
+        );
+        if !canon.starts_with(&home) {
+            return Err(format!("path {} not under $HOME", canon.display()));
+        }
+        Ok(())
+    }
+}
+
+// Unix 通用 helper 从 posix.rs 继承（Wave 3 去重，与 linux_path.rs 一致）。
+// `posix` 模块仅在 `#[cfg(unix)]` 编译，故这里必须守卫：macOS（unix）走
+// re-export；其余非 unix 兜底平台走本地等价实现，避免 E0432 未解析模块。
+// `path_component_eq` / `python_command` 在 macOS 由 mod.rs 经本模块 glob
+// 消费（未被显式 re-export 遮蔽），转发计为已用。
+#[cfg(unix)]
+pub use super::posix::{
+    path_component_eq, path_component_prefix, path_component_suffix, python_command,
+};
+
+// macOS 经 macos_path 直接 re-export posix 实现（经 mod.rs 显式 re-export 遮蔽
+// 本转发，unused_imports=deny 会拦），且 validate_upload_location 的 unix 臂现
+// 直调 posix helper、不再于本模块内消费该名字；仅当 unsupported 自身作为
+// platform（linux/windows/macos 之外的 unix 兜底目标）时才需要从 posix 继承。
+#[cfg(all(unix, not(target_os = "macos")))]
+pub use super::posix::platform_compat_path;
+
+// 同上：macOS 由 macos_path re-export posix 实现遮蔽，本转发仅服务兜底目标。
+#[cfg(all(unix, not(target_os = "macos")))]
+pub use super::posix::filesystem_path_identity_key;
+
+#[cfg(not(unix))]
+pub fn path_component_eq(component: &OsStr, expected: &str) -> bool {
+    component == OsStr::new(expected)
+}
+
+#[cfg(not(unix))]
+pub fn path_component_prefix(component: &OsStr, prefix: &str) -> bool {
+    component.to_string_lossy().starts_with(prefix)
+}
+
+#[cfg(not(unix))]
+pub fn path_component_suffix(component: &OsStr, suffix: &str) -> bool {
+    component.to_string_lossy().ends_with(suffix)
+}
+
+#[cfg(not(unix))]
+pub fn filesystem_path_identity_key(path: &str) -> String {
+    path.to_string()
+}
+
+#[cfg(not(unix))]
+pub fn platform_compat_path(value: &str) -> PathBuf {
+    PathBuf::from(value)
+}
+
+#[cfg(not(unix))]
+pub fn python_command() -> String {
+    "python3".to_string()
+}
+
+/// 空设备路径桩（未知平台按 POSIX 约定）。
+pub fn null_device() -> &'static str {
+    "/dev/null"
+}
+
+pub fn connector_cli_command(_cli_bin: &str, program: &str) -> Command {
+    Command::new(program)
+}
+
+pub fn apply_user_npm_prefix(_cmd: &mut Command) {}
+
+/// Unix 实现收口于 `posix::kill_pid_tree`（组杀语义与 kill(-1) 事故警告见其
+/// 文档）；macOS 经本模块 glob 继承这里的 re-export。非 unix 目标无 POSIX
+/// 进程组语义，合约分支遵循本文件「未支持能力」约定显式不做任何事，并保持
+/// 受 `scripts/architecture-guard.py` 检查，不得引入外部 kill 调用形态。
+#[cfg(unix)]
+pub use super::posix::kill_pid_tree;
+
+#[cfg(not(unix))]
+pub fn kill_pid_tree(pid: u32) {
+    // Non-unix targets have no POSIX process-group semantics; per this
+    // file's unsupported-capability contract the branch does nothing
+    // instead of delegating to an external tool. It stays under the
+    // architecture guard, so an external kill must never return here.
+    let _ = pid;
+}
+
+pub fn super_permission_is_enabled() -> bool {
+    false
+}
+
+pub fn enable_super_permission() -> Result<(), String> {
+    Err("当前系统不支持 Linux sudo 超级权限开关".to_string())
+}
+
+pub fn disable_super_permission() -> Result<(), String> {
+    Ok(())
+}
+
+pub fn super_permission_turn_reminder() -> &'static str {
+    "当前系统不支持超级权限开关。**禁止用 sudo**(应用内会被 execpolicy 直接拒绝)。需要管理员权限的操作,请引导用户在系统终端手动执行,不要尝试提权变通。"
+}
+
+/// Unsupported platforms have no bundled Node.js runtime; consumers fall back to PATH.
+pub fn bundled_node() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Unsupported platforms provide no process-liveness probe.
+pub fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// Unsupported platforms do not provide a portable directory-permission primitive.
+pub fn make_private_dir(_path: &Path) {}
+
+/// Unsupported platforms report success: there is no permission primitive
+/// to fail (the caller's fail-closed path is meaningful only where chmod
+/// exists).
+pub fn try_make_private_dir(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+/// The macOS WebView carries image items natively in paste events, so no
+/// native clipboard fallback is needed; always returns `None` (the
+/// `pasteImageClipboardRead` capability is false on macOS).
+pub fn read_clipboard_image(_app: &tauri::AppHandle) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_archive_runtime_is_not_advertised() {
+        assert!(!archive_tool_exists());
+        assert!(!show_archive_dependency_check());
+        assert_eq!(archive_dependency_packages(), "");
+        assert_eq!(archive_tool_path(), PathBuf::from("7z"));
+    }
+
+    #[test]
+    fn upload_location_rejects_outside_home() {
+        assert!(validate_upload_location(Path::new("/etc/passwd")).is_err());
+    }
+
+    /// The reminder states the real contract (sudo is execpolicy-denied here
+    /// — safety_deny_rules always emits the sudo deny rules when the
+    /// platform hardcodes the switch off) and must not claim a Linux-only
+    /// toggle exists. Pin the anchors.
+    #[test]
+    fn super_permission_reminder_pins_sudo_denied_contract() {
+        let reminder = super_permission_turn_reminder();
+        for anchor in ["禁止用 sudo", "execpolicy 直接拒绝", "系统终端"] {
+            assert!(
+                reminder.contains(anchor),
+                "reminder lost `{anchor}`: {reminder}"
+            );
+        }
+        assert!(
+            !reminder.contains("设置"),
+            "reminder must not point at the in-app toggle"
+        );
+    }
+}

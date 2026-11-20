@@ -1,0 +1,1053 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  bannerErrorReset,
+  computerUseConsentView,
+  computerUseTarget,
+  extractComputerUseScreenshotPath,
+  formatComputerUseConfirmAction,
+} from '../src/features/computer-use/computer-use-logic.js';
+
+// ── Screenshot path extraction ──────────────────────────────────────────────────
+assert.equal(
+  extractComputerUseScreenshotPath('已截图，保存至 /home/u/.pinvou3/sessions/s1/attachments/computer_use/shot_1.png'),
+  '/home/u/.pinvou3/sessions/s1/attachments/computer_use/shot_1.png',
+  'plain text with an absolute unix path must be extracted',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('screenshot saved: C:\\Users\\asto\\.pinvou3\\sessions\\s1\\attachments\\computer_use\\shot 2.png done'),
+  'C:\\Users\\asto\\.pinvou3\\sessions\\s1\\attachments\\computer_use\\shot 2.png',
+  'windows drive paths with backslash separators must be extracted',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('shot saved C:\\Users\\John Smith\\.pinvou3\\sessions\\s1\\attachments\\computer_use\\shot.png'),
+  'C:\\Users\\John Smith\\.pinvou3\\sessions\\s1\\attachments\\computer_use\\shot.png',
+  'a space INSIDE the path (walk-back extends past inner boundaries) must not lose the card',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('saved /mnt/John Smith/.pinvou3/sessions/s1/attachments/computer_use/shot.png'),
+  '/mnt/John Smith/.pinvou3/sessions/s1/attachments/computer_use/shot.png',
+  'unix absolute paths with inner spaces must be extracted too',
+);
+// Relative mentions stay rejected no matter how far the walk-back extends:
+// only a head genuinely reaching '/' or '<drive>:/' wins.
+assert.equal(
+  extractComputerUseScreenshotPath('evil src/attachments/computer_use/shot.png'),
+  null,
+  'a relative mention after prose must still be rejected',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('saved /ws/attachments/computer_use/shot.png.png and more'),
+  '/ws/attachments/computer_use/shot.png.png',
+  'a basename ending in .png.png must not be truncated at the first .png',
+);
+assert.equal(
+  extractComputerUseScreenshotPath(JSON.stringify({
+    content: [{ type: 'text', text: '截图已保存到 /ws/attachments/computer_use/envelope.png' }],
+  })),
+  '/ws/attachments/computer_use/envelope.png',
+  'MCP-style JSON envelopes must be unwrapped before searching',
+);
+// Envelope + Windows path: the raw JSON's escaped backslashes must NOT win
+// the last-match rule and produce a doubled-separator path.
+assert.equal(
+  extractComputerUseScreenshotPath(JSON.stringify({
+    content: [{ type: 'text', text: 'saved C:\\Users\\u\\attachments\\computer_use\\win.png' }],
+  })),
+  'C:\\Users\\u\\attachments\\computer_use\\win.png'.replaceAll('\\\\', '\\'),
+  'envelope Windows paths must resolve to the clean single-separator form',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('first /ws/attachments/computer_use/a.png then /ws/attachments/computer_use/b.png'),
+  '/ws/attachments/computer_use/b.png',
+  'a multi-step result resolves to the newest (last) screenshot',
+);
+// The backend's own "screenshot saved:" line is the authoritative emission:
+// it wins over the generic last-marker scan, so planted marker text later in
+// the same result (an a11y name, a blocked-action label) cannot steer the
+// card away from the screenshot the backend actually wrote.
+assert.equal(
+  extractComputerUseScreenshotPath(
+    'screenshot saved: /ws/attachments/computer_use/real.png\n'
+    + 'see /ws/attachments/computer_use/planted.png for details',
+  ),
+  '/ws/attachments/computer_use/real.png',
+  'the backend saved-line emission must outrank a planted later mention',
+);
+// A saved line that fails validation (relative head) falls back to the
+// generic scan instead of losing the card entirely.
+assert.equal(
+  extractComputerUseScreenshotPath(
+    'screenshot saved: src/attachments/computer_use/relative.png',
+  ),
+  null,
+  'a relative saved line is rejected outright (no absolute anchor)',
+);
+// Locale-sensitive characters: 'İ'.toLowerCase() is TWO code units, so
+// index math on a lowercased copy used to mis-slice — and silently lose —
+// the card. Matchers now run over the original string.
+assert.equal(
+  extractComputerUseScreenshotPath('/Users/İsmail/.pinvou3/sessions/s1/attachments/computer_use/shot.PNG'),
+  '/Users/İsmail/.pinvou3/sessions/s1/attachments/computer_use/shot.PNG',
+  'a path containing İ and an uppercase .PNG suffix must still extract',
+);
+// Envelope with NO text blocks: an envelope that parses must never fall back
+// to searching the raw JSON — its escaped backslashes (\\) normalize into
+// slash-doubled paths and non-text blocks must not surface either.
+assert.equal(
+  extractComputerUseScreenshotPath('{"content":[{"type":"image","text":"shot C:\\\\Users\\\\u/attachments/computer_use/mixed.png"}]}'),
+  null,
+  'an envelope without text blocks must not resurface the raw JSON as a slash-doubled path',
+);
+assert.equal(
+  extractComputerUseScreenshotPath(JSON.stringify({
+    content: [{ type: 'image', text: 'saved C:\\Users\\u\\attachments\\computer_use\\hidden.png' }],
+  })),
+  null,
+  'a Windows path in a non-text block must not be extracted',
+);
+assert.equal(
+  extractComputerUseScreenshotPath(JSON.stringify({
+    content: [{ type: 'image', text: 'saved /ws/attachments/computer_use/hidden.png' }],
+  })),
+  null,
+  'a forward-slash path in a non-text block must not be extracted either',
+);
+assert.equal(
+  extractComputerUseScreenshotPath(JSON.stringify({ content: [] })),
+  null,
+  'an envelope with an empty content list resolves to no screenshot',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('SEE /WS/ATTACHMENTS/COMPUTER_USE/UP.PNG'),
+  '/WS/ATTACHMENTS/COMPUTER_USE/UP.PNG',
+  'matching is case-insensitive for the directory marker and extension',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('no screenshot in this step'),
+  null,
+  'output without a screenshot falls back to the default tool card',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('wrote /ws/attachments/notes/summary.png'),
+  null,
+  'PNGs outside attachments/computer_use must not be picked up',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('see attachments/computer_use/relative.png'),
+  null,
+  'relative paths without an absolute anchor must be rejected',
+);
+assert.equal(extractComputerUseScreenshotPath(null), null);
+assert.equal(extractComputerUseScreenshotPath(''), null);
+assert.equal(
+  extractComputerUseScreenshotPath({ content: [{ type: 'text', text: 'saved /ws/attachments/computer_use/obj.png' }] }),
+  '/ws/attachments/computer_use/obj.png',
+  'object outputs are searched via their JSON serialization',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('saved /ws/attachments/computer_use/../../secrets/inner.png'),
+  null,
+  'a traversal segment inside the attachments dir must reject the whole mention',
+);
+assert.equal(
+  extractComputerUseScreenshotPath('saved C:/ws/attachments/computer_use/../..\\payload.png'),
+  null,
+  'traversal with backslash separators must be rejected too',
+);
+
+// ── Consent UI visibility state machine ─────────────────────────────────────────────────────
+assert.deepEqual(
+  computerUseConsentView(null),
+  { enabled: false, stopped: false, showBanner: false, grantRequest: null, confirmRequest: null },
+  'a missing slice hides every surface',
+);
+assert.deepEqual(
+  computerUseConsentView({ enabled: false, granted: true, grantRequest: { sessionId: 's1' }, confirmRequest: { confirmId: 'c1' } }),
+  { enabled: false, stopped: false, showBanner: false, grantRequest: null, confirmRequest: null },
+  'feature toggle off: no banner, no dialogs even with stale requests',
+);
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, granted: false, stopped: false }),
+  { enabled: true, stopped: false, showBanner: false, grantRequest: null, confirmRequest: null },
+  'enabled but ungranted stays quiet until a request arrives',
+);
+const grantRequest = { sessionId: 's1' };
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, grantRequest }),
+  { enabled: true, stopped: false, showBanner: false, grantRequest, confirmRequest: null },
+  'grant_required surfaces the grant dialog',
+);
+const confirmRequest = { sessionId: 's1', action: 'click', element: 'Save', confirmId: 'c1' };
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, granted: true, stopped: false, confirmRequest }),
+  { enabled: true, stopped: false, showBanner: true, grantRequest: null, confirmRequest },
+  'a per-action confirmation stacks on top of the persistent banner',
+);
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, granted: true, stopped: true, confirmRequest }),
+  { enabled: true, stopped: true, showBanner: false, grantRequest: null, confirmRequest: null },
+  'stop() collapses the banner and the dialogs: stop_all already killed the pending confirm, so its approve button must not stay live',
+);
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, granted: false, stopped: true, grantRequest }),
+  { enabled: true, stopped: true, showBanner: false, grantRequest: null, confirmRequest: null },
+  'stop() also collapses a pending grant dialog',
+);
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, granted: true, stopped: false }),
+  { enabled: true, stopped: false, showBanner: true, grantRequest: null, confirmRequest: null },
+  'granted and not stopped keeps the non-dismissible banner visible',
+);
+
+// ── Consent target resolution (fail-neutral) ─────────────────────────────
+// Newer backends mark grant/confirm payloads (and the granted slice) with
+// target "virtual" when the agent works inside the isolated virtual display.
+// A missing, null, or malformed value MUST resolve to "physical": the dialogs
+// may only ever under-claim isolation, never over-claim it.
+assert.equal(computerUseTarget('virtual'), 'virtual', 'the exact wire value resolves to virtual');
+assert.equal(computerUseTarget('physical'), 'physical', 'an explicit physical resolves to physical');
+assert.equal(computerUseTarget(), 'physical', 'a missing target (old payload) falls back to physical');
+assert.equal(computerUseTarget(null), 'physical', 'a null target falls back to physical');
+assert.equal(computerUseTarget(''), 'physical', 'an empty target falls back to physical');
+assert.equal(computerUseTarget('VIRTUAL'), 'physical', 'the wire value is case-sensitive: anything else is physical');
+assert.equal(computerUseTarget('virtual '), 'physical', 'a padded near-match is physical, not virtual');
+assert.equal(computerUseTarget(0), 'physical', 'a non-string value falls back to physical');
+// computerUseConsentView itself passes the request objects through by
+// reference, so the target rides along unchanged (no reshaping, no copying).
+const virtualGrantRequest = { sessionId: 's1', target: 'virtual' };
+assert.deepEqual(
+  computerUseConsentView({ enabled: true, grantRequest: virtualGrantRequest }),
+  { enabled: true, stopped: false, showBanner: false, grantRequest: virtualGrantRequest, confirmRequest: null },
+  'a virtual grant request passes through to the view untouched',
+);
+
+// ── Structured confirm description rendering ─────────────────────────────
+// Backend contract: the confirm payload carries the action name plus
+// structured fields, with the English summary kept for fallback. The
+// formatter localizes the structured shape and reports the preview block /
+// too-long hint separately.
+const zhConfirmCopy = {
+  textTooLongToPreview: '文本过长，无法完整预览',
+  buttonName: { left: '左键', right: '右键', middle: '中键' },
+  confirmClick1: '单击', confirmClick2: '双击', confirmClick3: '三击',
+  confirmClick: (button, verb) => `${button}${verb}`,
+  confirmClickAt: (button, verb, point) => `在 ${point} ${button}${verb}`,
+  confirmTypeCount: (count) => `输入 ${count} 个字符`,
+  confirmKeyChord: (chord) => `按下组合键 ${chord}`,
+  confirmHoldKey: (chord, ms) => `按住 ${chord} ${ms} 毫秒`,
+  confirmKeyChordMasked: (chord, count) => chord ? `按下组合键 ${chord} + ${count} 个隐藏字符` : `按下 ${count} 个隐藏字符`,
+  confirmHoldKeyMasked: (chord, count, ms) => chord ? `按住 ${chord} + ${count} 个隐藏字符 ${ms} 毫秒` : `按住 ${count} 个隐藏字符 ${ms} 毫秒`,
+  confirmDrag: (from, to) => `从 ${from} 拖拽到 ${to}`,
+  confirmMouseDown: (button) => `按住${button}`,
+  confirmMouseUp: (button) => `松开${button}`,
+};
+const structured = (fields) => ({ sessionId: 's1', confirmId: 'c1', summary: 'english fallback', actionName: null, button: null, clickCount: null, point: null, endPoint: null, textLength: null, textPreview: null, textPreviewTruncated: false, chord: null, holdMs: null, ...fields });
+
+// ── Shipped i18n hold copy ───────────────────────────────────────────────
+// The fixture above is a hand-copied dictionary; the round-5 fix (ja said
+// 押す "press", zh said 按下 "press down" for a multi-second HOLD) was pinned
+// nowhere, so a revert kept every suite green. These read the SHIPPED
+// dictionaries so the hold verbs cannot silently regress to press verbs.
+for (const [locale, holdKey, mouseDown] of [
+  ['zh', /confirmHoldKey:\(chord, ms\)=>`按住/, /confirmMouseDown:button=>`按住/],
+  ['ja', /confirmHoldKey:\(chord, ms\)=>`.*押し続ける/, /confirmMouseDown:button=>`.*押し続ける/],
+  ['en', /confirmHoldKey:\(chord, ms\)=>`Hold /, /confirmMouseDown:button=>`Press and hold /],
+]) {
+  const source = readFileSync(
+    fileURLToPath(new URL(`../src/shared/i18n/${locale}.js`, import.meta.url)),
+    'utf8',
+  );
+  assert.match(source, holdKey, `${locale} confirmHoldKey must say hold, not press`);
+  assert.match(source, mouseDown, `${locale} confirmMouseDown must say hold, not press`);
+}
+
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'click', button: 'left', clickCount: 1, point: { x: 5, y: 6 } })),
+  { description: '在 (5, 6) 左键单击', preview: null, previewTooLong: false },
+  'a structured single click at a point renders the localized template',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'click', button: 'right', clickCount: 3 })),
+  { description: '右键三击', preview: null, previewTooLong: false },
+  'a structured triple click without a point renders the bare template',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'click', button: 'middle', clickCount: 2, point: { x: 1, y: 2 } })),
+  { description: '在 (1, 2) 中键双击', preview: null, previewTooLong: false },
+  'button × count combinations compose',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'type', textLength: 12 })),
+  { description: '输入 12 个字符', preview: null, previewTooLong: false },
+  'a type action renders the character count',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'type', textLength: 12, textPreviewTruncated: true })),
+  { description: '输入 12 个字符', preview: null, previewTooLong: true },
+  'a truncated type action with no preview flags the too-long hint',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'type', textLength: 3, textPreview: 'abc' })),
+  { description: '输入 3 个字符', preview: 'abc', previewTooLong: false },
+  'a type action with a preview feeds the inline preview block',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'key', chord: 'Control+C' })),
+  { description: '按下组合键 Control+C', preview: null, previewTooLong: false },
+  'a key chord renders the chord string',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'hold_key', chord: 'Shift', holdMs: 500 })),
+  { description: '按住 Shift 500 毫秒', preview: null, previewTooLong: false },
+  'a hold-key action renders chord and duration',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'key', chord: null, chordMaskedChars: 4 })),
+  { description: '按下 4 个隐藏字符', preview: null, previewTooLong: false },
+  'a masked chord on a secure target renders the count, never the characters',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'key', chord: 'Control', chordMaskedChars: 1 })),
+  { description: '按下组合键 Control + 1 个隐藏字符', preview: null, previewTooLong: false },
+  'a masked mixed chord keeps the named keys and the count',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'hold_key', chord: null, chordMaskedChars: 2, holdMs: 500 })),
+  { description: '按住 2 个隐藏字符 500 毫秒', preview: null, previewTooLong: false },
+  'a masked hold-key renders count and duration',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'hold_key', chord: null, chordMaskedChars: 2, holdMs: null })),
+  { description: 'english fallback', preview: null, previewTooLong: false },
+  'a masked hold-key without holdMs falls back to the summary instead of rendering "null ms"',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'drag', point: { x: 1, y: 2 }, endPoint: { x: 3, y: 4 } })),
+  { description: '从 (1, 2) 拖拽到 (3, 4)', preview: null, previewTooLong: false },
+  'a drag renders both endpoints',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'scroll', point: { x: 7, y: 8 } })),
+  { description: 'english fallback', preview: null, previewTooLong: false },
+  'a scroll confirm falls back to the summary (scroll is never screened/blocked)',
+);
+// Canonical names: the Rust backend emits left_mouse_down/left_mouse_up (T3
+// confirmation-required actions), mapped through CANONICAL_ACTION_FIELDS.
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'left_mouse_down', button: null })),
+  { description: '按住左键', preview: null, previewTooLong: false },
+  'a mouse down renders the button (hold copy, matching the shipped zh dictionary)',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'left_mouse_up', button: null })),
+  { description: '松开左键', preview: null, previewTooLong: false },
+  'a canonical mouse up renders the mapped button',
+);
+// Bare kinds still render (switch-level coverage), request button wins over
+// the mapped default.
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'mouse_down', button: 'right' })),
+  { description: '按住右键', preview: null, previewTooLong: false },
+  'a mouse down renders the requested button',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'mouse_up', button: 'middle' })),
+  { description: '松开中键', preview: null, previewTooLong: false },
+  'a mouse up renders the requested button',
+);
+// Legacy payload generation: no structured fields — the English summary is
+// the only content and must pass through verbatim.
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, { sessionId: 's1', confirmId: 'c1', summary: 'left click x1 at Some((5, 6))' }),
+  { description: 'left click x1 at Some((5, 6))', preview: null, previewTooLong: false },
+  'a legacy request falls back to the English summary',
+);
+// Structured shape with missing required data falls back to the summary too.
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'drag', point: { x: 1, y: 2 } })),
+  { description: 'english fallback', preview: null, previewTooLong: false },
+  'an incomplete structured shape falls back to the English summary',
+);
+assert.deepEqual(
+  formatComputerUseConfirmAction(zhConfirmCopy, structured({ actionName: 'teleport', point: { x: 1, y: 2 } })),
+  { description: 'english fallback', preview: null, previewTooLong: false },
+  'an unknown action name falls back to the English summary',
+);
+// A missing/legacy copy (no template keys) must not throw and must fall back.
+assert.deepEqual(
+  formatComputerUseConfirmAction({}, structured({ actionName: 'click', button: 'left', clickCount: 1 })),
+  { description: 'english fallback', preview: null, previewTooLong: false },
+  'a copy without template keys falls back to the English summary',
+);
+
+console.log('computer use logic tests passed');
+
+// ── Consent dialog UI projection (real component, stubbed React runtime) ──
+// node --test has no DOM renderer and the repo has no jsdom, so the dialog
+// component is loaded through a bare Vite SSR server whose 'react' imports
+// resolve to a minimal hooks runtime (same approach as
+// tests/use_throttled_value.test.mjs) and whose JSX runtime produces plain
+// element trees the assertions walk directly. This keeps the review-critical
+// render behavior (always-inline full-text previews, secure-target omission,
+// error leakage) covered without a browser while the real component source is
+// exercised unmodified.
+
+// Minimal React replacement: only the hooks ComputerUseConsent.jsx and its
+// useBridge import use, with React semantics (Object.is idempotent writes,
+// per-commit hook slots, pairwise deps comparison, cleanup before re-run).
+function createReactRuntime() {
+  const states = [];
+  const refs = [];
+  const slots = [];
+  let stateIndex = 0;
+  let refIndex = 0;
+  let effectIndex = 0;
+  let dirty = false;
+  const useState = (initial) => {
+    const i = stateIndex++;
+    if (states.length <= i) states.push(typeof initial === 'function' ? initial() : initial);
+    const setState = (update) => {
+      const prev = states[i];
+      const next = typeof update === 'function' ? update(prev) : update;
+      if (!Object.is(next, prev)) {
+        states[i] = next;
+        dirty = true;
+      }
+    };
+    return [states[i], setState];
+  };
+  const useRef = (initial) => {
+    const i = refIndex++;
+    if (refs.length <= i) refs.push({ current: initial });
+    return refs[i];
+  };
+  const useEffect = (fn, deps) => {
+    const i = effectIndex++;
+    if (slots.length <= i) slots.push({ deps: undefined, cleanup: undefined, ran: false, pending: null });
+    const slot = slots[i];
+    const changed = !slot.ran
+      || deps === undefined
+      || deps.length !== slot.deps.length
+      || deps.some((d, k) => !Object.is(d, slot.deps[k]));
+    if (changed) slot.pending = { fn, deps };
+  };
+  // Effects flush after commit; each slot's old cleanup runs before its
+  // re-run, mirroring React's ordering guarantees.
+  const flushEffects = () => {
+    for (const slot of slots) {
+      if (!slot.pending) continue;
+      const { fn, deps } = slot.pending;
+      slot.pending = null;
+      if (typeof slot.cleanup === 'function') slot.cleanup();
+      const result = fn();
+      slot.cleanup = typeof result === 'function' ? result : undefined;
+      slot.deps = deps;
+      slot.ran = true;
+    }
+  };
+  return {
+    hooks: { useState, useRef, useEffect },
+    render(component, props) {
+      stateIndex = 0;
+      refIndex = 0;
+      effectIndex = 0;
+      let output = component(props);
+      for (let guard = 0; dirty && guard < 25; guard += 1) {
+        dirty = false;
+        stateIndex = 0;
+        refIndex = 0;
+        effectIndex = 0;
+        output = component(props);
+      }
+      dirty = false;
+      flushEffects();
+      return output;
+    },
+    get dirty() { return dirty; },
+    reset() {
+      states.length = 0;
+      refs.length = 0;
+      slots.length = 0;
+      dirty = false;
+    },
+  };
+}
+
+const REACT_STUB_SOURCE = [
+  'const rt = () => globalThis.__pinvouConsentReact;',
+  'export const useState = (...args) => rt().hooks.useState(...args);',
+  'export const useRef = (...args) => rt().hooks.useRef(...args);',
+  'export const useEffect = (...args) => rt().hooks.useEffect(...args);',
+  '',
+].join('\n');
+
+// Plain-object JSX runtime: elements are walked directly by the assertions,
+// no renderer needed. Key semantics mirror the real runtime (explicit third
+// argument wins over config.key).
+const JSX_STUB_SOURCE = [
+  "const RE = Symbol.for('react.element');",
+  "export const Fragment = Symbol.for('react.fragment');",
+  'function makeKey(maybeKey, config) {',
+  '  if (maybeKey !== undefined) return String(maybeKey);',
+  '  return config.key !== undefined ? String(config.key) : null;',
+  '}',
+  'function makeElement(type, config, maybeKey) {',
+  '  const { children, ...rest } = config;',
+  '  return { $$typeof: RE, type, key: makeKey(maybeKey, config), ref: null, props: { ...rest, children } };',
+  '}',
+  'export const jsx = makeElement;',
+  'export const jsxs = makeElement;',
+  'export const jsxDEV = makeElement;',
+  '',
+].join('\n');
+
+const hadWindow = Object.prototype.hasOwnProperty.call(globalThis, 'window');
+const hadDocument = Object.prototype.hasOwnProperty.call(globalThis, 'document');
+// useBridge.js reads window.TauriBridge at module load: the dialog's buttons
+// call bridge.computerUse.* through it, so the mock is how tests fire actions.
+const bridgeMock = { available: true, computerUse: {} };
+globalThis.window = globalThis.window || { TauriBridge: bridgeMock };
+// createPortal validates only container.nodeType, and the hand-rolled
+// renderer never reconciles into the container, so a minimal fake body is
+// enough for the dialogs' document.body portal target.
+globalThis.document = globalThis.document || {
+  addEventListener() {},
+  removeEventListener() {},
+  body: { nodeType: 1 },
+};
+
+// The stub modules must be real files: Vite externalizes bare 'react' before
+// user resolveId hooks run, but resolve.alias rewrites it into app code that
+// the SSR pipeline inlines.
+const stubDir = mkdtempSync(path.join(tmpdir(), 'pinvou-consent-stub-'));
+const reactStubFile = path.join(stubDir, 'react-stub.mjs');
+const jsxStubFile = path.join(stubDir, 'jsx-stub.mjs');
+writeFileSync(reactStubFile, REACT_STUB_SOURCE);
+writeFileSync(jsxStubFile, JSX_STUB_SOURCE);
+
+const { createServer } = await import('vite');
+const vite = await createServer({
+  configFile: false,
+  root: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+  logLevel: 'error',
+  server: { middlewareMode: true, watch: null },
+  optimizeDeps: { noDiscovery: true },
+  resolve: {
+    alias: [
+      { find: /^react$/, replacement: reactStubFile },
+      { find: /^react\/jsx-dev-runtime$/, replacement: jsxStubFile },
+      { find: /^react\/jsx-runtime$/, replacement: jsxStubFile },
+    ],
+  },
+});
+
+const REACT_ELEMENT = Symbol.for('react.element');
+
+// Round-17 portal pin: the walker adapts to portals, so it must also PROVE
+// it saw one — otherwise reverting createPortal back to inline rendering
+// would keep every UI assertion here green while re-opening the stacking
+// regression the portal fix closed.
+let portalsUnwrapped = 0;
+let lastPortalContainer;
+
+function walkElements(node, visit) {
+  if (node == null || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    for (const child of node) walkElements(child, visit);
+    return;
+  }
+  // The consent dialogs portal to document.body (production stacking-order
+  // fix), so the component now returns a react.portal object; unwrap it and
+  // keep walking its children.
+  if (node.$$typeof === REACT_PORTAL) {
+    portalsUnwrapped += 1;
+    lastPortalContainer = node.containerInfo ?? node.container;
+    walkElements(node.children, visit);
+    return;
+  }
+  if (node.$$typeof !== REACT_ELEMENT) return;
+  visit(node);
+  walkElements(node.props && node.props.children, visit);
+}
+
+function findByTestId(root, testId) {
+  const hits = [];
+  walkElements(root, (el) => {
+    if (el.props && el.props['data-testid'] === testId) hits.push(el);
+  });
+  return hits[0] || null;
+}
+
+const REACT_PORTAL = Symbol.for('react.portal');
+
+function allText(root) {
+  const parts = [];
+  walkElements(root, (el) => {
+    const collect = (node) => {
+      if (node == null || typeof node === 'boolean') return;
+      if (typeof node === 'string' || typeof node === 'number') {
+        parts.push(String(node));
+        return;
+      }
+      if (Array.isArray(node)) node.forEach(collect);
+    };
+    collect(el.props && el.props.children);
+  });
+  return parts.join('\n');
+}
+
+const dialogCopy = {
+  bannerTitle: 'Agent is controlling your computer',
+  bannerTitleVirtual: 'Agent is working in an isolated virtual display',
+  bannerNote: 'physical note',
+  bannerNoteVirtual: 'virtual note',
+  bannerStop: 'Stop control',
+  grantTitle: 'Grant control of your computer',
+  grantTitleVirtual: 'Grant an isolated virtual display',
+  grantDesc: 'desc',
+  grantDescVirtual: 'The agent works in an isolated virtual display, not on your screen.',
+  grantMacCaveat: 'On this Mac, opened apps can stay visible on your desktop without the Accessibility permission.',
+  grantLinuxCaveat: 'On Linux, a raw-Wayland app could still show its window on your screen.',
+  grantWindowsCaveat: 'On Windows, a broker-launched app can surface its real window on your screen and keep running after the session.',
+  grantUnknownPlatformCaveat: "This platform's isolation limits could not be verified — an opened app may appear on your screen.",
+  grantAllow: 'Allow',
+  grantDeny: 'Deny',
+  unreadableTarget: '【読み取れないターゲット】',
+  confirmTitle: 'Confirm this action',
+  confirmActionLabel: 'Action',
+  confirmElementLabel: 'Target element',
+  confirmTargetVirtual: 'Target: isolated virtual display',
+  confirmTargetPhysical: 'Target: your screen',
+  confirmOnce: 'Allow this once',
+  confirmDeny: 'Deny',
+  fullTextWarning: 'The agent will type exactly this text.',
+  textTooLongToPreview: 'Text too long to preview in full',
+  buttonName: { left: 'Left', right: 'Right', middle: 'Middle' },
+  confirmClick1: 'click', confirmClick2: 'double-click', confirmClick3: 'triple-click',
+  confirmClick: (button, verb) => `${button} ${verb}`,
+  confirmClickAt: (button, verb, point) => `${button} ${verb} at ${point}`,
+  confirmTypeCount: (count) => `Type ${count} characters`,
+  confirmKeyChord: (chord) => `Press ${chord}`,
+  confirmHoldKey: (chord, ms) => `Hold ${chord} for ${ms} ms`,
+  confirmDrag: (from, to) => `Drag from ${from} to ${to}`,
+  confirmMouseDown: (button) => `Press and hold the ${button} mouse button`,
+  confirmMouseUp: (button) => `Release the ${button} mouse button`,
+  actionFailed: (error) => `Action failed: ${error}`,
+};
+
+function confirmSlice(confirmId, typePreviewFull) {
+  const request = { sessionId: 's1', action: 'type', element: 'Reply box', confirmId };
+  if (typePreviewFull !== undefined) request.typePreviewFull = typePreviewFull;
+  return { enabled: true, granted: true, stopped: false, confirmRequest: request };
+}
+
+try {
+  const { ComputerUseBanner, ComputerUseDialogs } = await vite.ssrLoadModule('/src/features/computer-use/ComputerUseConsent.jsx');
+  const runtime = createReactRuntime();
+  globalThis.__pinvouConsentReact = runtime;
+  let tree = null;
+  const render = (slice, virtualDisplayNote) => {
+    tree = runtime.render(ComputerUseDialogs, { slice, copy: dialogCopy, virtualDisplayNote });
+    return tree;
+  };
+  // Drives the promise chain inside useConsentAction's run() to completion
+  // (setPendingAction → action → catch/finally), then re-renders until stable.
+  const settle = async (slice) => {
+    // setImmediate drains the microtask chain inside useConsentAction's run().
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    render(slice);
+    for (let guard = 0; runtime.dirty && guard < 25; guard += 1) render(slice);
+    return tree;
+  };
+
+  // ── UI-1. Full typePreviewFull always renders inline, approval stays enabled ──
+  // The old reveal gate locked approval behind a "show full text" click; the
+  // exact typed text must be visible without any click (mainstream behavior)
+  // and approval must never depend on reveal state — the preview scrolls
+  // instead of gating.
+  runtime.reset();
+  portalsUnwrapped = 0;
+  lastPortalContainer = null;
+  tree = render(confirmSlice('cu-1', 'Hello 三'));
+  const inlinePre = findByTestId(tree, 'computer-use-confirm-full-text');
+  // Portal pin (see portalsUnwrapped above): the dialog must genuinely
+  // render AS a portal into document.body, not inline — the walker adapts
+  // to portals, so this proves the adaptation still has something to adapt
+  // to (findByTestId above is what drives the walk).
+  assert.ok(portalsUnwrapped > 0, 'the dialog render must produce a react.portal');
+  // React stores the portal target as containerInfo (the walker records
+  // containerInfo, falling back to container across runtimes).
+  assert.equal(lastPortalContainer, globalThis.document.body,
+    'the portal container must be document.body');
+  assert.ok(inlinePre, 'a short preview must render the full text inline');
+  assert.ok(allText(inlinePre).includes('Hello 三'), 'the inline text must be the full preview');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-show-full'), null,
+    'no reveal step exists anymore');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-once').props.disabled, false,
+    '"Allow this once" must be enabled while the short text is visible');
+  assert.ok(allText(tree).includes(dialogCopy.fullTextWarning),
+    'the warning line stays for the inline case');
+  // Texts beyond the old 200-char inline cap render inline too — visible
+  // without any click and "Allow this once" enabled (no reveal gate).
+  const longText = `${'a'.repeat(200)}b`;
+  tree = render(confirmSlice('cu-2', longText));
+  const longPre = findByTestId(tree, 'computer-use-confirm-full-text');
+  assert.ok(longPre, 'a >200-char preview must render inline without a reveal click');
+  assert.ok(allText(longPre).includes(longText), 'the inline element must contain the full long text');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-show-full'), null,
+    'long texts must not bring back the reveal button');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-once').props.disabled, false,
+    '"Allow this once" must never be disabled by preview visibility');
+  assert.ok(allText(tree).includes(dialogCopy.fullTextWarning),
+    'the warning line stays for the long-text case');
+  // The backend contract caps the preview at 4096 chars; a max-size preview
+  // stays inline as well (the scrollable container keeps the dialog sized).
+  tree = render(confirmSlice('cu-3', 'b'.repeat(4096)));
+  assert.ok(findByTestId(tree, 'computer-use-confirm-full-text'),
+    'a 4096-char preview renders inline in the scrollable container');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-once').props.disabled, false,
+    '"Allow this once" stays enabled for a max-size preview');
+
+  // ── UI-1b. The unreadable-target sentinel is localized everywhere ──
+  // The wire label keeps the canonical English sentinel (it is part of the
+  // approval-token binding), and drag labels join every screened point, so
+  // the sentinel can arrive as one segment of a longer label. An
+  // exact-equality localization left that case as raw English inside a
+  // non-English safety dialog; every occurrence must be replaced.
+  {
+    const dragSlice = { enabled: true, granted: true, stopped: false,
+      confirmRequest: { sessionId: 's1', action: 'drag',
+        element: 'Transfer all funds (AXButton) → (no readable target)', confirmId: 'cu-4' } };
+    tree = render(dragSlice);
+    const text = allText(tree);
+    assert.ok(text.includes(dialogCopy.unreadableTarget),
+      'the unreadable-target sentinel must render localized');
+    assert.ok(!text.includes('(no readable target)'),
+      'no raw English sentinel may survive into the rendered dialog');
+    assert.ok(text.includes('Transfer all funds'),
+      'the readable half of the label must still be shown');
+    // A label that is ONLY the sentinel (single unreadable point) localizes
+    // as well — the case the original equality handled.
+    const soloSlice = { enabled: true, granted: true, stopped: false,
+      confirmRequest: { sessionId: 's1', action: 'left_mouse_down',
+        element: '(no readable target)', confirmId: 'cu-5' } };
+    tree = render(soloSlice);
+    assert.ok(allText(tree).includes(dialogCopy.unreadableTarget),
+      'a solo unreadable-target label must render localized');
+    assert.ok(!allText(tree).includes('(no readable target)'),
+      'a solo label must not keep the raw sentinel either');
+  }
+
+  // ── UI-2. A failed action's error must not leak into the next dialog ──
+  // actionError used to survive after a dialog closed and was then rendered
+  // inside the next, unrelated dialog as a message about a different
+  // confirm_id.
+  runtime.reset();
+  bridgeMock.computerUse.deny = () => Promise.reject(new Error('backend exploded'));
+  const failingSlice = confirmSlice('cu-1');
+  tree = render(failingSlice);
+  assert.equal(findByTestId(tree, 'computer-use-confirm-once').props.disabled, false,
+    'a request without typePreviewFull must not gate "Allow this once" behind a reveal');
+  findByTestId(tree, 'computer-use-confirm-deny').props.onClick();
+  // Same slice object: the failing action happens while THIS dialog is up, so
+  // the error belongs to it (a new slice identity would legitimately reset it).
+  tree = await settle(failingSlice);
+  assert.ok(allText(tree).includes('Action failed: backend exploded'),
+    'the failure must surface inside the dialog it happened in');
+  assert.ok(findByTestId(tree, 'computer-use-confirm-deny'),
+    'the dialog stays up after the failed action');
+  // The request goes away, then an unrelated new request re-opens the dialog.
+  tree = await settle({ enabled: true, granted: true, stopped: false });
+  assert.equal(tree, null, 'without a pending request no dialog renders');
+  tree = await settle(confirmSlice('cu-2', 'hi'));
+  assert.ok(findByTestId(tree, 'computer-use-confirm-deny'), 'the new dialog is up');
+  assert.equal(allText(tree).includes('Action failed: backend exploded'), false,
+    'the stale error about cu-1 must not leak into the cu-2 dialog');
+
+  // ── UI-3. Secure targets (no typePreviewFull) show no preview at all ──
+  // Backend contract: password/secure Type confirmations ship no preview, so
+  // neither the typed-text block nor its warning may render.
+  runtime.reset();
+  tree = render(confirmSlice('cu-secure'));
+  assert.equal(findByTestId(tree, 'computer-use-confirm-full-text'), null,
+    'a secure target must not render any typed-text preview');
+  assert.equal(allText(tree).includes(dialogCopy.fullTextWarning), false,
+    'the exact-text warning belongs to the preview block and stays hidden for secure targets');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-once').props.disabled, false,
+    'a missing preview must not disable "Allow this once"');
+
+  // ── UI-4. Structured payloads render localized; too-long texts hint ──
+  // The dialog must not surface the raw English summary when the structured
+  // fields are present, and a truncated text without a preview shows the
+  // too-long hint bar instead of the preview block.
+  runtime.reset();
+  const structuredSlice = (confirmId, fields) => ({
+    enabled: true, granted: true, stopped: false,
+    confirmRequest: {
+      sessionId: 's1', confirmId, element: 'Buy now',
+      summary: 'left click x2 at Some((5, 6))',
+      actionName: null, button: null, clickCount: null, point: null, endPoint: null,
+      textLength: null, textPreview: null, textPreviewTruncated: false,
+      chord: null, holdMs: null,
+      ...fields,
+    },
+  });
+  tree = render(structuredSlice('cu-1', { actionName: 'click', button: 'left', clickCount: 2, point: { x: 5, y: 6 } }));
+  assert.ok(allText(tree).includes('Left double-click at (5, 6)'),
+    'a structured click renders the localized template, not the English summary');
+  assert.equal(allText(tree).includes('left click x2'), false,
+    'the English summary must not leak through when the structured fields exist');
+  tree = render(structuredSlice('cu-2', { actionName: 'type', textLength: 12, textPreviewTruncated: true }));
+  assert.ok(allText(tree).includes('Type 12 characters'),
+    'a structured type renders the localized count');
+  assert.ok(findByTestId(tree, 'computer-use-confirm-text-too-long'),
+    'a truncated text without a preview shows the too-long hint bar');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-full-text'), null,
+    'no preview block renders when the backend shipped no preview');
+  assert.equal(allText(tree).includes(dialogCopy.fullTextWarning), false,
+    'the exact-text warning stays hidden without a preview');
+  tree = render(structuredSlice('cu-3', { actionName: 'type', textLength: 3, textPreview: 'abc' }));
+  const textPre = findByTestId(tree, 'computer-use-confirm-full-text');
+  assert.ok(textPre && allText(textPre).includes('abc'),
+    'a structured text_preview feeds the inline preview block');
+  assert.equal(findByTestId(tree, 'computer-use-confirm-text-too-long'), null,
+    'a shipped preview suppresses the too-long hint');
+
+  // ── UI-5. Target-aware consent copy (virtual display vs physical screen) ──
+  // The grant dialog must say explicitly that a "virtual" request works
+  // inside the isolated virtual display and NOT on the user's screen; the
+  // confirm dialog shows a small target line; a missing field must render
+  // the physical copy everywhere (fail-neutral). Allow/Deny semantics,
+  // buttons and testids stay identical across both variants.
+  runtime.reset();
+  tree = render({ enabled: true, stopped: false, grantRequest: { sessionId: 's1', target: 'virtual' } });
+  let grantText = allText(tree);
+  assert.ok(grantText.includes(dialogCopy.grantTitleVirtual),
+    'a virtual grant request renders the virtual title');
+  assert.ok(grantText.includes(dialogCopy.grantDescVirtual),
+    'a virtual grant request renders the virtual description');
+  assert.equal(grantText.includes(dialogCopy.grantTitle), false,
+    'the physical title must not leak into the virtual dialog');
+  assert.ok(findByTestId(tree, 'computer-use-grant-allow'), 'the Allow button stays');
+  assert.ok(findByTestId(tree, 'computer-use-grant-deny'), 'the Deny button stays');
+  // Per-platform caveats under the virtual grant: the macOS/Linux/Windows
+  // fidelity notes render on their platform and nowhere else — an unknown
+  // capability (undefined) renders only the generic honesty line (no
+  // wrong-platform copy, fail-neutral hiding).
+  tree = render({ enabled: true, stopped: false, grantRequest: { sessionId: 's1', target: 'virtual' } }, 'macos');
+  grantText = allText(tree);
+  assert.ok(grantText.includes(dialogCopy.grantMacCaveat),
+    'the macOS caveat renders on macos');
+  assert.equal(grantText.includes(dialogCopy.grantLinuxCaveat), false,
+    'the Linux caveat must not render on macos');
+  assert.equal(grantText.includes(dialogCopy.grantWindowsCaveat), false,
+    'the Windows caveat must not render on macos');
+  tree = render({ enabled: true, stopped: false, grantRequest: { sessionId: 's1', target: 'virtual' } }, 'linux');
+  grantText = allText(tree);
+  assert.ok(grantText.includes(dialogCopy.grantLinuxCaveat),
+    'the Linux caveat renders on linux');
+  assert.equal(grantText.includes(dialogCopy.grantMacCaveat), false,
+    'the macOS caveat must not render on linux');
+  tree = render({ enabled: true, stopped: false, grantRequest: { sessionId: 's1', target: 'virtual' } }, 'windows');
+  grantText = allText(tree);
+  // R8: Windows carries the broker-launch residual (a store-app stub's
+  // real window can surface on the user's screen and keeps running after
+  // the session) — the same user-visibility shape the macOS/Linux caveats
+  // disclose.
+  assert.ok(grantText.includes(dialogCopy.grantWindowsCaveat),
+    'the Windows caveat renders on windows');
+  assert.equal(grantText.includes(dialogCopy.grantMacCaveat), false,
+    'no mac caveat on windows');
+  assert.equal(grantText.includes(dialogCopy.grantLinuxCaveat), false,
+    'no linux caveat on windows');
+  assert.equal(grantText.includes(dialogCopy.grantUnknownPlatformCaveat), false,
+    'the unknown-platform honesty line must not render on a KNOWN platform');
+  // R7: an unknown/absent capability previously left the base copy claiming
+  // absolute isolation with no qualification — the generic honesty line now
+  // renders instead of the platform caveats (the security surface must not
+  // over-claim when the platform's real limits are unverified).
+  tree = render({ enabled: true, stopped: false, grantRequest: { sessionId: 's1', target: 'virtual' } });
+  grantText = allText(tree);
+  assert.equal(grantText.includes(dialogCopy.grantMacCaveat), false,
+    'no platform caveat when the capability is unknown');
+  assert.equal(grantText.includes(dialogCopy.grantLinuxCaveat), false,
+    'no platform caveat when the capability is unknown');
+  assert.ok(grantText.includes(dialogCopy.grantUnknownPlatformCaveat),
+    'the unknown-platform honesty line renders when the capability is unknown');
+  tree = render({ enabled: true, stopped: false, grantRequest: { sessionId: 's1' } });
+  grantText = allText(tree);
+  assert.ok(grantText.includes(dialogCopy.grantTitle),
+    'a request without the target field renders the physical title');
+  assert.equal(grantText.includes(dialogCopy.grantTitleVirtual), false,
+    'the virtual copy must not appear for a target-less request');
+  assert.equal(findByTestId(tree, 'computer-use-grant-allow').props.disabled, false,
+    'Allow stays enabled in the physical fallback dialog');
+
+  const virtualConfirmSlice = { enabled: true, granted: true, stopped: false,
+    confirmRequest: { sessionId: 's1', action: 'type', element: 'Reply box',
+      confirmId: 'cu-t-v', target: 'virtual' } };
+  tree = render(virtualConfirmSlice);
+  let confirmText = allText(tree);
+  assert.ok(confirmText.includes(dialogCopy.confirmTargetVirtual),
+    'a virtual confirm renders the virtual target line');
+  assert.equal(confirmText.includes(dialogCopy.confirmTargetPhysical), false,
+    'the physical target line must not leak into the virtual dialog');
+  tree = render(confirmSlice('cu-t-p'));
+  confirmText = allText(tree);
+  assert.ok(confirmText.includes(dialogCopy.confirmTargetPhysical),
+    'a confirm without the target field renders the physical target line');
+  assert.equal(confirmText.includes(dialogCopy.confirmTargetVirtual), false,
+    'the virtual target line must not appear without the field');
+
+  // Banner: the virtual grant reads less alarming but keeps role="alert",
+  // the Stop button and the testid; a slice without grantedTarget (old
+  // backend, or a grant decided before the field existed) stays physical.
+  const bannerSlice = (extra) => ({ enabled: true, granted: true, stopped: false, ...extra });
+  let bannerTree = runtime.render(ComputerUseBanner, { slice: bannerSlice({ grantedTarget: 'virtual' }), copy: dialogCopy });
+  const bannerNode = findByTestId(bannerTree, 'computer-use-banner');
+  assert.ok(bannerNode, 'the banner testid stays on the virtual variant');
+  assert.equal(bannerNode.props.role, 'alert', 'role=alert survives the virtual variant');
+  assert.ok(findByTestId(bannerTree, 'computer-use-stop'), 'the Stop button survives the virtual variant');
+  assert.ok(allText(bannerTree).includes(dialogCopy.bannerTitleVirtual),
+    'a virtual grant renders the virtual banner title');
+  assert.equal(allText(bannerTree).includes(dialogCopy.bannerTitle), false,
+    'the physical banner title must not leak into the virtual banner');
+  assert.ok(allText(bannerTree).includes(dialogCopy.bannerNoteVirtual),
+    'a virtual grant renders the virtual banner note (R9: untested before)');
+  assert.equal(allText(bannerTree).includes(dialogCopy.bannerNote), false,
+    'the physical banner note must not leak into the virtual banner');
+  bannerTree = runtime.render(ComputerUseBanner, { slice: bannerSlice(), copy: dialogCopy });
+  assert.ok(allText(bannerTree).includes(dialogCopy.bannerTitle),
+    'a slice without grantedTarget renders the physical banner title');
+  assert.equal(allText(bannerTree).includes(dialogCopy.bannerTitleVirtual), false,
+    'the virtual banner title must not appear without the field');
+  assert.ok(allText(bannerTree).includes(dialogCopy.bannerNote),
+    'a slice without grantedTarget renders the physical banner note');
+  assert.equal(allText(bannerTree).includes(dialogCopy.bannerNoteVirtual), false,
+    'the virtual banner note must not appear without the field');
+} finally {
+  await vite.close();
+  rmSync(stubDir, { recursive: true, force: true });
+  if (!hadWindow) delete globalThis.window;
+  if (!hadDocument) delete globalThis.document;
+  delete globalThis.__pinvouConsentReact;
+}
+
+// ── Banner epoch gate (round-14: stale-error reset, was untested) ──
+{
+  // Rising edge of a NEW grant: the previous epoch's error is dropped.
+  assert.deepEqual(bannerErrorReset(false, true), { resetError: true, wasShown: true });
+  // An error raised DURING the shown phase survives (same epoch).
+  assert.deepEqual(bannerErrorReset(true, true), { resetError: false, wasShown: true });
+  // Hiding re-arms the gate without touching errors.
+  assert.deepEqual(bannerErrorReset(true, false), { resetError: false, wasShown: false });
+  assert.deepEqual(bannerErrorReset(false, false), { resetError: false, wasShown: false });
+}
+
+// ── Portal source pin (round-17 M5): the stacking-order fix must be pinned
+// at the source level too — the walker above ADAPTS to portals, so reverting
+// createPortal back to inline rendering would keep every UI assertion here
+// green. Same pattern as knowledge_visual_contract.test.mjs. ──
+{
+  const consentSource = readFileSync(
+    new URL('../src/features/computer-use/ComputerUseConsent.jsx', import.meta.url),
+    'utf8',
+  );
+  assert.match(consentSource, /import \{ createPortal \} from 'react-dom';/);
+  // Both dialogs (grant + confirm) must portal to document.body — pinned on
+  // the actual `return createPortal(` call sites so comment mentions don't
+  // satisfy the count.
+  assert.equal(consentSource.match(/return createPortal\(/g)?.length, 2,
+    'both dialogs must render through createPortal');
+  assert.equal(consentSource.match(/document\.body,/g)?.length, 2,
+    'both portals must target document.body');
+  // z-[1210]: strictly above every app overlay including the voice intro's
+  // z-[1200] portal — a security prompt must never lose a same-z DOM-order
+  // race (round-17 nit, bumped from z-[1200]).
+  assert.match(consentSource, /fixed inset-0 z-\[1210\]/);
+  // Height bound + pinned decision row. An over-tall target label used to push
+  // Deny/Allow out of a panel that did not scroll; capping alone is not the
+  // fix, because buttons left inside the scroll region can still be scrolled
+  // away from. Both panels therefore cap, clip, and give the body its own
+  // scroller with the button row outside it. The harness below stubs the DOM
+  // (it emits `ref: null`), so this can only be pinned at the source level.
+  assert.equal(
+    consentSource.match(/max-h-\[85vh\] flex flex-col overflow-hidden/g)?.length,
+    2,
+    'both dialogs must cap their height and clip at the panel',
+  );
+  assert.equal(
+    consentSource.match(/min-h-0 flex-1 overflow-y-auto/g)?.length,
+    2,
+    'both dialogs must scroll their body, not the whole panel',
+  );
+  assert.equal(
+    consentSource.match(/shrink-0 flex items-center justify-end gap-2/g)?.length,
+    2,
+    'both dialogs must keep the Deny/Allow row outside the scroll region',
+  );
+  // Deny is the last control in the panel, so focusing it without
+  // preventScroll would open a tall dialog already scrolled past the action
+  // the user is being asked to approve.
+  assert.match(
+    consentSource,
+    /target\.focus\(\{ preventScroll: true \}\)/,
+    'initial focus must not scroll the consent body out of view',
+  );
+}
+
+// ── Leaving to the draft screen must run the session-less refresh ──
+// The r2/r3 session-less branch fixed the stale slice, but until the fourth
+// round it had no production caller on the actual leave transition:
+// ChatView's effect early-returned on a null activeSessionId, so
+// createNewSession / leaveSessionView / delete all left the phantom banner
+// (and any unanswered dialog) rendered on the welcome composer. Like the
+// class pins above, the wiring can only be pinned at the source level — the
+// harness stubs the DOM and never mounts ChatView.
+{
+  const chatSource = readFileSync(
+    new URL('../src/features/chat/ChatView.jsx', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    chatSource,
+    /if \(!activeSessionId\) \{\s*bridge\.computerUse\.refreshStatus\(null\)/,
+    'leaving to the draft screen must fire the session-less refreshStatus',
+  );
+}
+
+// ── The unreadable-target sentinel must stay in step across languages ──
+// The sentinel is part of the approval-token binding (tool.rs owns the wire
+// value) and is localized at render time by split/join on the JS constant.
+// The two constants live in different languages with no shared module; if
+// they drift, the split silently stops matching and zh/ja dialogs fall back
+// to the raw English sentinel mid-label — invisible to any test on either
+// side alone (the Rust pins never render, the JS render pins never read the
+// Rust value). Same cross-language step pattern as `invisible_lists_stay_in_step`.
+{
+  const rustSource = readFileSync(
+    new URL('../src-tauri/src/features/computer_use/tool.rs', import.meta.url),
+    'utf8',
+  );
+  const consent = readFileSync(
+    new URL('../src/features/computer-use/ComputerUseConsent.jsx', import.meta.url),
+    'utf8',
+  );
+  const rustValue = rustSource.match(/UNREADABLE_TARGET_LABEL: &str = "([^"]+)"/)?.[1];
+  const jsValue = consent.match(/const UNREADABLE_TARGET = '([^']+)'/)?.[1];
+  assert.ok(rustValue, 'the Rust sentinel constant must be found');
+  assert.ok(jsValue, 'the JS sentinel constant must be found');
+  assert.equal(
+    jsValue,
+    rustValue,
+    'the JS sentinel must stay byte-identical to the wire value the token binds',
+  );
+}
+
+console.log('computer use consent dialog UI tests passed');

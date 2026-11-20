@@ -1,0 +1,233 @@
+param(
+  [switch]$ForceLfsPull,
+  [switch]$CacheKeyOnly,
+  [switch]$OnnxOnly,
+  [switch]$ImportFunctionsOnly
+)
+
+$ErrorActionPreference = "Stop"
+
+# A Windows PowerShell 5.1 process spawned under a pwsh 7 parent (a CI step
+# shell or a pwsh terminal) inherits pwsh's PSModulePath and then cannot load
+# its own built-in modules (Get-FileHash). Rebuild the host default module
+# path whenever the process path is missing the system module directory or
+# carries pwsh entries; plain 5.1 consoles already match and are left
+# untouched.
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+  $systemModulePath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\Modules"
+  $modulePathEntries = @(
+    [System.Environment]::GetEnvironmentVariable("PSModulePath", "Process") -split ";"
+  ) | Where-Object { $_ }
+  $pwshModuleEntries = $modulePathEntries | Where-Object {
+    $_ -like "*\PowerShell\7\Modules" -or $_ -like "*\PowerShell\Modules"
+  }
+  if (($modulePathEntries -notcontains $systemModulePath) -or $pwshModuleEntries) {
+    $env:PSModulePath = @(
+      (Join-Path $HOME "Documents\WindowsPowerShell\Modules"),
+      (Join-Path $env:ProgramFiles "WindowsPowerShell\Modules"),
+      $systemModulePath
+    ) -join ";"
+  }
+}
+
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..\..\..\..")).Path
+$runtimePath = "private-runtimes/windows"
+$runtimeRoot = Join-Path $repoRoot $runtimePath
+$runtimeLockPath = Join-Path $repoRoot "pinvou3-app\src-tauri\config\platforms\windows\runtime\x86_64.lock.json"
+$resolverCacheRoot = Join-Path $repoRoot "pinvou3-app\src-tauri\target\windows-runtime"
+$resolverLockPath = Join-Path $resolverCacheRoot ".resolver.lock"
+$lfsStorageRoot = Join-Path $resolverCacheRoot "lfs-storage"
+$cacheSchema = "v5"
+
+function Invoke-Git {
+  param(
+    [string]$WorkingDirectory,
+    [string[]]$Arguments,
+    [string]$FailureMessage,
+    [string]$GitCommand = "git"
+  )
+
+  try {
+    $gitExecutable = [string](
+      Get-Command -Name $GitCommand -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1 -ExpandProperty Source
+    )
+  } catch {
+    # A missing/unresolvable executable must keep the contextual failure
+    # message instead of surfacing the raw Get-Command error.
+    throw "$FailureMessage Unable to resolve the Git executable '$GitCommand': $($_.Exception.Message)"
+  }
+  $previousErrorActionPreference = $ErrorActionPreference
+  $exitCode = $null
+  try {
+    # Windows PowerShell 5.1 converts native stderr into ErrorRecord objects.
+    # Git writes normal fetch progress to stderr, so only its exit code may
+    # decide success; keep the captured stderr for diagnostics on real errors.
+    $ErrorActionPreference = "Continue"
+    $output = & $gitExecutable -C $WorkingDirectory @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+  if ($exitCode -ne 0) {
+    throw "$FailureMessage $($output -join ' ')"
+  }
+  return @($output)
+}
+
+function Get-GitlinkCommit {
+  $lines = Invoke-Git -WorkingDirectory $repoRoot -Arguments @("ls-files", "--stage", "--", $runtimePath) -FailureMessage "Unable to inspect the Windows runtime gitlink."
+  $line = ($lines -join "`n").Trim()
+  if ($line -notmatch "^160000 ([0-9a-fA-F]{40}) 0`t") {
+    throw "Windows runtime gitlink is missing or unresolved: $runtimePath"
+  }
+  return $Matches[1].ToLowerInvariant()
+}
+
+function Get-RuntimeLockSha256 {
+  if (-not (Test-Path -LiteralPath $runtimeLockPath -PathType Leaf)) {
+    throw "Windows runtime lock file is missing: $runtimeLockPath"
+  }
+  return (Get-FileHash -LiteralPath $runtimeLockPath -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-CurrentRuntimeCommit {
+  if (-not (Test-Path -LiteralPath (Join-Path $runtimeRoot ".git"))) {
+    return ""
+  }
+  $output = & git -C $runtimeRoot rev-parse HEAD 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    return ""
+  }
+  return ($output -join "`n").Trim().ToLowerInvariant()
+}
+
+function Test-LfsPointer {
+  param([string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    return $true
+  }
+  $item = Get-Item -LiteralPath $Path
+  if ($item.Length -gt 1024) {
+    return $false
+  }
+  $firstLine = Get-Content -LiteralPath $Path -TotalCount 1 -ErrorAction SilentlyContinue
+  return [string]$firstLine -eq "version https://git-lfs.github.com/spec/v1"
+}
+
+function Get-LfsTrackedPaths {
+  $trackedPaths = Invoke-Git -WorkingDirectory $runtimeRoot -Arguments @("lfs", "ls-files", "-n") -FailureMessage "Unable to list Windows runtime Git LFS files."
+  return @(
+    $trackedPaths |
+      ForEach-Object { [string]$_ } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+}
+
+function Get-LfsPointerPaths {
+  return @(
+    Get-LfsTrackedPaths |
+      Where-Object {
+        $fullPath = Join-Path $runtimeRoot $_.Replace('/', '\')
+        Test-LfsPointer -Path $fullPath
+      }
+  )
+}
+
+function Update-RuntimeSubmoduleWithoutLfsSmudge {
+  $previousSkipSmudge = [Environment]::GetEnvironmentVariable("GIT_LFS_SKIP_SMUDGE", "Process")
+  try {
+    [Environment]::SetEnvironmentVariable("GIT_LFS_SKIP_SMUDGE", "1", "Process")
+    Invoke-Git -WorkingDirectory $repoRoot -Arguments @(
+      "-c", "submodule.$runtimePath.update=checkout",
+      "submodule", "update", "--init", "--checkout", "--", $runtimePath
+    ) -FailureMessage "Unable to initialize the private Windows runtime submodule. Confirm repository access and retry." | Out-Null
+  } finally {
+    [Environment]::SetEnvironmentVariable("GIT_LFS_SKIP_SMUDGE", $previousSkipSmudge, "Process")
+  }
+}
+
+function Enter-RuntimeResolverLock {
+  param([int]$TimeoutSeconds = 120)
+
+  New-Item -ItemType Directory -Path $resolverCacheRoot -Force | Out-Null
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  while ($true) {
+    try {
+      return [System.IO.File]::Open(
+        $resolverLockPath,
+        [System.IO.FileMode]::OpenOrCreate,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+      )
+    } catch [System.IO.IOException] {
+      if ([DateTime]::UtcNow -ge $deadline) {
+        throw "Timed out waiting for the Windows runtime resolver lock: $resolverLockPath"
+      }
+      Start-Sleep -Milliseconds 200
+    }
+  }
+}
+
+if ($ImportFunctionsOnly) {
+  return
+}
+
+$expectedCommit = Get-GitlinkCommit
+$lockSha256 = Get-RuntimeLockSha256
+$cacheKey = "pinvou3-windows-runtime-$cacheSchema-$expectedCommit-$($lockSha256.Substring(0, 16))"
+if ($CacheKeyOnly) {
+  Write-Output $cacheKey
+  exit 0
+}
+
+$resolverLock = Enter-RuntimeResolverLock
+try {
+  $currentCommit = Get-CurrentRuntimeCommit
+  if ($currentCommit -ne $expectedCommit) {
+    Update-RuntimeSubmoduleWithoutLfsSmudge
+
+    $currentCommit = Get-CurrentRuntimeCommit
+    if ($currentCommit -ne $expectedCommit) {
+      throw "Windows runtime submodule did not reach the expected gitlink commit. Expected $expectedCommit, found $currentCommit."
+    }
+    Write-Host "Updated private Windows runtime submodule: $expectedCommit"
+  } else {
+    Write-Host "Reused private Windows runtime submodule checkout: $expectedCommit"
+  }
+
+  New-Item -ItemType Directory -Path $lfsStorageRoot -Force | Out-Null
+  $pointerPaths = if ($ForceLfsPull) { @(Get-LfsTrackedPaths) } else { @(Get-LfsPointerPaths) }
+  if ($OnnxOnly) {
+    $pointerPaths = @($pointerPaths | Where-Object { $_ -like "*/onnxruntime-win-x64-*-runtime.zip" })
+  }
+  if ($ForceLfsPull -or $pointerPaths.Count -gt 0) {
+    $lfsArguments = @("-c", "lfs.storage=$lfsStorageRoot", "lfs", "pull")
+    if ($OnnxOnly -or (-not $ForceLfsPull -and $pointerPaths.Count -gt 0)) {
+      $lfsArguments += "--include=$($pointerPaths -join ',')"
+      $lfsArguments += "--exclude="
+    }
+    Invoke-Git -WorkingDirectory $runtimeRoot -Arguments $lfsArguments -FailureMessage "Unable to materialize Git LFS objects for the private Windows runtime submodule." | Out-Null
+
+    $remainingPointers = if ($OnnxOnly) {
+      @($pointerPaths | Where-Object { Test-LfsPointer -Path (Join-Path $runtimeRoot $_.Replace('/', '\')) })
+    } else {
+      @(Get-LfsPointerPaths)
+    }
+    if ($remainingPointers.Count -gt 0) {
+      throw "Git LFS objects remain unmaterialized: $($remainingPointers -join ', ')"
+    }
+    Write-Host ("Materialized Windows runtime Git LFS files: {0}" -f $pointerPaths.Count)
+  } else {
+    Write-Host "Reused materialized Windows runtime Git LFS files; git lfs pull was skipped."
+  }
+
+  Write-Host "Windows runtime Jenkins cache key: $cacheKey"
+  Write-Host "Windows runtime external Git LFS storage: $lfsStorageRoot"
+  Write-Output "PINVOU3_WINDOWS_RUNTIME_CACHE_KEY=$cacheKey"
+} finally {
+  if ($null -ne $resolverLock) {
+    $resolverLock.Dispose()
+  }
+}

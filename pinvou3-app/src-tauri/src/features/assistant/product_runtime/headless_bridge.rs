@@ -1,0 +1,2936 @@
+//! Narrow, windowless adapter over the product EnginePool runtime.
+
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::future::Future;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use agent_backend_api::{
+    AgentBackendError, AgentRunObserver, AgentSessionHandle, AgentTaskInput, AgentTaskOutcome,
+    HeadlessAgentBackend, PrepareRequest, PrivateInputResolver, PrivateOutputHandle,
+    PrivateOutputResolver, ResolvedAttachmentSource, SafeAgentEvent, SafeModelRequestMetric,
+    SafeRunStatus, SafeUsageMetrics, SecretOutput, SecretText, SuiteModelIdentity, notify_observer,
+};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use deepseek_tui::AppMode;
+use tauri::Manager;
+use tokio::sync::Mutex as AsyncMutex;
+
+use crate::features::assistant::attachments::{
+    build_read_only_message_with_attachments, copy_bounded, stage_file_in_workspace,
+};
+use crate::features::assistant::engine_pool::{EnginePool, EngineToolFactory, ToolPolicy};
+use crate::features::assistant::platform::headless_attachments::ensure_staged_attachments_supported;
+use crate::features::assistant::product_runtime::eval_tool_policy::{
+    EvalToolPolicy, resolve_eval_policy,
+};
+use crate::features::assistant::product_runtime::{
+    EnginePoolRuntime, EvalSuiteModelGuard, SessionSpec, TurnInput, note_stderr,
+};
+use crate::features::{knowledge, sessions::SessionStore};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafeToolOutcome {
+    pub name: String,
+    pub failed: bool,
+    pub failure_code: Option<String>,
+    pub elapsed_ms: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProductTurnOutcome {
+    pub status: String,
+    pub failure_code: Option<String>,
+    pub assistant_text: String,
+    pub usage: Option<SafeUsageMetrics>,
+    pub tools: Vec<SafeToolOutcome>,
+    pub model_requests: Vec<SafeModelRequestMetric>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ProductToolPolicy(EvalToolPolicy);
+
+impl std::fmt::Debug for ProductTurnOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProductTurnOutcome")
+            .field("status", &self.status)
+            .field("failure_code", &self.failure_code)
+            .field("assistant_text", &"[redacted]")
+            .field("usage", &self.usage)
+            .field("tools", &self.tools)
+            .field("model_requests", &self.model_requests)
+            .finish()
+    }
+}
+
+impl ProductTurnOutcome {
+    fn merge_recovery(&mut self, mut recovery: Self) {
+        self.status = recovery.status;
+        self.failure_code = recovery.failure_code;
+        self.assistant_text = recovery.assistant_text;
+        self.usage = match (self.usage, recovery.usage) {
+            (Some(first), Some(second)) => Some(SafeUsageMetrics::new(
+                first.input_tokens().saturating_add(second.input_tokens()),
+                first.output_tokens().saturating_add(second.output_tokens()),
+                first
+                    .cache_hit_tokens()
+                    .saturating_add(second.cache_hit_tokens()),
+                first
+                    .cache_miss_tokens()
+                    .saturating_add(second.cache_miss_tokens()),
+            )),
+            (usage @ Some(_), None) | (None, usage @ Some(_)) => usage,
+            (None, None) => None,
+        };
+        self.tools.append(&mut recovery.tools);
+        self.model_requests.append(&mut recovery.model_requests);
+    }
+}
+
+#[async_trait]
+pub trait ProductRuntimePort: Send + Sync {
+    async fn prepare(&self, session_id: &str) -> Result<()>;
+    async fn run_with_policy(
+        &self,
+        _session_id: &str,
+        _prompt: &str,
+        _policy: ProductToolPolicy,
+    ) -> Result<ProductTurnOutcome> {
+        anyhow::bail!("unsupported_tool_policy")
+    }
+    async fn run_with_staged_attachments_and_policy(
+        &self,
+        _session_id: &str,
+        _prompt: &str,
+        _staged_workspace: &Path,
+        _policy: ProductToolPolicy,
+    ) -> Result<ProductTurnOutcome> {
+        anyhow::bail!("unsupported_tool_policy")
+    }
+    async fn cancel(&self, session_id: &str) -> Result<()>;
+    async fn close(&self, session_id: &str) -> Result<()>;
+}
+
+struct EnginePoolPort {
+    runtime: EnginePoolRuntime,
+    suite_model: EvalSuiteModelGuard,
+}
+
+impl EnginePoolPort {
+    async fn run_content(
+        &self,
+        session_id: &str,
+        content: String,
+        eval_tool_policy: EvalToolPolicy,
+    ) -> Result<ProductTurnOutcome> {
+        let handle = self
+            .runtime
+            .submit(&TurnInput {
+                session_id: session_id.to_owned(),
+                content,
+                mode: AppMode::Agent,
+                restrict_tools: false,
+                eval_tool_policy: Some(eval_tool_policy),
+            })
+            .await?;
+        let turn = self.runtime.wait_for_completion(&handle).await?;
+        let model_requests = turn
+            .milestones
+            .iter()
+            .filter(|event| event.event == "model_request_metric")
+            .filter_map(|event| {
+                Some(SafeModelRequestMetric::new(
+                    event.request_duration_ms?,
+                    event.ttft_ms,
+                    event.input_tokens?,
+                    event.output_tokens?,
+                ))
+            })
+            .collect();
+        Ok(ProductTurnOutcome {
+            status: turn.status,
+            failure_code: turn
+                .error
+                .as_deref()
+                .map(classify_product_failure)
+                .map(str::to_owned),
+            assistant_text: turn.assistant_text,
+            usage: turn.usage.map(|usage| {
+                SafeUsageMetrics::new(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_hit_tokens,
+                    usage.cache_miss_tokens,
+                )
+            }),
+            tools: turn
+                .tool_events
+                .into_iter()
+                .map(|tool| {
+                    let name = if eval_tool_policy.allows(&tool.name) {
+                        tool.name
+                    } else {
+                        "[unexpected-tool]".to_owned()
+                    };
+                    SafeToolOutcome {
+                        name,
+                        failed: tool.failed,
+                        failure_code: tool
+                            .failure_code
+                            .as_deref()
+                            .and_then(validated_tool_failure_code)
+                            .map(str::to_owned),
+                        elapsed_ms: tool.elapsed_ms,
+                    }
+                })
+                .collect(),
+            model_requests,
+        })
+    }
+}
+
+fn classify_product_failure(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    let code = if normalized.contains("context length")
+        || normalized.contains("context window")
+        || normalized.contains("maximum context")
+        || normalized.contains("too many tokens")
+    {
+        "model_context_limit"
+    } else if normalized.contains("rate limit") || normalized.contains("429") {
+        "model_rate_limited"
+    } else if normalized.contains("timed out") || normalized.contains("timeout") {
+        "model_request_timeout"
+    } else if normalized.contains("connection")
+        || normalized.contains("connect error")
+        || normalized.contains("transport")
+        || normalized.contains("network")
+    {
+        "model_transport_failed"
+    } else if normalized.contains("invalid response")
+        || normalized.contains("protocol")
+        || normalized.contains("deserialize")
+        || normalized.contains("decode")
+    {
+        "model_protocol_failed"
+    } else if normalized == "unsupported_tool_policy" {
+        "unsupported_tool_policy"
+    } else if normalized.contains("tool") || normalized.contains("mcp") {
+        "agent_tool_failed"
+    } else {
+        "agent_turn_failed"
+    };
+    code
+}
+
+fn validated_product_failure_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some("model_context_limit") => "model_context_limit",
+        Some("model_rate_limited") => "model_rate_limited",
+        Some("model_request_timeout") => "model_request_timeout",
+        Some("model_transport_failed") => "model_transport_failed",
+        Some("model_protocol_failed") => "model_protocol_failed",
+        Some("agent_tool_failed") => "agent_tool_failed",
+        Some("unsupported_tool_policy") => "unsupported_tool_policy",
+        _ => "agent_turn_failed",
+    }
+}
+
+fn should_attempt_gaia_final_recovery(turn: &ProductTurnOutcome) -> bool {
+    if extract_final_answer(&turn.assistant_text).is_some() {
+        return false;
+    }
+    turn.status.eq_ignore_ascii_case("completed")
+        || turn.failure_code.as_deref() == Some("agent_tool_failed")
+}
+
+fn validated_tool_failure_code(code: &str) -> Option<&'static str> {
+    match code {
+        "tool_call_budget_exhausted" => Some("tool_call_budget_exhausted"),
+        "missing_action" => Some("missing_action"),
+        "invalid_arguments" => Some("invalid_arguments"),
+        "tool_execution_failed" => Some("tool_execution_failed"),
+        "network_failed" => Some("network_failed"),
+        "network_timeout" => Some("network_timeout"),
+        "dynamic_page_unreadable" => Some("dynamic_page_unreadable"),
+        "content_extraction_failed" => Some("content_extraction_failed"),
+        "remote_access_denied" => Some("remote_access_denied"),
+        "http_status_failed" => Some("http_status_failed"),
+        "resource_not_found" => Some("resource_not_found"),
+        "network_policy_blocked" => Some("network_policy_blocked"),
+        "restricted_address" => Some("restricted_address"),
+        "policy_denied" => Some("policy_denied"),
+        "search_provider_config" => Some("search_provider_config"),
+        "host_read_only_blocked" => Some("host_read_only_blocked"),
+        "host_tool_blocked" => Some("host_tool_blocked"),
+        "approval_required" => Some("approval_required"),
+        _ => None,
+    }
+}
+
+fn prepare_product_attachment_content(
+    prompt: String,
+    staged_workspace: PathBuf,
+    execution_root: PathBuf,
+    image_tools_allowed: bool,
+) -> Result<String> {
+    let fixed_error = || anyhow::anyhow!("attachment_staging_failed");
+    let mut entries = std::fs::read_dir(&staged_workspace)
+        .map_err(|_| fixed_error())?
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|_| fixed_error())?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut attachments = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let file_type = entry.file_type().map_err(|_| fixed_error())?;
+        let basename = entry.file_name().into_string().map_err(|_| fixed_error())?;
+        if !file_type.is_file() || file_type.is_symlink() {
+            return Err(fixed_error());
+        }
+        let staged_path = stage_file_in_workspace(
+            entry.path().to_string_lossy().as_ref(),
+            &basename,
+            &execution_root,
+            "attachments",
+        )
+        .ok_or_else(fixed_error)?;
+        attachments.push(
+            crate::features::files::file_ingest::ingest_attachment(
+                &execution_root.join(staged_path),
+            )
+            .map_err(|_| fixed_error())?,
+        );
+    }
+    Ok(build_read_only_message_with_attachments(
+        prompt,
+        attachments,
+        &execution_root,
+        image_tools_allowed,
+    ))
+}
+
+#[async_trait]
+impl ProductRuntimePort for EnginePoolPort {
+    async fn prepare(&self, session_id: &str) -> Result<()> {
+        self.runtime
+            .prepare(&SessionSpec {
+                session_id: session_id.to_owned(),
+                model_selection: Some(self.suite_model.derive_case_selection()?),
+                // Eval-suite lanes use the pool's default workspace: these
+                // sessions are scratch records, not workspace-bound runs.
+                workspace: None,
+            })
+            .await
+    }
+
+    async fn run_with_policy(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        policy: ProductToolPolicy,
+    ) -> Result<ProductTurnOutcome> {
+        self.run_content(session_id, prompt.to_owned(), policy.0)
+            .await
+    }
+
+    async fn run_with_staged_attachments_and_policy(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        staged_workspace: &Path,
+        policy: ProductToolPolicy,
+    ) -> Result<ProductTurnOutcome> {
+        let execution_root = self
+            .runtime
+            .eval_session_execution_root(session_id)
+            .map_err(|_| anyhow::anyhow!("attachment_staging_failed"))?;
+        let prompt = prompt.to_owned();
+        let staged_workspace = staged_workspace.to_path_buf();
+        let image_tools_allowed = policy.0.allows("image_analyze");
+        let content = tokio::task::spawn_blocking(move || {
+            prepare_product_attachment_content(
+                prompt,
+                staged_workspace,
+                execution_root,
+                image_tools_allowed,
+            )
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("attachment_staging_failed"))??;
+        self.run_content(session_id, content, policy.0).await
+    }
+
+    async fn cancel(&self, session_id: &str) -> Result<()> {
+        self.runtime.cancel(session_id).await;
+        Ok(())
+    }
+
+    async fn close(&self, session_id: &str) -> Result<()> {
+        self.runtime.schedule_eval_cleanup(session_id);
+        self.runtime.close_eval_session_result(session_id).await
+    }
+}
+
+#[derive(Clone)]
+pub struct ProductHeadlessBackend {
+    runtime: Arc<dyn ProductRuntimePort>,
+    runtime_sessions: Arc<Mutex<HashMap<String, RuntimeSession>>>,
+    private_outputs: Arc<Mutex<PrivateOutputs>>,
+    attachment_workspaces: Arc<Mutex<HashMap<String, tempfile::TempDir>>>,
+    tool_policies: Arc<Mutex<HashMap<String, ProductToolPolicy>>>,
+    suite_model_identity: Option<SuiteModelIdentity>,
+}
+
+#[derive(Default)]
+struct PrivateOutputs {
+    values: HashMap<String, SecretText>,
+    by_session: HashMap<String, Vec<String>>,
+}
+
+type RuntimeSession = Arc<AsyncMutex<RuntimeSessionState>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RuntimeSessionState {
+    Active,
+    Closed,
+}
+
+struct PrepareCleanupGuard {
+    runtime: Arc<dyn ProductRuntimePort>,
+    session_id: String,
+    armed: bool,
+}
+
+impl PrepareCleanupGuard {
+    fn new(runtime: Arc<dyn ProductRuntimePort>, session_id: String) -> Self {
+        Self {
+            runtime,
+            session_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PrepareCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let session_id = self.session_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = runtime.close(&session_id).await;
+            });
+        }
+    }
+}
+
+impl ProductHeadlessBackend {
+    pub fn from_runtime(runtime: Arc<dyn ProductRuntimePort>) -> Self {
+        Self::with_suite_model_identity(runtime, None)
+    }
+
+    fn with_suite_model_identity(
+        runtime: Arc<dyn ProductRuntimePort>,
+        identity: Option<SuiteModelIdentity>,
+    ) -> Self {
+        Self {
+            runtime,
+            runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
+            private_outputs: Arc::new(Mutex::new(PrivateOutputs::default())),
+            attachment_workspaces: Arc::new(Mutex::new(HashMap::new())),
+            tool_policies: Arc::new(Mutex::new(HashMap::new())),
+            suite_model_identity: identity,
+        }
+    }
+
+    fn from_engine_pool(pool: EnginePool) -> Result<Self> {
+        let runtime = EnginePoolRuntime::new(Arc::new(pool));
+        let suite_model = runtime.capture_eval_suite_model()?;
+        let identity = SuiteModelIdentity::new(
+            suite_model.identity().provider.clone(),
+            suite_model.identity().model.clone(),
+        )
+        .map_err(|_| anyhow::anyhow!("unsafe suite model identity"))?;
+        Ok(Self::with_suite_model_identity(
+            Arc::new(EnginePoolPort {
+                runtime,
+                suite_model,
+            }),
+            Some(identity),
+        ))
+    }
+
+    #[cfg(feature = "benchmark-hooks")]
+    pub fn has_staged_attachments(&self, session: &AgentSessionHandle) -> bool {
+        self.attachment_workspaces
+            .lock()
+            .map(|workspaces| workspaces.contains_key(session.expose_to_backend()))
+            .unwrap_or(false)
+    }
+
+    #[cfg(feature = "benchmark-hooks")]
+    pub fn staged_attachment_workspace(
+        &self,
+        session: &AgentSessionHandle,
+    ) -> Option<std::path::PathBuf> {
+        self.attachment_workspaces
+            .lock()
+            .ok()
+            .and_then(|workspaces| {
+                workspaces
+                    .get(session.expose_to_backend())
+                    .map(|workspace| workspace.path().to_path_buf())
+            })
+    }
+
+    fn take_private_session_state(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<tempfile::TempDir>, AgentBackendError> {
+        let mut policies = self
+            .tool_policies
+            .lock()
+            .map_err(|_| backend_error("private_session_state_failed"))?;
+        policies.remove(session_id);
+        drop(policies);
+
+        let mut outputs = self
+            .private_outputs
+            .lock()
+            .map_err(|_| backend_error("private_session_state_failed"))?;
+        if let Some(ids) = outputs.by_session.remove(session_id) {
+            for id in ids {
+                outputs.values.remove(&id);
+            }
+        }
+        drop(outputs);
+
+        self.attachment_workspaces
+            .lock()
+            .map(|mut workspaces| workspaces.remove(session_id))
+            .map_err(|_| backend_error("private_session_state_failed"))
+    }
+
+    fn runtime_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<RuntimeSession>, AgentBackendError> {
+        self.runtime_sessions
+            .lock()
+            .map(|sessions| sessions.get(session_id).cloned())
+            .map_err(|_| backend_error("session_lifecycle_failed"))
+    }
+
+    async fn close_runtime_locked(
+        &self,
+        session_id: &str,
+        state: &mut RuntimeSessionState,
+    ) -> Result<()> {
+        if *state == RuntimeSessionState::Active {
+            self.runtime.close(session_id).await?;
+            *state = RuntimeSessionState::Closed;
+        }
+        Ok(())
+    }
+
+    async fn close_runtime_session(&self, session_id: &str) -> Result<()> {
+        let Some(session) = self
+            .runtime_session(session_id)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        let mut state = session.lock().await;
+        self.close_runtime_locked(session_id, &mut state).await?;
+        drop(state);
+        let mut sessions = self
+            .runtime_sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session_lifecycle_failed"))?;
+        if sessions
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &session))
+        {
+            sessions.remove(session_id);
+        }
+        Ok(())
+    }
+
+    /// Shared teardown behind `fail_run_locked` / `finish_failed_run_locked`:
+    /// drop the session's private state, close the runtime once, and remove
+    /// the id slot only while it still holds THIS session (the `Arc::ptr_eq`
+    /// guard keeps a newer session reusing the id slot intact).
+    async fn teardown_failed_run(
+        &self,
+        session_id: &str,
+        runtime_session: &RuntimeSession,
+        mut state: tokio::sync::OwnedMutexGuard<RuntimeSessionState>,
+    ) {
+        let _workspace = self.take_private_session_state(session_id);
+        let _ = self.close_runtime_locked(session_id, &mut state).await;
+        let closed = *state == RuntimeSessionState::Closed;
+        drop(state);
+        if closed {
+            if let Ok(mut sessions) = self.runtime_sessions.lock() {
+                if sessions
+                    .get(session_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, runtime_session))
+                {
+                    sessions.remove(session_id);
+                }
+            }
+        }
+    }
+
+    /// Roll back a failed prepare tail (both `prepare` registration failures
+    /// below): drop the private state registered so far and close the runtime
+    /// session. When the close fails the cleanup guard stays armed so its
+    /// Drop retries the close on unwind.
+    async fn abort_failed_prepare(
+        &self,
+        cleanup: &mut PrepareCleanupGuard,
+        session_id: &str,
+        code: &'static str,
+    ) -> AgentBackendError {
+        let _ = self.take_private_session_state(session_id);
+        if self.close_runtime_session(session_id).await.is_ok() {
+            cleanup.disarm();
+        }
+        backend_error(code)
+    }
+
+    async fn fail_run_locked<T>(
+        &self,
+        session_id: &str,
+        runtime_session: &RuntimeSession,
+        state: tokio::sync::OwnedMutexGuard<RuntimeSessionState>,
+        error: AgentBackendError,
+    ) -> Result<T, AgentBackendError> {
+        self.teardown_failed_run(session_id, runtime_session, state)
+            .await;
+        Err(error)
+    }
+
+    async fn finish_failed_run_locked(
+        &self,
+        session_id: &str,
+        runtime_session: &RuntimeSession,
+        state: tokio::sync::OwnedMutexGuard<RuntimeSessionState>,
+        turn: ProductTurnOutcome,
+        failure_code: &str,
+        elapsed: Duration,
+    ) -> Result<AgentTaskOutcome, AgentBackendError> {
+        self.teardown_failed_run(session_id, runtime_session, state)
+            .await;
+        let mut outcome = AgentTaskOutcome::failed(elapsed, failure_code)
+            .with_model_request_metrics(turn.model_requests);
+        if let Some(usage) = turn.usage {
+            outcome = outcome.with_usage(usage);
+        }
+        Ok(outcome)
+    }
+
+    fn take_staged_workspace(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<tempfile::TempDir>, AgentBackendError> {
+        self.attachment_workspaces
+            .lock()
+            .map(|mut workspaces| workspaces.remove(session_id))
+            .map_err(|_| backend_error("attachment_staging_failed"))
+    }
+
+    fn session_policy(&self, session_id: &str) -> Result<ProductToolPolicy, AgentBackendError> {
+        self.tool_policies
+            .lock()
+            .map_err(|_| backend_error("unsupported_tool_policy"))?
+            .get(session_id)
+            .copied()
+            .ok_or_else(|| backend_error("unsupported_tool_policy"))
+    }
+
+    fn store_private_output(
+        &self,
+        session_id: &str,
+        assistant_text: String,
+    ) -> Result<PrivateOutputHandle, AgentBackendError> {
+        let output_id = format!("output-{:032x}", rand::random::<u128>());
+        let mut outputs = self
+            .private_outputs
+            .lock()
+            .map_err(|_| backend_error("private_output_store_failed"))?;
+        outputs
+            .values
+            .insert(output_id.clone(), SecretText::new(assistant_text));
+        outputs
+            .by_session
+            .entry(session_id.to_owned())
+            .or_default()
+            .push(output_id.clone());
+        Ok(PrivateOutputHandle::new(output_id))
+    }
+}
+
+/// Upper bound on staged attachments; shared with the agent request path so
+/// the two headless pipelines cannot drift apart.
+/// `pub` for the headless CLI's `agent run --attach` pre-boot gate
+/// (round-40 review): the CLI refuses over-cap attachments BEFORE the
+/// windowless host boots — the exact "doomed after expensive setup" the
+/// engine-side `validate_attachments` check runs too late to prevent — and
+/// consumes these constants rather than drifting copies.
+pub const MAX_STAGED_ATTACHMENTS: usize = 16;
+/// Per-attachment size cap in bytes (50 MiB).
+/// Same cap the staging copier (`copy_bounded` at the shared call sites)
+/// enforces: tied to `file_ingest::MAX_FILE_BYTES` at compile time so the
+/// request validator and the copier cannot drift apart.
+/// Round-51 review: the constant moved to `attachments.rs` (an
+/// unconditionally compiled module) as the single definition — the old
+/// second literal here plus the benchmark-hooks-only compile-time assert
+/// left the tie unpinned in default GUI builds. This re-export keeps the
+/// established paths (`pinvou3_lib::headless_bridge::…` for the CLI's
+/// `agent_task`, the `agentic_task` import) valid; an alias can never
+/// drift.
+pub use crate::features::assistant::attachments::MAX_STAGED_ATTACHMENT_BYTES;
+/// Aggregate size cap across one attachment batch (100 MiB).
+pub const MAX_STAGED_ATTACHMENTS_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
+fn is_safe_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.is_ascii()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+        && !matches!(name, "." | "..")
+        && matches!(
+            Path::new(name).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        )
+}
+
+enum StagedAttachmentInput {
+    Verified(ResolvedAttachmentSource),
+    Legacy(File),
+}
+
+fn stage_attachments(
+    sources: &[ResolvedAttachmentSource],
+) -> Result<tempfile::TempDir, AgentBackendError> {
+    if sources.len() > MAX_STAGED_ATTACHMENTS {
+        return Err(backend_error("attachment_staging_failed"));
+    }
+    let workspace = tempfile::Builder::new()
+        .prefix("pinvou-eval-attachment-")
+        .tempdir()
+        .map_err(|_| backend_error("attachment_staging_failed"))?;
+    let mut names = HashSet::new();
+    let mut validated = Vec::with_capacity(sources.len());
+    let mut total_bytes = 0_u64;
+    for source in sources {
+        let name = source.suggested_name();
+        if !is_safe_attachment_name(name) || !names.insert(name.to_owned()) {
+            return Err(backend_error("attachment_staging_failed"));
+        }
+        let (size, input) = if source.has_verified_file() {
+            let size = source
+                .verified_file_size()
+                .map_err(|_| backend_error("attachment_staging_failed"))?
+                .ok_or_else(|| backend_error("attachment_staging_failed"))?;
+            (size, StagedAttachmentInput::Verified(source.clone()))
+        } else {
+            let link_metadata = std::fs::symlink_metadata(source.local_path())
+                .map_err(|_| backend_error("attachment_staging_failed"))?;
+            if link_metadata.file_type().is_symlink() || !link_metadata.file_type().is_file() {
+                return Err(backend_error("attachment_staging_failed"));
+            }
+            let source_file = File::open(source.local_path())
+                .map_err(|_| backend_error("attachment_staging_failed"))?;
+            let metadata = source_file
+                .metadata()
+                .map_err(|_| backend_error("attachment_staging_failed"))?;
+            if !metadata.is_file()
+                || !crate::platform::filesystem::reserved_target_is_unchanged(
+                    &source_file,
+                    source.local_path(),
+                )
+            {
+                return Err(backend_error("attachment_staging_failed"));
+            }
+            (metadata.len(), StagedAttachmentInput::Legacy(source_file))
+        };
+        if size > MAX_STAGED_ATTACHMENT_BYTES {
+            return Err(backend_error("attachment_staging_failed"));
+        }
+        total_bytes = total_bytes
+            .checked_add(size)
+            .filter(|total| *total <= MAX_STAGED_ATTACHMENTS_TOTAL_BYTES)
+            .ok_or_else(|| backend_error("attachment_staging_failed"))?;
+        validated.push((name.to_owned(), input));
+    }
+    for (name, mut input) in validated {
+        let mut destination = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(workspace.path().join(name))
+            .map_err(|_| backend_error("attachment_staging_failed"))?;
+        // copy_bounded enforces the per-file cap on the copy itself, so the
+        // byte count carries no further decision here.
+        let _ = match &mut input {
+            StagedAttachmentInput::Verified(source) => source
+                .try_read_verified_file(|file| {
+                    copy_bounded(file, &mut destination, MAX_STAGED_ATTACHMENT_BYTES)
+                })
+                .map_err(|_| backend_error("attachment_staging_failed"))?
+                .ok_or_else(|| backend_error("attachment_staging_failed"))?,
+            StagedAttachmentInput::Legacy(source_file) => copy_bounded(
+                &mut *source_file,
+                &mut destination,
+                MAX_STAGED_ATTACHMENT_BYTES,
+            )
+            .map_err(|_| backend_error("attachment_staging_failed"))?,
+        };
+    }
+    // The pre-copy stats go stale the same way the per-file cap does: a
+    // source swapped between its stat and its copy lands bytes the caller's
+    // reported sizes never covered. The copier bounds each file, so the
+    // overshoot is bounded (16 × 50 MiB in this private tempdir); the batch
+    // cap is therefore re-checked once on the landed bytes after the loop —
+    // the agentic lane's landed-bytes principle at batch granularity (that
+    // lane re-checks per file in-loop and fails at the crossing file).
+    let landed = staged_landed_bytes(workspace.path())
+        .map_err(|_| backend_error("attachment_staging_failed"))?;
+    if landed > MAX_STAGED_ATTACHMENTS_TOTAL_BYTES {
+        return Err(backend_error("attachment_staging_failed"));
+    }
+    Ok(workspace)
+}
+
+/// Landed byte total of a staging workspace: sum the actual file sizes on
+/// disk rather than trusting the caller-reported pre-stats.
+fn staged_landed_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(dir)? {
+        total += entry?.metadata()?.len();
+    }
+    Ok(total)
+}
+
+fn backend_error(code: &'static str) -> AgentBackendError {
+    AgentBackendError::Operation(code.to_owned())
+}
+
+fn extract_final_answer(output: &str) -> Option<String> {
+    const MARKER: &str = "FINAL ANSWER";
+    let mut recognized = None;
+    for line in output.lines() {
+        let mut candidate = line.trim();
+        let emphasis = ["**", "__"]
+            .into_iter()
+            .find(|token| candidate.starts_with(token));
+        if let Some(token) = emphasis {
+            candidate = candidate[token.len()..].trim_start();
+        }
+        let Some(prefix) = candidate.get(..MARKER.len()) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case(MARKER) {
+            continue;
+        }
+        let mut remainder = candidate[MARKER.len()..].trim_start();
+        if let Some(token) = emphasis.filter(|token| remainder.starts_with(token)) {
+            remainder = remainder[token.len()..].trim_start();
+        }
+        let Some(answer) = remainder.strip_prefix(':') else {
+            continue;
+        };
+        let mut answer = answer.trim();
+        if let Some(token) = ["**", "__"]
+            .into_iter()
+            .find(|token| answer.starts_with(token) && answer.ends_with(token) && answer.len() >= 4)
+        {
+            answer = answer[token.len()..answer.len() - token.len()].trim();
+        } else if let Some(token) = emphasis.filter(|token| answer.ends_with(token)) {
+            answer = answer[..answer.len() - token.len()].trim_end();
+        }
+        recognized = Some((!answer.is_empty()).then(|| answer.to_owned()));
+    }
+    recognized.flatten()
+}
+
+fn project_private_output(
+    task: &AgentTaskInput,
+    assistant_text: &str,
+) -> Result<String, AgentBackendError> {
+    match task.output_contract().map(|contract| contract.as_str()) {
+        Some("gaia-final/v1") => extract_final_answer(assistant_text)
+            .ok_or_else(|| backend_error("missing_final_answer")),
+        _ => Ok(assistant_text.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod final_answer_contract_tests {
+    use super::extract_final_answer;
+
+    #[test]
+    fn gaia_contract_uses_the_last_marker_line_only() {
+        let output = "FINAL ANSWER: stale\nFinal Answer: 42\nignored trailing explanation";
+        assert_eq!(extract_final_answer(output), Some("42".to_owned()));
+        assert_eq!(
+            extract_final_answer("analysis FINAL ANSWER: wrong\nFINAL ANSWER: right"),
+            Some("right".to_owned())
+        );
+    }
+
+    #[test]
+    fn gaia_contract_accepts_case_and_markdown_emphasis() {
+        assert_eq!(
+            extract_final_answer("**Final Answer: 42**"),
+            Some("42".to_owned())
+        );
+        assert_eq!(
+            extract_final_answer("__FINAL ANSWER__: Paris"),
+            Some("Paris".to_owned())
+        );
+        assert_eq!(
+            extract_final_answer("FINAL ANSWER: **yes**"),
+            Some("yes".to_owned())
+        );
+    }
+
+    #[test]
+    fn gaia_contract_rejects_missing_or_empty_final_answer_markers() {
+        assert_eq!(extract_final_answer("analysis only"), None);
+        assert_eq!(extract_final_answer("FINAL ANSWER:   \n"), None);
+        assert_eq!(
+            extract_final_answer("FINAL ANSWER: stale\n**final answer:**   "),
+            None
+        );
+    }
+}
+
+fn emit_finished(
+    observer: &dyn AgentRunObserver,
+    task_id: &str,
+    status: SafeRunStatus,
+    started: Instant,
+) {
+    let _ = notify_observer(
+        observer,
+        &SafeAgentEvent::RunFinished {
+            task_id: task_id.to_owned(),
+            status,
+            elapsed: started.elapsed(),
+        },
+    );
+}
+
+fn emit_tool_outcomes(observer: &dyn AgentRunObserver, task_id: &str, tools: &[SafeToolOutcome]) {
+    for tool in tools {
+        let _ = notify_observer(
+            observer,
+            &SafeAgentEvent::tool_finished_with_code(
+                task_id,
+                tool.name.clone(),
+                !tool.failed,
+                std::time::Duration::from_millis(tool.elapsed_ms.unwrap_or(0)),
+                tool.failure_code.clone(),
+            ),
+        );
+    }
+}
+
+fn session_id(task_id: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let safe = task_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .take(32)
+        .collect::<String>();
+    format!(
+        "eval_{safe}_{}_{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[async_trait]
+impl HeadlessAgentBackend for ProductHeadlessBackend {
+    fn suite_model_identity(&self) -> Option<SuiteModelIdentity> {
+        self.suite_model_identity.clone()
+    }
+
+    async fn prepare(
+        &self,
+        request: PrepareRequest,
+    ) -> Result<AgentSessionHandle, AgentBackendError> {
+        let policy = request
+            .tool_policy()
+            .ok_or_else(|| backend_error("unsupported_tool_policy"))
+            .and_then(|id| {
+                resolve_eval_policy(id.as_str())
+                    .map(|policy| ProductToolPolicy(policy.id))
+                    .map_err(|_| backend_error("unsupported_tool_policy"))
+            })?;
+        if request.attachments().len() != request.resolved_attachments().len() {
+            return Err(backend_error("attachment_staging_failed"));
+        }
+        let workspace = if request.resolved_attachments().is_empty() {
+            None
+        } else {
+            Some(stage_attachments(request.resolved_attachments())?)
+        };
+        let id = session_id(request.task_id());
+        let mut cleanup = PrepareCleanupGuard::new(self.runtime.clone(), id.clone());
+        if self.runtime.prepare(&id).await.is_err() {
+            return Err(backend_error("prepare_failed"));
+        }
+        let runtime_session = Arc::new(AsyncMutex::new(RuntimeSessionState::Active));
+        let registered = self
+            .runtime_sessions
+            .lock()
+            .map(|mut sessions| {
+                if sessions.contains_key(&id) {
+                    false
+                } else {
+                    sessions.insert(id.clone(), runtime_session);
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if !registered {
+            return Err(backend_error("prepare_failed"));
+        }
+        let policy_inserted = self
+            .tool_policies
+            .lock()
+            .map(|mut policies| policies.insert(id.clone(), policy).is_none())
+            .unwrap_or(false);
+        if !policy_inserted {
+            return Err(self
+                .abort_failed_prepare(&mut cleanup, &id, "prepare_failed")
+                .await);
+        }
+        if let Some(workspace) = workspace {
+            let inserted = if let Ok(mut workspaces) = self.attachment_workspaces.lock() {
+                workspaces.insert(id.clone(), workspace);
+                true
+            } else {
+                false
+            };
+            if !inserted {
+                return Err(self
+                    .abort_failed_prepare(&mut cleanup, &id, "attachment_staging_failed")
+                    .await);
+            }
+        }
+        cleanup.disarm();
+        Ok(AgentSessionHandle::new(id))
+    }
+
+    async fn run(
+        &self,
+        session: &AgentSessionHandle,
+        task: AgentTaskInput,
+        private_inputs: Arc<dyn PrivateInputResolver>,
+        observer: Arc<dyn AgentRunObserver>,
+    ) -> Result<AgentTaskOutcome, AgentBackendError> {
+        let session_id = session.expose_to_backend();
+        let runtime_session = match self.runtime_session(session_id) {
+            Ok(Some(session)) => session,
+            Ok(None) => return Err(backend_error("session_closed")),
+            Err(error) => return Err(error),
+        };
+        let runtime_state = runtime_session.clone().lock_owned().await;
+        if *runtime_state == RuntimeSessionState::Closed {
+            return Err(backend_error("session_closed"));
+        }
+        let staged_workspace = match self.take_staged_workspace(session_id) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                return self
+                    .fail_run_locked(session_id, &runtime_session, runtime_state, error)
+                    .await;
+            }
+        };
+        let policy = match self.session_policy(session_id) {
+            Ok(policy) => policy,
+            Err(error) => {
+                return self
+                    .fail_run_locked(session_id, &runtime_session, runtime_state, error)
+                    .await;
+            }
+        };
+        if let Err(code) = ensure_staged_attachments_supported(staged_workspace.is_some()) {
+            return self
+                .fail_run_locked(
+                    session_id,
+                    &runtime_session,
+                    runtime_state,
+                    backend_error(code),
+                )
+                .await;
+        }
+        let input = match private_inputs.resolve(task.prompt_handle()).await {
+            Ok(input) => input,
+            Err(error) => {
+                return self
+                    .fail_run_locked(session_id, &runtime_session, runtime_state, error)
+                    .await;
+            }
+        };
+        if staged_workspace.is_none() && !input.attachments().is_empty() {
+            return self
+                .fail_run_locked(
+                    session_id,
+                    &runtime_session,
+                    runtime_state,
+                    backend_error("attachments_runtime_unsupported"),
+                )
+                .await;
+        }
+        let started = Instant::now();
+        let _ = notify_observer(
+            observer.as_ref(),
+            &SafeAgentEvent::run_started(task.task_id()),
+        );
+        let turn = match staged_workspace.as_ref() {
+            Some(workspace) => {
+                self.runtime
+                    .run_with_staged_attachments_and_policy(
+                        session.expose_to_backend(),
+                        input.prompt().expose_to_backend(),
+                        workspace.path(),
+                        policy,
+                    )
+                    .await
+            }
+            None => {
+                self.runtime
+                    .run_with_policy(
+                        session.expose_to_backend(),
+                        input.prompt().expose_to_backend(),
+                        policy,
+                    )
+                    .await
+            }
+        };
+        let mut turn = match turn {
+            Ok(turn) => turn,
+            Err(error) => {
+                emit_finished(
+                    observer.as_ref(),
+                    task.task_id(),
+                    SafeRunStatus::Failed,
+                    started,
+                );
+                // A failed guard on "unsupported_tool_policy" falls through to
+                // classify_product_failure, whose exact-match arm returns
+                // "unsupported_tool_policy" — the pre-collapse if/for arms
+                // mapped identically.
+                let error_text = error.to_string();
+                let failure_code = match error_text.as_str() {
+                    "unsupported_tool_policy" if staged_workspace.is_some() => {
+                        "attachments_runtime_unsupported"
+                    }
+                    // Exact-code arms re-yield the 'static literals: binding the
+                    // matched text would carry error_text's non-static borrow,
+                    // which backend_error(&'static str) rejects.
+                    "attachments_runtime_unsupported" => "attachments_runtime_unsupported",
+                    "attachment_staging_failed" => "attachment_staging_failed",
+                    _ => classify_product_failure(&error_text),
+                };
+                return self
+                    .fail_run_locked(
+                        session_id,
+                        &runtime_session,
+                        runtime_state,
+                        backend_error(failure_code),
+                    )
+                    .await;
+            }
+        };
+        let requires_gaia_answer = task
+            .output_contract()
+            .is_some_and(|contract| contract.as_str() == "gaia-final/v1");
+        if requires_gaia_answer && should_attempt_gaia_final_recovery(&turn) {
+            let recovery = match self
+                .runtime
+                .run_with_policy(
+                    session.expose_to_backend(),
+                    "Provide the required final answer now.",
+                    ProductToolPolicy(EvalToolPolicy::GaiaFinalAnswerOnlyV1),
+                )
+                .await
+            {
+                Ok(recovery) => recovery,
+                Err(error) => {
+                    emit_tool_outcomes(observer.as_ref(), task.task_id(), &turn.tools);
+                    emit_finished(
+                        observer.as_ref(),
+                        task.task_id(),
+                        SafeRunStatus::Failed,
+                        started,
+                    );
+                    let failure_code = classify_product_failure(&error.to_string());
+                    return self
+                        .finish_failed_run_locked(
+                            session_id,
+                            &runtime_session,
+                            runtime_state,
+                            turn,
+                            failure_code,
+                            started.elapsed(),
+                        )
+                        .await;
+                }
+            };
+            turn.merge_recovery(recovery);
+        }
+        emit_tool_outcomes(observer.as_ref(), task.task_id(), &turn.tools);
+        let elapsed = started.elapsed();
+        let status = if turn.status.eq_ignore_ascii_case("completed") {
+            SafeRunStatus::Completed
+        } else {
+            SafeRunStatus::Failed
+        };
+        if status != SafeRunStatus::Completed {
+            emit_finished(
+                observer.as_ref(),
+                task.task_id(),
+                SafeRunStatus::Failed,
+                started,
+            );
+            let failure_code = validated_product_failure_code(turn.failure_code.as_deref());
+            return self
+                .finish_failed_run_locked(
+                    session_id,
+                    &runtime_session,
+                    runtime_state,
+                    turn,
+                    failure_code,
+                    elapsed,
+                )
+                .await;
+        }
+        let private_output = match project_private_output(&task, &turn.assistant_text) {
+            Ok(output) => output,
+            Err(_) => {
+                emit_finished(
+                    observer.as_ref(),
+                    task.task_id(),
+                    SafeRunStatus::Failed,
+                    started,
+                );
+                return self
+                    .finish_failed_run_locked(
+                        session_id,
+                        &runtime_session,
+                        runtime_state,
+                        turn,
+                        "missing_final_answer",
+                        elapsed,
+                    )
+                    .await;
+            }
+        };
+        let output = match self.store_private_output(session_id, private_output) {
+            Ok(output) => output,
+            Err(_) => {
+                emit_finished(
+                    observer.as_ref(),
+                    task.task_id(),
+                    SafeRunStatus::Failed,
+                    started,
+                );
+                return self
+                    .finish_failed_run_locked(
+                        session_id,
+                        &runtime_session,
+                        runtime_state,
+                        turn,
+                        "private_output_store_failed",
+                        elapsed,
+                    )
+                    .await;
+            }
+        };
+        emit_finished(
+            observer.as_ref(),
+            task.task_id(),
+            SafeRunStatus::Completed,
+            started,
+        );
+        let mut outcome = AgentTaskOutcome::completed(elapsed).with_private_output(output);
+        if let Some(usage) = turn.usage {
+            outcome = outcome.with_usage(usage);
+        }
+        outcome = outcome.with_model_request_metrics(turn.model_requests);
+        Ok(outcome)
+    }
+
+    async fn cancel(&self, session: &AgentSessionHandle) -> Result<(), AgentBackendError> {
+        let session_id = session.expose_to_backend();
+        let runtime_session = self
+            .runtime_session(session_id)?
+            .ok_or_else(|| backend_error("cancel_failed"))?;
+        let _workspace = self.take_private_session_state(session_id)?;
+        let cancel_result = self.runtime.cancel(session_id).await;
+        let mut runtime_state = runtime_session.lock().await;
+        if *runtime_state == RuntimeSessionState::Closed {
+            return cancel_result.map_err(|_| backend_error("cancel_failed"));
+        }
+        self.close_runtime_locked(session_id, &mut runtime_state)
+            .await
+            .map_err(|_| backend_error("cancel_failed"))?;
+        cancel_result.map_err(|_| backend_error("cancel_failed"))
+    }
+
+    async fn resolve_output(
+        &self,
+        handle: &PrivateOutputHandle,
+    ) -> Result<SecretOutput, AgentBackendError> {
+        PrivateOutputResolver::resolve(self, handle).await
+    }
+
+    async fn close(&self, session: AgentSessionHandle) -> Result<(), AgentBackendError> {
+        let session_id = session.expose_to_backend().to_owned();
+        let Some(runtime_session) = self.runtime_session(&session_id)? else {
+            return Ok(());
+        };
+        let mut runtime_state = runtime_session.lock().await;
+        let _workspace = self
+            .take_private_session_state(&session_id)
+            .map_err(|_| backend_error("close_failed"))?;
+        self.close_runtime_locked(&session_id, &mut runtime_state)
+            .await
+            .map_err(|_| backend_error("close_failed"))?;
+        drop(runtime_state);
+        let mut sessions = self
+            .runtime_sessions
+            .lock()
+            .map_err(|_| backend_error("close_failed"))?;
+        if sessions
+            .get(&session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &runtime_session))
+        {
+            sessions.remove(&session_id);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PrivateOutputResolver for ProductHeadlessBackend {
+    async fn resolve(
+        &self,
+        handle: &PrivateOutputHandle,
+    ) -> Result<SecretOutput, AgentBackendError> {
+        let outputs = self
+            .private_outputs
+            .lock()
+            .map_err(|_| backend_error("private_output_store_failed"))?;
+        let value = outputs
+            .values
+            .get(handle.expose_to_backend())
+            .cloned()
+            .ok_or_else(|| backend_error("private_output_not_found"))?;
+        Ok(SecretOutput::new(value))
+    }
+}
+
+/// Debug-only fail-fast for the windowless host: refuse to resolve the real
+/// user data home. In-process callers (tests, harnesses) that forget to set
+/// PINVOU3_HOME would otherwise boot `SessionStore` against the real
+/// `~/.pinvou3` — junk sessions, plus the boot retention sweep silently
+/// evicting the user's oldest real sessions (the observed incident). The
+/// predicate mirrors the store's home resolver (`platform::paths::pinvou3_home`
+/// reads `std::env::var`, so a non-UTF-8 value falls back to the real home
+/// and an empty value resolves `sessions/` relative to the CWD) — only a
+/// set, non-empty UTF-8 value opens the gate. The gate is
+/// debug-only on purpose: release CLI users legitimately run with
+/// PINVOU3_HOME unset against the real home, and the GUI boots via
+/// `SessionStore::boot_for_process_startup` (lib.rs), never through here.
+#[cfg(debug_assertions)]
+fn ensure_isolated_debug_home() -> Result<()> {
+    match std::env::var("PINVOU3_HOME") {
+        Ok(home) if !home.is_empty() => Ok(()),
+        _ => anyhow::bail!(
+            "run_windowless_host refuses the real user data home in debug builds: set PINVOU3_HOME to an isolated, non-empty temp dir (see platform::test_support::with_temp_home)"
+        ),
+    }
+}
+
+/// Shared bootstrap of the windowless product host: rustls/env/tokio/the
+/// single generate_context expansion, the store boot sequence, `build_pool`,
+/// and finally handing `EnginePool + SessionStore` to the work closure. Both
+/// `run_headless_host` (eval backend) and `run_agentic_task_headless`
+/// (agentic single task) go through here, so the host bootstrap has exactly
+/// one implementation.
+pub fn run_windowless_host<T, Work, WorkFuture>(work: Work) -> Result<T>
+where
+    T: Send + 'static,
+    Work: FnOnce(EnginePool, SessionStore) -> WorkFuture + Send + 'static,
+    WorkFuture: Future<Output = Result<T>> + Send + 'static,
+{
+    #[cfg(debug_assertions)]
+    ensure_isolated_debug_home()?;
+    let async_runtime = claim_headless_host_runtime()?;
+    tauri::async_runtime::set(async_runtime.handle().clone());
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    // Reuse lib.rs's single generate_context expansion point: a second
+    // expansion inside this crate triggers duplicate
+    // _EMBED_INFO_PLIST (embed_plist) link errors on macOS.
+    let mut context = crate::build_tauri_context();
+    context.config_mut().app.windows.clear();
+    // The bootstrap and the event loop run on the caller's MAIN thread. In
+    // embedded environments where tauri's EventLoop refuses a non-main
+    // thread — and on any other bootstrap fault — the unwind used to take
+    // the whole process down with exit 101, outside the 0/1/2 exit-code
+    // contract every pinvou-cli family documents. Contained here at the
+    // single shared bootstrap, so EVERY host lane (monitor, knowledge,
+    // voice, agent task, benchmarks, the organize lanes) degrades to an
+    // ordinary Err; the two per-call-site catch_unwind wraps this replaces
+    // covered only their own lanes.
+    let host_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<T> {
+        let app = tauri::Builder::default()
+            .setup(move |app| {
+                // Same order as the GUI host (the lib.rs
+                // `disabled_bundles_migration` marks): the fresh-vs-upgrade
+                // verdict must be read and frozen before first-startup writes
+                // such as SessionStore boot / engine spawn (sessions/, default
+                // settings.json) — otherwise a brand-new home directory first
+                // touched by a windowless host freezes a polluted "upgrade"
+                // verdict, plain flips back to fully open, and later GUI starts
+                // respect the already-frozen marker (review #455 blocking item 3).
+                // The shared helper mirrors a freeze-persist failure onto the
+                // startup timeline.
+                crate::features::marketplace::scope::load_disabled_bundles_startup_mirrored();
+                if let Ok(resource_dir) = app.path().resource_dir() {
+                    crate::platform::paths::set_runtime_resource_dir(resource_dir);
+                }
+                let store = SessionStore::boot().context("boot headless session store")?;
+                store.load_session_models();
+                store.load_pinned_sessions();
+                store.load_hidden_sessions();
+                app.manage(store.clone());
+                // The kb tools' visibility predicate consults these two
+                // services (same single source as the GUI, lib.rs); without
+                // managing them here the headless policy saw `None` on every
+                // spawn and denied kb_search/kb_open_source even with a fully
+                // indexed local KB or mounted remote collections. Both
+                // constructions are best-effort, exactly like the GUI's:
+                // a failed init logs and leaves the tools denied.
+                match knowledge::KnowledgeService::new(&knowledge::default_db_path()) {
+                    Ok(service) => {
+                        app.manage(service);
+                    }
+                    // `note_stderr`, not a bare eprintln!: a closed stderr
+                    // (the headless CLI's `2>&1 | head`) turns a plain
+                    // eprintln! into a panic, which the catch_unwind around
+                    // .setup() would degrade into a failed run — this arm is
+                    // the documented log-and-leave-tools-denied degrade.
+                    Err(error) => note_stderr(&format!(
+                        "[headless] knowledge service init failed: {error:#}"
+                    )),
+                }
+                match crate::features::remote_knowledge::RemoteKnowledgeService::load(
+                    crate::features::remote_knowledge::RemoteKnowledgeService::default_path(),
+                ) {
+                    Ok(service) => {
+                        app.manage(service);
+                    }
+                    Err(error) => {
+                        // Same closed-stderr panic hazard as above.
+                        note_stderr(&format!(
+                            "[headless] remote knowledge service init failed: {error}"
+                        ))
+                    }
+                }
+                let pool = build_pool(app.handle().clone(), store.clone())?;
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // The work future runs on a nested task so a panic inside
+                    // it surfaces as a JoinError instead of being swallowed
+                    // by tokio: an unguarded panic would skip the send and
+                    // the exit below, and the caller would block on
+                    // `run_return`'s windowless event loop forever, outside
+                    // the 0/1/2 exit contract. The teardown's deliberate
+                    // re-raise after a pinned restore lands here too and
+                    // degrades to an ordinary Err like any other fault.
+                    let joined = tauri::async_runtime::spawn(work(pool, store));
+                    let result = match joined.await {
+                        Ok(result) => result,
+                        Err(join_error) => {
+                            Err(anyhow::anyhow!("windowless work failed: {join_error}"))
+                        }
+                    };
+                    let _ = result_tx.send(result);
+                    handle.exit(0);
+                });
+                Ok(())
+            })
+            .build(context)
+            .context("build windowless Pinvou host")?;
+        app.run_return(|_, _| {});
+        Ok(result_rx
+            .blocking_recv()
+            .context("headless host exited before work completed")??)
+    }));
+    match host_outcome {
+        Ok(result) => result,
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    panic
+                        .downcast_ref::<&str>()
+                        .map(|reason| (*reason).to_owned())
+                })
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            Err(anyhow::anyhow!("windowless host panicked: {detail}"))
+        }
+    }
+}
+
+/// Process latch for the at-most-once precondition shared by BOTH host
+/// lanes — [`run_bare_host`] and [`run_windowless_host`] (round-43 review
+/// doc fix: the comment used to name only the bare lane).
+static BARE_HOST_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// The bootstrap shared by BOTH host lanes above: the process env setup
+/// (rustls, release env, startup process env), the [`BARE_HOST_TAKEN`]
+/// at-most-once latch (bailing with the lane-collision message), and the
+/// shared multi-thread tokio runtime build. The caller alone performs
+/// `tauri::async_runtime::set` on the returned runtime's handle, keeping
+/// each host's local flow readable. (round-47 review: the lane-collision
+/// message used to blame run_bare_host even when the windowless lane took
+/// the latch first)
+fn claim_headless_host_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    crate::install_rustls_provider();
+    crate::ensure_release_env();
+    crate::startup_process_env();
+    // Same as the GUI host (lib.rs run()): the startup timeline must be
+    // initialized before the freeze read in the setup closure — this host
+    // attaches no log plugin either, so without the file sink the
+    // freeze-persist CRITICAL below would reach only stderr and the
+    // "the startup timeline is the only durable channel" claim would be
+    // false exactly where it matters.
+    crate::platform::startup::init();
+    if BARE_HOST_TAKEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        anyhow::bail!(
+            "a windowless host lane (run_windowless_host or run_bare_host) already ran in this process: tauri::async_runtime::set panics on a second runtime, and both helpers share one latch and must stay the process's only host lanes"
+        );
+    }
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(16 * 1024 * 1024)
+        .build()
+        .context("build headless async runtime")?;
+    Ok(async_runtime)
+}
+
+/// Bare async host for lanes that need the app crate's runtime environment
+/// (rustls, release env, the shared multi-thread tokio runtime with
+/// `tauri::async_runtime` wired) but touch neither the engine pool nor the
+/// session store: the remote-knowledge network lanes and the monitor
+/// probes. Booting the full windowless product host for these built a whole
+/// Tauri context and ran `SessionStore::boot` — whose retention sweep can
+/// evict the user's oldest sessions, a destructive side effect a status
+/// command must not carry — for closures that ignore both handles, and it
+/// made the lanes need a display on headless Linux (the Tauri event loop).
+/// No event loop and no app context here: the work future runs on the
+/// runtime directly as one spawned task, whose JoinHandle contains panics
+/// as the same "headless work failed" JoinError as any other fault. One
+/// hard precondition, unlike the windowless
+/// product host (which contains its whole boot): the WORK future is
+/// panic-contained, but the boot itself is not — `tauri::async_runtime::set`
+/// panics if a runtime was already initialized in this process, so this
+/// helper must stay at-most-once per process and never run beside another
+/// host lane.
+pub fn run_bare_host<T, Work, WorkFuture>(work: Work) -> Result<T>
+where
+    T: Send + 'static,
+    Work: FnOnce() -> WorkFuture + Send + 'static,
+    WorkFuture: Future<Output = Result<T>> + Send + 'static,
+{
+    let async_runtime = claim_headless_host_runtime()?;
+    tauri::async_runtime::set(async_runtime.handle().clone());
+    let joined = async_runtime.spawn(work());
+    match async_runtime.block_on(joined) {
+        Ok(result) => result,
+        Err(join_error) => Err(anyhow::anyhow!("headless work failed: {join_error}")),
+    }
+}
+
+pub fn run_headless_host<T, Work, WorkFuture>(work: Work) -> Result<T>
+where
+    T: Send + 'static,
+    Work: FnOnce(Arc<dyn HeadlessAgentBackend>) -> WorkFuture + Send + 'static,
+    WorkFuture: Future<Output = Result<T>> + Send + 'static,
+{
+    run_windowless_host(|pool, _store| async move {
+        let backend: Arc<dyn HeadlessAgentBackend> =
+            Arc::new(ProductHeadlessBackend::from_engine_pool(pool)?);
+        work(backend).await
+    })
+}
+
+/// Build an EnginePool with the same tool_policy combination as the GUI:
+/// `unavailable_tool_names` plus the kb pair gated by the same
+/// `KnowledgeService::kb_tools_usable` predicate over the services the
+/// windowless setup manages above. The tool_factory intentionally stays
+/// narrower than the GUI's: computer_use is
+/// not constructed here because headless hosts have no consent UI to answer
+/// its grant/confirm prompts (the tool would be unusable and unsupervised).
+/// The `agentic_task` headless host reuses this constructor so agentic turns
+/// stay identical to the product path for everything else.
+pub(crate) fn build_pool(app: tauri::AppHandle, store: SessionStore) -> Result<EnginePool> {
+    let tool_factory: EngineToolFactory = Arc::new(|app, session_id| {
+        vec![
+            Arc::new(knowledge::KbSearchTool::new(
+                app.clone(),
+                session_id.to_owned(),
+            )),
+            Arc::new(knowledge::KbOpenSourceTool::new(
+                app.clone(),
+                session_id.to_owned(),
+            )),
+        ]
+    });
+    let tool_policy: ToolPolicy = Arc::new(|app| {
+        let mut tools = crate::features::marketplace::unavailable_tool_names();
+        // No ScheduledTaskState/watcher is hosted here. Refuse pending writes
+        // rather than advertising requests that can never drain in this host.
+        tools.extend([
+            "automation".to_owned(),
+            "send_later".to_owned(),
+            "mcp_app-automations_*".to_owned(),
+        ]);
+        // The GUI's single-source predicate (KnowledgeService::kb_tools_usable
+        // via lib.rs): visibility tracks CONTENT/CONNECTIONS, deliberately not
+        // the embedding model's load state — a visibility that fluctuates with
+        // the model makes the snapshot recalc write kb_search into disallowed
+        // and the tool's on-demand self-heal reload unreachable. The old
+        // headless formula (`has_indexed_content() && semantic_ready()`) was
+        // both a different rule and moot: no service was managed here, so kb
+        // tools were denied on every headless run.
+        let kb_usable = knowledge::KnowledgeService::kb_tools_usable(
+            app.try_state::<knowledge::KnowledgeService>()
+                .map(|service| service.has_indexed_content())
+                .unwrap_or(false),
+            app.try_state::<crate::features::remote_knowledge::RemoteKnowledgeService>()
+                .map(|service| service.has_connections())
+                .unwrap_or(false),
+        );
+        if !kb_usable {
+            tools.extend(["kb_search".to_owned(), "kb_open_source".to_owned()]);
+        }
+        tools
+    });
+    EnginePool::new_with_dependencies(app, store, tool_factory, tool_policy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        EvalToolPolicy, ProductHeadlessBackend, ProductRuntimePort, ProductToolPolicy,
+        ProductTurnOutcome, SafeToolOutcome, classify_product_failure,
+        should_attempt_gaia_final_recovery, validated_product_failure_code,
+        validated_tool_failure_code,
+    };
+    use agent_backend_api::{
+        AgentOutputContractId, AgentRunObserver, AgentSessionHandle, AgentTaskInput,
+        AgentToolPolicyId, HeadlessAgentBackend, PrepareRequest, PrivateInputHandle,
+        PrivateInputResolver, ResolvedPrivateInput, SafeAgentEvent, SafeModelRequestMetric,
+        SafeRunStatus, SafeUsageMetrics, SecretText,
+    };
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    #[test]
+    fn headless_host_denies_the_undrainable_automation_family() {
+        let source = include_str!("headless_bridge.rs");
+        let body = source
+            .split("let tool_policy: ToolPolicy =")
+            .nth(1)
+            .unwrap()
+            .split("EnginePool::new_with_dependencies")
+            .next()
+            .unwrap();
+        let body: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(body.contains("tools.extend([\"automation\".to_owned(),\"send_later\".to_owned(),\"mcp_app-automations_*\".to_owned(),]);"));
+    }
+
+    #[test]
+    fn landed_bytes_sums_the_staged_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::staged_landed_bytes(dir.path()).unwrap(),
+            0,
+            "an empty workspace lands nothing"
+        );
+        std::fs::write(dir.path().join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.path().join("b.bin"), vec![0u8; 50]).unwrap();
+        assert_eq!(
+            super::staged_landed_bytes(dir.path()).unwrap(),
+            150,
+            "the landed total must come from disk, not reported sizes"
+        );
+    }
+
+    #[test]
+    fn product_failures_are_reduced_to_fixed_safe_codes() {
+        assert_eq!(
+            classify_product_failure("maximum context length exceeded: PRIVATE_PROMPT"),
+            "model_context_limit"
+        );
+        assert_eq!(
+            classify_product_failure("provider secret must not escape"),
+            "agent_turn_failed"
+        );
+        assert_eq!(
+            classify_product_failure("unsupported_tool_policy"),
+            "unsupported_tool_policy"
+        );
+        assert_eq!(
+            validated_product_failure_code(Some("PRIVATE_FAILURE_SENTINEL")),
+            "agent_turn_failed"
+        );
+        assert_eq!(
+            validated_product_failure_code(Some("unsupported_tool_policy")),
+            "unsupported_tool_policy"
+        );
+        assert_eq!(
+            validated_tool_failure_code("policy_denied"),
+            Some("policy_denied")
+        );
+        assert_eq!(
+            validated_tool_failure_code("dynamic_page_unreadable"),
+            Some("dynamic_page_unreadable")
+        );
+        assert_eq!(
+            validated_tool_failure_code("PRIVATE_FAILURE_SENTINEL"),
+            None
+        );
+    }
+
+    /// Anti-drift sync between the two failure-code ends: every code
+    /// `classify_tool_failure` (product_runtime/mod.rs) can emit must be
+    /// accepted by `validated_tool_failure_code`, otherwise the safe-contract
+    /// bridge silently turns a real failure cause into `None` and the eval
+    /// transcript loses the reason. One assert per code, in the classifier's
+    /// branch order: removing or renaming a code on either side breaks this
+    /// test and forces both lists back in sync. A newly added code gets no
+    /// assert automatically — pair it with a new assert here (and a validator
+    /// arm when the code is meant to cross the bridge).
+    #[test]
+    fn every_classify_tool_failure_code_passes_validated_tool_failure_code() {
+        use super::super::classify_tool_failure;
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure(
+                "per-turn tool-call budget exhausted"
+            )),
+            Some("tool_call_budget_exhausted")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("host read-only turn policy")),
+            Some("host_read_only_blocked")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("host turn policy")),
+            Some("host_tool_blocked")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("blocked by network policy")),
+            Some("network_policy_blocked")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("private/loopback/link-local")),
+            Some("restricted_address")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("requires approval")),
+            Some("approval_required")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("missing `action`")),
+            Some("missing_action")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("invalid input")),
+            Some("invalid_arguments")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("api key")),
+            Some("search_provider_config")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("requires javascript")),
+            Some("dynamic_page_unreadable")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("content extraction failed")),
+            Some("content_extraction_failed")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("cloudflare challenge")),
+            Some("remote_access_denied")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("http status 500")),
+            Some("http_status_failed")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("no such file")),
+            Some("resource_not_found")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("timeout")),
+            Some("network_timeout")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("connection refused")),
+            Some("network_failed")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("permission")),
+            Some("policy_denied")
+        );
+        assert_eq!(
+            validated_tool_failure_code(classify_tool_failure("unclassifiable failure")),
+            Some("tool_execution_failed")
+        );
+    }
+
+    #[test]
+    fn gaia_final_recovery_is_limited_to_contract_and_tool_failures() {
+        let outcome = |status: &str, failure_code: Option<&str>, text: &str| ProductTurnOutcome {
+            status: status.to_owned(),
+            failure_code: failure_code.map(str::to_owned),
+            assistant_text: text.to_owned(),
+            usage: None,
+            tools: vec![],
+            model_requests: vec![],
+        };
+        assert!(should_attempt_gaia_final_recovery(&outcome(
+            "completed",
+            None,
+            "analysis only"
+        )));
+        assert!(should_attempt_gaia_final_recovery(&outcome(
+            "failed",
+            Some("agent_tool_failed"),
+            "partial evidence"
+        )));
+        assert!(!should_attempt_gaia_final_recovery(&outcome(
+            "failed",
+            Some("model_transport_failed"),
+            "partial"
+        )));
+        assert!(!should_attempt_gaia_final_recovery(&outcome(
+            "completed",
+            None,
+            "FINAL ANSWER: 42"
+        )));
+    }
+
+    #[derive(Default)]
+    struct LegacyRuntime {
+        run_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for LegacyRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            // The trait default already fails closed without touching the
+            // counter; record the consult, then reproduce the same bail.
+            self.run_calls.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("unsupported_tool_policy")
+        }
+
+        async fn run_with_staged_attachments_and_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _staged_workspace: &std::path::Path,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            // Same boundary consult for the staged-attachments lane: record
+            // the call, then fail closed with the trait default's error.
+            self.run_calls.fetch_add(1, Ordering::Relaxed);
+            anyhow::bail!("unsupported_tool_policy")
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_run_lanes_fail_closed_at_the_runtime_boundary() {
+        let runtime = LegacyRuntime::default();
+
+        let error = runtime
+            .run_with_policy(
+                "session",
+                "secret",
+                ProductToolPolicy(EvalToolPolicy::GaiaOfflineV1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unsupported_tool_policy");
+        assert_eq!(runtime.run_calls.load(Ordering::Relaxed), 1);
+
+        let workspace = tempfile::tempdir().unwrap();
+        let error = runtime
+            .run_with_staged_attachments_and_policy(
+                "session",
+                "secret",
+                workspace.path(),
+                ProductToolPolicy(EvalToolPolicy::GaiaOfflineV1),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "unsupported_tool_policy");
+        assert_eq!(runtime.run_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[derive(Default)]
+    struct FinalAnswerRecoveryRuntime {
+        policies: Mutex<Vec<EvalToolPolicy>>,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for FinalAnswerRecoveryRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            let mut policies = self.policies.lock().unwrap();
+            policies.push(policy.0);
+            let assistant_text = if policy.0 == EvalToolPolicy::GaiaFinalAnswerOnlyV1 {
+                "FINAL ANSWER: 42"
+            } else {
+                "analysis ended without the required marker"
+            };
+            Ok(ProductTurnOutcome {
+                status: "completed".to_owned(),
+                failure_code: None,
+                assistant_text: assistant_text.to_owned(),
+                usage: None,
+                tools: vec![],
+                model_requests: vec![],
+            })
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn gaia_missing_marker_gets_one_tool_free_recovery_turn() {
+        let runtime = Arc::new(FinalAnswerRecoveryRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session = backend.prepare(request("final-recovery")).await.unwrap();
+        let task = AgentTaskInput::new("final-recovery", PrivateInputHandle::new("opaque"))
+            .with_output_contract(AgentOutputContractId::new("gaia-final/v1").unwrap());
+
+        let outcome = backend
+            .run(&session, task, Arc::new(Resolver), Arc::new(Observer))
+            .await
+            .unwrap();
+        let output = backend
+            .resolve_output(outcome.output_handle().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(output.text().expose_to_backend(), "42");
+        assert_eq!(
+            *runtime.policies.lock().unwrap(),
+            [
+                EvalToolPolicy::GaiaOfflineV1,
+                EvalToolPolicy::GaiaFinalAnswerOnlyV1
+            ]
+        );
+        backend.close(session).await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecoveryFailureRuntime {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for RecoveryFailureRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Ok(ProductTurnOutcome {
+                    status: "completed".to_owned(),
+                    failure_code: None,
+                    assistant_text: "analysis without marker".to_owned(),
+                    usage: Some(SafeUsageMetrics::new(100, 20, 70, 30)),
+                    tools: vec![SafeToolOutcome {
+                        name: "File".to_owned(),
+                        failed: false,
+                        failure_code: None,
+                        elapsed_ms: Some(7),
+                    }],
+                    model_requests: vec![SafeModelRequestMetric::new(50, Some(10), 100, 20)],
+                });
+            }
+            anyhow::bail!("provider_failed")
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingObserver(Mutex<Vec<SafeAgentEvent>>);
+
+    impl AgentRunObserver for CollectingObserver {
+        fn on_event(&self, event: &SafeAgentEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn gaia_recovery_failure_preserves_first_turn_diagnostics() {
+        let runtime = Arc::new(RecoveryFailureRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime);
+        let session = backend.prepare(request("recovery-failure")).await.unwrap();
+        let observer = Arc::new(CollectingObserver::default());
+        let task = AgentTaskInput::new("recovery-failure", PrivateInputHandle::new("opaque"))
+            .with_output_contract(AgentOutputContractId::new("gaia-final/v1").unwrap());
+
+        let outcome = backend
+            .run(&session, task, Arc::new(Resolver), observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status(), SafeRunStatus::Failed);
+        assert_eq!(outcome.failure_code(), Some("agent_turn_failed"));
+        assert_eq!(
+            outcome.usage(),
+            Some(SafeUsageMetrics::new(100, 20, 70, 30))
+        );
+        assert_eq!(outcome.model_request_metrics().len(), 1);
+        assert!(observer.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SafeAgentEvent::ToolFinished { tool_name, .. } if tool_name == "File"
+        )));
+        backend.close(session).await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecoveryPolicyRejectionRuntime {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for RecoveryPolicyRejectionRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Ok(ProductTurnOutcome {
+                    status: "completed".to_owned(),
+                    failure_code: None,
+                    assistant_text: "analysis without marker".to_owned(),
+                    usage: Some(SafeUsageMetrics::new(100, 20, 70, 30)),
+                    tools: vec![],
+                    model_requests: vec![],
+                });
+            }
+            anyhow::bail!("unsupported_tool_policy")
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn gaia_recovery_policy_rejection_keeps_lifecycle_code() {
+        let runtime = Arc::new(RecoveryPolicyRejectionRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime);
+        let session = backend.prepare(request("recovery-policy")).await.unwrap();
+        let observer = Arc::new(CollectingObserver::default());
+        let task = AgentTaskInput::new("recovery-policy", PrivateInputHandle::new("opaque"))
+            .with_output_contract(AgentOutputContractId::new("gaia-final/v1").unwrap());
+
+        let outcome = backend
+            .run(&session, task, Arc::new(Resolver), observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status(), SafeRunStatus::Failed);
+        assert_eq!(outcome.failure_code(), Some("unsupported_tool_policy"));
+        assert_eq!(
+            outcome.usage(),
+            Some(SafeUsageMetrics::new(100, 20, 70, 30))
+        );
+        backend.close(session).await.unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecoveryMissingMarkerRuntime {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for RecoveryMissingMarkerRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ProductTurnOutcome {
+                status: "completed".to_owned(),
+                failure_code: None,
+                assistant_text: format!("analysis without marker on turn {call}"),
+                usage: Some(if call == 0 {
+                    SafeUsageMetrics::new(100, 20, 70, 30)
+                } else {
+                    SafeUsageMetrics::new(40, 10, 25, 15)
+                }),
+                tools: vec![SafeToolOutcome {
+                    name: format!("tool-{call}"),
+                    failed: false,
+                    failure_code: None,
+                    elapsed_ms: Some(7),
+                }],
+                model_requests: vec![SafeModelRequestMetric::new(50, Some(10), 100, 20)],
+            })
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn gaia_recovery_missing_marker_preserves_merged_diagnostics_and_failed_event() {
+        let runtime = Arc::new(RecoveryMissingMarkerRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session = backend
+            .prepare(request("recovery-missing-marker"))
+            .await
+            .unwrap();
+        let observer = Arc::new(CollectingObserver::default());
+        let task =
+            AgentTaskInput::new("recovery-missing-marker", PrivateInputHandle::new("opaque"))
+                .with_output_contract(AgentOutputContractId::new("gaia-final/v1").unwrap());
+
+        let outcome = backend
+            .run(&session, task, Arc::new(Resolver), observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(outcome.status(), SafeRunStatus::Failed);
+        assert_eq!(outcome.failure_code(), Some("missing_final_answer"));
+        assert_eq!(
+            outcome.usage(),
+            Some(SafeUsageMetrics::new(140, 30, 95, 45))
+        );
+        assert_eq!(outcome.model_request_metrics().len(), 2);
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SafeAgentEvent::ToolFinished { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    SafeAgentEvent::RunFinished { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [SafeRunStatus::Failed]
+        );
+    }
+
+    #[derive(Default)]
+    struct CompletedDiagnosticRuntime;
+
+    #[async_trait]
+    impl ProductRuntimePort for CompletedDiagnosticRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            Ok(ProductTurnOutcome {
+                status: "completed".to_owned(),
+                failure_code: None,
+                assistant_text: "FINAL ANSWER: 42".to_owned(),
+                usage: Some(SafeUsageMetrics::new(12, 3, 7, 5)),
+                tools: vec![],
+                model_requests: vec![SafeModelRequestMetric::new(25, Some(5), 12, 3)],
+            })
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn private_output_store_failure_preserves_diagnostics_and_failed_event() {
+        let backend = ProductHeadlessBackend::from_runtime(Arc::new(CompletedDiagnosticRuntime));
+        let session = backend
+            .prepare(request("output-store-failure"))
+            .await
+            .unwrap();
+        let outputs = backend.private_outputs.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = outputs.lock().unwrap();
+                panic!("poison private output store for the failure-path test");
+            })
+            .join()
+            .is_err()
+        );
+        let observer = Arc::new(CollectingObserver::default());
+        let task = AgentTaskInput::new("output-store-failure", PrivateInputHandle::new("opaque"))
+            .with_output_contract(AgentOutputContractId::new("gaia-final/v1").unwrap());
+
+        let outcome = backend
+            .run(&session, task, Arc::new(Resolver), observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status(), SafeRunStatus::Failed);
+        assert_eq!(outcome.failure_code(), Some("private_output_store_failed"));
+        assert_eq!(outcome.usage(), Some(SafeUsageMetrics::new(12, 3, 7, 5)));
+        assert_eq!(outcome.model_request_metrics().len(), 1);
+        assert_eq!(
+            observer
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    SafeAgentEvent::RunFinished { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [SafeRunStatus::Failed]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecoverySucceedsRuntime {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for RecoverySucceedsRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ProductTurnOutcome {
+                status: "completed".to_owned(),
+                failure_code: None,
+                assistant_text: if call == 0 {
+                    "analysis without marker".to_owned()
+                } else {
+                    "FINAL ANSWER: 42".to_owned()
+                },
+                usage: Some(if call == 0 {
+                    SafeUsageMetrics::new(100, 20, 70, 30)
+                } else {
+                    SafeUsageMetrics::new(40, 10, 25, 15)
+                }),
+                tools: vec![SafeToolOutcome {
+                    name: format!("tool-{call}"),
+                    failed: false,
+                    failure_code: None,
+                    elapsed_ms: Some(7),
+                }],
+                model_requests: vec![SafeModelRequestMetric::new(50, Some(10), 100, 20)],
+            })
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn gaia_recovery_store_failure_preserves_merged_diagnostics_and_failed_event() {
+        let runtime = Arc::new(RecoverySucceedsRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime);
+        let session = backend
+            .prepare(request("recovery-store-failure"))
+            .await
+            .unwrap();
+        let outputs = backend.private_outputs.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = outputs.lock().unwrap();
+                panic!("poison private output store for the recovery failure-path test");
+            })
+            .join()
+            .is_err()
+        );
+        let observer = Arc::new(CollectingObserver::default());
+        let task = AgentTaskInput::new("recovery-store-failure", PrivateInputHandle::new("opaque"))
+            .with_output_contract(AgentOutputContractId::new("gaia-final/v1").unwrap());
+
+        let outcome = backend
+            .run(&session, task, Arc::new(Resolver), observer.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status(), SafeRunStatus::Failed);
+        assert_eq!(outcome.failure_code(), Some("private_output_store_failed"));
+        assert_eq!(
+            outcome.usage(),
+            Some(SafeUsageMetrics::new(140, 30, 95, 45))
+        );
+        assert_eq!(outcome.model_request_metrics().len(), 2);
+        let events = observer.0.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SafeAgentEvent::ToolFinished { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    SafeAgentEvent::RunFinished { status, .. } => Some(*status),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [SafeRunStatus::Failed]
+        );
+    }
+
+    #[derive(Default)]
+    struct FailingPolicyRuntime {
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for FailingPolicyRuntime {
+        async fn prepare(&self, session_id: &str) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("prepare:{session_id}"));
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            self.calls.lock().unwrap().push(format!("run:{session_id}"));
+            anyhow::bail!("provider_failed")
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, session_id: &str) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("close:{session_id}"));
+            Ok(())
+        }
+    }
+
+    struct Resolver;
+
+    #[async_trait]
+    impl PrivateInputResolver for Resolver {
+        async fn resolve(
+            &self,
+            _handle: &PrivateInputHandle,
+        ) -> Result<ResolvedPrivateInput, agent_backend_api::AgentBackendError> {
+            Ok(ResolvedPrivateInput::new(SecretText::new("secret"), vec![]))
+        }
+    }
+
+    struct Observer;
+
+    impl AgentRunObserver for Observer {
+        fn on_event(&self, _event: &SafeAgentEvent) {}
+    }
+
+    fn request(task_id: &str) -> PrepareRequest {
+        PrepareRequest::new(task_id, vec![])
+            .with_tool_policy(AgentToolPolicyId::new("pinvou-gaia-offline/v1").unwrap())
+    }
+
+    #[tokio::test]
+    async fn prepare_policy_store_failure_closes_prepared_runtime_session() {
+        let runtime = Arc::new(FailingPolicyRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let policies = backend.tool_policies.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = policies.lock().unwrap();
+            panic!("poison policy store");
+        });
+
+        let error = backend.prepare(request("poison")).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "agent backend operation failed: prepare_failed"
+        );
+        let calls = runtime.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("prepare:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("close:"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_run_cleans_private_state_and_closes_runtime_only_once() {
+        let runtime = Arc::new(FailingPolicyRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session: AgentSessionHandle = backend.prepare(request("run-fail")).await.unwrap();
+
+        let error = backend
+            .run(
+                &session,
+                AgentTaskInput::new("run-fail", PrivateInputHandle::new("opaque")),
+                Arc::new(Resolver),
+                Arc::new(Observer),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "agent backend operation failed: agent_turn_failed"
+        );
+        assert!(
+            !backend
+                .tool_policies
+                .lock()
+                .unwrap()
+                .contains_key(session.expose_to_backend())
+        );
+        assert!(
+            !backend
+                .runtime_sessions
+                .lock()
+                .unwrap()
+                .contains_key(session.expose_to_backend())
+        );
+        assert_eq!(
+            runtime
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("close:"))
+                .count(),
+            1
+        );
+
+        backend.close(session).await.unwrap();
+        assert_eq!(
+            runtime
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.starts_with("close:"))
+                .count(),
+            1
+        );
+    }
+
+    #[derive(Default)]
+    struct PendingCloseRuntime {
+        close_attempts: AtomicUsize,
+        close_started: Notify,
+        release_close: Notify,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for PendingCloseRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.close_attempts.fetch_add(1, Ordering::Relaxed);
+            self.close_started.notify_one();
+            self.release_close.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_pending_close_keeps_session_retryable() {
+        let runtime = Arc::new(PendingCloseRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session = backend.prepare(request("close-retry")).await.unwrap();
+
+        let pending = tokio::spawn({
+            let backend = backend.clone();
+            let session = session.clone();
+            async move { backend.close(session).await }
+        });
+        runtime.close_started.notified().await;
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+
+        runtime.release_close.notify_one();
+        backend.close(session).await.unwrap();
+        assert_eq!(runtime.close_attempts.load(Ordering::Relaxed), 2);
+    }
+
+    #[derive(Default)]
+    struct BlockingRunRuntime {
+        run_started: Notify,
+        release_run: Notify,
+        cancel_called: Notify,
+        close_calls: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct PendingCancelRuntime {
+        cancel_called: Notify,
+        cancel_release: Notify,
+        close_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for PendingCancelRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.cancel_called.notify_one();
+            self.cancel_release.notified().await;
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.close_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_cancel_clears_private_state_and_keeps_close_retryable() {
+        let runtime = Arc::new(PendingCancelRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session = backend.prepare(request("cancel-abort")).await.unwrap();
+        let cancelling = tokio::spawn({
+            let backend = backend.clone();
+            let session = session.clone();
+            async move { backend.cancel(&session).await }
+        });
+        runtime.cancel_called.notified().await;
+        cancelling.abort();
+        assert!(cancelling.await.unwrap_err().is_cancelled());
+        assert!(
+            !backend
+                .tool_policies
+                .lock()
+                .unwrap()
+                .contains_key(session.expose_to_backend())
+        );
+        assert!(
+            backend
+                .runtime_sessions
+                .lock()
+                .unwrap()
+                .contains_key(session.expose_to_backend())
+        );
+
+        backend.close(session).await.unwrap();
+        assert_eq!(runtime.close_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for BlockingRunRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn run_with_policy(
+            &self,
+            _session_id: &str,
+            _prompt: &str,
+            _policy: ProductToolPolicy,
+        ) -> anyhow::Result<ProductTurnOutcome> {
+            self.run_started.notify_one();
+            self.release_run.notified().await;
+            Ok(ProductTurnOutcome {
+                status: "completed".to_owned(),
+                failure_code: None,
+                assistant_text: "private answer".to_owned(),
+                usage: None,
+                tools: vec![],
+                model_requests: vec![],
+            })
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.cancel_called.notify_one();
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.close_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_and_close_are_serialized_without_resurrecting_private_output() {
+        let runtime = Arc::new(BlockingRunRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session = backend.prepare(request("run-close")).await.unwrap();
+        let running = tokio::spawn({
+            let backend = backend.clone();
+            let session = session.clone();
+            async move {
+                backend
+                    .run(
+                        &session,
+                        AgentTaskInput::new("run-close", PrivateInputHandle::new("opaque")),
+                        Arc::new(Resolver),
+                        Arc::new(Observer),
+                    )
+                    .await
+            }
+        });
+        runtime.run_started.notified().await;
+        let closing = tokio::spawn({
+            let backend = backend.clone();
+            let session = session.clone();
+            async move { backend.close(session).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(runtime.close_calls.load(Ordering::Relaxed), 0);
+
+        runtime.release_run.notify_one();
+        let outcome = running.await.unwrap().unwrap();
+        let output = outcome.output_handle().unwrap().clone();
+        closing.await.unwrap().unwrap();
+
+        assert_eq!(runtime.close_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            backend
+                .resolve_output(&output)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "agent backend operation failed: private_output_not_found"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_reaches_runtime_before_waiting_for_blocked_run() {
+        let runtime = Arc::new(BlockingRunRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let session = backend.prepare(request("run-cancel")).await.unwrap();
+        let running = tokio::spawn({
+            let backend = backend.clone();
+            let session = session.clone();
+            async move {
+                backend
+                    .run(
+                        &session,
+                        AgentTaskInput::new("run-cancel", PrivateInputHandle::new("opaque")),
+                        Arc::new(Resolver),
+                        Arc::new(Observer),
+                    )
+                    .await
+            }
+        });
+        runtime.run_started.notified().await;
+        let cancelling = tokio::spawn({
+            let backend = backend.clone();
+            let session = session.clone();
+            async move { backend.cancel(&session).await }
+        });
+
+        runtime.cancel_called.notified().await;
+        assert!(!cancelling.is_finished());
+        runtime.release_run.notify_one();
+        running.await.unwrap().unwrap();
+        cancelling.await.unwrap().unwrap();
+        assert_eq!(runtime.close_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Default)]
+    struct PendingPrepareRuntime {
+        prepare_started: Notify,
+        release_prepare: Notify,
+        close_called: Notify,
+    }
+
+    #[async_trait]
+    impl ProductRuntimePort for PendingPrepareRuntime {
+        async fn prepare(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.prepare_started.notify_one();
+            self.release_prepare.notified().await;
+            Ok(())
+        }
+
+        async fn cancel(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.close_called.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_pending_prepare_eventually_closes_runtime_session() {
+        let runtime = Arc::new(PendingPrepareRuntime::default());
+        let backend = ProductHeadlessBackend::from_runtime(runtime.clone());
+        let pending = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.prepare(request("prepare-abort")).await }
+        });
+        runtime.prepare_started.notified().await;
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        runtime.close_called.notified().await;
+    }
+
+    /// Last line of defense for the session-test-leak bug class: any
+    /// in-process caller that boots the windowless host without
+    /// PINVOU3_HOME must fail fast here, because the store would otherwise
+    /// silently resolve the real `~/.pinvou3` — junk sessions plus the boot
+    /// retention sweep evicting the user's oldest real sessions (the
+    /// observed incident). Debug-only: release CLI users legitimately run
+    /// with PINVOU3_HOME unset against the real home, and the GUI boots via
+    /// `SessionStore::boot_for_process_startup` (lib.rs), never through
+    /// here.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn windowless_host_refuses_unset_pinvou3_home_in_debug() {
+        use crate::platform::test_support::locked_env;
+
+        let (_lock, _env) = locked_env(&["PINVOU3_HOME", "HOME", "USERPROFILE"]);
+        // SAFETY: holding platform::paths::tests::ENV_LOCK via locked_env; env writes serialized in-process.
+        unsafe { std::env::remove_var("PINVOU3_HOME") };
+        // If the gate below is ever dropped, these redirects keep the
+        // resulting store boot off the real user home (`user_home_dir()`
+        // prefers HOME on macOS/Linux and USERPROFILE on Windows) while the
+        // assertion still fails.
+        let fake_home = std::env::temp_dir().join(format!(
+            "pinvou3-headless-gate-{}-{}",
+            std::process::id(),
+            crate::platform::paths::tests::unique_suffix()
+        ));
+        std::fs::create_dir_all(&fake_home).unwrap();
+        // SAFETY: holding platform::paths::tests::ENV_LOCK via locked_env.
+        unsafe { std::env::set_var("HOME", &fake_home) };
+        // SAFETY: holding platform::paths::tests::ENV_LOCK via locked_env.
+        unsafe { std::env::set_var("USERPROFILE", &fake_home) };
+
+        // The macOS tao event loop cannot be created off the main thread and
+        // a headless Linux CI runner has no display: past the gate, the host
+        // dies inside `Builder::build` before any store boot. catch_unwind
+        // turns that panic — and any other unrelated failure, or a full
+        // success — into one string the assertion can reject.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::run_windowless_host(|_pool, _store| async move { Ok::<(), anyhow::Error>(()) })
+        }));
+        let description = match outcome {
+            Ok(Ok(())) => "the host booted and completed without error".to_owned(),
+            Ok(Err(error)) => format!("{error:#}"),
+            Err(payload) => match payload.downcast_ref::<&str>() {
+                Some(message) => (*message).to_owned(),
+                None => payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "opaque panic payload".to_owned()),
+            },
+        };
+        // Clean up before asserting so the temp home does not leak when the
+        // assertion fails.
+        let _ = std::fs::remove_dir_all(&fake_home);
+        assert!(
+            description.contains("PINVOU3_HOME"),
+            "run_windowless_host must fail fast on an unset PINVOU3_HOME in debug builds; got: {description}"
+        );
+    }
+
+    /// The gate itself must open on an isolated temp home, so a host caller
+    /// that did its isolation duty is not refused. Asserted on the gate
+    /// helper rather than through `run_windowless_host`: past the gate the
+    /// full host runs (tao event loop cannot leave the main thread on macOS,
+    /// headless Linux CI has no display), so the public path has no cheap
+    /// success to reach — the caller-visible pass condition is pinned by
+    /// `windowless_host_refuses_unset_pinvou3_home_in_debug` above.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn isolated_debug_home_gate_opens_with_temp_pinvou3_home() {
+        use crate::platform::test_support::with_temp_home;
+
+        with_temp_home("headless-gate-open", || {
+            assert!(
+                super::ensure_isolated_debug_home().is_ok(),
+                "an isolated temp PINVOU3_HOME must pass the debug home gate"
+            );
+        });
+    }
+
+    /// An EMPTY PINVOU3_HOME must not open the gate: the store's resolver
+    /// would take the value verbatim and root `sessions/` relative to the
+    /// process CWD — the same silent-misdirection class this gate refuses,
+    /// just onto the repo dir instead of the real home. Pinned on the gate
+    /// helper (same reasoning as the gate-opens test above).
+    #[cfg(debug_assertions)]
+    #[test]
+    fn isolated_debug_home_gate_refuses_empty_pinvou3_home() {
+        use crate::platform::test_support::locked_env;
+
+        let (_lock, _env) = locked_env(&["PINVOU3_HOME"]);
+        // SAFETY: holding platform::paths::tests::ENV_LOCK via locked_env; env writes serialized in-process.
+        unsafe { std::env::set_var("PINVOU3_HOME", "") };
+        let error = super::ensure_isolated_debug_home()
+            .expect_err("an empty PINVOU3_HOME must not pass the debug home gate");
+        assert!(
+            format!("{error:#}").contains("PINVOU3_HOME"),
+            "the refusal must name the offending variable: {error:#}"
+        );
+    }
+}

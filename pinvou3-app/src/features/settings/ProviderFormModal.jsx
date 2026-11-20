@@ -1,0 +1,777 @@
+// ACP Provider（第三方中转）新增/编辑弹窗。照 ModelFormModal 范式：
+// 预设填充 + 掩码 key（keep/replace/delete）+ 草稿-保存。
+
+import { useEffect, useRef, useState } from 'react';
+import { ChevronDown, X } from '../../components/icons.jsx';
+import { invokeTauri } from '../../platform/tauri/client.js';
+import { bridge } from '../../hooks/useBridge.js';
+import {
+  ACP_MODEL_1M_VARIANTS, ACP_MODEL_PRESETS, ACP_PROVIDER_PRESETS, CLAUDE_MODEL_SLOT_IDS,
+} from './acp-provider-catalog.js';
+import EndpointModelPicker from './endpoint-model-picker.jsx';
+
+// Dropdown mechanism shared by ModelSuggestInput and PresetSelect: 150ms blur-delayed close,
+// Esc to close, onMouseDown to select. Keep the blur-timeout approach (not outside-pointer detection):
+// selection happens after blur and before the timer fires, and that timing semantics is existing behavior.
+function useSuggestDropdown() {
+  const [open, setOpen] = useState(false);
+  return {
+    open,
+    setOpen,
+    onBlur: () => window.setTimeout(() => setOpen(false), 150),
+    onKeyDown: event => { if (event.key === 'Escape') setOpen(false); },
+  };
+}
+
+// Dropdown panel (same panel styling for both selectors; only the max height differs).
+function SuggestPanel({ testId, maxHeightClass, children }) {
+  return (
+    <div
+      data-testid={testId}
+      className={`absolute z-10 mt-1 ${maxHeightClass} w-full overflow-y-auto custom-scrollbar rounded-xl border border-black/[0.08] dark:border-white/[0.12] bg-white dark:bg-[#2A2B2D] shadow-lg`}
+    >
+      {children}
+    </div>
+  );
+}
+
+// Option onMouseDown + preventDefault: complete selection and collapse the panel before the trigger element blurs.
+const selectViaMouseDown = (select, setOpen) => event => {
+  event.preventDefault();
+  select();
+  setOpen(false);
+};
+
+// 模型建议下拉（替代原生 datalist）：**候选全量展示、不做字符过滤**（原生
+// datalist 会把不匹配的候选隐藏，用户容易误以为「只有匹配的几个模型可
+// 选」），仅按输入把匹配项排在前面。点击选中；Esc/失焦关闭。
+function ModelSuggestInput({ value, onChange, suggestions, inputClass, placeholder, testId }) {
+  const { open, setOpen, onBlur, onKeyDown } = useSuggestDropdown();
+  const query = String(value || '').trim().toLowerCase();
+  const score = name => {
+    const lower = name.toLowerCase();
+    if (!query) return 0;
+    if (lower === query) return 0;
+    if (lower.startsWith(query)) return 1;
+    if (lower.includes(query)) return 2;
+    return 3;
+  };
+  const sorted = query
+    ? [...suggestions].sort((a, b) => score(a) - score(b) || a.localeCompare(b))
+    : suggestions;
+  return (
+    <div className="relative mt-1.5">
+      <input
+        data-testid={testId}
+        className={inputClass}
+        value={value}
+        onChange={event => { onChange(event.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={onBlur}
+        onKeyDown={onKeyDown}
+        placeholder={placeholder}
+        spellCheck={false}
+        autoComplete="off"
+      />
+      {open && sorted.length > 0 && (
+        <SuggestPanel testId={`${testId}-suggest`} maxHeightClass="max-h-44">
+          {sorted.map(modelName => (
+            <button
+              key={modelName}
+              type="button"
+              data-testid={`${testId}-option-${modelName}`}
+              onMouseDown={selectViaMouseDown(() => onChange(modelName), setOpen)}
+              className="block w-full px-3 py-2 text-left font-mono text-[12px] hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
+            >
+              {modelName}
+            </button>
+          ))}
+        </SuggestPanel>
+      )}
+    </div>
+  );
+}
+
+// 预设选择器（替代原生 select，与 ModelSuggestInput 同款面板样式）：
+// 按钮展示当前选择，点开全量列表，失焦/Esc 关闭。
+function PresetSelect({ value, onChange, presets, otherLabel, copy, inputClass }) {
+  const { open, setOpen, onBlur, onKeyDown } = useSuggestDropdown();
+  const current = presets.find(preset => preset.key === value) || null;
+  // 展示名走 i18n（copy[preset.nameKey]），缺失 key 时回退 preset.name
+  const label = preset => (preset && copy && copy[preset.nameKey]) || (preset && preset.name) || '';
+  return (
+    <div className="relative mt-1.5">
+      <button
+        type="button"
+        data-testid="acp-provider-preset"
+        onClick={() => setOpen(current => !current)}
+        onBlur={onBlur}
+        onKeyDown={onKeyDown}
+        className={`${inputClass} flex items-center justify-between gap-2 text-left`}
+      >
+        <span className="truncate">{current ? label(current) : otherLabel}</span>
+        <ChevronDown size={14} className="shrink-0 opacity-60" />
+      </button>
+      {open && (
+        <SuggestPanel testId="acp-provider-preset-suggest" maxHeightClass="max-h-56">
+          <button
+            type="button"
+            data-testid="acp-provider-preset-option-other"
+            onMouseDown={selectViaMouseDown(() => onChange(''), setOpen)}
+            className="block w-full px-3 py-2 text-left text-[12px] opacity-70 hover:bg-black/[0.05] dark:hover:bg-white/[0.08]"
+          >
+            {otherLabel}
+          </button>
+          {presets.map(preset => (
+            <button
+              key={preset.key}
+              type="button"
+              data-testid={`acp-provider-preset-option-${preset.key}`}
+              onMouseDown={selectViaMouseDown(() => onChange(preset.key), setOpen)}
+              className={`block w-full px-3 py-2 text-left text-[12px] hover:bg-black/[0.05] dark:hover:bg-white/[0.08] ${preset.key === value ? 'font-semibold text-[#007AFF]' : ''}`}
+            >
+              {label(preset)}
+            </button>
+          ))}
+        </SuggestPanel>
+      )}
+    </div>
+  );
+}
+
+export function ProviderFormModal({ agent, copy, initial, onClose, onSaved, t }) {
+  const [name, setName] = useState(initial?.name || '');
+  const [baseUrl, setBaseUrl] = useState(initial?.baseUrl || '');
+  // Kimi Agent 默认走 Kimi 原生协议（Kimi Code 官方文档的专用类型）；
+  // Claude Code 只支持 Anthropic 协议（固定，不提供选择）；
+  // Codex 固定 Responses（OpenAI 协议家族），记录默认 openai；
+  // 其余 Agent 默认 Anthropic 兼容。
+  const [wireApi, setWireApi] = useState(
+    initial?.wireApi || (agent === 'kimi' ? 'kimi' : agent === 'codex' ? 'openai' : 'anthropic')
+  );
+  const [model, setModel] = useState(initial?.model || '');
+  // 上下文窗口（可选，仅 codex/kimi）：codex 写模型 catalog、
+  // kimi 写 max_context_size；留空用 CLI 默认。
+  const [contextWindow, setContextWindow] = useState(
+    initial?.contextWindow ? String(initial.contextWindow) : ''
+  );
+  // Claude Code 细化模型槽位：默认跟随主模型，可单独修改；必填（留空槽位
+  // 会让 CC 子 agent 回落官方模型走官方流量）。
+  const [modelSlots, setModelSlots] = useState(() => ({ ...initial?.modelSlots }));
+  const [apiKey, setApiKey] = useState('');
+  const [keyLoaded, setKeyLoaded] = useState(false);
+  // 用户在密钥框操作过（输入/清空）后，迟到的回填不得覆盖用户输入
+  // （慢速凭据存储下 backfill 晚于用户操作的竞态，复审 F4）。
+  const apiKeyTouchedRef = useRef(false);
+  // save 校验通过后暂存模型槽位/上下文窗口 payload：doSave 与自绘确认
+  // 回调（JSX onClick）跨函数共享，不能直接引用 save 内的局部变量。
+  const payloadRef = useRef({ slotPayload: null, contextWindowPayload: null });
+  // base URL 实时镜像(复审 M5):探测在飞时改了 base URL,resolve 后的旧端点
+  // 结果作废,不在新 URL 的表单下展示。
+  const baseUrlRef = useRef(baseUrl);
+  baseUrlRef.current = baseUrl; // eslint-disable-line react-hooks/refs -- mirror the live base URL so an in-flight probe result can be discarded when the field moved on (round-1 review M5)
+  // wire 实时镜像(round-5 审 m1):kimi 表单是唯一带 wire 切换的面,探测
+  // 在飞时切换 wire,resolve 后的旧协议结果同样作废——URL 没变但协议变了,
+  // listing 的语义(乃至 auth_required 与否)属于旧 wire。
+  const wireRef = useRef(wireApi);
+  wireRef.current = wireApi; // eslint-disable-line react-hooks/refs -- mirror the live wire so an in-flight probe result can be discarded when the protocol toggled (round-5 review m1)
+  // key 实时镜像(review P2 2026-11-17):探测在飞时换 key,旧 key 探得的
+  // 列表不得在新 key 的表单下打开——picker 的 Add 会按当前凭证落库。
+  const apiKeyRef = useRef(apiKey);
+  apiKeyRef.current = apiKey; // eslint-disable-line react-hooks/refs -- mirror the live key so an in-flight probe result can be discarded when the credential changed
+  const [showKey, setShowKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  // 自绘确认步骤（null = 无）：'emptyKey'（新建空 key）/ 'deleteKey'（编辑删除已存密钥）
+  const [confirmStep, setConfirmStep] = useState(null);
+  const [error, setError] = useState('');
+  // 预设下拉：'' = 其它（自定义，不应用任何预设）。
+  const [presetKey, setPresetKey] = useState('');
+  // 端点模型自动发现（规格 §2.7）：候选列表只进本地 state 打开共享 picker，
+  // 绝不自动发请求、绝不写库；「获取模型列表」仅按钮显式点击触发。
+  const [endpointListing, setEndpointListing] = useState(null);
+  const [endpointPickerOpen, setEndpointPickerOpen] = useState(false);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  // 每次「获取模型列表」点击递增,作为共享 picker 的 React key:新列表重挂,
+  // filterDraft/滚动位置干净复位(与聊天线同一处理)。
+  const [endpointFetchSeq, setEndpointFetchSeq] = useState(0);
+
+  // 模型建议列表：选择预设后按该厂商官方在列名单筛选；「其它」显示全部官方在列模型。
+  // Claude 额外提供该厂商的 1M 上下文变体（仅 CC 需要显式声明 [1m]；选中预设
+  // 只显示本厂商变体，「其它」时汇总全部）。
+  const activePreset = ACP_PROVIDER_PRESETS.find(preset => preset.key === presetKey) || null;
+  const baseSuggestions = activePreset && activePreset.models && activePreset.models.length
+    ? activePreset.models
+    : ACP_MODEL_PRESETS;
+  const oneMVariants = activePreset
+    ? (activePreset.models1m || [])
+    : ACP_MODEL_1M_VARIANTS;
+  const suggestedModels = agent === 'claude'
+    ? [...baseSuggestions, ...oneMVariants.filter(variant => !baseSuggestions.includes(variant))]
+    : baseSuggestions;
+  // wire 协议由 Agent 的 CLI 硬约束决定，不提供选择：
+  // - Claude Code 只支持 Anthropic 协议（避免选了 OpenAI 兼容后必然 404/400）
+  // - Codex 官方当前版本统一使用 Responses 协议（wire_api 仅 "responses" 合法）
+  const wireLocked = agent === 'claude' || agent === 'codex';
+  const wireLockedLabel = agent === 'claude' ? copy.wireAnthropic : copy.wireResponses;
+  // N10：Claude 只支持 Anthropic 协议，选中无 Anthropic 端点的预设时给出
+  // 警告（列表保持全量，不隐藏供应商）。
+  const anthropicEndpointMissing =
+    wireLocked && agent === 'claude' && activePreset && !activePreset.baseUrlAnthropic;
+
+  useEffect(() => {
+    const onKey = event => {
+      // Escape 逐层关闭(复审 ACP minor):候选面板打开时只关面板,其次二级
+      // 确认弹窗(打开时只关确认层),最后才是整个表单——上层浮层绝不连带
+      // 下层一起消失。
+      if (event.key === 'Escape') {
+        if (endpointPickerOpen) setEndpointPickerOpen(false);
+        else if (confirmStep) setConfirmStep(null);
+        else onClose();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose, confirmStep, endpointPickerOpen]);
+
+  // 编辑有 key 的 Provider 时回填真实密钥：输入框 type=password 自然掩码，
+  // 点「显示」切 text 变明文（密码管理器范式）。仅编辑时拉取，列表永不回传。
+  useEffect(() => {
+    if (!initial || !initial.hasCredential) return;
+    let alive = true;
+    invokeTauri('get_acp_provider_key', { agent, providerId: initial.id })
+      .then(key => {
+        if (!alive) return;
+        // 仅当字段仍为空且用户未手动操作过才回填：否则「清空=删除」意图
+        // 会被迟到的旧 key 吞成 keep（复审 F4）。
+        if (key && !apiKeyTouchedRef.current) setApiKey(key);
+        // 仅**非空** key 才视为「已加载」：返回空串（解密失败/存储异常等）时
+        // 保持 keyLoaded=false → save 走 keep（保留旧密钥），防止用户看到
+        // 空字段直接保存把已保存的密钥静默删成 delete（高危项加固）。
+        if (key) setKeyLoaded(true);
+      })
+      // 回填失败**不**置 keyLoaded：保持 false → save 时按「保留」处理，
+      // 防止读不到已保存密钥时用户看到空字段直接保存即静默删除（评审高危项）。
+      .catch(() => {});
+    return () => { alive = false; };
+    // eslint 的 exhaustive-deps 本仓未启用；仅挂载/编辑目标变化时拉一次
+  }, [agent, initial]);
+
+  // 选择预设只填 base URL 与 wire 协议，**不自动填模型**：模型由用户自行
+  // 输入（输入框提供按厂商筛选的官方在列模型建议），避免预设值造成
+  // 「不可自行填写」的误解，也兼容中转商自有的模型名。
+  // wire 按 Agent 适配：Kimi 原生预设（Moonshot/Kimi Code）用于非 Kimi Agent
+  // 时落到 OpenAI 兼容（这些端点同样提供 OpenAI 协议）；Claude 固定 Anthropic。
+  // base URL 变更即失效既有探测结果(复审 M5,与聊天线同一不变量):URL A 上
+  // 探到的候选列表绝不许当 URL B 的结果展示/使用。手输与预设回填两条路径都要清。
+  // round-4 审 m1-1:探测失败写在本表单共享的 error 条上,此前只清 listing/picker,
+  // 旧 URL 的红色失败条会挂在已改走的新 URL/协议下(与聊天线 fetchModelsMessage
+  // 的 round-3 minor 同因)。error 的其余写入方是表单校验与保存失败,同属
+  // 「上一次尝试」的过期提示,随失效点一并清扫不会丢失任何活跃状态。
+  const clearEndpointProbeState = () => {
+    setEndpointListing(null);
+    setEndpointPickerOpen(false);
+    setError('');
+  };
+  const handleBaseUrlChange = value => {
+    setBaseUrl(value);
+    clearEndpointProbeState();
+  };
+
+  const applyPreset = preset => {
+    if (!preset) return;
+    const useAnthropicEndpoint = agent === 'claude' || preset.wireApi === 'anthropic';
+    setBaseUrl((useAnthropicEndpoint && preset.baseUrlAnthropic) || preset.baseUrl || '');
+    clearEndpointProbeState();
+    if (wireLocked) return;
+    if (preset.wireApi === 'kimi' && agent !== 'kimi') {
+      setWireApi('openai');
+    } else {
+      setWireApi(preset.wireApi || 'anthropic');
+    }
+  };
+
+  // 主模型变化时，把「仍等于旧主模型或为空」的槽位一起跟随；用户手动改过的
+  // 槽位保持不变。比较基准用渲染期的 model 值：输入是离散事件、同步刷新，
+  // 逐键准确（不能用 ref，updater 延迟执行会读到新值导致永远不跟随）。
+  const changeModel = value => {
+    const previous = model;
+    setModelSlots(slots => {
+      const next = { ...slots };
+      for (const slot of CLAUDE_MODEL_SLOT_IDS) {
+        if (!next[slot] || next[slot] === previous) next[slot] = value;
+      }
+      return next;
+    });
+    setModel(value);
+  };
+
+  // 按钮探活（与 SettingsView 聊天线同一语义）：老版本桌面或 web 白名单未放行时
+  // bridge.models.probeEndpointModels 不存在，按钮禁用并以 title 提示。
+  const probeEndpointModelsAvailable = typeof bridge?.models?.probeEndpointModels === 'function';
+
+  // 获取模型列表（规格 §2.7）：按表单 base_url + 当前 wire 协议 + 表单 key 探测
+  // （key 为空传 null，keyless 端点照常探测）。ACP 线没有 ModelPreset，wire 之外
+  // 不传 preset。失败透传到表单错误条（命令层已脱敏，不携带 URL/key）。
+  const handleFetchEndpointModels = async () => {
+    if (!probeEndpointModelsAvailable || fetchingModels) return;
+    const probedBaseUrl = String(baseUrl || '').trim();
+    const probedWire = wireApi;
+    const probedKey = String(apiKey || '').trim() || null;
+    if (!probedBaseUrl) return;
+    setEndpointFetchSeq(seq => seq + 1);
+    setFetchingModels(true);
+    setError('');
+    try {
+      const listing = await bridge.models.probeEndpointModels({
+        baseUrl: probedBaseUrl,
+        apiKey: probedKey,
+        wire: probedWire,
+      });
+      // 探测期间 base URL 已被改走 → 结果作废(复审 M5 同因);wire 切换了
+      // 也同样作废(round-5 审 m1)——URL 没变但协议变了,listing 的语义属于
+      // 旧 wire(kimi 表单是唯一带 wire 切换的面)。
+      if (String(baseUrlRef.current || '').trim() !== probedBaseUrl) return;
+      if (wireRef.current !== probedWire) return;
+      // review P2 2026-11-17:凭据维度并入失效键——换 key 后旧 key 探得的
+      // 列表不得在新 key 表单下打开(Add 按当前凭证落库)。
+      if ((String(apiKeyRef.current || '').trim() || null) !== probedKey) return;
+      setEndpointListing(listing && typeof listing === 'object' ? listing : { status: 'error', models: [] });
+      setEndpointPickerOpen(true);
+    } catch (e) {
+      // reject 穿透的是命令层错误,直接 String(e) 会把英文原始串透出到表单;
+      // 按聊天线 normalizeConnectionTestResult 的同一映射归一为三语文案。
+      // round-3 审 minor:reject 路径与 try 路径同一 resolve 时刻守卫——
+      // URL A 的探测失败不许以错误条挂在已改走的 URL B 表单下;wire 同因
+      // (round-5 审 m1)。
+      if (String(baseUrlRef.current || '').trim() !== probedBaseUrl) return;
+      if (wireRef.current !== probedWire) return;
+      // reject 路径同键(review P2 2026-11-17)。
+      if ((String(apiKeyRef.current || '').trim() || null) !== probedKey) return;
+      const connectionCopy = t.uiSettingsDetail.connectionMessages;
+      if (e && typeof e === 'object' && !Array.isArray(e)) {
+        const code = String(e.code || (e.ok ? 'ok' : 'unknown'));
+        setError(String(connectionCopy[code] || connectionCopy.unknown || e.message || code));
+      } else {
+        setError(String(connectionCopy.unknown || ''));
+      }
+    } finally {
+      setFetchingModels(false);
+    }
+  };
+
+  // 候选行「添加」（ACP 线 onPick）：模型 id 走输入框同一 changeModel 通道填入；
+  // contextWindow **仅在当前为空**时用条目的 context_window_tokens 填入，绝不
+  // 覆盖非空值（与聊天线同一不变量；anthropic wire 条目的长度字段核心层已归一）。
+  // 填入即完成本面板使命，关闭面板（ACP 线无批量添加）。
+  const handleEndpointModelPick = row => {
+    if (!row || !row.id) return;
+    changeModel(row.id);
+    const probedContext = Number(row.contextWindowTokens);
+    if (!String(contextWindow || '').trim() && Number.isFinite(probedContext) && probedContext > 0) {
+      setContextWindow(String(probedContext));
+    }
+    setEndpointPickerOpen(false);
+  };
+
+  const save = async () => {
+    if (!String(name || '').trim()) {
+      setError(copy.providerName);
+      return;
+    }
+    if (!String(baseUrl || '').trim()) {
+      setError(copy.baseUrl);
+      return;
+    }
+    let slotPayload = null;
+    if (agent === 'claude') {
+      const missing = CLAUDE_MODEL_SLOT_IDS.filter(slot => !String(modelSlots[slot] || '').trim());
+      if (missing.length) {
+        setError(copy.modelSlotsRequired);
+        return;
+      }
+      slotPayload = Object.fromEntries(
+        CLAUDE_MODEL_SLOT_IDS.map(slot => [slot, String(modelSlots[slot]).trim()])
+      );
+    }
+    let contextWindowPayload = null;
+    if (agent !== 'claude' && String(contextWindow || '').trim()) {
+      const parsed = Number.parseInt(String(contextWindow).trim(), 10); // eslint-disable-line unicorn/prefer-number-coercion -- keep parseInt's lenient parsing semantics
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        setError(copy.contextWindowInvalid);
+        return;
+      }
+      contextWindowPayload = parsed;
+    }
+    payloadRef.current = { slotPayload, contextWindowPayload };
+    // key 语义（密码管理器范式，无选择器）：编辑时字段已回填真实 key——
+    // 清空 = 删除，改动 = 替换，原样 = 重写同值（无效果）。例外：
+    // 编辑回填失败（keyLoaded=false）且字段仍为空 → 走 keep（无操作），
+    // 避免「清空无密钥」触发误导性删除确认。
+    const trimmedKey = String(apiKey || '').trim();
+    // 危险/存疑操作走**自绘二级确认弹窗**（Tauri WebView2 下系统
+    // window.confirm 实测不弹；应用内自绘弹窗无此限制）：
+    // - 新建 + 空 key，或编辑**无已存密钥**（hasCredential=false）+ 空 key：
+    //   允许保存（走 keep），提交前确认「切换前需补 key」
+    // - 编辑 + 清空 key（有已存密钥）：= 删除密钥，确认防误触
+    // 回填失败（keyLoaded=false）且有已存密钥时恒走 keep 且不弹确认：
+    // 密钥实际存在，不得提示「未填写」，更不能删。
+    const apiKeyAction = initial
+      ? trimmedKey
+        ? 'replace'
+        : (initial.hasCredential && keyLoaded ? 'delete' : 'keep')
+      : (trimmedKey ? 'replace' : 'keep');
+    if (!trimmedKey && (!initial || !initial.hasCredential)) {
+      setConfirmStep('emptyKey');
+      return;
+    }
+    if (apiKeyAction === 'delete') {
+      setConfirmStep('deleteKey');
+      return;
+    }
+    await doSave(apiKeyAction, trimmedKey);
+  };
+
+  const doSave = async (apiKeyAction, trimmedKey) => {
+    setSaving(true);
+    setError('');
+    try {
+      const { slotPayload, contextWindowPayload } = payloadRef.current;
+      const saved = await invokeTauri('save_acp_provider', {
+        agent,
+        providerId: initial?.id || null,
+        name: String(name).trim(),
+        baseUrl: String(baseUrl).trim(),
+        model: String(model || '').trim() || null,
+        modelSlots: slotPayload,
+        contextWindow: contextWindowPayload,
+        wireApi,
+        apiKey: trimmedKey || null,
+        apiKeyAction,
+      });
+      onSaved(saved);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+      setSaving(false);
+    }
+  };
+
+  const inputClass = `w-full h-10 rounded-xl px-3 text-[13px] outline-none transition-colors bg-[#F0F4F9] text-[#1F1F1F] border border-black/[0.06] focus:border-[#0B57D0]/50 dark:bg-white/[0.06] dark:text-[#E8EAED] dark:border-white/[0.09] dark:focus:border-[#64B5F6]/50`;
+
+  return (
+    // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop click-to-close layer; keyboard path is the form's top-right close button
+    <div
+      data-testid="acp-provider-form-dialog"
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-[110] flex items-center justify-center bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200"
+      onClick={onClose}
+    >
+      {/* biome-ignore lint/a11y/useKeyWithClickEvents: click propagation stop layer; keyboard events need no bubbling here */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: click propagation stop layer, not an interactive container */}
+      <div
+        onClick={event => event.stopPropagation()}
+        className={`relative w-[min(480px,calc(100vw-24px))] max-h-[calc(100vh-48px)] overflow-y-auto custom-scrollbar rounded-[24px] p-6 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E8EAED]`}
+      >
+        <div className="flex items-center justify-between mb-5">
+          <h2 className="text-[17px] font-semibold">
+            {initial ? `${copy.edit} · ${initial.name}` : copy.addProvider}
+          </h2>
+          <button type="button" data-testid="acp-provider-form-close" onClick={onClose} aria-label={copy.cancel} className="h-8 w-8 rounded-full flex items-center justify-center hover:bg-black/[0.06] dark:hover:bg-white/[0.08]">
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* 预设（仅新增时展示）：默认「其它」= 自定义填写；选择预设后自动填
+            base URL 与协议，模型建议列表按该厂商筛选。 */}
+        {!initial && (
+          <div className="block mb-4">
+            <span className="text-[12px] font-medium opacity-70">{copy.addProvider}</span>
+            <PresetSelect
+              value={presetKey}
+              onChange={next => {
+                setPresetKey(next);
+                applyPreset(ACP_PROVIDER_PRESETS.find(preset => preset.key === next));
+              }}
+              presets={ACP_PROVIDER_PRESETS}
+              otherLabel={copy.providerOther}
+              copy={copy}
+              inputClass={inputClass}
+            />
+          </div>
+        )}
+
+        <label className="block mb-4">
+          <span className="text-[12px] font-medium opacity-70">{copy.providerName}</span>
+          <input
+            data-testid="acp-provider-name"
+            className={`${inputClass} mt-1.5`}
+            value={name}
+            onChange={event => setName(event.target.value)}
+            placeholder={copy.providerNamePlaceholder}
+          />
+        </label>
+
+        <label className="block mb-4">
+          <span className="text-[12px] font-medium opacity-70">{copy.baseUrl}</span>
+          <input
+            data-testid="acp-provider-base-url"
+            className={`${inputClass} mt-1.5 font-mono`}
+            value={baseUrl}
+            onChange={event => handleBaseUrlChange(event.target.value)}
+            placeholder={copy.baseUrlPlaceholder}
+            spellCheck={false}
+          />
+        </label>
+
+        <div className="mb-4">
+          <span className="block text-[12px] font-medium opacity-70 mb-1.5">{copy.wireApi}</span>
+          {wireLocked ? (
+            // Claude Code 固定 Anthropic / Codex 固定 Responses
+            <div className="mt-1.5 h-9 inline-flex items-center px-3.5 rounded-full bg-black/[0.04] dark:bg-white/[0.06] text-[12px] font-semibold opacity-70">
+              {wireLockedLabel}
+            </div>
+          ) : (
+            <div className="flex gap-1.5">
+              {[
+                { key: 'anthropic', label: copy.wireAnthropic },
+                { key: 'openai', label: copy.wireOpenai },
+                // Kimi 原生协议（type="kimi"）仅 Kimi Agent 提供：Kimi Code
+                // 托管服务与 Kimi Platform API key 的官方接入方式。
+                ...(agent === 'kimi' ? [{ key: 'kimi', label: copy.wireKimi }] : []),
+              ].map(option => (
+                <button
+                  key={option.key}
+                  data-testid={`acp-provider-wire-${option.key}`}
+                  type="button"
+                  onClick={() => {
+                    setWireApi(option.key);
+                    // round-3 审 minor:wire 切换使既有探测结果跨协议失效——
+                    // anthropic wire 下探到的列表不许在 openai wire 的表单下
+                    // 打开/回填(与 base URL 变更同一不变量)。
+                    clearEndpointProbeState();
+                  }}
+                  className={`h-9 px-3.5 rounded-full text-[12px] font-semibold transition-colors ${
+                    wireApi === option.key
+                      ? 'bg-[#007AFF] text-white'
+                      : 'bg-[#F0F4F9] text-[#5F6368] dark:bg-white/[0.08] dark:text-[#C7C7CC]'
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {anthropicEndpointMissing && (
+          <div data-testid="acp-provider-no-anthropic-warning" className="mb-4 rounded-xl px-3 py-2.5 text-[12px] leading-relaxed bg-amber-500/[0.1] text-amber-700 dark:text-amber-300">
+            {copy.noAnthropicEndpointWarning}
+          </div>
+        )}
+
+        <div className="block mb-4">
+          <span className="text-[12px] font-medium opacity-70">{copy.model} · {copy.modelOptional}</span>
+          <div className="flex items-start gap-2">
+            <span className="min-w-0 flex-1">
+              <ModelSuggestInput
+                testId="acp-provider-model"
+                inputClass={inputClass}
+                value={model}
+                onChange={changeModel}
+                placeholder={copy.modelPlaceholder}
+                suggestions={suggestedModels}
+              />
+            </span>
+            {/* 端点模型自动发现（规格 §2.7）：仅 codex/kimi 且 base URL 非空时提供
+                「获取模型列表」；claude 的模型槽位走官方编辑器，不提供该按钮。
+                bridge 方法缺失时探活禁用并以 title 提示（见 probeEndpointModelsAvailable）。 */}
+            {(agent === 'codex' || agent === 'kimi') && String(baseUrl || '').trim() !== '' && (
+              <button
+                type="button"
+                data-testid="acp-provider-fetch-models"
+                onClick={handleFetchEndpointModels}
+                disabled={fetchingModels || !probeEndpointModelsAvailable}
+                title={probeEndpointModelsAvailable ? undefined : copy.fetchUnavailable}
+                className="shrink-0 mt-1.5 h-10 px-3 rounded-xl text-[12px] font-medium border border-black/[0.08] dark:border-white/[0.12] disabled:opacity-50"
+              >
+                {fetchingModels ? copy.fetchingModels : copy.fetchModels}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Claude Code 细化模型槽位：默认跟随主模型，可单独修改；必填（留空
+            槽位会让 CC 子 agent 回落官方模型走官方流量）。 */}
+        {agent === 'claude' && (
+          <div className="mb-4">
+            <span className="block text-[12px] font-medium opacity-70 mb-1.5">{copy.modelSlotsTitle}</span>
+            <div className="space-y-2">
+              {CLAUDE_MODEL_SLOT_IDS.map(slot => (
+                // biome-ignore lint/a11y/noLabelWithoutControl: the slot name is inline layout text only; the input is a custom component with its own aria
+                <label key={slot} className="flex items-center gap-2">
+                  <span className="w-20 shrink-0 text-[12px] opacity-60">{copy[`slot_${slot}`]}</span>
+                  <span className="flex-1">
+                    <ModelSuggestInput
+                      testId={`acp-provider-slot-${slot}`}
+                      inputClass={inputClass}
+                      value={modelSlots[slot] || ''}
+                      onChange={value =>
+                        setModelSlots(slots => ({ ...slots, [slot]: value }))
+                      }
+                      suggestions={suggestedModels}
+                    />
+                  </span>
+                </label>
+              ))}
+            </div>
+            <span className="block mt-1.5 text-[12px] opacity-50">{copy.modelSlotsHint}</span>
+          </div>
+        )}
+
+        {/* 上下文窗口（可选，仅 codex/kimi）：codex 写模型 catalog、
+            kimi 写 max_context_size；claude 用 [1m] 变体表达，无需此字段 */}
+        {agent !== 'claude' && (
+          <label className="block mb-4">
+            <span className="text-[12px] font-medium opacity-70">{copy.contextWindow} · {copy.modelOptional}</span>
+            <input
+              data-testid="acp-provider-context-window"
+              className={`${inputClass} mt-1.5 font-mono`}
+              value={contextWindow}
+              onChange={event => setContextWindow(event.target.value.replaceAll(/[^0-9]/g, ''))} // eslint-disable-line sonarjs/concise-regex -- keep [^0-9] literal instead of \D; readability first
+              placeholder={copy.contextWindowPlaceholder}
+              inputMode="numeric"
+              spellCheck={false}
+            />
+            <span className="block mt-1.5 text-[12px] opacity-50">{copy.contextWindowHint}</span>
+          </label>
+        )}
+
+        <label className="block mb-4">
+          <span className="text-[12px] font-medium opacity-70">{copy.apiKey}</span>
+          <div className="mt-1.5 flex items-center gap-2">
+            <input
+              data-testid="acp-provider-api-key"
+              className={`${inputClass} font-mono`}
+              // 恒为 text + WebkitTextSecurity 掩码：type=password 会触发
+              // WebView2 自带的眼睛按钮（与「显示」重复）
+              type="text"
+              style={showKey ? undefined : { WebkitTextSecurity: 'disc' }}
+              value={apiKey}
+              onChange={event => {
+                apiKeyTouchedRef.current = true;
+                setApiKey(event.target.value);
+              }}
+              placeholder={copy.apiKeyPlaceholder}
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+            />
+            <button
+              type="button"
+              data-testid="acp-provider-key-toggle"
+              onClick={() => setShowKey(current => !current)}
+              className="shrink-0 h-10 px-3 rounded-xl text-[12px] font-medium border border-black/[0.08] dark:border-white/[0.12]"
+            >
+              {showKey ? copy.hideKey : copy.showKey}
+            </button>
+          </div>
+          <span className="block mt-1.5 text-[12px] opacity-50">{copy.apiKeyHint}</span>
+        </label>
+
+        {error && (
+          <div data-testid="acp-provider-form-error" className="mb-4 rounded-xl px-3 py-2.5 text-[12px] text-red-500 bg-red-500/[0.08]">
+            {error}
+          </div>
+        )}
+
+        <div className={`rounded-xl px-3 py-2.5 text-[12px] leading-relaxed bg-amber-500/[0.1] text-amber-800 dark:bg-amber-500/[0.08] dark:text-amber-200/80`}>
+          {copy.thirdPartyWarning}
+        </div>
+
+        {/* 二级确认弹窗（Tauri WebView2 下系统 window.confirm 不弹，应用内
+            自绘弹窗无此限制）：新建/无密钥编辑 + 空 key、编辑清空已存密钥。
+            z-[120] 压在整个表单弹窗（z-[110]）之上；背景点击只关确认层 */}
+        {confirmStep && (
+          // biome-ignore lint/a11y/useKeyWithClickEvents: backdrop click-to-close layer; keyboard path is the real buttons inside the confirm layer
+          // biome-ignore lint/a11y/noStaticElementInteractions: backdrop click-to-close layer, not an interactive container
+          <div
+            data-testid="acp-provider-form-confirm"
+            className="fixed inset-0 z-[120] flex items-center justify-center bg-black/45 backdrop-blur-[14px] animate-in fade-in duration-200"
+            onClick={event => {
+              event.stopPropagation();
+              setConfirmStep(null);
+            }}
+          >
+            {/* biome-ignore lint/a11y/useKeyWithClickEvents: click propagation stop layer; keyboard events need no bubbling here */}
+            {/* biome-ignore lint/a11y/noStaticElementInteractions: click propagation stop layer, not an interactive container */}
+            <div
+              onClick={event => event.stopPropagation()}
+              className="w-[min(400px,calc(100vw-24px))] rounded-[24px] p-6 bg-white text-[#1F1F1F] dark:bg-[#1E1F20] dark:text-[#E8EAED]"
+            >
+              <p className="text-[13px] leading-relaxed opacity-85">
+                {confirmStep === 'emptyKey' ? copy.apiKeyEmptyConfirm : copy.deleteKeyConfirm}
+              </p>
+              <div className="mt-6 flex justify-end gap-2">
+                <button type="button"
+                  onClick={() => setConfirmStep(null)}
+                  disabled={saving}
+                  className="h-9 px-4 rounded-full text-[13px] font-semibold border border-black/[0.08] dark:border-white/[0.12] disabled:opacity-50"
+                >
+                  {copy.cancel}
+                </button>
+                <button type="button"
+                  data-testid="acp-provider-form-confirm-ok"
+                  onClick={() => {
+                    const action = confirmStep === 'emptyKey' ? 'keep' : 'delete';
+                    const key = String(apiKey || '').trim();
+                    setConfirmStep(null);
+                    doSave(action, key);
+                  }}
+                  disabled={saving}
+                  className={`h-9 px-4 rounded-full text-white text-[13px] font-semibold disabled:opacity-50 ${confirmStep === 'emptyKey' ? 'bg-[#007AFF]' : 'bg-red-500'}`}
+                >
+                  {confirmStep === 'emptyKey' ? copy.save : copy.deleteConfirm}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-6 flex justify-end gap-2">
+          <button type="button"
+            data-testid="acp-provider-form-cancel"
+            onClick={onClose}
+            disabled={saving}
+            className="h-10 px-4 rounded-full text-[13px] font-semibold border border-black/[0.08] dark:border-white/[0.12] disabled:opacity-50"
+          >
+            {copy.cancel}
+          </button>
+          <button type="button"
+            data-testid="acp-provider-form-save"
+            onClick={save}
+            disabled={saving}
+            className="h-10 px-5 rounded-full bg-[#007AFF] text-white text-[13px] font-semibold disabled:opacity-60"
+          >
+            {saving ? copy.saving : copy.save}
+          </button>
+        </div>
+
+        {/* 端点模型候选面板（规格 §2.7）：纯 props 驱动复用聊天线组件；ACP 线
+            不传 onAddAll（无批量添加），不传 savedKeys（provider 无已保存模型
+            去重语义，组件按「无已保存」处理：行恒可添加、无「已保存」标记）。 */}
+        <EndpointModelPicker
+          key={endpointFetchSeq}
+          open={endpointPickerOpen}
+          onClose={() => setEndpointPickerOpen(false)}
+          listing={endpointListing}
+          loading={fetchingModels}
+          onPick={handleEndpointModelPick}
+          baseUrl={baseUrl.trim()}
+          t={t}
+        />
+      </div>
+    </div>
+  );
+}

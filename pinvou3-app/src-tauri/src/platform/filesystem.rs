@@ -1,0 +1,4117 @@
+use std::fs::File;
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+)))]
+use std::fs::Metadata;
+use std::io;
+use std::path::{Path, PathBuf};
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+extern crate libc as platform_libc;
+
+// The anchored directory ABI below is intentionally limited to the Unix
+// targets shipped by the desktop app. Other targets are rejected explicitly
+// instead of guessing their libc `dirent` layout or using unsafe path fallback.
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+mod libc {
+    use std::os::raw::{c_char, c_int};
+
+    #[repr(C)]
+    pub(crate) struct DIR {
+        _private: [u8; 0],
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    pub(crate) struct Dirent {
+        pub(crate) d_ino: u64,
+        pub(crate) d_seekoff: u64,
+        pub(crate) d_reclen: u16,
+        pub(crate) d_namlen: u16,
+        pub(crate) d_type: u8,
+        pub(crate) d_name: [c_char; 1024],
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[repr(C)]
+    pub(crate) struct Dirent {
+        pub(crate) d_ino: u64,
+        pub(crate) d_off: i64,
+        pub(crate) d_reclen: u16,
+        pub(crate) d_type: u8,
+        pub(crate) d_name: [c_char; 256],
+    }
+
+    #[cfg(target_os = "macos")]
+    const _: () = {
+        assert!(std::mem::offset_of!(Dirent, d_name) == 21);
+        assert!(std::mem::size_of::<Dirent>() == 1048);
+    };
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    const _: () = {
+        assert!(std::mem::offset_of!(Dirent, d_name) == 19);
+        assert!(std::mem::size_of::<Dirent>() == 280);
+    };
+
+    // Use the target libc's values rather than transcribing one architecture's
+    // ABI. In particular, Linux/aarch64 assigns O_DIRECTORY and O_NOFOLLOW
+    // different bits than Linux/x86_64.
+    pub(crate) const O_RDONLY: c_int = super::platform_libc::O_RDONLY;
+    pub(crate) const O_WRONLY: c_int = super::platform_libc::O_WRONLY;
+    pub(crate) const O_APPEND: c_int = super::platform_libc::O_APPEND;
+    pub(crate) const O_RDWR: c_int = super::platform_libc::O_RDWR;
+    pub(crate) const O_CREAT: c_int = super::platform_libc::O_CREAT;
+    pub(crate) const O_EXCL: c_int = super::platform_libc::O_EXCL;
+    pub(crate) const O_CLOEXEC: c_int = super::platform_libc::O_CLOEXEC;
+    pub(crate) const O_NOFOLLOW: c_int = super::platform_libc::O_NOFOLLOW;
+    pub(crate) const O_DIRECTORY: c_int = super::platform_libc::O_DIRECTORY;
+    pub(crate) const O_NONBLOCK: c_int = super::platform_libc::O_NONBLOCK;
+    pub(crate) const AT_REMOVEDIR: c_int = super::platform_libc::AT_REMOVEDIR;
+    #[cfg(target_os = "macos")]
+    pub(crate) const RENAME_EXCL: u32 = 0x0000_0004;
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) const RENAME_NOREPLACE: u32 = 0x0000_0001;
+    #[cfg(target_os = "macos")]
+    pub(crate) type ModeT = u16;
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) type ModeT = u32;
+
+    unsafe extern "C" {
+        pub(crate) fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+        pub(crate) fn openat(directory: c_int, path: *const c_char, flags: c_int, ...) -> c_int;
+        pub(crate) fn mkdirat(directory: c_int, path: *const c_char, mode: ModeT) -> c_int;
+        pub(crate) fn renameat(
+            source_directory: c_int,
+            source: *const c_char,
+            destination_directory: c_int,
+            destination: *const c_char,
+        ) -> c_int;
+        #[cfg(target_os = "linux")]
+        pub(crate) fn renameat2(
+            source_directory: c_int,
+            source: *const c_char,
+            destination_directory: c_int,
+            destination: *const c_char,
+            flags: u32,
+        ) -> c_int;
+        #[cfg(target_os = "macos")]
+        pub(crate) fn renameatx_np(
+            source_directory: c_int,
+            source: *const c_char,
+            destination_directory: c_int,
+            destination: *const c_char,
+            flags: u32,
+        ) -> c_int;
+        pub(crate) fn unlinkat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
+        pub(crate) fn close(fd: c_int) -> c_int;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "fdopendir$INODE64"
+        )]
+        pub(crate) fn fdopendir(fd: c_int) -> *mut DIR;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
+        pub(crate) fn readdir(directory: *mut DIR) -> *mut Dirent;
+        pub(crate) fn closedir(directory: *mut DIR) -> c_int;
+
+        #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
+        #[cfg_attr(target_os = "macos", link_name = "__error")]
+        pub(crate) fn errno_location() -> *mut c_int;
+    }
+}
+
+/// The canonical image-extension → MIME mapping table: the single source
+/// behind `image_mime_type` and the classification sets derived from it
+/// (codex_acp attachments, workspace file classification, files/visual_preview
+/// artifact previews, and the headless CLI's `code workspace diff` file-kind,
+/// which imports it instead of hand-copying the extension list).
+pub const IMAGE_MIME_TABLE: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("svg", "image/svg+xml"),
+    ("bmp", "image/bmp"),
+];
+
+/// Extension-based image MIME lookup shared by every feature that embeds or
+/// previews image files. Returns `None` for extensions outside
+/// [`IMAGE_MIME_TABLE`] so callers decide their own fallback or rejection.
+pub(crate) fn image_mime_type(path: &Path) -> Option<&'static str> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    IMAGE_MIME_TABLE
+        .iter()
+        .find(|(table_ext, _)| *table_ext == extension)
+        .map(|(_, mime)| *mime)
+}
+
+/// Return whether a path is a regular file the current platform can execute.
+/// Unix discovery must not advertise a chmod 0644 placeholder as a usable
+/// runtime; Windows execution permission is represented by ACLs/file type and
+/// is ultimately enforced by process creation.
+pub(crate) fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplaceState {
+    Committed,
+    RolledBack,
+    RecoveryRequired,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReplaceError {
+    state: ReplaceState,
+    source: io::Error,
+}
+
+impl ReplaceError {
+    pub(crate) fn new(state: ReplaceState, source: io::Error) -> Self {
+        Self { state, source }
+    }
+
+    pub(crate) fn state(&self) -> ReplaceState {
+        self.state
+    }
+
+    pub(crate) fn into_io_error(self) -> io::Error {
+        io::Error::new(self.source.kind(), self.to_string())
+    }
+}
+
+impl std::fmt::Display for ReplaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "atomic replace {:?}: {}",
+            self.state, self.source
+        )
+    }
+}
+
+impl std::error::Error for ReplaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+pub(crate) type ReplaceResult = Result<ReplaceState, ReplaceError>;
+
+/// Converge a layout left by an interrupted Windows replacement. Callers must
+/// hold the same lifecycle lock used for writes so active temporary files are
+/// never mistaken for recovery candidates.
+pub(crate) fn recover_interrupted_replace(
+    replacement: &Path,
+    target: &Path,
+    backup: &Path,
+) -> ReplaceResult {
+    if target.is_file() {
+        return Ok(ReplaceState::Committed);
+    }
+    if backup.is_file() {
+        return promote_replacement(backup, target).map_or_else(
+            |error| {
+                Err(ReplaceError::new(
+                    ReplaceState::RecoveryRequired,
+                    error.into_io_error(),
+                ))
+            },
+            |_| {
+                Err(ReplaceError::new(
+                    ReplaceState::RolledBack,
+                    io::Error::other("interrupted replacement was rolled back"),
+                ))
+            },
+        );
+    }
+    if replacement.is_file() {
+        return promote_replacement(replacement, target);
+    }
+    Err(ReplaceError::new(
+        ReplaceState::RecoveryRequired,
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "interrupted replacement has no recoverable candidate",
+        ),
+    ))
+}
+
+/// 原子写文件：先写同目录临时文件并 sync，再原子替换目标。
+///
+/// 直接 `std::fs::write(target)` 在进程被中断（强杀/崩溃）时会留下截断或
+/// 半写的目标文件；对持久化的会话状态（如 `_session_mode_states.json`、
+/// settings.json）而言，一个损坏的目标会让启动恢复静默失败，表现为
+/// "切换成功但重启后丢失"。tmp + rename 保证目标要么是旧完整内容、
+/// 要么是新完整内容，永无中间态。失败清理按替换终态区分（对齐
+/// artifacts 版）：不得把装着旧完整内容的恢复候选一并删掉。
+pub fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
+    atomic_write_impl(path, content, false)
+}
+
+/// Uses the same replacement semantics as `atomic_write`, but creates the temporary file
+/// with private permissions immediately. Use it for configurations containing secrets or
+/// unauthenticated local-port data to avoid a pre-rename default-umask window on Unix.
+/// Windows continues to rely on the user-directory ACL.
+pub fn atomic_write_private(path: &Path, content: &[u8]) -> io::Result<()> {
+    atomic_write_impl(path, content, true)
+}
+
+fn atomic_write_impl(path: &Path, content: &[u8], private: bool) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("state.json");
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp = parent.join(format!(".{file_name}.tmp-{token}"));
+    let backup = parent.join(format!(".{file_name}.bak-{token}"));
+
+    let stage_result = (|| -> io::Result<()> {
+        // Stage with create_new (O_EXCL / CREATE_NEW) on both legs, not a
+        // truncate-open: the pid+nanos name makes collisions unreachable,
+        // so an existing entry at the staged path (a planted symlink, a
+        // leftover strand) must fail the open instead of being truncated
+        // through — the private leg must not be weaker than the plain one.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if private {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        Ok(())
+    })();
+    if let Err(error) = stage_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+
+    // Windows 状态机内部自带「目标不存在 → promote（单文件移动）」分支，
+    // POSIX 实现就是 rename，无需外层再区分首写/覆盖。
+    match replace_file_atomically(&tmp, path, &backup) {
+        Ok(ReplaceState::Committed) => {
+            let _ = std::fs::remove_file(&backup);
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+            Ok(())
+        }
+        Ok(state) => Err(io::Error::other(format!(
+            "unexpected successful replacement state: {state:?}"
+        ))),
+        Err(error) => {
+            // RolledBack：布局已收敛回旧内容，tmp/backup 是残留垃圾；
+            // RecoveryRequired 且目标路径仍被占用（如目录占位）：恢复永无
+            // 可能，同样是垃圾；目标真正丢失的 RecoveryRequired 保留候选，
+            // 供恢复流程 promote——这正是不能无条件清理的原因。
+            if error.state() == ReplaceState::RolledBack
+                || (error.state() == ReplaceState::RecoveryRequired && path.exists())
+            {
+                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&backup);
+            }
+            Err(error.into_io_error())
+        }
+    }
+}
+
+/// 以 0600 权限创建（或截断）文件：写入含明文密钥的 CLI 配置时**直接**以
+/// 0600 创建，避免「先按默认 umask 0644 写、再收紧」的暴露窗口（复审低危 4）；
+/// Windows 无 POSIX 权限概念，忽略权限位。
+pub(crate) fn create_secret_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// `path` 的 POSIX 权限位（低 9 位）；无 POSIX 模式概念的平台返回 `None`
+/// （隐私由用户目录 ACL 表达）。供 feature 层断言敏感文件权限使用：
+/// `cfg(unix)` 留在本层，feature 层保持无条件编译
+/// （architecture-guard: rust_target_cfg_outside_adapter）。
+pub(crate) fn permission_bits(path: &Path) -> io::Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        Ok(Some(std::fs::metadata(path)?.permissions().mode() & 0o777))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+/// A file's stable identity (device/inode); `None` on platforms without a
+/// portable equivalent, where callers must fall back to the weaker change
+/// signal (length + mtime). An atomic rename always changes the inode, so
+/// identity can distinguish "a different write of identical length at the
+/// same instant". Same reasoning as [`permission_bits`]: the `cfg(unix)`
+/// stays in this layer and the feature layer stays unconditionally compiled
+/// (architecture-guard: rust_target_cfg_outside_adapter).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+/// Extract the identity from already-fetched metadata (reuses the same
+/// stat; adds no extra syscall).
+pub(crate) fn metadata_file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
+/// Open a private append-only data file without introducing a world-readable
+/// creation window on Unix. `mode(0o600)` only applies at creation — an
+/// existing file left loose by an earlier revision or external tooling would
+/// stay group/world-readable forever, so re-tighten the mode on every open
+/// (round-6 review). Windows relies on the owning profile directory's
+/// ACL, consistent with the rest of the application data tree.
+pub(crate) fn open_private_append_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+/// Open a cross-process lock file (an fd-lock flock/LockFileEx target) for
+/// read-modify-write serialization. The file holds no user data, but
+/// private-by-default is the home's convention: created 0600 on Unix and
+/// re-tightened only when the mode has drifted (a stat is cheaper than the
+/// ctime-dirtying chmod on hot read paths). On Unix the open is hardened
+/// against a planted or swapped path: `O_NOFOLLOW` refuses a symlink (a
+/// swapped symlink could otherwise point the 0600 tighten — or the flock —
+/// at an unrelated target, or split the exclusion across two inodes), and
+/// `O_NONBLOCK` keeps a planted FIFO from blocking the `open` itself (the
+/// callers' bounded try-lock funnel cannot bound a syscall below it). A
+/// planted FIFO that survives both is not refused, and the outcome is
+/// platform-split: on macOS flock on it fails with `EOPNOTSUPP` (verified
+/// empirically), so writes refuse and reads degrade — the accepted
+/// fail-closed directions; where flock does succeed (Linux), all peers
+/// opening the same path exclude on the same inode, so exclusion still
+/// holds — the file just is not the regular lock file. A planted
+/// HARDLINK is likewise not refused (flock still excludes on the shared
+/// inode), but the stat-gated tighten then re-modes the linked victim's
+/// inode — disclosed, accepted for a private home.
+/// Deleting or replacing the file while a peer holds the lock splits
+/// exclusion across two inodes on BOTH platforms (Unix unlink is always
+/// possible; Windows opens the handle with the default share mode, which
+/// includes FILE_SHARE_DELETE) — do not delete the lock file while other
+/// Pinvou processes may be running. Cross-user protection on Windows relies
+/// on the owning profile directory's ACL, consistent with the rest of the
+/// application data tree.
+pub(crate) fn open_private_lock_file(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Stat-gated so the steady state pays one fstat and no chmod. Caveat
+        // (undocumented filesystem classes): on mounts where mode bits do not
+        // stick (some FAT/network/WSL drvfs mounts), every acquisition keeps
+        // seeing !=0600 and pays the fchmod — noisy but harmless; if chmod
+        // errors outright, writes refuse and reads degrade, which is the
+        // accepted fail-closed direction.
+        let needs_tighten = match file.metadata() {
+            Ok(meta) => meta.permissions().mode() & 0o777 != 0o600,
+            Err(_) => true,
+        };
+        if needs_tighten {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    // Name the file and the recovery: every marketplace write
+                    // refuses while this fails, and the lock file holds no
+                    // user data. Advice is rename-aside, not deletion:
+                    // deleting the file while a peer holds the flock splits
+                    // exclusion across two inodes — the lost update the lock
+                    // exists to prevent.
+                    std::io::Error::other(format!(
+                        "tighten {} to 0600: {error} (fix the file's permissions, or rename it aside while no other Pinvou process is running; it holds no data)",
+                        path.display()
+                    ))
+                })?;
+        }
+    }
+    Ok(file)
+}
+
+/// Open a private-home DATA file for reading, hardened the same way
+/// [`open_private_lock_file`] hardens the lock file: on
+/// Unix the open carries `O_NOFOLLOW` (a planted symlink at the data path
+/// must fail the read rather than drag a hot reader into whatever the link
+/// points at) and `O_NONBLOCK` (a planted FIFO must not block the `open`);
+/// on Windows the open pins the full share mode so a concurrent writer's
+/// atomic rename-replace (`MoveFileEx` persist) is never blocked by this
+/// reader. The post-open gate is platform-general: it refuses anything that is not a
+/// regular file (a FIFO or device node would otherwise feed the reader
+/// forever — `/dev/zero` is an unbounded read) plus anything larger than the
+/// caller's size bound ([`MAX_PRIVATE_DATA_READ_BYTES`] for the state-file
+/// family). The open-time size check is the fail-fast half: it refuses at
+/// one `stat` before any read; `read_capped` below closes the
+/// append-after-gate window and bounds the allocation either way.
+/// Unlike the lock file this is read-intent: no create, no mode tightening.
+///
+/// Cohort note: a state file that is itself a symlink —
+/// a dotfile manager pointing it at a synced store — previously read
+/// through the link and now refuses (`ELOOP`): `disabled_bundles.json`
+/// recovers fail-closed (all packs off), `mcp.json` reads as unparseable
+/// and boot keeps its writers off. Deliberate: the planted-link threat
+/// model cannot distinguish a hostile link from a managed one; roaming the
+/// state via symlinks should point `PINVOU3_HOME` at the real location
+/// instead. Windows has no `O_NOFOLLOW` equivalent; the same documented
+/// residual applies (profile-directory ACL reliance, consistent with the
+/// rest of the application data tree).
+///
+/// The state-file callers use the default cap; with a caller-chosen size
+/// bound, the marketplace same-content comparison reads landed package
+/// payloads whose legitimate size is the import package budget, not the
+/// state-file cap — bounding the disk read below what the importer accepts
+/// would make an identical re-import of a large package report conflicting
+/// content.
+fn open_private_data_file_within(path: &Path, max_bytes: u64) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Pinned by name rather than relying on callers knowing std's
+        // default: a missing `FILE_SHARE_DELETE` would turn a read in
+        // flight during a peer's locked persist into a sharing violation
+        // and a spurious refusal of that write after its retry budget.
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    }
+    let file = options.open(path)?;
+    let metadata = refuse_non_regular_file(&file, path)?;
+    if metadata.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} exceeds the read cap ({max_bytes} bytes); rename it aside if it is yours",
+                path.display()
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Shared post-open gate of the hardened private-data primitives: a handle
+/// that is not a regular file (a planted FIFO or device node) is refused
+/// before any byte is read or written. On success it returns the handle's
+/// metadata so a caller needing size or mode does not re-fstat the same fd.
+fn refuse_non_regular_file(file: &std::fs::File, path: &Path) -> io::Result<std::fs::Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Upper bound for one private-state data read. The regular-file gate
+/// exists because `/dev/zero` is an unbounded read; a planted huge REGULAR
+/// file is the same shape (a full allocation per read on hot per-turn
+/// paths). Generous against every legitimate consumer — the family reads
+/// JSON state files, markers, and SKILL.md-sized bundle assets, nothing
+/// near this bound.
+const MAX_PRIVATE_DATA_READ_BYTES: u64 = 16 * 1024 * 1024;
+
+/// UTF-8 variant of [`read_private_data_file_bytes`]: an invalid-UTF-8
+/// refusal keeps `ErrorKind::InvalidData` (the message text comes from
+/// `FromUtf8Error` instead of std's stream text), so kind-matched callers
+/// are unaffected.
+pub(crate) fn read_private_data_file(path: &Path) -> io::Result<String> {
+    read_private_data_file_bytes(path).and_then(|bytes| {
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    })
+}
+
+/// [`read_private_data_file`] for raw bytes: the salvage read that preserves
+/// a corrupt store's bytes before quarantine. The whole hardening is
+/// [`open_private_data_file_within`]'s; this body adds only the read, bounded
+/// by [`read_capped`] so a file appended past the cap after the open-time
+/// gate is refused too.
+pub(crate) fn read_private_data_file_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    read_private_data_file_bytes_within(path, MAX_PRIVATE_DATA_READ_BYTES)
+}
+
+/// [`read_private_data_file_bytes`] with a caller-chosen size bound: the
+/// marketplace same-content comparison reads landed package payloads whose
+/// legitimate size is the import package budget, not the state-file cap —
+/// a disk-side cap below what the importer accepts makes an identical
+/// re-import of a large package report conflicting content.
+/// Every other hardening (no-follow, non-blocking, Windows share mode,
+/// regular-file gate, the bound enforced again past the gate) is the
+/// shared primitive's, unchanged.
+pub(crate) fn read_private_data_file_bytes_within(
+    path: &Path,
+    max_bytes: u64,
+) -> io::Result<Vec<u8>> {
+    let mut file = open_private_data_file_within(path, max_bytes)?;
+    read_capped(&mut file, max_bytes)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+/// One bounded read: at most `cap` bytes, with a one-byte overshoot window
+/// so the overflow arm can distinguish "exactly cap" from "cap or more".
+/// The metadata gate in [`open_private_data_file_within`] bounds the read at open
+/// time only — a concurrent appender can grow the file between the gate and
+/// EOF (the fd pins the inode, so no swap is needed), and the former
+/// unbounded `read_to_end` would have read and allocated it whole.
+fn read_capped<R: std::io::Read>(reader: &mut R, cap: u64) -> io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("exceeds the read cap ({cap} bytes)"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Hardened CREATE+WRITE for private-home state files whose bytes are
+/// liveness/crash-recovery signals (the landing journal mark): the write runs
+/// under a cross-process lock, so a planted FIFO or symlink at the path must
+/// refuse, not block the lock holder's `open` (same trust
+/// surface and same consequence as the hardened reads above). Same Unix
+/// hardening as [`open_private_data_file_within`], plus create/truncate at 0600;
+/// the fstat gate runs BEFORE any byte is written, so a non-regular inode is
+/// refused untouched. Windows keeps plain create+write (no `O_NOFOLLOW`
+/// equivalent; the documented profile-ACL residual applies).
+pub(crate) fn write_private_data_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        let metadata = refuse_non_regular_file(&file, path)?;
+        // Re-tighten a drifted mode like the lock
+        // file open does — a landing mark written by main's std::fs::write
+        // (0644) otherwise stayed world-readable forever. Stat-gated: the
+        // steady state pays one fstat and no chmod; a chmod failure refuses
+        // the write, the accepted fail-closed direction (the caller degrades
+        // loudly — e.g. the landing mark to live-by-absence with its warn).
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    use std::io::Write as _;
+    file.write_all(bytes)
+}
+
+/// The plain shared open scaffold for cross-process lock files:
+/// `create_dir_all(parent)` + open read+write, created but never truncated
+/// (`truncate(false)` — the lock files hold no data and are never deleted;
+/// a leftover empty file must not block the next acquirer). Callers apply
+/// their own acquire policy on the returned handle (blocking `lock`,
+/// `try_lock`, bounded retry) and their own error contexts.
+///
+/// 0600 posture (mirrors the settings-lock copies:
+/// `prefs::open_settings_lock_file` and the CLI's `open_family_lock_file`):
+/// these lock files are never deleted, so a file created at the umask
+/// default (0644) stays world-readable forever, and flock needs only READ
+/// permission — on a shared/group home any low-privilege account could then
+/// hold the lock and wedge every writer behind it. A FRESH create is
+/// therefore private from the first instant (`.mode(0o600)`; the umask can
+/// only strip bits owner-only mode does not have), and every open
+/// best-effort re-tightens to 0600 so a pre-existing 0644 file from an
+/// older build heals the next time a lock is taken. The tighten is
+/// best-effort (not [`open_private_lock_file`]'s fail-closed one) for the
+/// same reason the settings-lock copies give: the lock stays usable either
+/// way (flock needs no write permission), so a failing chmod must not fail
+/// the consumer's lock acquisition.
+///
+/// Still deliberately NOT [`open_private_lock_file`]: what remains
+/// unshared is that function's open hardening (O_NOFOLLOW/O_NONBLOCK and
+/// the fail-closed tighten) — it guards opens on paths a third party could
+/// plant or swap, while these consumers open a lock file inside a directory
+/// this scaffold itself just created. Only the permission posture is shared;
+/// switching the open semantics wholesale would still be a behavior change
+/// for the existing consumers, not a refactor.
+pub(crate) fn open_lock_file_with_dirs(path: &Path) -> io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path);
+    let file = opened?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
+}
+
+#[derive(Clone)]
+pub(crate) struct RealDirectoryIdentity {
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    canonical_path: PathBuf,
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    device: u64,
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+/// A private directory whose concrete filesystem object stays stable for
+/// relative file operations. macOS and 64-bit Linux anchor operations to an
+/// open directory fd; Windows holds non-delete-shared handles for every
+/// canonical path component. Other targets reject this capability.
+pub(crate) struct PrivateFileDirectory {
+    #[cfg(windows)]
+    canonical_path: PathBuf,
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    directory_handle: File,
+    #[cfg(windows)]
+    _component_handles: Vec<File>,
+}
+
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+pub(crate) fn open_private_file_directory(path: &Path) -> io::Result<PrivateFileDirectory> {
+    let expected = ensure_private_real_directory(path)?;
+    let directory = open_private_file_directory_impl(expected)?;
+    directory.enforce_private_permissions()?;
+    Ok(directory)
+}
+
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+pub(crate) fn open_existing_private_file_directory(
+    path: &Path,
+) -> io::Result<Option<PrivateFileDirectory>> {
+    let expected = match real_directory_identity(path) {
+        Ok(expected) => expected,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let directory = open_private_file_directory_impl(expected)?;
+    directory.enforce_private_permissions()?;
+    Ok(Some(directory))
+}
+
+fn private_file_parent_and_name(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no parent"))?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file has no filename")
+    })?;
+    Ok((parent, name))
+}
+
+/// Read a regular private file without following the final component or a
+/// replaced parent directory. The directory handle remains pinned until the
+/// complete file body has been read.
+pub(crate) fn read_private_file_anchored(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let (parent, name) = private_file_parent_and_name(path)?;
+    let Some(directory) = open_existing_private_file_directory(parent)? else {
+        return Ok(None);
+    };
+    let Some(mut file) = directory.open_plain_file(name)? else {
+        return Ok(None);
+    };
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    Ok(Some(content))
+}
+
+/// Atomically replace a private file relative to a pinned directory object.
+/// Creating or renaming the visible parent path cannot redirect this write.
+pub(crate) fn atomic_write_private_anchored(path: &Path, content: &[u8]) -> io::Result<()> {
+    let (parent, name) = private_file_parent_and_name(path)?;
+    open_private_file_directory(parent)?.atomic_write_private_file(name, content)
+}
+
+/// Remove a regular private file relative to a pinned directory object. A
+/// missing directory or file is idempotent success (`false`).
+pub(crate) fn remove_private_file_anchored(path: &Path) -> io::Result<bool> {
+    let (parent, name) = private_file_parent_and_name(path)?;
+    let Some(directory) = open_existing_private_file_directory(parent)? else {
+        return Ok(false);
+    };
+    directory.remove_plain_file(name)
+}
+
+// unsupported-private-file-directory:start
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+)))]
+fn private_file_directory_unsupported<T>() -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private snapshot directory is unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+)))]
+pub(crate) fn open_private_file_directory(_path: &Path) -> io::Result<PrivateFileDirectory> {
+    private_file_directory_unsupported()
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+)))]
+pub(crate) fn open_existing_private_file_directory(
+    _path: &Path,
+) -> io::Result<Option<PrivateFileDirectory>> {
+    private_file_directory_unsupported()
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+)))]
+fn ensure_private_real_directory(_path: &Path) -> io::Result<RealDirectoryIdentity> {
+    private_file_directory_unsupported()
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+)))]
+impl PrivateFileDirectory {
+    pub(crate) fn entry_names(&self) -> io::Result<Vec<std::ffi::OsString>> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn entry_names_up_to(&self, _limit: usize) -> io::Result<Vec<std::ffi::OsString>> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn open_append_file(&self, _name: &std::ffi::OsStr) -> io::Result<File> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn create_delete_on_close_file(&self, _name: &str) -> io::Result<File> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn remove_plain_file(&self, _name: &std::ffi::OsStr) -> io::Result<bool> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<Metadata> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn open_child_directory(
+        &self,
+        _name: &std::ffi::OsStr,
+    ) -> io::Result<PrivateFileDirectory> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn create_private_child_directory(
+        &self,
+        _name: &std::ffi::OsStr,
+    ) -> io::Result<PrivateFileDirectory> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn open_plain_file(&self, _name: &std::ffi::OsStr) -> io::Result<Option<File>> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn atomic_write_private_file(
+        &self,
+        _name: &std::ffi::OsStr,
+        _content: &[u8],
+    ) -> io::Result<()> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn move_plain_file_to(
+        &self,
+        _source_name: &std::ffi::OsStr,
+        _destination: &PrivateFileDirectory,
+        _destination_name: &std::ffi::OsStr,
+    ) -> io::Result<MovePlainFileOutcome> {
+        private_file_directory_unsupported()
+    }
+
+    pub(crate) fn remove_empty_child_directory(&self, _name: &std::ffi::OsStr) -> io::Result<bool> {
+        private_file_directory_unsupported()
+    }
+}
+// unsupported-private-file-directory:end
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn open_private_file_directory_impl(
+    expected: RealDirectoryIdentity,
+) -> io::Result<PrivateFileDirectory> {
+    use std::os::fd::{FromRawFd as _, RawFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let path = std::ffi::CString::new(expected.canonical_path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "directory path contains NUL"))?;
+    // SAFETY: path is a CString, NUL terminated with a lifetime covering the call;
+    // O_NOFOLLOW|O_DIRECTORY guarantees no symlink following and accepts directories
+    // only, and a -1 failure is converted to io::Error below.
+    let fd: RawFd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is verified non-negative, an owning fd just returned by open and
+    // not yet adopted; from_raw_fd hands sole ownership to File, whose Drop is
+    // responsible for closing it.
+    let directory_handle = unsafe { File::from_raw_fd(fd) };
+    let metadata = directory_handle.metadata()?;
+    if !metadata.is_dir() || metadata.dev() != expected.device || metadata.ino() != expected.inode {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private directory changed while acquiring its stable handle",
+        ));
+    }
+    Ok(PrivateFileDirectory { directory_handle })
+}
+
+#[cfg(windows)]
+fn open_private_file_directory_impl(
+    expected: RealDirectoryIdentity,
+) -> io::Result<PrivateFileDirectory> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut current = PathBuf::new();
+    let mut handles = Vec::new();
+    for component in expected.canonical_path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => current.push(Path::new(r"\")),
+            std::path::Component::Normal(name) => {
+                current.push(name);
+                let mut options = std::fs::OpenOptions::new();
+                options
+                    .read(true)
+                    // Omitting FILE_SHARE_DELETE keeps the canonical chain
+                    // from being renamed or replaced while path-based Win32
+                    // leaf creation/enumeration is in progress.
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+                let handle = options.open(&current)?;
+                let metadata = handle.metadata()?;
+                if !metadata_is_real_directory(&metadata) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "private directory chain contains a reparse point: {}",
+                            current.display()
+                        ),
+                    ));
+                }
+                handles.push(handle);
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "private directory path must be normalized",
+                ));
+            }
+        }
+    }
+    let final_handle = handles.last().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private directory cannot be a volume root",
+        )
+    })?;
+    let (volume_serial_number, file_index) = windows_file_identity(final_handle)?;
+    if volume_serial_number != expected.volume_serial_number || file_index != expected.file_index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private directory changed while acquiring its stable handles",
+        ));
+    }
+    Ok(PrivateFileDirectory {
+        canonical_path: expected.canonical_path,
+        _component_handles: handles,
+    })
+}
+
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+impl PrivateFileDirectory {
+    fn enforce_private_permissions(&self) -> io::Result<()> {
+        #[cfg(any(
+            target_os = "macos",
+            all(target_os = "linux", target_pointer_width = "64")
+        ))]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let metadata = self.directory_handle.metadata()?;
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                self.directory_handle
+                    .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn entry_names(&self) -> io::Result<Vec<std::ffi::OsString>> {
+        entry_names_impl(self, usize::MAX)
+    }
+
+    /// Bound enumeration before allocating names; callers can drain in batches.
+    pub(crate) fn entry_names_up_to(&self, limit: usize) -> io::Result<Vec<std::ffi::OsString>> {
+        entry_names_impl(self, limit)
+    }
+
+    pub(crate) fn open_append_file(&self, name: &std::ffi::OsStr) -> io::Result<File> {
+        validate_private_file_name(name)?;
+        open_append_file_impl(self, name)
+    }
+
+    /// Create a private read/write file and immediately remove its directory
+    /// entry (Unix) or mark the exact file handle delete-pending (Windows).
+    /// The returned handle is therefore the sole authority for its lifetime.
+    pub(crate) fn create_delete_on_close_file(&self, name: &str) -> io::Result<File> {
+        validate_private_file_name(std::ffi::OsStr::new(name))?;
+        create_delete_on_close_file_impl(self, name)
+    }
+
+    pub(crate) fn remove_plain_file(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
+        validate_private_file_name(name)?;
+        remove_plain_file_impl(self, name)
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        directory_metadata_impl(self)
+    }
+
+    pub(crate) fn open_child_directory(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<PrivateFileDirectory> {
+        validate_private_file_name(name)?;
+        open_child_directory_impl(self, name)
+    }
+
+    pub(crate) fn create_private_child_directory(
+        &self,
+        name: &std::ffi::OsStr,
+    ) -> io::Result<PrivateFileDirectory> {
+        validate_private_file_name(name)?;
+        create_private_child_directory_impl(self, name)
+    }
+
+    pub(crate) fn open_plain_file(&self, name: &std::ffi::OsStr) -> io::Result<Option<File>> {
+        validate_private_file_name(name)?;
+        open_plain_file_impl(self, name)
+    }
+
+    /// Atomically replace one private regular file relative to this pinned
+    /// directory. The temporary file and final rename never re-resolve the
+    /// directory path, so replacing the visible root cannot redirect the write.
+    pub(crate) fn atomic_write_private_file(
+        &self,
+        name: &std::ffi::OsStr,
+        content: &[u8],
+    ) -> io::Result<()> {
+        validate_private_file_name(name)?;
+        atomic_write_private_file_impl(self, name, content)
+    }
+
+    pub(crate) fn move_plain_file_to(
+        &self,
+        source_name: &std::ffi::OsStr,
+        destination: &PrivateFileDirectory,
+        destination_name: &std::ffi::OsStr,
+    ) -> io::Result<MovePlainFileOutcome> {
+        validate_private_file_name(source_name)?;
+        validate_private_file_name(destination_name)?;
+        move_plain_file_to_impl(self, source_name, destination, destination_name)
+    }
+
+    pub(crate) fn remove_empty_child_directory(&self, name: &std::ffi::OsStr) -> io::Result<bool> {
+        validate_private_file_name(name)?;
+        remove_empty_child_directory_impl(self, name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MovePlainFileOutcome {
+    Missing,
+    AlreadyMoved,
+    Moved,
+}
+
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn validate_private_file_name(name: &std::ffi::OsStr) -> io::Result<()> {
+    let path = Path::new(name);
+    if path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+        || path.file_name() != Some(name)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private file name must be one normal path component",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn directory_metadata_impl(directory: &PrivateFileDirectory) -> io::Result<std::fs::Metadata> {
+    directory.directory_handle.metadata()
+}
+
+#[cfg(windows)]
+fn directory_metadata_impl(directory: &PrivateFileDirectory) -> io::Result<std::fs::Metadata> {
+    directory
+        ._component_handles
+        .last()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no handle"))?
+        .metadata()
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn open_child_directory_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<PrivateFileDirectory> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = unix_name(name)?;
+    // SAFETY: directory_handle is an open, owned fd whose lifetime covers the
+    // call; name is a CString, NUL terminated and alive for the call;
+    // O_NOFOLLOW|O_DIRECTORY rejects symlinks and non-directories, and a -1
+    // failure is converted to io::Error below.
+    let fd = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let child = PrivateFileDirectory {
+        // SAFETY: fd is verified non-negative, an owning fd just returned by
+        // openat and not yet adopted; from_raw_fd hands sole ownership to File,
+        // whose Drop is responsible for closing it.
+        directory_handle: unsafe { File::from_raw_fd(fd) },
+    };
+    child.enforce_private_permissions()?;
+    Ok(child)
+}
+
+#[cfg(windows)]
+fn open_child_directory_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<PrivateFileDirectory> {
+    let path = directory.canonical_path.join(name);
+    open_existing_private_file_directory(&path)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("private child directory is missing: {}", path.display()),
+        )
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn create_private_child_directory_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<PrivateFileDirectory> {
+    use std::os::fd::AsRawFd as _;
+
+    let name_c = unix_name(name)?;
+    // SAFETY: directory_handle is an open, owned fd whose lifetime covers the
+    // call; name_c is a CString, NUL terminated and alive for the call; the
+    // 0o700 mode is a plain value, and a nonzero failure is converted to
+    // io::Error via errno below, with AlreadyExists tolerated.
+    if unsafe {
+        libc::mkdirat(
+            directory.directory_handle.as_raw_fd(),
+            name_c.as_ptr(),
+            0o700 as libc::ModeT,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    }
+    open_child_directory_impl(directory, name)
+}
+
+#[cfg(windows)]
+fn create_private_child_directory_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<PrivateFileDirectory> {
+    let path = directory.canonical_path.join(name);
+    match std::fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    open_child_directory_impl(directory, name)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn open_plain_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<Option<File>> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = unix_name(name)?;
+    // SAFETY: directory_handle is an open, owned fd whose lifetime covers the
+    // call; name is a CString, NUL terminated and alive for the call;
+    // O_NOFOLLOW rejects symlinks, and a -1 failure is converted to io::Error
+    // below, with NotFound mapped to None.
+    let fd = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: fd is verified non-negative, an owning fd just returned by openat
+    // and not yet adopted; from_raw_fd hands sole ownership to File, whose Drop
+    // is responsible for closing it.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !unix_named_file_matches(directory, &name, &file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private entry is not one stable regular file",
+        ));
+    }
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
+fn open_plain_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<Option<File>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_GENERIC_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match options.open(directory.canonical_path.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata_is_plain_file(&file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private entry is a reparse point or non-file",
+        ));
+    }
+    Ok(Some(file))
+}
+
+fn private_atomic_temp_name() -> std::ffi::OsString {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        ".pinvou-private-write-{}-{timestamp}-{sequence}.tmp",
+        std::process::id()
+    )
+    .into()
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn atomic_write_private_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+    content: &[u8],
+) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let destination = unix_name(name)?;
+    let (temporary_name, mut temporary_file) = loop {
+        let temporary_name = private_atomic_temp_name();
+        let temporary_name_c = unix_name(&temporary_name)?;
+        // SAFETY: directory_handle is an open, owned fd whose lifetime covers
+        // the call; temporary_name_c is a CString, NUL terminated and alive for
+        // the call; O_EXCL guarantees a fresh entry, the mode is passed as the
+        // C-variadic-promoted c_uint, and a -1 failure is converted to
+        // io::Error below, with AlreadyExists retried.
+        let fd = unsafe {
+            libc::openat(
+                directory.directory_handle.as_raw_fd(),
+                temporary_name_c.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                // C variadic arguments apply integer promotion. On macOS,
+                // mode_t is u16, so pass the promoted unsigned-int value.
+                0o600 as std::os::raw::c_uint,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: fd is verified non-negative, an owning fd just returned
+            // by openat and not yet adopted; from_raw_fd hands sole ownership
+            // to File, whose Drop is responsible for closing it.
+            break (temporary_name, unsafe { File::from_raw_fd(fd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+    };
+    let temporary_name_c = unix_name(&temporary_name)?;
+    // SAFETY: directory_handle is an open, owned fd whose lifetime covers the
+    // call, and temporary_name_c is a CString, NUL terminated and alive for
+    // the call; the removal target is the temporary entry created above, and
+    // any failure is ignored (best-effort cleanup).
+    let cleanup_temporary = || unsafe {
+        libc::unlinkat(
+            directory.directory_handle.as_raw_fd(),
+            temporary_name_c.as_ptr(),
+            0,
+        )
+    };
+    if let Err(error) = temporary_file
+        .write_all(content)
+        .and_then(|()| temporary_file.sync_all())
+    {
+        drop(temporary_file);
+        cleanup_temporary();
+        return Err(error);
+    }
+    // SAFETY: directory_handle is an open, owned fd whose lifetime covers the
+    // call (used for both sides of the rename); temporary_name_c and
+    // destination are CStrings, NUL terminated and alive for the call; a
+    // nonzero failure is converted to io::Error via errno below.
+    if unsafe {
+        libc::renameat(
+            directory.directory_handle.as_raw_fd(),
+            temporary_name_c.as_ptr(),
+            directory.directory_handle.as_raw_fd(),
+            destination.as_ptr(),
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        drop(temporary_file);
+        cleanup_temporary();
+        return Err(error);
+    }
+    directory.directory_handle.sync_all()
+}
+
+#[cfg(windows)]
+// windows-private-handle-relative-rename:start
+/// Rename an already-open file relative to an already-open directory.
+///
+/// `SetFileInformationByHandle` with `FileRenameInfo` rejects a non-null
+/// `RootDirectory` with `ERROR_INVALID_PARAMETER` on supported Windows hosts.
+/// Its absolute-path form would re-resolve the directory chain, so use the
+/// native file-information class that preserves the pinned-root contract.
+fn rename_windows_file_to_directory(
+    source_file: &File,
+    destination_handle: &File,
+    destination_name: &std::ffi::OsStr,
+    replace_if_exists: bool,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
+    };
+    use windows_sys::Win32::Foundation::RtlNtStatusToDosError;
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let destination_name_wide = destination_name.encode_wide().collect::<Vec<_>>();
+    let header_size = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
+    let name_size = destination_name_wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+    let buffer_size = header_size
+        .checked_add(name_size)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?
+        .max(std::mem::size_of::<FILE_RENAME_INFORMATION>());
+    let mut rename_buffer = vec![0_usize; buffer_size.div_ceil(std::mem::size_of::<usize>())];
+    let rename_info = rename_buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    // SAFETY: rename_buffer is a heap allocation of buffer_size bytes (at least
+    // size_of::<FILE_RENAME_INFORMATION>()), so rename_info is a valid,
+    // uniquely owned pointer for the header fields written below, and the
+    // trailing FileName flexible array has name_size bytes available, exactly
+    // the length copied out of destination_name_wide (buffer_size is
+    // header_size + name_size, rounded up to a usize multiple). source_file
+    // and destination_handle are open, owned handles whose lifetimes cover the
+    // call, io_status outlives it, and NtSetInformationFile reports failure via
+    // the returned NTSTATUS (checked below) rather than by writing beyond the
+    // supplied buffer_length.
+    let status = unsafe {
+        (*rename_info).Anonymous.ReplaceIfExists = replace_if_exists;
+        (*rename_info).RootDirectory = destination_handle.as_raw_handle();
+        (*rename_info).FileNameLength = u32::try_from(name_size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "filename is too long"))?;
+        std::ptr::copy_nonoverlapping(
+            destination_name_wide.as_ptr(),
+            (*rename_info).FileName.as_mut_ptr(),
+            destination_name_wide.len(),
+        );
+        NtSetInformationFile(
+            source_file.as_raw_handle(),
+            &mut io_status,
+            rename_info.cast(),
+            u32::try_from(buffer_size).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "rename buffer is too large")
+            })?,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        // SAFETY: status is the NTSTATUS returned by NtSetInformationFile above;
+        // RtlNtStatusToDosError takes the NTSTATUS by value, performs no memory
+        // access, and always returns a valid Win32 error code.
+        let windows_error = unsafe { RtlNtStatusToDosError(status) };
+        if let Ok(raw_error) = i32::try_from(windows_error) {
+            return Err(io::Error::from_raw_os_error(raw_error));
+        }
+        return Err(io::Error::other(format!(
+            "NtSetInformationFile failed with NTSTATUS {status:#010x}"
+        )));
+    }
+    Ok(())
+}
+// windows-private-handle-relative-rename:end
+
+#[cfg(windows)]
+fn atomic_write_private_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+    content: &[u8],
+) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let (temporary_name, mut temporary_file) = loop {
+        let temporary_name = private_atomic_temp_name();
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        match options.open(directory.canonical_path.join(&temporary_name)) {
+            Ok(file) => break (temporary_name, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    if !metadata_is_plain_file(&temporary_file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "created private temporary file is a reparse point or non-file",
+        ));
+    }
+    if let Err(error) = temporary_file
+        .write_all(content)
+        .and_then(|()| temporary_file.sync_all())
+    {
+        let _ = mark_windows_file_handle_for_deletion(&temporary_file);
+        return Err(error);
+    }
+
+    let expected = windows_file_identity(&temporary_file)?;
+    let destination_handle = directory
+        ._component_handles
+        .last()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "directory has no handle"))?;
+    if let Err(error) =
+        rename_windows_file_to_directory(&temporary_file, destination_handle, name, true)
+    {
+        let _ = mark_windows_file_handle_for_deletion(&temporary_file);
+        return Err(error);
+    }
+    let moved = directory
+        .open_plain_file(name)?
+        .ok_or_else(|| io::Error::other("atomically written private file is not visible"))?;
+    if expected != windows_file_identity(&moved)? {
+        return Err(io::Error::other(
+            "private file identity changed during anchored atomic write",
+        ));
+    }
+    drop(temporary_name);
+    Ok(())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn move_plain_file_to_impl(
+    source: &PrivateFileDirectory,
+    source_name: &std::ffi::OsStr,
+    destination: &PrivateFileDirectory,
+    destination_name: &std::ffi::OsStr,
+) -> io::Result<MovePlainFileOutcome> {
+    use std::os::fd::AsRawFd as _;
+
+    let source_file = source.open_plain_file(source_name)?;
+    let destination_file = destination.open_plain_file(destination_name)?;
+    match (source_file.as_ref(), destination_file.as_ref()) {
+        (None, None) => return Ok(MovePlainFileOutcome::Missing),
+        (None, Some(_)) => return Ok(MovePlainFileOutcome::AlreadyMoved),
+        (Some(_), Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "both source and destination private files exist",
+            ));
+        }
+        (Some(_), None) => {}
+    }
+    let source_name_c = unix_name(source_name)?;
+    let destination_name_c = unix_name(destination_name)?;
+    #[cfg(target_os = "linux")]
+    // SAFETY: source.directory_handle and destination.directory_handle are
+    // open, owned fds whose lifetimes cover the call; source_name_c and
+    // destination_name_c are CStrings, NUL terminated and alive for the call;
+    // RENAME_NOREPLACE prevents clobbering an existing destination, and a
+    // nonzero failure is converted to io::Error via errno below.
+    let rename_result = unsafe {
+        libc::renameat2(
+            source.directory_handle.as_raw_fd(),
+            source_name_c.as_ptr(),
+            destination.directory_handle.as_raw_fd(),
+            destination_name_c.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: source.directory_handle and destination.directory_handle are
+    // open, owned fds whose lifetimes cover the call; source_name_c and
+    // destination_name_c are CStrings, NUL terminated and alive for the call;
+    // RENAME_EXCL prevents clobbering an existing destination, and a nonzero
+    // failure is converted to io::Error via errno below.
+    let rename_result = unsafe {
+        libc::renameatx_np(
+            source.directory_handle.as_raw_fd(),
+            source_name_c.as_ptr(),
+            destination.directory_handle.as_raw_fd(),
+            destination_name_c.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rename_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let moved = destination
+        .open_plain_file(destination_name)?
+        .ok_or_else(|| io::Error::other("moved private file is not visible"))?;
+    // The match above returns early for every combination where source_file is
+    // None, so reaching this point implies Some; restructuring would only
+    // obscure that single fall-through case.
+    #[allow(clippy::expect_used)]
+    let source_file = source_file.expect("source file checked above");
+    use std::os::unix::fs::MetadataExt as _;
+    let expected = source_file.metadata()?;
+    let actual = moved.metadata()?;
+    if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        return Err(io::Error::other(
+            "private file identity changed during anchored rename",
+        ));
+    }
+    Ok(MovePlainFileOutcome::Moved)
+}
+
+#[cfg(windows)]
+fn move_plain_file_to_impl(
+    source: &PrivateFileDirectory,
+    source_name: &std::ffi::OsStr,
+    destination: &PrivateFileDirectory,
+    destination_name: &std::ffi::OsStr,
+) -> io::Result<MovePlainFileOutcome> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut source_options = std::fs::OpenOptions::new();
+    source_options
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let source_file = match source_options.open(source.canonical_path.join(source_name)) {
+        Ok(file) if metadata_is_plain_file(&file.metadata()?) => Some(file),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private source is a reparse point or non-file",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let destination_file = destination.open_plain_file(destination_name)?;
+    match (source_file.as_ref(), destination_file.as_ref()) {
+        (None, None) => return Ok(MovePlainFileOutcome::Missing),
+        (None, Some(_)) => return Ok(MovePlainFileOutcome::AlreadyMoved),
+        (Some(_), Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "both source and destination private files exist",
+            ));
+        }
+        (Some(_), None) => {}
+    }
+    // The match above returns early for every combination where source_file is
+    // None, so reaching this point implies Some; report it as an error instead
+    // of panicking, consistent with the rest of this function.
+    let source_file = source_file
+        .as_ref()
+        .ok_or_else(|| io::Error::other("source file checked above"))?;
+    let expected = windows_file_identity(source_file)?;
+    let destination_handle = destination
+        ._component_handles
+        .last()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no handle"))?;
+    rename_windows_file_to_directory(source_file, destination_handle, destination_name, false)?;
+    let moved = destination
+        .open_plain_file(destination_name)?
+        .ok_or_else(|| io::Error::other("moved private file is not visible"))?;
+    if expected != windows_file_identity(&moved)? {
+        return Err(io::Error::other(
+            "private file identity changed during anchored rename",
+        ));
+    }
+    Ok(MovePlainFileOutcome::Moved)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn remove_empty_child_directory_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = unix_name(name)?;
+    // SAFETY: directory_handle is an open, owned fd whose lifetime covers the
+    // call; name is a CString, NUL terminated and alive for the call;
+    // AT_REMOVEDIR restricts removal to directories, and a nonzero failure is
+    // converted to io::Error via errno below, with NotFound mapped to false.
+    if unsafe {
+        libc::unlinkat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::AT_REMOVEDIR,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn remove_empty_child_directory_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match options.open(directory.canonical_path.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata_is_real_directory(&file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private child is a reparse point or non-directory",
+        ));
+    }
+    mark_windows_file_handle_for_deletion(&file)?;
+    drop(file);
+    Ok(true)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+struct UnixDirectoryStream(*mut libc::DIR);
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+impl Drop for UnixDirectoryStream {
+    fn drop(&mut self) {
+        // SAFETY: self.0 can only come from a successful fdopendir (see
+        // entry_names_impl) and is exclusively owned by UnixDirectoryStream after
+        // construction; closedir frees it exactly once (together with the fd it
+        // adopted internally), and it is not accessed after drop.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn next_unix_directory_entry_with<ClearErrno, ReadEntry, ReadErrno>(
+    clear_errno: ClearErrno,
+    read_entry: ReadEntry,
+    read_errno: ReadErrno,
+) -> io::Result<Option<std::ffi::OsString>>
+where
+    ClearErrno: FnOnce(),
+    ReadEntry: FnOnce() -> Option<std::ffi::OsString>,
+    ReadErrno: FnOnce() -> i32,
+{
+    clear_errno();
+    match read_entry() {
+        Some(name) => Ok(Some(name)),
+        None => match read_errno() {
+            0 => Ok(None),
+            errno => Err(io::Error::from_raw_os_error(errno)),
+        },
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn next_unix_directory_entry(
+    stream: &UnixDirectoryStream,
+) -> io::Result<Option<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    next_unix_directory_entry_with(
+        // SAFETY: errno_location() returns a valid writable address of errno in
+        // this thread's TLS; zero it to distinguish whether readdir returning NULL
+        // means EOF or an error.
+        || unsafe { *libc::errno_location() = 0 },
+        || {
+            // SAFETY: stream.0 comes from a successful fdopendir and is exclusively
+            // owned by UnixDirectoryStream, with no concurrent readdir inside this
+            // closure; the returned dirent pointer is valid only until the next
+            // readdir/closedir, and d_name is read immediately below, not held
+            // across calls.
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                None
+            } else {
+                // SAFETY: entry is non-NULL and readdir has not been called again;
+                // the kernel guarantees d_name is NUL terminated and within array
+                // bounds, and CStr::from_ptr reads only up to that terminator.
+                let bytes =
+                    unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                Some(std::ffi::OsString::from_vec(bytes.to_vec()))
+            }
+        },
+        // SAFETY: errno_location() points at this thread's errno, zeroed by the
+        // earlier closure, so a non-zero value is readdir's real error code.
+        || unsafe { *libc::errno_location() },
+    )
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn entry_names_impl(
+    directory: &PrivateFileDirectory,
+    limit: usize,
+) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::os::fd::AsRawFd as _;
+
+    // The literal "." contains no NUL, so the CString construction cannot fail;
+    // propagate the error as a fallback instead of panicking.
+    let current = std::ffi::CString::new(".")
+        .map_err(|e| std::io::Error::other(format!("failed to build directory literal: {e}")))?;
+    // SAFETY: directory_handle holds a live directory fd; current is the CString of
+    // the literal ".", NUL terminated with a lifetime covering the call; a -1
+    // failure is converted to io::Error below.
+    let duplicate = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            current.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if duplicate < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: duplicate is verified non-negative, freshly duplicated for this
+    // purpose and not yet adopted; POSIX defines fdopendir as taking exclusive
+    // ownership of the fd on success (closedir releases it), while on failure the
+    // fd still belongs to the caller.
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed without adopting duplicate, so the fd still
+        // belongs to this function; close it exactly once to avoid a leak, and the
+        // return value has no further recovery action and may be ignored.
+        unsafe { libc::close(duplicate) };
+        return Err(error);
+    }
+    let stream = UnixDirectoryStream(stream);
+    let mut names = Vec::new();
+    while names.len() < limit {
+        let Some(name) = next_unix_directory_entry(&stream)? else {
+            break;
+        };
+        if name != "." && name != ".." {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(windows)]
+fn entry_names_impl(
+    directory: &PrivateFileDirectory,
+    limit: usize,
+) -> io::Result<Vec<std::ffi::OsString>> {
+    std::fs::read_dir(&directory.canonical_path)?
+        .take(limit)
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn unix_name(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private file name contains NUL",
+        )
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn unix_named_file_matches(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::CString,
+    file: &File,
+) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    // SAFETY: directory_handle holds a live directory fd; name is a CString, NUL
+    // terminated with a lifetime covering the call; O_NOFOLLOW|O_NONBLOCK guarantees
+    // no link following and no blocking when opening a FIFO; failure returns -1.
+    let named_fd = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if named_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: named_fd is verified non-negative and not yet adopted; from_raw_fd
+    // transfers sole ownership to File.
+    let named = unsafe { File::from_raw_fd(named_fd) }.metadata()?;
+    let opened = file.metadata()?;
+    Ok(opened.file_type().is_file()
+        && opened.nlink() == 1
+        && opened.dev() == named.dev()
+        && opened.ino() == named.ino())
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn create_delete_on_close_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &str,
+) -> io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = unix_name(std::ffi::OsStr::new(name))?;
+    // SAFETY: directory_handle holds a live directory fd; name is a CString, NUL
+    // terminated; O_CREAT|O_EXCL guarantees atomic creation with 0600 only when
+    // absent, never overwriting an existing entry, and O_NOFOLLOW rejects symlinks;
+    // failure returns -1.
+    let fd = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is verified non-negative and not yet adopted; from_raw_fd
+    // transfers sole ownership to File.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !unix_named_file_matches(directory, &name, &file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "created private file changed before unlink",
+        ));
+    }
+    // SAFETY: directory_handle holds a live directory fd; name is NUL terminated;
+    // flags=0 unlinks exactly this directory entry without following links; the
+    // previous line revalidated dev/ino/nlink against the just-created handle.
+    if unsafe { libc::unlinkat(directory.directory_handle.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn create_delete_on_close_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &str,
+) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let path = directory.canonical_path.join(name);
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = options.open(path)?;
+    if !metadata_is_plain_file(&file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "created private file is a reparse point or non-file",
+        ));
+    }
+    mark_windows_file_handle_for_deletion(&file)?;
+    Ok(file)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn remove_plain_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<bool> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = unix_name(name)?;
+    // SAFETY: directory_handle holds a live directory fd; name is a CString, NUL
+    // terminated; O_NOFOLLOW|O_NONBLOCK rejects symlinks and does not block when
+    // opening a FIFO; failure returns -1.
+    let fd = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: fd is verified non-negative and not yet adopted; from_raw_fd
+    // transfers sole ownership to File.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !unix_named_file_matches(directory, &name, &file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private entry is non-regular, multiply linked, or changed during removal",
+        ));
+    }
+    // SAFETY: directory_handle holds a live directory fd; name is NUL terminated;
+    // flags=0 unlinks exactly this directory entry without following links; the
+    // previous line revalidated that the target and the opened handle are the same
+    // plain file.
+    if unsafe { libc::unlinkat(directory.directory_handle.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn remove_plain_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match options.open(directory.canonical_path.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata_is_plain_file(&file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private entry is a reparse point or non-file",
+        ));
+    }
+    mark_windows_file_handle_for_deletion(&file)?;
+    drop(file);
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn mark_windows_file_handle_for_deletion(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: file is an open, owned handle whose lifetime covers the call;
+    // disposition is a stack value cast to a void pointer valid for
+    // size_of::<FILE_DISPOSITION_INFO>() bytes, which matches the
+    // FileDispositionInfo information class, and SetFileInformationByHandle
+    // reports failure via its BOOL return (checked below).
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Create an app-owned directory without a permissive Unix creation window,
+/// then reject symlink, junction, or other Windows reparse-point roots.
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn ensure_private_real_directory(path: &Path) -> io::Result<RealDirectoryIdentity> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let builder = private_directory_builder();
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    let identity = real_directory_identity(path)?;
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        let expected = std::fs::canonicalize(parent)?.join(name);
+        if identity.canonical_path != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "private directory resolves outside its app-owned parent: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(identity)
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn private_directory_builder() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+#[cfg(windows)]
+fn private_directory_builder() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
+}
+
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn real_directory_identity(path: &Path) -> io::Result<RealDirectoryIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata_is_real_directory(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path is not a real directory: {}", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    // Capture the identity from the original, non-following path before
+    // canonicalization. If the root is exchanged for a junction between these
+    // steps, the identity cannot accidentally describe the junction target and
+    // the stable component-chain acquisition below rejects the mismatch.
+    let (volume_serial_number, file_index) = windows_directory_identity(path)?;
+    let canonical_path = std::fs::canonicalize(path)?;
+    Ok(RealDirectoryIdentity {
+        canonical_path,
+        #[cfg(any(
+            target_os = "macos",
+            all(target_os = "linux", target_pointer_width = "64")
+        ))]
+        device: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.dev()
+        },
+        #[cfg(any(
+            target_os = "macos",
+            all(target_os = "linux", target_pointer_width = "64")
+        ))]
+        inode: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.ino()
+        },
+        #[cfg(windows)]
+        volume_serial_number,
+        #[cfg(windows)]
+        file_index,
+    })
+}
+
+#[cfg(windows)]
+fn windows_directory_identity(path: &Path) -> io::Result<(u32, u64)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let handle = options.open(path)?;
+    windows_file_identity(&handle)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: file is an open, owned handle whose lifetime covers the call, and
+    // information.as_mut_ptr() points at zeroed storage reserved for the full
+    // BY_HANDLE_FILE_INFORMATION struct that GetFileInformationByHandle fully
+    // overwrites on success; failure is reported via the zero return checked
+    // below, in which case the MaybeUninit is never read.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the call above succeeded, and a successful
+    // GetFileInformationByHandle fully initializes every field of
+    // BY_HANDLE_FILE_INFORMATION, a plain-data struct with no validity
+    // invariants beyond initialization.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+#[cfg(windows)]
+fn metadata_is_plain_file(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    use std::os::windows::fs::MetadataExt as _;
+    windows_attributes_are_not_reparse(metadata.file_attributes())
+}
+
+#[cfg(any(
+    windows,
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn metadata_is_real_directory(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        return windows_attributes_are_not_reparse(metadata.file_attributes());
+    }
+    #[cfg(not(windows))]
+    true
+}
+
+#[cfg(windows)]
+fn windows_attributes_are_not_reparse(attributes: u32) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(windows)]
+pub(crate) fn replace_file_atomically(tmp: &Path, target: &Path, backup: &Path) -> ReplaceResult {
+    replace_file_atomically_with(tmp, target, backup, system_replace_file)
+}
+
+#[cfg(windows)]
+fn system_replace_file(target: &Path, replacement: &Path, backup: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let target_wide = wide(target);
+    let tmp_wide = wide(replacement);
+    let backup_wide = wide(backup);
+    // SAFETY: target_wide, tmp_wide, and backup_wide are Vec<u16>s built by
+    // appending an explicit NUL terminator, so each as_ptr() yields a valid
+    // NUL-terminated wide string for the duration of the call, and the vectors
+    // outlive it; lpExclude and lpReserved are passed as null as documented for
+    // ReplaceFileW; failure is reported via the zero return checked below.
+    let replaced = unsafe {
+        ReplaceFileW(
+            target_wide.as_ptr(),
+            tmp_wide.as_ptr(),
+            backup_wide.as_ptr(),
+            REPLACEFILE_WRITE_THROUGH,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if replaced == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn replace_file_atomically_with<F>(
+    tmp: &Path,
+    target: &Path,
+    backup: &Path,
+    replace: F,
+) -> ReplaceResult
+where
+    F: FnOnce(&Path, &Path, &Path) -> io::Result<()>,
+{
+    if !target.exists() {
+        return promote_replacement(tmp, target);
+    }
+
+    // The target is authoritative before ReplaceFileW starts. A stale backup
+    // from an earlier completed operation is no longer a recovery candidate.
+    let _ = std::fs::remove_file(backup);
+    match replace(target, tmp, backup) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(backup);
+            Ok(ReplaceState::Committed)
+        }
+        Err(error) => converge_failed_windows_replace(tmp, target, backup, error),
+    }
+}
+
+fn promote_replacement(replacement: &Path, target: &Path) -> ReplaceResult {
+    std::fs::rename(replacement, target).map_or_else(
+        |error| {
+            let state = if target.is_file() {
+                ReplaceState::RolledBack
+            } else {
+                ReplaceState::RecoveryRequired
+            };
+            Err(ReplaceError::new(state, error))
+        },
+        |_| Ok(ReplaceState::Committed),
+    )
+}
+
+#[cfg(windows)]
+fn converge_failed_windows_replace(
+    replacement: &Path,
+    target: &Path,
+    backup: &Path,
+    replace_error: io::Error,
+) -> ReplaceResult {
+    // ReplaceFileW documents partially-mutated layouts for errors 1175/1176/1177.
+    // First restore an authoritative name. Until that is confirmed, neither rollback nor
+    // replacement is deleted.
+    if !target.is_file() {
+        if backup.is_file() {
+            if let Err(restore_error) = promote_replacement(backup, target) {
+                return Err(ReplaceError::new(
+                    ReplaceState::RecoveryRequired,
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!(
+                            "replace failed ({replace_error}); restoring backup failed: {restore_error}"
+                        ),
+                    ),
+                ));
+            }
+        } else if replacement.is_file() {
+            // No old authority survived, so the durable replacement is the only recoverable
+            // candidate. Promoting it completes the write rather than returning an empty state.
+            return promote_replacement(replacement, target);
+        }
+    }
+
+    if !target.is_file() {
+        return Err(ReplaceError::new(
+            ReplaceState::RecoveryRequired,
+            io::Error::new(
+                replace_error.kind(),
+                format!("atomic replace left no authoritative file: {replace_error}"),
+            ),
+        ));
+    }
+
+    // The old target either retained its name or was restored from backup.
+    // Preserve every remaining candidate; callers may clean them only after
+    // observing RolledBack and completing their own lifecycle transaction.
+    Err(ReplaceError::new(ReplaceState::RolledBack, replace_error))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn replace_file_atomically(tmp: &Path, target: &Path, _backup: &Path) -> ReplaceResult {
+    promote_replacement(tmp, target)
+}
+
+#[cfg(unix)]
+pub(crate) fn reserved_target_is_unchanged(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (Ok(opened), Ok(named)) = (file.metadata(), std::fs::symlink_metadata(path)) else {
+        return false;
+    };
+    named.file_type().is_file() && opened.dev() == named.dev() && opened.ino() == named.ino()
+}
+
+#[cfg(windows)]
+pub(crate) fn reserved_target_is_unchanged(_file: &File, path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let Ok(named) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    named.file_type().is_file() && named.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn reserved_target_is_unchanged(_file: &File, path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+/// Move a corrupt file aside, preserving its bytes for inspection, under a
+/// unique timestamped name. The sub-second suffix matters: `rename` silently
+/// replaces an existing destination on Unix, so two corruptions landing in
+/// the same wall-clock second (fast retry loops, racing processes) must not
+/// destroy each other's evidence. Returns the quarantine path; the caller
+/// owns the refuse/log semantics.
+pub(crate) fn quarantine_corrupt_file(path: &Path) -> io::Result<PathBuf> {
+    let quarantine = quarantine_destination(path);
+    std::fs::rename(path, &quarantine)?;
+    Ok(quarantine)
+}
+
+/// Rename-free fallback for callers whose fresh-start path would otherwise
+/// overwrite or delete the corrupt original: when `rename` fails (Windows
+/// AV/backup locks, transiently immutable directories), the in-memory bytes
+/// are written to the same timestamped quarantine name so the evidence
+/// survives the caller's destructive rewrite of the original path.
+pub(crate) fn quarantine_corrupt_file_bytes(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let quarantine = quarantine_destination(path);
+    atomic_write_private(&quarantine, bytes)?;
+    Ok(quarantine)
+}
+
+/// Full-content fallback for oversize sources: the bytes-fallback above only
+/// holds what the caller's bounded read kept in memory (a truncated prefix by
+/// design), so when the complete on-disk file is the evidence, copy it whole.
+/// Permission inheritance is platform-shaped: on unix, `fs::copy` preserves
+/// permission bits and the caller repairs the source to 0600 before
+/// quarantining, so the copy inherits that mode — a caller on a path where
+/// the repair did NOT or could not run must use
+/// [`quarantine_secret_file`] instead (the copy would inherit the loose
+/// mode); on Windows the repair is a documented no-op and the copy carries
+/// the source's ACL (same exposure as the source file, no widening).
+pub(crate) fn quarantine_corrupt_file_copy(path: &Path) -> io::Result<PathBuf> {
+    let quarantine = quarantine_destination(path);
+    std::fs::copy(path, &quarantine)?;
+    Ok(quarantine)
+}
+
+/// Quarantine a secret-bearing file whose 0600 permission repair itself
+/// failed (a backup restore can leave a foreign-owned world-readable
+/// secret at the well-known path). A plain `rename` preserves the loose
+/// mode bits, so the evidence copy would stay world-readable at its new
+/// name. Here the app owns the copy it creates: stream-copy the content
+/// (no unbounded in-memory read), tighten the copy to 0600 — the chmod
+/// that failed on the foreign-owned source succeeds on our own file —
+/// then unlink the loose original. The app's authority over the original
+/// is the parent directory's write bit, not the file's ownership.
+/// Non-regular targets (the EISDIR fixture plants a directory at the
+/// path), unreadable sources, and copy failures keep
+/// [`quarantine_corrupt_file`]'s rename semantics; if the copy lands but
+/// the unlink fails, the returned error makes the caller log that the
+/// loose file stays in place (the 0600 copy still exists as evidence).
+pub(crate) fn quarantine_secret_file(path: &Path) -> io::Result<PathBuf> {
+    let is_regular = std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false);
+    let quarantine = quarantine_destination(path);
+    // Round-11 复审 minor:unix 腿改用 0600 create_new 直接创建副本再流
+    // 式拷贝——`fs::copy` 先按默认模式(通常 0644)落盘再收紧,证据副本
+    // 在 copy+chmod 窗口内全局可读;且收紧失败被静默吞掉,恰在本 helper
+    // 存在的修复失败路径上自相矛盾(文档声称该 chmod 必然成功)。副本
+    // 创建即 0600,后续 chmod 只是显式兜底,失败时大声记录。Windows 腿
+    // 保留 `fs::copy`:副本继承源 ACL(与源文件同暴露,无扩大),默认
+    // ACL 反而取决于目录模板,不在本次收紧范围。
+    let copy_landed = if !is_regular {
+        false
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let copy_result: io::Result<()> = (|| {
+                let mut source = std::fs::File::open(path)?;
+                let mut destination = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&quarantine)?;
+                std::io::copy(&mut source, &mut destination)?;
+                Ok(())
+            })();
+            match copy_result {
+                Ok(()) => true,
+                Err(_) => {
+                    let _ = std::fs::remove_file(&quarantine);
+                    return quarantine_corrupt_file(path);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(path, &quarantine).is_ok()
+        }
+    };
+    if copy_landed {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Err(error) =
+                std::fs::set_permissions(&quarantine, std::fs::Permissions::from_mode(0o600))
+            {
+                eprintln!(
+                    "quarantine: tighten {} to 0600 failed: {error} (copy was created 0600)",
+                    quarantine.display()
+                );
+            }
+        }
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(quarantine),
+            Err(remove_error) => Err(remove_error),
+        };
+    }
+    quarantine_corrupt_file(path)
+}
+
+fn quarantine_destination(path: &Path) -> PathBuf {
+    let now = chrono::Utc::now();
+    let stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    path.with_file_name(format!(
+        "{stem}.corrupt-{}.{:09}",
+        now.format("%Y%m%dT%H%M%S"),
+        now.timestamp_subsec_nanos(),
+    ))
+}
+
+/// Append-only log/diary rotation: when `path` exceeds `max_bytes`, either
+/// delete it (`keep: None`) or rename it to the explicit `keep` destination
+/// (overwrite-replace, so the newest superseded copy survives). Missing
+/// source is "nothing to rotate" (`Ok(false)`), matching every caller's
+/// inspect-then-act preamble. The rename relies on std's replace-existing
+/// semantics on both platforms; concurrent rotations may lose the race —
+/// logging is not worth a lock, callers ignore or log the error.
+pub(crate) fn rotate_log_if_oversized(
+    path: &Path,
+    max_bytes: u64,
+    keep: Option<&Path>,
+) -> io::Result<bool> {
+    let oversized = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len() > max_bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !oversized {
+        return Ok(false);
+    }
+    match keep {
+        None => std::fs::remove_file(path)?,
+        Some(destination) => std::fs::rename(path, destination)?,
+    }
+    Ok(true)
+}
+
+/// Test helper: assert `path`'s POSIX mode equals `expected` (callers pass
+/// 0600 for files, 0700 for directories — see the thin wrappers below). The
+/// target cfg stays in this adapter layer (architecture guard rule). Windows
+/// has no POSIX mode bits, always passes. The assertion message states only the outcome and never repeats the path
+/// (round-12 review: the path contains a session id, and CodeQL models it formatted into
+/// panic/assert messages as sensitive information reaching logs; on test failure the
+/// specific file is identifiable from the call site).
+#[cfg(test)]
+fn assert_private_mode(path: &Path, expected: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.permissions().mode(),
+            Err(_) => panic!("private-mode assertion failed: artifact is missing"),
+        };
+        assert!(
+            mode & 0o777 == expected,
+            "private-mode assertion failed: artifact is more permissive than {expected:o}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, expected);
+    }
+}
+
+/// Test helper: assert the file mode is 0600. The tool layer's CI
+/// tests check the screenshot capture_and_store wrote through this — the target cfg stays
+/// in this adapter layer (architecture guard rule). Windows has no POSIX mode bits, always
+/// passes. Thin wrapper over [`assert_private_mode`], which owns the
+/// never-repeat-the-path rule.
+#[cfg(test)]
+pub(crate) fn assert_private_file_mode(path: &Path) {
+    assert_private_mode(path, 0o600);
+}
+
+/// Test helper (review round-11): assert the directory mode is 0700. computer_use's audit
+/// log directory is checked through this — the target cfg stays in this adapter layer
+/// (architecture guard rule, same as [`assert_private_file_mode`]). Windows has no POSIX
+/// mode bits, always passes.
+#[cfg(test)]
+pub(crate) fn assert_private_dir_mode(path: &Path) {
+    assert_private_mode(path, 0o700);
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::path::Path;
+
+    use super::{
+        atomic_write, atomic_write_private, is_executable_file, quarantine_corrupt_file,
+        quarantine_corrupt_file_bytes, quarantine_corrupt_file_copy, read_capped,
+        rotate_log_if_oversized,
+    };
+    // Round-12 复审:permission_bits / quarantine_secret_file 的调用测试是
+    // cfg(unix)(0600 语义),无条件导入会在 Windows 测试构建下悬空为
+    // unused-import 硬错——此前该分支从未在 Windows 上编译过,与 Round-4
+    // 的「Linux 把坏臂 cfg 出去、本地验证全绿」同型。
+    #[cfg(unix)]
+    use super::{create_secret_file, open_private_append_file, open_private_lock_file};
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    use super::{ensure_private_real_directory, open_private_file_directory};
+    #[cfg(unix)]
+    use super::{permission_bits, quarantine_secret_file};
+
+    /// The open-time metadata gate bounds the read only at
+    /// open time — a file appended past the cap between the gate and EOF
+    /// (the fd pins the inode, so no swap is needed) must be refused by the
+    /// read itself instead of being read and allocated whole.
+    #[test]
+    fn read_capped_refuses_a_reader_grown_past_the_cap() {
+        let mut reader = std::io::repeat(b'x');
+        let error = read_capped(&mut reader, 16).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+        assert!(
+            error.to_string().contains("read cap"),
+            "the overflow must name the cap: {error}"
+        );
+    }
+
+    #[test]
+    fn rotate_log_deletes_oversized_file_when_no_suffix_requested() {
+        let path = std::env::temp_dir().join(format!(
+            "pinvou3_rotate_del_test_{}.log",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"x".repeat(16)).unwrap();
+        // Under budget: no rotation, file intact.
+        assert!(!rotate_log_if_oversized(&path, 32, None).unwrap());
+        assert!(path.exists());
+        // Over budget: file removed.
+        assert!(rotate_log_if_oversized(&path, 8, None).unwrap());
+        assert!(!path.exists());
+        // Already gone: reported as nothing to rotate, not an error.
+        assert!(!rotate_log_if_oversized(&path, 8, None).unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotate_log_renames_to_suffix_replacing_previous_copy() {
+        let base = std::env::temp_dir().join(format!(
+            "pinvou3_rotate_keep_test_{}.log",
+            std::process::id()
+        ));
+        let rotated = std::env::temp_dir().join(format!(
+            "pinvou3_rotate_keep_test_{}.log.old",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&rotated);
+        std::fs::write(&base, b"new contents exceeding the budget").unwrap();
+        std::fs::write(&rotated, b"old").unwrap();
+        assert!(rotate_log_if_oversized(&base, 8, Some(&rotated)).unwrap());
+        assert!(!base.exists());
+        assert_eq!(
+            std::fs::read(&rotated).unwrap(),
+            b"new contents exceeding the budget"
+        );
+        let _ = std::fs::remove_file(&rotated);
+    }
+
+    #[test]
+    fn darwin_x86_64_directory_symbols_are_inode64_qualified() {
+        let source = include_str!("filesystem.rs");
+        let inode64 = ["$", "INODE64"].concat();
+        for function in ["fdopendir", "readdir"] {
+            let binding = format!("link_name = \"{function}{inode64}\"");
+            assert_eq!(source.matches(&binding).count(), 1, "missing {binding}");
+        }
+        let x86_64_cfg = [
+            "all(target_os = \"mac",
+            "os\", target_arch = \"x86_",
+            "64\")",
+        ]
+        .concat();
+        assert_eq!(source.matches(&x86_64_cfg).count(), 2);
+        let darwin_errno = ["__err", "or"].concat();
+        let linux_errno = ["__errno_", "location"].concat();
+        for errno_symbol in [darwin_errno, linux_errno] {
+            let binding = format!("link_name = \"{errno_symbol}\"");
+            assert_eq!(source.matches(&binding).count(), 1, "missing {binding}");
+        }
+    }
+
+    #[test]
+    fn unsupported_private_directory_contract_has_no_path_mutations() {
+        let source = include_str!("filesystem.rs");
+        let start = ["// unsupported-private-file-directory:", "start"].concat();
+        let end = ["// unsupported-private-file-directory:", "end"].concat();
+        let block = source
+            .split_once(&start)
+            .and_then(|(_, rest)| rest.split_once(&end).map(|(block, _)| block))
+            .expect("unsupported private directory contract block");
+
+        assert_eq!(block.matches("io::ErrorKind::Unsupported").count(), 1);
+        assert_eq!(
+            block
+                .matches("private_file_directory_unsupported()")
+                .count(),
+            15
+        );
+        for forbidden in [
+            "std::fs::",
+            "OpenOptions",
+            ".create_new(",
+            "remove_file(",
+            "read_dir(",
+            ".join(",
+        ] {
+            assert!(
+                !block.contains(forbidden),
+                "forbidden fallback: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_private_directory_rename_remains_root_handle_relative() {
+        let source = include_str!("filesystem.rs");
+        let block = source
+            .split_once("// windows-private-handle-relative-rename:start")
+            .and_then(|(_, rest)| {
+                rest.split_once("// windows-private-handle-relative-rename:end")
+                    .map(|(block, _)| block)
+            })
+            .expect("Windows handle-relative rename contract block");
+
+        for required in [
+            "NtSetInformationFile(",
+            "FileRenameInformation",
+            "RootDirectory = destination_handle.as_raw_handle()",
+            ".max(std::mem::size_of::<FILE_RENAME_INFORMATION>())",
+            "RtlNtStatusToDosError(status)",
+        ] {
+            assert!(block.contains(required), "missing contract: {required}");
+        }
+        for forbidden in [
+            "SetFileInformationByHandle(",
+            ".canonical_path",
+            "std::fs::rename(",
+            "RootDirectory = std::ptr::null",
+        ] {
+            assert!(!block.contains(forbidden), "unsafe fallback: {forbidden}");
+        }
+    }
+
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn windows_and_posix_private_directory_moves_and_removes_files_through_stable_handles() {
+        use std::ffi::OsStr;
+        use std::io::Read as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let root = open_private_file_directory(&root_path).unwrap();
+        root.atomic_write_private_file(OsStr::new("state.json"), b"old")
+            .unwrap();
+        root.atomic_write_private_file(OsStr::new("state.json"), b"new")
+            .unwrap();
+        let mut state = root
+            .open_plain_file(OsStr::new("state.json"))
+            .unwrap()
+            .unwrap();
+        let mut state_raw = Vec::new();
+        state.read_to_end(&mut state_raw).unwrap();
+        assert_eq!(state_raw, b"new");
+        drop(state);
+        assert!(root.remove_plain_file(OsStr::new("state.json")).unwrap());
+        std::fs::create_dir(root_path.join("non-file-entry")).unwrap();
+        assert!(
+            root.remove_plain_file(OsStr::new("non-file-entry"))
+                .is_err()
+        );
+        assert!(root_path.join("non-file-entry").is_dir());
+        std::fs::remove_dir(root_path.join("non-file-entry")).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::write(root_path.join("linked-source"), b"linked").unwrap();
+            std::fs::hard_link(
+                root_path.join("linked-source"),
+                root_path.join("linked-entry"),
+            )
+            .unwrap();
+            assert!(root.remove_plain_file(OsStr::new("linked-entry")).is_err());
+            assert!(root_path.join("linked-source").is_file());
+            assert!(root_path.join("linked-entry").is_file());
+            std::fs::remove_file(root_path.join("linked-entry")).unwrap();
+            std::fs::remove_file(root_path.join("linked-source")).unwrap();
+        }
+        std::fs::write(root_path.join("source"), b"anchored").unwrap();
+        let child = root
+            .create_private_child_directory(OsStr::new("child"))
+            .unwrap();
+
+        assert_eq!(
+            root.move_plain_file_to(OsStr::new("source"), &child, OsStr::new("destination"))
+                .unwrap(),
+            super::MovePlainFileOutcome::Moved
+        );
+        assert!(
+            root.open_plain_file(OsStr::new("source"))
+                .unwrap()
+                .is_none()
+        );
+        let mut moved = child
+            .open_plain_file(OsStr::new("destination"))
+            .unwrap()
+            .unwrap();
+        let mut raw = Vec::new();
+        moved.read_to_end(&mut raw).unwrap();
+        assert_eq!(raw, b"anchored");
+        drop(moved);
+        assert!(child.remove_plain_file(OsStr::new("destination")).unwrap());
+        drop(child);
+        assert!(
+            root.remove_empty_child_directory(OsStr::new("child"))
+                .unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anchored_directory_does_not_follow_replacement_root() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let parked_path = temp.path().join("parked");
+        let outside_path = temp.path().join("outside");
+        std::fs::create_dir_all(&root_path).unwrap();
+        std::fs::create_dir_all(&outside_path).unwrap();
+        std::fs::write(root_path.join("victim"), b"inside").unwrap();
+        std::fs::write(outside_path.join("victim"), b"outside").unwrap();
+        let root = open_private_file_directory(&root_path).unwrap();
+
+        std::fs::rename(&root_path, &parked_path).unwrap();
+        symlink(&outside_path, &root_path).unwrap();
+        assert!(root.remove_plain_file(OsStr::new("victim")).unwrap());
+        root.atomic_write_private_file(OsStr::new("state.json"), b"anchored-write")
+            .unwrap();
+
+        assert!(!parked_path.join("victim").exists());
+        assert_eq!(
+            std::fs::read(parked_path.join("state.json")).unwrap(),
+            b"anchored-write"
+        );
+        assert!(!outside_path.join("state.json").exists());
+        assert_eq!(
+            std::fs::read(outside_path.join("victim")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_directory_handle_blocks_root_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = temp.path().join("root");
+        let parked_path = temp.path().join("parked");
+        let root = open_private_file_directory(&root_path).unwrap();
+
+        assert!(std::fs::rename(&root_path, &parked_path).is_err());
+        drop(root);
+        std::fs::rename(&root_path, &parked_path).unwrap();
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn readdir_null_propagates_errno_after_clearing_it() {
+        let cleared = std::cell::Cell::new(false);
+        let error = super::next_unix_directory_entry_with(
+            || cleared.set(true),
+            || {
+                assert!(cleared.get(), "errno must be cleared before readdir");
+                None
+            },
+            || 5,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn readdir_null_with_clear_errno_is_eof() {
+        let result = super::next_unix_directory_entry_with(|| {}, || None, || 0).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn delete_on_close_file_round_trips_only_through_its_handle() {
+        use std::io::{Read as _, Seek as _, Write as _};
+
+        let parent = std::env::temp_dir().join(format!(
+            "pinvou3-delete-on-close-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let directory_path = parent.join("owned");
+        let directory = open_private_file_directory(&directory_path).unwrap();
+        let mut file = directory
+            .create_delete_on_close_file("download_round_trip.json")
+            .unwrap();
+        file.write_all(b"handle-only").unwrap();
+        file.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut content = String::new();
+        file.read_to_string(&mut content).unwrap();
+        assert_eq!(content, "handle-only");
+
+        drop(file);
+        drop(directory);
+        assert!(!directory_path.join("download_round_trip.json").exists());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(
+        windows,
+        target_os = "macos",
+        all(target_os = "linux", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn private_real_directory_is_created_without_a_link_root() {
+        let parent = std::env::temp_dir().join(format!(
+            "pinvou3-private-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let directory = parent.join("owned");
+
+        ensure_private_real_directory(&directory).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&directory).unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attribute_is_rejected() {
+        assert!(!super::windows_attributes_are_not_reparse(0x400));
+        assert!(super::windows_attributes_are_not_reparse(0));
+    }
+
+    #[test]
+    fn executable_file_check_rejects_directories_and_unix_non_executable_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "pinvou3-executable-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("runtime");
+        std::fs::write(&file, b"runtime").unwrap();
+        assert!(!is_executable_file(&dir));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!is_executable_file(&file));
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(is_executable_file(&file));
+        }
+        #[cfg(not(unix))]
+        assert!(is_executable_file(&file));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn atomic_write_round_trips_content() {
+        let dir = std::env::temp_dir().join(format!("pinvou3-atomic-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // 首次创建（目标不存在）：Windows 上必须走普通 rename，不能失败。
+        let target = dir.join("_code_mode_states.json");
+        atomic_write(&target, br#"{"session-1":"yolo"}"#).expect("first write");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read back"),
+            r#"{"session-1":"yolo"}"#
+        );
+
+        // 覆盖写入仍保持完整内容（原子替换语义）。
+        atomic_write(&target, br#"{"session-1":"plan","session-2":"yolo"}"#).expect("rewrite");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read rewritten"),
+            r#"{"session-1":"plan","session-2":"yolo"}"#
+        );
+
+        // 成功后不残留临时/备份文件。
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name != "_code_mode_states.json"
+            })
+            .collect();
+        assert!(leftover.is_empty(), "leftover files: {leftover:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writers_create_and_repair_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pinvou3-private-writers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let append = dir.join("outbox.jsonl");
+        std::fs::write(&append, b"existing\n").unwrap();
+        std::fs::set_permissions(&append, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_private_append_file(&append).unwrap());
+        assert_eq!(
+            std::fs::metadata(&append).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let atomic = dir.join("state.json");
+        atomic_write_private(&atomic, b"private").unwrap();
+        assert_eq!(
+            std::fs::metadata(&atomic).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // create_secret_file truncate-opens the final path in place, so a
+        // legacy world-readable file must also be repaired on open.
+        let secret = dir.join("private.json");
+        std::fs::write(&secret, b"stale\n").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(create_secret_file(&secret).unwrap());
+        assert_eq!(
+            std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn private_atomic_write_replaces_existing_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "pinvou3-private-atomic-write-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("secret.json");
+
+        atomic_write_private(&path, b"old").expect("initial private write");
+        atomic_write_private(&path, b"new").expect("replace private write");
+        assert_eq!(std::fs::read(&path).expect("read target"), b"new");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("target metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_failure_is_reported_without_residue() {
+        let dir =
+            std::env::temp_dir().join(format!("pinvou3-atomic-write-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        // 父级是普通文件 → tmp 无法创建，写入必须报错且不留任何残留。
+        let file_as_parent = dir.join("not-a-dir");
+        std::fs::write(&file_as_parent, "x").expect("seed parent file");
+        let target = file_as_parent.join("state.json");
+        assert!(atomic_write(&target, b"new").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file_as_parent).expect("parent untouched"),
+            "x"
+        );
+
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list dir")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(leftover.len(), 1, "no tmp/backup residue: {leftover:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    pub(crate) fn try_link_file(target: &Path, link: &Path) -> bool {
+        try_link_file_impl(target, link)
+    }
+
+    pub(crate) fn try_link_dir(target: &Path, link: &Path) -> bool {
+        try_link_dir_impl(target, link)
+    }
+
+    pub(crate) fn remove_dir_link(link: &Path) {
+        remove_dir_link_impl(link)
+    }
+
+    #[test]
+    fn failed_atomic_replace_preserves_the_authoritative_target() {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou-atomic-replace-failure-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("profile.json");
+        let missing_tmp = root.join("missing.tmp");
+        let backup = root.join("profile.bak");
+        std::fs::write(&target, "authoritative").unwrap();
+
+        assert!(super::replace_file_atomically(&missing_tmp, &target, &backup).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "authoritative");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    fn windows_replace_fixture(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou-windows-replace-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("memory.json");
+        let replacement = root.join("memory.tmp");
+        let backup = root.join("memory.bak");
+        (root, target, replacement, backup)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_covers_first_write_and_success_cleanup() {
+        let (root, target, replacement, backup) = windows_replace_fixture("success");
+        std::fs::write(&replacement, "first").unwrap();
+        super::replace_file_atomically(&replacement, &target, &backup).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first");
+
+        std::fs::write(&replacement, "second").unwrap();
+        super::replace_file_atomically(&replacement, &target, &backup).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second");
+        assert!(!replacement.exists());
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // The 1175/1176/1177 family converges through one code path
+    // (converge_failed_windows_replace never reads the raw code), so one
+    // representative error code pins the roll-back layout; there is no
+    // per-code branch left to catch.
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1175_retains_the_two_official_original_names() {
+        let (root, target, replacement, backup) = windows_replace_fixture("1175");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&replacement, "new").unwrap();
+
+        let error =
+            super::replace_file_atomically_with(&replacement, &target, &backup, |_, _, _| {
+                Err(std::io::Error::from_raw_os_error(1175))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.state(), super::ReplaceState::RolledBack);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&replacement).unwrap(), "new");
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1177_restores_the_official_backup_layout() {
+        let (root, target, replacement, backup) = windows_replace_fixture("1177");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&replacement, "new").unwrap();
+
+        let error = super::replace_file_atomically_with(
+            &replacement,
+            &target,
+            &backup,
+            |target, _, backup| {
+                std::fs::rename(target, backup)?;
+                Err(std::io::Error::from_raw_os_error(1177))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.state(), super::ReplaceState::RolledBack);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&replacement).unwrap(), "new");
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_replace_promotes_only_surviving_replacement() {
+        let (root, target, replacement, backup) = windows_replace_fixture("replacement-only");
+        std::fs::write(&replacement, "new").unwrap();
+        let state = super::converge_failed_windows_replace(
+            &replacement,
+            &target,
+            &backup,
+            std::io::Error::from_raw_os_error(1177),
+        )
+        .unwrap();
+        assert_eq!(state, super::ReplaceState::Committed);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!replacement.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_replace_keeps_candidates_when_no_authority_can_be_restored() {
+        let (root, target, replacement, backup) = windows_replace_fixture("no-candidate");
+        let result = super::converge_failed_windows_replace(
+            &replacement,
+            &target,
+            &backup,
+            std::io::Error::from_raw_os_error(1176),
+        );
+        assert!(result.is_err());
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_partial_replace_preserves_occupied_recovery_candidates() {
+        use std::cell::RefCell;
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let (root, target, replacement, backup) = windows_replace_fixture("occupied-backup");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&replacement, "new").unwrap();
+        let occupied = RefCell::new(None);
+        let error = super::replace_file_atomically_with(
+            &replacement,
+            &target,
+            &backup,
+            |target, _, backup| {
+                std::fs::rename(target, backup)?;
+                *occupied.borrow_mut() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(0)
+                        .open(backup)?,
+                );
+                Err(std::io::Error::from_raw_os_error(1177))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.state(), super::ReplaceState::RecoveryRequired);
+        assert!(!target.exists());
+        assert!(replacement.exists());
+        assert!(backup.exists());
+        drop(occupied.borrow_mut().take());
+
+        let recovered =
+            super::recover_interrupted_replace(&replacement, &target, &backup).unwrap_err();
+        assert_eq!(recovered.state(), super::ReplaceState::RolledBack);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&replacement).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_failed_first_promotion_preserves_the_complete_replacement() {
+        let (root, target, replacement, backup) = windows_replace_fixture("promotion-blocked");
+        std::fs::write(&replacement, "complete-new-value").unwrap();
+        // 目标名被目录占用:target.exists() 为 true,走 ReplaceFileW(目标是目录,
+        // 必然失败)→ 收敛分支 promote_replacement,rename(文件→目录名)同样必然
+        // ERROR_ACCESS_DENIED,且 target.is_file() 为 false → RecoveryRequired。
+        // 此前版本用 share_mode(0) 独占打开 replacement 期望首写提升的 rename
+        // 失败,但 NTFS 的 rename 只改目录项、不受源文件独占句柄影响,Windows CI
+        // 上 rename 直接成功,前提不成立(与 memory 侧
+        // memory_write_cleans_tmp_backup_on_permanently_occupied_target 同构)。
+        std::fs::create_dir(&target).unwrap();
+
+        let error = super::replace_file_atomically(&replacement, &target, &backup).unwrap_err();
+
+        assert_eq!(error.state(), super::ReplaceState::RecoveryRequired);
+        assert!(target.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(&replacement).unwrap(),
+            "complete-new-value"
+        );
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_atomic_replace_never_exposes_a_partial_target_to_readers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (root, target, replacement, backup) = windows_replace_fixture("concurrent-reader");
+        let old = "a".repeat(32 * 1024);
+        let new = "b".repeat(32 * 1024);
+        std::fs::write(&target, &old).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let reader_running = Arc::clone(&running);
+        let reader_target = target.clone();
+        let old_for_reader = old.clone();
+        let new_for_reader = new.clone();
+        let reader = std::thread::spawn(move || {
+            while reader_running.load(Ordering::Acquire) {
+                if let Ok(value) = std::fs::read_to_string(&reader_target) {
+                    assert!(value == old_for_reader || value == new_for_reader);
+                }
+            }
+        });
+
+        for index in 0..32 {
+            let value = if index % 2 == 0 { &new } else { &old };
+            std::fs::write(&replacement, value).unwrap();
+            super::replace_file_atomically(&replacement, &target, &backup).unwrap();
+        }
+        running.store(false, Ordering::Release);
+        reader.join().unwrap();
+        let final_value = std::fs::read_to_string(&target).unwrap();
+        assert!(final_value == old || final_value == new);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Round-9 复审 minor:秘密文件的隔离必须是「0600 副本 + unlink 原
+    /// 件」——普通 rename 保留放宽的 mode 位,他者属主的世界可读密文件
+    /// 在隔离名下依旧裸奔。目录占位(EISDIR fixture)退回 rename。
+    #[test]
+    #[cfg(unix)]
+    fn quarantine_secret_file_copies_0600_and_unlinks_the_original() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-secret-quarantine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let loose = root.join("web-access.json");
+        std::fs::write(&loose, b"{\"desktop_secret\":\"token\"}").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let quarantined =
+            quarantine_secret_file(&loose).expect("regular-file quarantine must succeed");
+        assert!(!loose.exists(), "the loose original must be unlinked");
+        assert_eq!(
+            std::fs::read(&quarantined).unwrap(),
+            b"{\"desktop_secret\":\"token\"}",
+            "the quarantined evidence must stay verbatim"
+        );
+        // Round-11 复审 minor(源码契约钉):副本必须以 0600 create_new 直接
+        // 创建——终态 0600 断言看不见 `fs::copy` 先按 0644 落盘再收紧的
+        // copy+chmod 窗口;回退成 copy-then-chmod 时本钉变红。unix 专属
+        // 窗口语义,Windows 腿保留 fs::copy(ACL 继承,见函数文档)。
+        #[cfg(unix)]
+        {
+            let source = include_str!("filesystem.rs");
+            let start = source
+                .find("pub(crate) fn quarantine_secret_file(")
+                .expect("quarantine_secret_file must exist");
+            let body = &source[start..];
+            let body = &body[..body
+                .find("\npub(crate) fn ")
+                .expect("quarantine_secret_file body must be terminated by the next fn")];
+            // Round-14 复审 NIT:精确多行形态对 rustfmt 重排脆(纯重排会
+            // 假红);按压缩空白后的形状断言——copy-then-chmod 回退仍红,
+            // 重排不再误伤。
+            let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains(".write(true) .create_new(true) .mode(0o600)"),
+                "the secret evidence copy must be created 0600, not copied loose and tightened after"
+            );
+        }
+        assert_eq!(
+            permission_bits(&quarantined).unwrap(),
+            Some(0o600),
+            "the quarantined copy must be tightened to 0600"
+        );
+        assert!(
+            quarantined
+                .to_string_lossy()
+                .contains("web-access.json.corrupt-"),
+            "the quarantine name must stay in the same directory family"
+        );
+
+        // 目录占位(读取腿 EISDIR 的真实形态)退回 rename:原件挪走,
+        // 证据保留为目录。
+        let placeholder = root.join("pending.json");
+        std::fs::create_dir_all(&placeholder).unwrap();
+        let quarantined_dir =
+            quarantine_secret_file(&placeholder).expect("directory quarantine must fall back");
+        assert!(!placeholder.exists());
+        assert!(quarantined_dir.is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quarantine_names_stay_unique_within_one_second() {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-quarantine-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("state.json");
+        std::fs::write(&first, b"corrupt A").unwrap();
+        let first_quarantine = quarantine_corrupt_file(&first).unwrap();
+        // (Comparing two DIFFERENT stems would prove nothing about the
+        // timestamp suffix — different names differ regardless. The
+        // same-stem re-quarantine below is the discriminator.)
+        assert!(
+            first_quarantine
+                .to_string_lossy()
+                .contains(".json.corrupt-")
+        );
+        assert!(!first.exists(), "the corrupt file must move aside");
+        assert_eq!(
+            std::fs::read(&first_quarantine).unwrap(),
+            b"corrupt A",
+            "the quarantined bytes must be preserved verbatim"
+        );
+        // Same stem again (the realistic same-second retry): the second
+        // capture must land under a fresh name instead of renaming over the
+        // first evidence.
+        std::fs::write(&first, b"corrupt A2").unwrap();
+        let re_quarantine = quarantine_corrupt_file(&first).unwrap();
+        assert_ne!(re_quarantine, first_quarantine);
+        assert_eq!(std::fs::read(&re_quarantine).unwrap(), b"corrupt A2");
+        assert_eq!(std::fs::read(&first_quarantine).unwrap(), b"corrupt A");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // Round-10 复审 minor:rename 失败时的两条回退腿(copy / bytes)此前零
+    // 执行测试——「quarantine fallback keeps full-file evidence」的承诺落在
+    // 未验证的代码上。unix 上能击破 rename 的形态同样击破 copy,两条腿只在
+    // Windows 锁场景可达;这里直接驱动 helper 本身,钉住证据字节与 0600 私密
+    // 落盘(两条腿都走 quarantine_destination/atomic_write_private/copy)。
+    #[test]
+    fn quarantine_fallback_legs_preserve_the_full_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "pinvou3-quarantine-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("state.json");
+
+        // copy 腿:整份文件按字节保留。契约是调用方先把源修复到 0600、
+        // copy 按位继承——先修复再隔离,钉住继承语义。
+        std::fs::write(&source, b"corrupt-full-bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let copied = quarantine_corrupt_file_copy(&source).unwrap();
+        assert!(copied.to_string_lossy().contains(".json.corrupt-"));
+        assert!(
+            source.exists(),
+            "the copy leg must leave the source in place"
+        );
+        assert_eq!(std::fs::read(&copied).unwrap(), b"corrupt-full-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&copied).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "a source repaired to 0600 before the copy must not quarantine loose"
+            );
+        }
+
+        // bytes 腿:调用方有界读保留的前缀按 atomic_write_private 落盘,
+        // 原路径留给调用方的破坏性重写。
+        let bytes_quarantine = quarantine_corrupt_file_bytes(&source, b"truncated-prefix").unwrap();
+        assert_ne!(
+            bytes_quarantine, copied,
+            "same-second captures need fresh names"
+        );
+        assert_eq!(
+            std::fs::read(&bytes_quarantine).unwrap(),
+            b"truncated-prefix"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&bytes_quarantine)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "atomic_write_private must land 0600");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    fn try_link_file_impl(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn try_link_file_impl(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn try_link_file_impl(_target: &Path, _link: &Path) -> bool {
+        false
+    }
+
+    #[cfg(unix)]
+    fn try_link_dir_impl(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn try_link_dir_impl(target: &Path, link: &Path) -> bool {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return true;
+        }
+        std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                &link.to_string_lossy(),
+                &target.to_string_lossy(),
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn try_link_dir_impl(_target: &Path, _link: &Path) -> bool {
+        false
+    }
+
+    #[cfg(windows)]
+    fn remove_dir_link_impl(link: &Path) {
+        let _ = std::fs::remove_dir(link);
+    }
+
+    #[cfg(not(windows))]
+    fn remove_dir_link_impl(link: &Path) {
+        let _ = std::fs::remove_file(link);
+    }
+
+    /// Round-6 review regression: `open_private_append_file`'s `mode(0o600)` only applies
+    /// at creation — an existing loose file must be re-tightened on every open, otherwise a
+    /// 0644 file left behind by an earlier version or an external tool stays group/world
+    /// readable forever.
+    #[cfg(unix)]
+    #[test]
+    fn private_append_open_re_tightens_a_loose_existing_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("audit-session.jsonl");
+
+        // Simulate a loose file left over from history.
+        std::fs::write(&path, b"prior revision data").unwrap();
+        let loose = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(&path, loose).unwrap();
+
+        {
+            let mut file = super::open_private_append_file(&path).expect("append open");
+            std::io::Write::write_all(&mut file, b"\nappended").unwrap();
+        }
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "reopen must re-tighten a loose private file"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"prior revision data\nappended"
+        );
+    }
+
+    /// The marketplace-lock counterpart of the append re-tighten regression: the
+    /// lock file is opened on every hot read, so a loose mode left behind by
+    /// an external tool must be tightened again on open — stat-gated, so the
+    /// steady 0600 case pays no chmod.
+    #[cfg(unix)]
+    #[test]
+    fn private_lock_open_re_tightens_a_loose_existing_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bundles.lock");
+
+        std::fs::write(&path, b"not user data").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _file = open_private_lock_file(&path).expect("lock open");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "reopen must re-tighten a loose lock file"
+        );
+    }
+
+    /// `O_NOFOLLOW` half of the planted-path hardening: a symlink planted at
+    /// the lock path must be refused fail-closed (ELOOP), and the tighten
+    /// must not have been redirected at the symlink's target.
+    #[cfg(unix)]
+    #[test]
+    fn private_lock_open_refuses_a_planted_symlink() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("unrelated-target.txt");
+        std::fs::write(&target, b"victim").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let lock_path = temp.path().join("bundles.lock");
+        std::os::unix::fs::symlink(&target, &lock_path).expect("plant symlink");
+
+        assert!(
+            open_private_lock_file(&lock_path).is_err(),
+            "a planted symlink at the lock path must be refused (O_NOFOLLOW)"
+        );
+        let mode = std::fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the tighten must stay on the opened inode, never the symlink's target"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+    }
+
+    /// The private-home DATA file read carries the same
+    /// planted-path hardening as the lock file. A symlink planted at the
+    /// data path must be refused (O_NOFOLLOW, ELOOP) instead of dragging a
+    /// hot reader into whatever the link points at.
+    #[cfg(unix)]
+    #[test]
+    fn private_data_read_refuses_a_planted_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("victim.txt");
+        std::fs::write(&target, b"victim").unwrap();
+
+        let data_path = temp.path().join("disabled_bundles.json");
+        std::os::unix::fs::symlink(&target, &data_path).expect("plant symlink");
+
+        assert!(
+            super::read_private_data_file(&data_path).is_err(),
+            "a planted symlink at the data path must be refused (O_NOFOLLOW)"
+        );
+        assert!(
+            super::read_private_data_file_bytes(&data_path).is_err(),
+            "the raw salvage read must refuse the planted symlink too"
+        );
+    }
+
+    /// A planted FIFO must fail the data read fast (the
+    /// regular-file fstat gate) instead of hanging a hot reader thread.
+    #[cfg(unix)]
+    #[test]
+    fn private_data_read_refuses_a_fifo_without_hanging() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("disabled_bundles.json");
+        crate::platform::paths::tests::plant_fifo(&data_path);
+
+        // Bounded worker: a regression to an unhardened
+        // read blocks `open()` forever — the shared helper fails the test
+        // on a bounded receive instead of hanging the whole lane. The timed-
+        // out worker holds no lock, so the red does not cascade.
+        let path = data_path.clone();
+        crate::platform::test_support::assert_refused_without_hanging(
+            "a planted FIFO read",
+            move || super::read_private_data_file(&path).is_err(),
+        );
+        crate::platform::test_support::assert_refused_without_hanging(
+            "the raw salvage read",
+            move || super::read_private_data_file_bytes(&data_path).is_err(),
+        );
+    }
+
+    /// A regular data file reads back through the hardened
+    /// helpers byte-for-byte (the hardening must not perturb the normal
+    /// read).
+    #[test]
+    fn private_data_read_serves_a_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("disabled_bundles.json");
+        std::fs::write(&data_path, r#"{"scopes":{}}"#).unwrap();
+        assert_eq!(
+            super::read_private_data_file(&data_path).unwrap(),
+            r#"{"scopes":{}}"#
+        );
+        assert_eq!(
+            super::read_private_data_file_bytes(&data_path).unwrap(),
+            br#"{"scopes":{}}"#
+        );
+    }
+
+    /// A planted huge REGULAR file must be refused by the
+    /// size cap instead of being read into memory in full (the same
+    /// unbounded-allocation shape the regular-file gate closes for
+    /// `/dev/zero`). The fixture uses a sparse file, so nothing is written.
+    #[test]
+    fn private_data_read_refuses_an_oversized_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_path = temp.path().join("huge.json");
+        let file = std::fs::File::create(&data_path).unwrap();
+        file.set_len(super::MAX_PRIVATE_DATA_READ_BYTES + 1)
+            .unwrap();
+        drop(file);
+        assert!(
+            super::read_private_data_file(&data_path).is_err(),
+            "an over-cap regular file must be refused"
+        );
+        assert!(
+            super::read_private_data_file_bytes(&data_path).is_err(),
+            "the raw salvage read must honor the cap too"
+        );
+    }
+
+    /// The hardened write re-tightens a drifted mode on an
+    /// existing file (a landing mark written by main's std::fs::write at
+    /// 0644 used to stay world-readable forever).
+    #[test]
+    #[cfg(unix)]
+    fn private_data_write_re_tightens_a_loose_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mark.pending");
+        std::fs::write(&path, b"old").unwrap();
+        assert!(
+            crate::platform::test_support::loosen_to_world_readable_for_test(&path),
+            "the loosen simulation must apply on unix"
+        );
+        super::write_private_data_file(&path, b"pending\n").unwrap();
+        assert_eq!(
+            crate::platform::test_support::permission_bits(&path),
+            Some(0o600),
+            "a drifted mode must be re-tightened"
+        );
+    }
+
+    #[test]
+    fn windows_bounded_directory_listing_and_anchored_append() {
+        use std::ffi::OsStr;
+        use std::io::{Read as _, Write as _};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bounded");
+        let directory = open_private_file_directory(&path).unwrap();
+        for i in 0..100 {
+            directory
+                .atomic_write_private_file(OsStr::new(&format!("{i}.json")), b"value")
+                .unwrap();
+        }
+        assert!(directory.entry_names_up_to(0).unwrap().is_empty());
+        assert_eq!(directory.entry_names_up_to(7).unwrap().len(), 7);
+        assert_eq!(directory.entry_names().unwrap().len(), 100);
+        for text in [b"one\n", b"two\n"] {
+            directory
+                .open_append_file(OsStr::new("audit.jsonl"))
+                .unwrap()
+                .write_all(text)
+                .unwrap();
+        }
+        let mut contents = String::new();
+        directory
+            .open_plain_file(OsStr::new("audit.jsonl"))
+            .unwrap()
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "one\ntwo\n");
+    }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(target_os = "linux", target_pointer_width = "64")
+))]
+fn open_append_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let name = unix_name(name)?;
+    // SAFETY: the owned directory fd and NUL-terminated name outlive openat.
+    // No-follow/nonblocking and the fstat below reject links and special files.
+    let fd = unsafe {
+        libc::openat(
+            directory.directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY
+                | libc::O_APPEND
+                | libc::O_CREAT
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK,
+            0o600 as std::os::raw::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a fresh owned descriptor, adopted exactly once.
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audit entry is not a regular file",
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_append_file_impl(
+    directory: &PrivateFileDirectory,
+    name: &std::ffi::OsStr,
+) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(directory.canonical_path.join(name))?;
+    if !metadata_is_plain_file(&file.metadata()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "audit entry is a reparse point or non-file",
+        ));
+    }
+    Ok(file)
+}
